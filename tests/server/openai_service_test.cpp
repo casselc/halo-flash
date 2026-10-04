@@ -98,6 +98,9 @@ struct Rig {
     std::string err;
     if (!server.Start(&err)) throw std::runtime_error(err);
   }
+  // Workers may still be streaming through the service: stop them first
+  // (members are destroyed in reverse order, the service before the server).
+  ~Rig() { server.Stop(); }
   ScriptedGenerator gen;
   Recording observed;
   HttpServer server;

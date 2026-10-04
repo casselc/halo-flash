@@ -98,7 +98,8 @@ struct ServiceOptions {
 class OpenAiService {
  public:
   OpenAiService(TextGenerator& generator, ServiceOptions options);
-  /// Registers the routes on `server`.
+  /// Registers the routes on `server`. The service must outlive the server's
+  /// Stop(): streaming responses run on the server's worker threads.
   void Register(HttpServer& server);
 
   HttpResponse Models(const HttpRequest& req);
