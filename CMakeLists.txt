@@ -143,6 +143,7 @@ endif()
 
 # --- tools ------------------------------------------------------------------
 add_executable(gguf_inspect tools/gguf_inspect.cpp)
+add_executable(halo_disk_bench tools/disk_bench.cpp)
 target_link_libraries(gguf_inspect PRIVATE halo_core)
 
 # --- tests ------------------------------------------------------------------
