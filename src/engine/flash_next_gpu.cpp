@@ -239,6 +239,8 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   router_ = Scratch(c.num_experts, error);
   expert_ids_ = Scratch(c.num_experts_used, error);
   expert_weights_ = Scratch(c.num_experts_used, error);
+  moe_h_ = Scratch(std::size_t{c.num_experts_used} * c.expert_ff, error);
+  moe_part_ = Scratch(std::size_t{c.num_experts_used} * c.hidden_size, error);
   eg_ = Scratch(std::max(c.expert_ff, c.shared_expert_ff), error);
   eu_ = Scratch(std::max(c.expert_ff, c.shared_expert_ff), error);
   ed_ = Scratch(H, error);
@@ -444,10 +446,45 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
       !Launch("halo_router_topk", {1}, {kBlock},
               {rt::Arg::Buf(router_), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(expert_weights_),
                rt::Arg::Val(c.num_experts), rt::Arg::Val(c.num_experts_used)},
-              error) ||
-      !dev_.Fill(block_out_, 0, error))
+              error))
     return false;
-  for (std::uint32_t i = 0; i < c.num_experts_used; ++i) {
+  // P3 fused path: every routed expert in three launches.
+  const auto& gate = l.ffn_gate_exps;
+  const auto& up = l.ffn_up_exps;
+  const auto& down = l.ffn_down_exps;
+  const auto& dd = tensors_.at(down.data);
+  const bool gate_up_fast = fused_moe_ && gate.type == core::GgmlType::kQ4_K && up.type == gate.type &&
+                            up.rows == gate.rows && up.cols == gate.cols && gate.cols % 256 == 0 && gate.cols <= 8192;
+  const bool down_q5_1 = down.type == core::GgmlType::kQ5_1 && down.cols % 32 == 0 && down.cols <= 8192;
+  const bool down_q8r = static_cast<bool>(dd.qs);
+  if (gate_up_fast && (down_q5_1 || down_q8r)) {
+    const auto ff = static_cast<std::uint32_t>(gate.rows), used = c.num_experts_used;
+    if (!Launch("halo_moe_gate_up_q4_k", {Blocks(ff, 8), used}, {256},
+                {rt::Arg::Buf(tensors_.at(gate.data).buf), rt::Arg::Buf(tensors_.at(up.data).buf),
+                 rt::Arg::Buf(expert_ids_), rt::Arg::Buf(mixed_), rt::Arg::Buf(moe_h_),
+                 rt::Arg::Val<std::uint64_t>(gate.RowBytes() * gate.rows), rt::Arg::Val(ff), rt::Arg::Val(H),
+                 rt::Arg::Val<std::uint64_t>(gate.RowBytes())},
+                error))
+      return false;
+    const bool down_ok =
+        down_q5_1 ? Launch("halo_moe_down_q5_1", {Blocks(H, 8), used}, {256},
+                           {rt::Arg::Buf(dd.buf), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(moe_h_), rt::Arg::Buf(moe_part_),
+                            rt::Arg::Val<std::uint64_t>(down.RowBytes() * down.rows), rt::Arg::Val(H), rt::Arg::Val(ff),
+                            rt::Arg::Val<std::uint64_t>(down.RowBytes())},
+                           error)
+                  : Launch("halo_moe_down_q8r", {Blocks(H, 8), used}, {256},
+                           {rt::Arg::Buf(dd.qs), rt::Arg::Buf(dd.d), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(moe_h_),
+                            rt::Arg::Buf(moe_part_), rt::Arg::Val(H), rt::Arg::Val(ff), rt::Arg::Val(dd.qstride)},
+                           error);
+    if (!down_ok || !Launch("halo_moe_combine", {Blocks(H)}, {kBlock},
+                            {rt::Arg::Buf(moe_part_), rt::Arg::Buf(expert_weights_), rt::Arg::Buf(block_out_),
+                             rt::Arg::Val(used), rt::Arg::Val(H)},
+                            error))
+      return false;
+  } else if (!dev_.Fill(block_out_, 0, error)) {
+    return false;
+  }
+  for (std::uint32_t i = 0; !(gate_up_fast && (down_q5_1 || down_q8r)) && i < c.num_experts_used; ++i) {
     if (!ExpertMatVec(l.ffn_gate_exps, i, mixed_, eg_, error) || !ExpertMatVec(l.ffn_up_exps, i, mixed_, eu_, error) ||
         !Launch("halo_silu_mul", {Blocks(c.expert_ff)}, {kBlock},
                 {rt::Arg::Buf(eg_), rt::Arg::Buf(eu_), rt::Arg::Val(c.expert_ff)}, error) ||

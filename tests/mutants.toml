@@ -783,3 +783,36 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuQuant.*"
 why = "values 16..31 take their fifth bit from qh bits 16..31"
+
+[[mutant]]
+name = "p3-moe-gate-up-swapped"
+file = "src/kernels/core.hip"
+find = '  if (lane == 0) h[static_cast<std::size_t>(slot) * rows + r] = Silu(g) * u;'
+replace = '  if (lane == 0) h[static_cast<std::size_t>(slot) * rows + r] = Silu(u) * g;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.FusedMoeMatchesCpuComposition"
+why = "SwiGLU gates the up projection with silu(gate)"
+timeout = 1200
+
+[[mutant]]
+name = "p3-moe-combine-unweighted"
+file = "src/kernels/core.hip"
+find = '    for (std::uint32_t s = 0; s < slots; ++s) acc += weights[s] * part[static_cast<std::size_t>(s) * n + i];'
+replace = '    for (std::uint32_t s = 0; s < slots; ++s) acc += part[static_cast<std::size_t>(s) * n + i];'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.FusedMoeMatchesCpuComposition"
+why = "routing weights scale each expert's output"
+timeout = 1200
+
+[[mutant]]
+name = "p3-moe-down-reads-slot-0"
+file = "src/kernels/core.hip"
+find = '  GemvBlocks<DotQ5_1>(down + ids[slot] * expert_bytes, row_bytes, h + static_cast<std::size_t>(slot) * cols,'
+replace = '  GemvBlocks<DotQ5_1>(down + ids[slot] * expert_bytes, row_bytes, h,'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.FusedMoeMatchesCpuComposition"
+why = "each slot's down projection reads its own hidden activations"
+timeout = 1200

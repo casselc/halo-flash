@@ -58,6 +58,7 @@ class FlashNextGpu {
   /// (default). Must be set before Create's upload, so it is a static knob.
   static inline bool repack_q8_ = true;
   static inline bool block_gemv_ = true;  ///< P3 Q4_K / Q5_1 GEMVs
+  static inline bool fused_moe_ = true;   ///< P3 routed experts in three launches
   /// Runs `tokens` in order; `logits` (optional) receives the last position's.
   /// Token at a time for now (P4 batches it); any chunking is equivalent.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error);
@@ -151,7 +152,7 @@ class FlashNextGpu {
   rt::Buffer ple_emb_, ple_key_, ple_value_, ple_query_, ple_gated_, ple_norm_, ple_history_;
   rt::Buffer qkv_, conv_out_, z_, alpha_, beta_, gdn_out_;
   rt::Buffer qg_, q_, gate_, k_, v_, ctx_, scores_, iq_, ik_, pooled_, block_scores_, visible_;
-  rt::Buffer router_, expert_ids_, expert_weights_, eg_, eu_, ed_, sgate_, logits_, lora_tmp_, lora_out_;
+  rt::Buffer router_, expert_ids_, expert_weights_, moe_h_, moe_part_, eg_, eu_, ed_, sgate_, logits_, lora_tmp_, lora_out_;
 };
 
 class FlashNextGpu::Snapshot {

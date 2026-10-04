@@ -1558,3 +1558,63 @@ __device__ void GemvBlocks(const std::uint8_t* w, std::uint64_t row_bytes, const
 
 HALO_GEMV_BLOCKS(halo_gemv_q4_k, DotQ4K)
 HALO_GEMV_BLOCKS(halo_gemv_q5_1, DotQ5_1)
+
+// ---- P3: fused routed-expert MoE --------------------------------------------
+//
+// All routed experts in three launches instead of five per expert:
+//   gate_up: h[slot][r] = silu(<gate_e[r], x>) * <up_e[r], x>   (grid.y = slot)
+//   down:    part[slot][r] = <down_e[r], h[slot]>                (grid.y = slot)
+//   combine: out[r] = sum_slot weights[slot] * part[slot][r]     (fixed order)
+// e = ids[slot]. gate/up are Q4_K; down is Q5_1 or repacked Q8_0.
+
+namespace {
+
+__device__ inline float RowDotQ4K(const std::uint8_t* row, const float* xs, std::uint32_t cols, std::uint32_t lane) {
+  float acc = 0;
+  for (std::uint32_t i = lane; i < cols / 64; i += kWarp) acc += DotQ4K::Item(row, xs, i);
+  return WarpSum(acc);
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_gate_up_q4_k(const std::uint8_t* gate, const std::uint8_t* up, const std::uint32_t* ids, const float* x,
+                          float* h, std::uint64_t expert_bytes, std::uint32_t rows, std::uint32_t cols,
+                          std::uint64_t row_bytes) {
+  __shared__ float xs[kGemvMaxCols];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  const std::uint32_t slot = blockIdx.y, r = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp;
+  if (r >= rows) return;
+  const std::uint32_t lane = threadIdx.x % kWarp;
+  const std::size_t e = ids[slot];
+  const float g = RowDotQ4K(gate + e * expert_bytes + r * row_bytes, xs, cols, lane);
+  const float u = RowDotQ4K(up + e * expert_bytes + r * row_bytes, xs, cols, lane);
+  if (lane == 0) h[static_cast<std::size_t>(slot) * rows + r] = Silu(g) * u;
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_down_q5_1(const std::uint8_t* down, const std::uint32_t* ids, const float* h, float* part,
+                       std::uint64_t expert_bytes, std::uint32_t rows, std::uint32_t cols, std::uint64_t row_bytes) {
+  const std::uint32_t slot = blockIdx.y;
+  GemvBlocks<DotQ5_1>(down + ids[slot] * expert_bytes, row_bytes, h + static_cast<std::size_t>(slot) * cols,
+                      part + static_cast<std::size_t>(slot) * rows, rows, cols);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_down_q8r(const std::int8_t* qs, const std::uint16_t* d, const std::uint32_t* ids, const float* h,
+                      float* part, std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride) {
+  const std::uint32_t slot = blockIdx.y;
+  const std::size_t e = ids[slot];
+  GemvQ8r<8>(qs + e * rows * qstride, d + e * rows * (cols / 32), h + static_cast<std::size_t>(slot) * cols,
+             part + static_cast<std::size_t>(slot) * rows, rows, cols, qstride);
+}
+
+extern "C" __global__ void halo_moe_combine(const float* part, const float* weights, float* out, std::uint32_t slots,
+                                            std::uint32_t n) {
+  for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+    float acc = 0;
+    for (std::uint32_t s = 0; s < slots; ++s) acc += weights[s] * part[static_cast<std::size_t>(s) * n + i];
+    out[i] = acc;
+  }
+}
