@@ -440,6 +440,14 @@ Copied MIT code keeps its notices in `NOTICE` and `licenses/`. The project is MI
   3. **`flash-pointer` decider.** A pointer head, with optional LoRA on Flash-Next's last k layers, reads the forked session's hidden states. The state is never re-prefilled, which makes this the cheapest decision path for a harness that already holds the conversation. It needs P11.
 - **Concurrency.** Decision forwards are scheduled like prefill chunks between LLM decode steps, with a per-request priority. A strands decider pinned to the NPU (N-lane candidate 1, below) would run fully in parallel.
 
+**P9 status (2026-10-04).** `POST /v1/systemone` is served by
+`halo_serve --decider-dir` (`src/server/systemone_service`, strands-decider's
+status codes: 422 with `detail`, `latency_ms` on answers), with Flash-Next and
+the 2B decider resident together. Measured warm: 3.5 s for an 83-token
+request, about 42 ms per token, because the Qwen3.5 GPU path still prefills a
+token at a time; the reference reports 115 ms per question on an RTX 3090.
+Batched prefill (P4 kernels, BF16 weights) is the fix.
+
 **P10: variants, first-class (supersedes "LoRA inference"; user, 2026-10-03).**
 
 Goal: train and load task-specific variants of a base model locally. Target
