@@ -3128,10 +3128,13 @@ extern "C" __global__ void halo_rmsnorm_rows(const float* x, const float* w_all,
 // each block also writes this stream's partial dot products of its normalized
 // row with them, ipart[(t * hc + s) * irows + r]; halo_inject_reduce sums the
 // streams (replacing that projection's GEMM, which re-read every row).
+// y may be null when its only reader rebuilds it (the mixer's up/mix
+// epilogue, from res, rscale and the gammas: the same (x * scale) * w); then
+// rscale[v] receives the row's scale instead of h floats of y.
 extern "C" __global__ void __launch_bounds__(256)
     halo_hc_combine_norm_rows(float* res, const float* out, const float* inject, const float* w_all, float* y,
                               _Float16* y16, std::uint32_t hc, std::uint32_t h, float eps, const float* iw,
-                              float* ipart, std::uint32_t irows) {
+                              float* ipart, std::uint32_t irows, float* rscale) {
   __shared__ float scratch[32];
   const std::size_t v = blockIdx.x, t = v / hc, row = v * h;
   const std::uint32_t st = static_cast<std::uint32_t>(v % hc);
@@ -3160,13 +3163,14 @@ extern "C" __global__ void __launch_bounds__(256)
   }
   ss = BlockSum(ss, scratch);
   const float scale = 1.0f / sqrtf(ss / static_cast<float>(h) + eps);
+  if (rscale && threadIdx.x == 0) rscale[v] = scale;
   float ip[8] = {};
 #pragma unroll
   for (std::uint32_t k = 0; k < 16; ++k) {
     const std::uint32_t i = threadIdx.x + k * blockDim.x;
     if (i < h) {
       const float yv = vals[k] * scale * w[i];
-      y[row + i] = yv;
+      if (y) y[row + i] = yv;
       if (y16) y16[row + i] = static_cast<_Float16>(yv);
       if (iw) {
 #pragma unroll
@@ -4291,10 +4295,13 @@ extern "C" __global__ void __launch_bounds__(256)
 // kMix (the mixer's up projection, rows permuted so row 4 i + s is stream s
 // of hidden index i; hc = 4): instead of y, the epilogue writes
 // mixed[t][i] = sum_s xn[t][s h + i] * sigmoid(gate) / 4, in fp32 and fp16.
+// With rs and nw, xn is the residual and xn[t][s h + i] is rebuilt as
+// (res * rs[t * 4 + s]) * nw[s h + i] (combine_norm's arithmetic).
 template <std::uint32_t BM, std::uint32_t BN, std::uint32_t WM, std::uint32_t WN, std::uint32_t KS, bool kMix = false>
 __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
                            std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens,
-                           const float* xn = nullptr, _Float16* y16 = nullptr) {
+                           const float* xn = nullptr, _Float16* y16 = nullptr, const float* rs = nullptr,
+                           const float* nw = nullptr) {
   constexpr std::uint32_t RS = KS + 8, NT = 256;
   constexpr std::uint32_t TM = BM / WM / 16, TN = BN / WN / 16;
   constexpr std::uint32_t APR = KS / 16, BPR = KS / 8;  // 16-byte pieces per row: int8 weights, fp16 tokens
@@ -4397,7 +4404,11 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
         const float* g = slice + tt * (TM * 16) + ii * 4;
         float acc = 0.0f;
 #pragma unroll
-        for (std::uint32_t st = 0; st < 4; ++st) acc += xr[st * h + i] * Sigmoid(g[st]);
+        for (std::uint32_t st = 0; st < 4; ++st) {
+          // With rs, xn is rebuilt from the residual as combine_norm computed it.
+          const float xv = rs ? xr[st * h + i] * rs[t * 4 + st] * nw[st * h + i] : xr[st * h + i];
+          acc += xv * Sigmoid(g[st]);
+        }
         const float m = acc / 4.0f;
         y[static_cast<std::size_t>(t) * h + i] = m;
         y16[static_cast<std::size_t>(t) * h + i] = static_cast<_Float16>(m);
@@ -4429,8 +4440,8 @@ extern "C" __global__ void __launch_bounds__(256)
 extern "C" __global__ void __launch_bounds__(256)
     halo_gemm_q8r_f16_mix(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
                           std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens,
-                          const float* xn, _Float16* y16) {
-  GemmQ8rF16<256, 128, 8, 1, 64, true>(qs, d, x, y, rows, cols, qstride, tokens, xn, y16);
+                          const float* xn, _Float16* y16, const float* rs, const float* nw) {
+  GemmQ8rF16<256, 128, 8, 1, 64, true>(qs, d, x, y, rows, cols, qstride, tokens, xn, y16, rs, nw);
 }
 
 // Repacked Q8_0 rows reordered stream-major -> index-major: destination row

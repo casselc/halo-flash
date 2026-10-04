@@ -1533,6 +1533,20 @@ TEST(GpuQuant, FusedMixerUpMatchesReference) {
       std::vector<float> lo(std::size_t{T} * cols), xn(std::size_t{T} * rows);
       for (auto& v : lo) v = 4 * rnd();
       for (auto& v : xn) v = 4 * rnd();
+      // Rebuild mode (combine_norm skipped xn): the kernel reads a residual,
+      // per-(token, stream) scales and gammas, and must form exactly
+      // (res * scale) * gamma, the xn the reference below uses.
+      const bool rebuild = tc.draw(gs::booleans());
+      std::vector<float> rs(std::size_t{T} * 4), nw(rows), resv = xn;
+      if (rebuild) {
+        for (auto& v : rs) v = 0.25f + std::fabs(rnd());
+        for (auto& v : nw) v = 2 * rnd();
+        for (std::uint32_t t = 0; t < T; ++t)
+          for (std::uint32_t r = 0; r < rows; ++r) {
+            const std::size_t at = std::size_t{t} * rows + r;
+            xn[at] = resv[at] * rs[t * 4 + r / h] * nw[r];
+          }
+      }
       std::vector<_Float16> loh(lo.size());
       for (std::size_t i = 0; i < lo.size(); ++i) loh[i] = static_cast<_Float16>(lo[i]);
       const std::uint32_t qstride = cols, nblk = cols / 32;
@@ -1540,10 +1554,13 @@ TEST(GpuQuant, FusedMixerUpMatchesReference) {
            db = dev->Alloc(std::size_t{rows} * nblk * 2, &error), pqs = dev->Alloc(std::size_t{rows} * qstride, &error),
            pdb = dev->Alloc(std::size_t{rows} * nblk * 2, &error), xb = dev->Alloc(loh.size() * 2, &error),
            nb = dev->Alloc(xn.size() * 4, &error), yb = dev->Alloc(std::size_t{T} * h * 4, &error),
-           y16 = dev->Alloc(std::size_t{T} * h * 2, &error);
-      ASSERT_TRUE(wb && qs && db && pqs && pdb && xb && nb && yb && y16) << error;
+           y16 = dev->Alloc(std::size_t{T} * h * 2, &error), rsb = dev->Alloc(rs.size() * 4, &error),
+           nwb = dev->Alloc(nw.size() * 4, &error);
+      ASSERT_TRUE(wb && qs && db && pqs && pdb && xb && nb && yb && y16 && rsb && nwb) << error;
       ASSERT_TRUE(dev->Upload(wb, 0, w.data(), w.size(), &error) && dev->Upload(xb, 0, loh.data(), loh.size() * 2, &error) &&
-                  dev->Upload(nb, 0, xn.data(), xn.size() * 4, &error))
+                  dev->Upload(nb, 0, (rebuild ? resv : xn).data(), xn.size() * 4, &error) &&
+                  dev->Upload(rsb, 0, rs.data(), rs.size() * 4, &error) &&
+                  dev->Upload(nwb, 0, nw.data(), nw.size() * 4, &error))
           << error;
       const rt::Arg ra[] = {rt::Arg::Buf(wb), rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Val(rows), rt::Arg::Val(cols),
                             rt::Arg::Val(qstride)};
@@ -1552,7 +1569,9 @@ TEST(GpuQuant, FusedMixerUpMatchesReference) {
                             rt::Arg::Val(qstride), rt::Arg::Val(nblk)};
       ASSERT_TRUE(dev->Launch(dev->Kernel("halo_permute_hc_rows", &error), {rows}, {64}, pa, &error)) << error;
       const rt::Arg ga[] = {rt::Arg::Buf(pqs), rt::Arg::Buf(pdb), rt::Arg::Buf(xb), rt::Arg::Buf(yb), rt::Arg::Val(rows),
-                            rt::Arg::Val(cols), rt::Arg::Val(qstride), rt::Arg::Val(T), rt::Arg::Buf(nb), rt::Arg::Buf(y16)};
+                            rt::Arg::Val(cols), rt::Arg::Val(qstride), rt::Arg::Val(T), rt::Arg::Buf(nb), rt::Arg::Buf(y16),
+                            rebuild ? rt::Arg::Buf(rsb) : rt::Arg::Val<std::uint64_t>(0),
+                            rebuild ? rt::Arg::Buf(nwb) : rt::Arg::Val<std::uint64_t>(0)};
       ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemm_q8r_f16_mix", &error), {(T + 127) / 128, (rows + 255) / 256}, {256},
                               ga, &error))
           << error;
@@ -1561,7 +1580,7 @@ TEST(GpuQuant, FusedMixerUpMatchesReference) {
       ASSERT_TRUE(dev->Download(yb, 0, y.data(), y.size() * 4, &error) &&
                   dev->Download(y16, 0, yh.data(), yh.size() * 2, &error))
           << error;
-      for (auto* b : {&wb, &qs, &db, &pqs, &pdb, &xb, &nb, &yb, &y16}) dev->Free(*b);
+      for (auto* b : {&wb, &qs, &db, &pqs, &pdb, &xb, &nb, &yb, &y16, &rsb, &nwb}) dev->Free(*b);
       // Weights in fp16 as the kernel stages them, row-major (stream s, index i at row s h + i).
       std::vector<float> wf(std::size_t{rows} * cols);
       for (std::uint32_t r = 0; r < rows; ++r)
@@ -1593,7 +1612,7 @@ TEST(GpuQuant, FusedMixerUpMatchesReference) {
           bound += 1e-6 * mag + 1e-30;
           const std::size_t at = std::size_t{t} * h + i;
           ASSERT_NEAR(y[at], want, bound) << rt::BackendName(backend) << " t " << t << " i " << i << " h " << h
-                                          << " cols " << cols << " T " << T;
+                                          << " cols " << cols << " T " << T << " rebuild " << rebuild;
           ASSERT_NEAR(static_cast<float>(yh[at]), want, bound + std::fabs(want) * 0x1p-11)
               << "fp16 copy t " << t << " i " << i;
         }
@@ -1719,7 +1738,14 @@ TEST(GpuKernels, CombineNormEqualsSeparateKernels) {
       launch("halo_hc_combine_norm_rows", T * hc, {rt::Arg::Buf(r2), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Buf(wb),
                                                    rt::Arg::Buf(y2), rt::Arg::Buf(h2), rt::Arg::Val(hc), rt::Arg::Val(h),
                                                    rt::Arg::Val(1e-6f), rt::Arg::Buf(iwb), rt::Arg::Buf(p2),
-                                                   rt::Arg::Val(irows)});
+                                                   rt::Arg::Val(irows), rt::Arg::Val<std::uint64_t>(0)});
+      // The same with xn skipped: per-row scales instead, everything else unchanged.
+      auto r3 = up(res.data(), n * 4), h3 = up(nullptr, n * 2), p3 = up(nullptr, std::size_t{T} * hc * irows * 4),
+           sb = up(nullptr, std::size_t{T} * hc * 4);
+      launch("halo_hc_combine_norm_rows", T * hc, {rt::Arg::Buf(r3), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Buf(wb),
+                                                   rt::Arg::Val<std::uint64_t>(0), rt::Arg::Buf(h3), rt::Arg::Val(hc),
+                                                   rt::Arg::Val(h), rt::Arg::Val(1e-6f), rt::Arg::Buf(iwb),
+                                                   rt::Arg::Buf(p3), rt::Arg::Val(irows), rt::Arg::Buf(sb)});
       launch("halo_inject_reduce", (T * irows + 255) / 256,
              {rt::Arg::Buf(p1), rt::Arg::Buf(j1), rt::Arg::Val(hc), rt::Arg::Val(irows), rt::Arg::Val(T)});
       launch("halo_inject_reduce", (T * irows + 255) / 256,
@@ -1748,6 +1774,22 @@ TEST(GpuKernels, CombineNormEqualsSeparateKernels) {
           ASSERT_NEAR(in1[t * irows + r], want, bound) << "inject (norm kernel) t " << t << " r " << r;
           ASSERT_NEAR(in2[t * irows + r], want, bound) << "inject (combine+norm) t " << t << " r " << r;
         }
+      std::vector<float> a3(n), q2(std::size_t{T} * hc * irows), q3(q2.size()), sc(std::size_t{T} * hc);
+      std::vector<std::uint16_t> c3(n);
+      ASSERT_TRUE(dev->Download(r3, 0, a3.data(), n * 4, &error) && dev->Download(h3, 0, c3.data(), n * 2, &error) &&
+                  dev->Download(p2, 0, q2.data(), q2.size() * 4, &error) &&
+                  dev->Download(p3, 0, q3.data(), q3.size() * 4, &error) && dev->Download(sb, 0, sc.data(), sc.size() * 4, &error))
+          << error;
+      for (std::size_t i = 0; i < n; ++i) {
+        ASSERT_EQ(std::bit_cast<std::uint32_t>(a3[i]), std::bit_cast<std::uint32_t>(a2[i])) << "skipped-xn residual " << i;
+        ASSERT_EQ(c3[i], c2[i]) << "skipped-xn fp16 " << i;
+        // The rebuild the mix epilogue does: (res * scale) * gamma, exactly the xn not written.
+        const std::size_t v = i / h;
+        const float rebuilt = a3[i] * sc[v] * w[(v % hc) * h + i % h];
+        ASSERT_EQ(std::bit_cast<std::uint32_t>(rebuilt), std::bit_cast<std::uint32_t>(b2[i])) << "rebuilt xn " << i;
+      }
+      for (std::size_t i = 0; i < q2.size(); ++i)
+        ASSERT_EQ(std::bit_cast<std::uint32_t>(q3[i]), std::bit_cast<std::uint32_t>(q2[i])) << "skipped-xn inject " << i;
       for (auto& o : owned) dev->Free(o);
       for (std::size_t i = 0; i < n; ++i) {
         ASSERT_EQ(std::bit_cast<std::uint32_t>(a1[i]), std::bit_cast<std::uint32_t>(a2[i])) << "residual " << i;

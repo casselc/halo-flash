@@ -89,6 +89,7 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   k.bbase = f(c.num_experts);
   k.pa = f(T * D);
   k.ipart = f(T * c.hc_count * 8);
+  k.rscale = f(T * c.hc_count);
   k.xh = f(T * max_cols / 2 + 1);
   k.mh = f(T * H / 2 + 1);
   k.pb = f(T * D);
@@ -103,7 +104,7 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   for (const auto* b : {&k.res, &k.xn, &k.lo, &k.gate, &k.mixed, &k.inject, &k.block_out, &k.embd, &k.xq, &k.xd,
                         &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg, &k.q, &k.gate_a, &k.k, &k.v, &k.ctx,
                         &k.iq, &k.ik, &k.router, &k.ids, &k.wts, &k.eg, &k.eu, &k.ed, &k.sgate, &k.host,
-                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16, &k.bcounts, &k.bbase, &k.pa, &k.pb, &k.ipart, &k.xh, &k.mh,
+                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16, &k.bcounts, &k.bbase, &k.pa, &k.pb, &k.ipart, &k.rscale, &k.xh, &k.mh,
                         &k.bscores, &k.vis, &k.ascores})
     if (!*b) return false;
   // Index-major copies of the mixers' up projections (fused GEMM + mix).
@@ -151,6 +152,13 @@ bool FlashNextGpu::FuseInject(const model::HcMixer& m) const {
   const auto& c = w_.config;
   return prefill_fused_inject_ && !prefill_exact_projections_ && !lora_.contains(m.inject.data) &&
          m.inject.type == core::GgmlType::kF32 && m.inject.rows <= 8 && m.inject.cols == c.HcDim();
+}
+
+// Whether the mixer's up projection and stream mix run as one FP16 GEMM
+// (halo_gemm_q8r_f16_mix over the index-major permuted weights).
+bool FlashNextGpu::MixFused(const model::HcMixer& m) const {
+  return prefill_f16_gemm_ && !prefill_exact_projections_ && hc_up_perm_.contains(m.up.data) &&
+         !lora_.contains(m.up.data);
 }
 
 // Whether Gemm takes the FP16 route for t (and so reads a provided x16).
@@ -254,16 +262,24 @@ bool FlashNextGpu::MixUp(const model::HcMixer& m, std::uint32_t T, std::string* 
   const auto& c = w_.config;
   const std::uint32_t H = c.hidden_size, low = c.hc_low_rank;
   const auto it = hc_up_perm_.find(m.up.data);
-  mh_valid_ = prefill_f16_gemm_ && !prefill_exact_projections_ && it != hc_up_perm_.end() && !lora_.contains(m.up.data);
+  mh_valid_ = MixFused(m);
   if (mh_valid_) {
     const auto& dt = tensors_.at(m.up.data);
     const auto rows = static_cast<std::uint32_t>(m.up.rows);
+    const bool rebuild = xn_skipped_;  // xn was not written: rebuild it from res
+    xn_skipped_ = false;
     return Half(ck_.lo, ck_.xh, T * low, error) &&
            Launch("halo_gemm_q8r_f16_mix", {(T + 127) / 128, (rows + 255) / 256}, {256},
                   {rt::Arg::Buf(it->second.qs), rt::Arg::Buf(it->second.d), rt::Arg::Buf(ck_.xh), rt::Arg::Buf(ck_.mixed),
                    rt::Arg::Val(rows), rt::Arg::Val(low), rt::Arg::Val(dt.qstride), rt::Arg::Val(T),
-                   rt::Arg::Buf(ck_.xn), rt::Arg::Buf(ck_.mh)},
+                   rt::Arg::Buf(rebuild ? ck_.res : ck_.xn), rt::Arg::Buf(ck_.mh),
+                   rebuild ? rt::Arg::Buf(ck_.rscale) : rt::Arg::Val<std::uint64_t>(0),
+                   rebuild ? rt::Arg::Buf(tensors_.at(m.norm.data).buf) : rt::Arg::Val<std::uint64_t>(0)},
                   error);
+  }
+  if (xn_skipped_) {
+    if (error) *error = "internal: xn was skipped but the mix is not the fused epilogue";
+    return false;
   }
   return Gemm(m.up, ck_.lo, ck_.gate, T, error) &&
          Launch("halo_hc_mix_rows", {Blocks(std::size_t{T} * H)}, {kBlock},
@@ -753,13 +769,18 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
   // them; `normed` carries "the next mixer's norm is done".
   const auto combine_norm = [&](const model::HcMixer& next) {
     const bool h16 = F16Route(next.down);
+    // xn's readers when it is skipped: the down GEMM takes xh (h16), the
+    // inject comes from the partials (fused), and the mix epilogue rebuilds it.
+    xn_skipped_ = prefill_mix_rebuild_ && h16 && FuseInject(next) && MixFused(next) && c.hc_count == 4;
     return Launch("halo_hc_combine_norm_rows", {T * c.hc_count}, {kBlock},
                   {rt::Arg::Buf(ck_.res), rt::Arg::Buf(ck_.block_out), rt::Arg::Buf(ck_.inject),
-                   rt::Arg::Buf(tensors_.at(next.norm.data).buf), rt::Arg::Buf(ck_.xn),
+                   rt::Arg::Buf(tensors_.at(next.norm.data).buf),
+                   xn_skipped_ ? rt::Arg::Val<std::uint64_t>(0) : rt::Arg::Buf(ck_.xn),
                    h16 ? rt::Arg::Buf(ck_.xh) : rt::Arg::Val<std::uint64_t>(0), rt::Arg::Val(c.hc_count),
                    rt::Arg::Val(H), rt::Arg::Val(c.rms_eps),
                    FuseInject(next) ? rt::Arg::Buf(tensors_.at(next.inject.data).buf) : rt::Arg::Val<std::uint64_t>(0),
-                   rt::Arg::Buf(ck_.ipart), rt::Arg::Val(static_cast<std::uint32_t>(next.inject.rows))},
+                   rt::Arg::Buf(ck_.ipart), rt::Arg::Val(static_cast<std::uint32_t>(next.inject.rows)),
+                   xn_skipped_ ? rt::Arg::Buf(ck_.rscale) : rt::Arg::Val<std::uint64_t>(0)},
                   error);
   };
   const bool fuse = prefill_fused_combine_ && H <= 16 * kBlock;

@@ -96,6 +96,9 @@ class FlashNextGpu {
   /// The mixers' F32 inject projection inside the norm that produces xn
   /// (per-stream partial products, then a reduce) instead of a GEMM.
   static inline bool prefill_fused_inject_ = true;
+  // combine_norm skips the fp32 xn the mixer's mix epilogue would re-read;
+  // the epilogue rebuilds it from res (same arithmetic, bit-identical).
+  static inline bool prefill_mix_rebuild_ = true;
   /// Attention of a chunk's tokens in batched launches (same arithmetic as
   /// stepping) instead of token by token.
   static inline bool prefill_batched_attention_ = true;
@@ -212,6 +215,7 @@ class FlashNextGpu {
     rt::Buffer sorted, pos, tiles, ntiles, hp, yp, x16, bcounts, bbase;
     rt::Buffer pa, pb;  // PLE key and normalized rows
     rt::Buffer ipart;   // inject partial products [T][hc][rows]
+    rt::Buffer rscale;  // per-row norm scale [T][hc] when combine_norm skipped writing xn
     rt::Buffer xh, mh;  // fp16 activations: per GEMM, and the shared `mixed`  // grouped experts (hp, x16 fp16)
     rt::Buffer bscores, vis, ascores;                // batched attention, kAttnSub tokens at a time
     std::size_t params_offset = 0;  // in `host`: per-token step params after the n-gram rows
@@ -237,6 +241,7 @@ class FlashNextGpu {
   bool AttentionChunk(const model::LayerWeights& l, AttnState& s, std::uint32_t tokens, std::string* error);
   bool F16Route(const model::TensorRef& t) const;
   bool FuseInject(const model::HcMixer& m) const;
+  bool MixFused(const model::HcMixer& m) const;
   bool MixUp(const model::HcMixer& m, std::uint32_t T, std::string* error);
   bool Half(const rt::Buffer& x, const rt::Buffer& out, std::uint32_t n, std::string* error);
   bool MixedHalf(std::uint32_t T, std::string* error);
@@ -275,6 +280,7 @@ class FlashNextGpu {
   };
   std::unordered_map<const void*, PermutedUp> hc_up_perm_;
   bool mh_valid_ = false;
+  bool xn_skipped_ = false;  // the last combine_norm wrote rscale instead of xn
   rt::FileUploader* loader_ = nullptr;  ///< during Init: weights read from their files
   std::unordered_map<const void*, DevLora> lora_;
   std::unordered_map<std::string, rt::KernelId> kernels_;
