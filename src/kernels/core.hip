@@ -2602,3 +2602,101 @@ extern "C" __global__ void __launch_bounds__(256)
                          float* y, std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
   GemmQ8rWmma<4, 2, 2, 4>(qs, d, xq, xd, y, rows, cols, qstride, tokens);
 }
+
+// ---- P4: DeltaNet over a prompt chunk ----------------------------------------
+//
+// halo_conv_l2norm for T tokens at once: token t's window is the previous
+// kern - 1 inputs, taken from the chunk or, before it, from the conv state;
+// the sums run in the decode kernel's order, so each token's output is
+// bit-identical to stepping. The state is not touched (blocks of other
+// tokens still read it); halo_conv_state_advance moves it afterwards.
+//   in, out [T][channels]; grid (ceil(channels / d), T), block d
+extern "C" __global__ void halo_conv_l2norm_prefill(const float* in, const float* state, const float* w, float* out,
+                                                    std::uint32_t channels, std::uint32_t kern,
+                                                    std::uint32_t l2_channels, float eps) {
+  __shared__ float scratch[32];
+  const std::uint32_t ch = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+  float v = 0.0f;
+  if (ch < channels) {
+    float acc = w[ch * kern + kern - 1] * in[static_cast<std::size_t>(t) * channels + ch];
+    for (std::uint32_t k = 0; k + 1 < kern; ++k) {
+      // Window slot k holds input t - (kern - 1) + k.
+      const std::int64_t i = static_cast<std::int64_t>(t) - static_cast<std::int64_t>(kern - 1) + k;
+      const float x = i >= 0 ? in[static_cast<std::size_t>(i) * channels + ch]
+                             : state[static_cast<std::size_t>(i + kern - 1) * channels + ch];
+      acc += w[ch * kern + k] * x;
+    }
+    v = Silu(acc);
+  }
+  if (blockIdx.x * blockDim.x < l2_channels) {  // block-uniform
+    const float ss = BlockSum(v * v, scratch);
+    v *= 1.0f / sqrtf(ss + eps);
+  }
+  if (ch < channels) out[static_cast<std::size_t>(t) * channels + ch] = v;
+}
+
+// The conv state after a chunk of T inputs: the last kern - 1 inputs, the
+// older ones from the previous state when T < kern - 1.
+//   grid (ceil(channels / 256)), block 256
+extern "C" __global__ void halo_conv_state_advance(const float* in, float* state, std::uint32_t channels,
+                                                   std::uint32_t kern, std::uint32_t tokens) {
+  const std::uint32_t ch = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ch >= channels || kern < 2) return;
+  float next[8];  // kern <= 9
+  for (std::uint32_t k = 0; k + 1 < kern; ++k) {
+    const std::int64_t i = static_cast<std::int64_t>(tokens) - static_cast<std::int64_t>(kern - 1) + k;
+    next[k] = i >= 0 ? in[static_cast<std::size_t>(i) * channels + ch]
+                     : state[static_cast<std::size_t>(i + kern - 1) * channels + ch];
+  }
+  for (std::uint32_t k = 0; k + 1 < kern; ++k) state[static_cast<std::size_t>(k) * channels + ch] = next[k];
+}
+
+// halo_gdn_step_d128_norm over T tokens in one launch: the head's 128 x 128
+// state stays in registers (a column per thread) across the chunk instead of
+// a round trip to memory per token. Same arithmetic, same order.
+//   row t of q and k at t * qk_stride, of v at t * v_stride, of z and out at
+//   t * zo_stride; alpha, beta [T][heads]. grid (heads), block 128
+extern "C" __global__ void __launch_bounds__(128)
+    halo_gdn_prefill_d128_norm(const float* q, const float* k, const float* v, const float* alpha,
+                               const float* beta, const float* a, const float* dt, float* state,
+                               const float* norm_w, const float* z, float* out, std::uint32_t num_k_heads, float eps,
+                               std::uint32_t mode, std::uint32_t tokens, std::uint32_t qk_stride,
+                               std::uint32_t v_stride, std::uint32_t zo_stride) {
+  constexpr std::uint32_t d = 128;
+  __shared__ float ks[d], qs[d], red[32];
+  const std::uint32_t h = blockIdx.x, j = threadIdx.x, heads = gridDim.x;
+  float* S = state + static_cast<std::size_t>(h) * d * d + j;
+  float s[d];
+#pragma unroll
+  for (std::uint32_t i = 0; i < d; ++i) s[i] = S[i * d];
+  const float ah = a[h], dth = dt[h], wj = norm_w[j];
+  for (std::uint32_t t = 0; t < tokens; ++t) {
+    const float* qh = q + static_cast<std::size_t>(t) * qk_stride + (h % num_k_heads) * d;
+    const float* kh = k + static_cast<std::size_t>(t) * qk_stride + (h % num_k_heads) * d;
+    // No barrier needed here: the previous token's last BlockSum ends with
+    // barriers after every read of ks / qs.
+    ks[j] = kh[j];
+    qs[j] = qh[j];
+    const float kq = BlockSum(kh[j] * qh[j], red);
+    const float decay = expf(ah * Softplus(alpha[static_cast<std::size_t>(t) * heads + h] + dth));
+    const float b = Sigmoid(beta[static_cast<std::size_t>(t) * heads + h]);
+    float A = 0.0f, B = 0.0f;
+#pragma unroll
+    for (std::uint32_t i = 0; i < d; ++i) {
+      A += s[i] * ks[i];
+      B += s[i] * qs[i];
+    }
+    const std::size_t vo = static_cast<std::size_t>(t) * v_stride + h * d + j;
+    const std::size_t zo = static_cast<std::size_t>(t) * zo_stride + h * d + j;
+    const float delta = (v[vo] - decay * A) * b;
+#pragma unroll
+    for (std::uint32_t i = 0; i < d; ++i) s[i] = decay * s[i] + delta * ks[i];
+    const float o = (decay * B + delta * kq) / sqrtf(static_cast<float>(d));
+    const float ss = BlockSum(o * o, red);
+    const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
+    const float zv = z[zo];
+    out[zo] = o * scale * wj * (mode == 0 ? Silu(zv) : Sigmoid(zv));
+  }
+#pragma unroll
+  for (std::uint32_t i = 0; i < d; ++i) S[i * d] = s[i];
+}

@@ -3,7 +3,8 @@
 // quantization), for several prompt-chunk sizes. Reports TOPS (2 * rows *
 // cols * tokens per second) and tokens per second for that one matrix.
 //   halo_gemm_bench [reps]
-//   halo_gemm_bench peak     register-only WMMA throughput (the ceiling)
+//   halo_gemm_bench peak      register-only WMMA throughput (the ceiling)
+//   halo_gemm_bench deltanet  one DeltaNet layer's chunk: decode steps vs chunked kernels
 
 #include <chrono>
 #include <cmath>
@@ -40,6 +41,61 @@ int main(int argc, char** argv) {
         std::printf("%s blocks %4u: %.1f TOPS\n", f16 ? "fp16" : "int8", blocks,
                     double(blocks) * 8 * iters * 4 * 16 * 16 * 16 * 2 / s / 1e12);
       }
+    return 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "deltanet") {
+    // One DeltaNet layer's conv + recurrence for a chunk of T tokens at the
+    // real model's sizes (16 q/k heads, 48 v heads, d 128, kernel 4): T decode
+    // steps against the chunked kernels.
+    auto d = rt::Device::Create(rt::Backend::kHip, &e);
+    if (!d || !d->LoadModule(kernels::CoreHsaco(), &e)) return std::printf("%s\n", e.c_str()), 1;
+    const std::uint32_t nk = 16, nv = 48, hd = 128, kern = 4, kd = nk * hd, vd = nv * hd, ch = 2 * kd + vd;
+    for (const std::uint32_t T : {64u, 512u, 2048u}) {
+      std::vector<float> host(std::size_t{T} * ch, 0.01f);
+      auto in = d->Alloc(host.size() * 4, &e), cs = d->Alloc(std::size_t{kern} * ch * 4, &e), cw = d->Alloc(std::size_t{ch} * kern * 4, &e),
+           conv = d->Alloc(host.size() * 4, &e), ab = d->Alloc(std::size_t{T} * nv * 4, &e), st = d->Alloc(std::size_t{nv} * hd * hd * 4, &e),
+           nw = d->Alloc(hd * 4, &e), z = d->Alloc(std::size_t{T} * vd * 4, &e), out = d->Alloc(std::size_t{T} * vd * 4, &e),
+           hv = d->Alloc(nv * 4, &e);
+      (void)d->Upload(in, 0, host.data(), host.size() * 4, &e);
+      const auto time = [&](auto&& f) {
+        f();
+        (void)d->Synchronize(&e);
+        const auto t0 = std::chrono::steady_clock::now();
+        f();
+        (void)d->Synchronize(&e);
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      };
+      const auto kc = d->Kernel("halo_conv_l2norm", &e), kg = d->Kernel("halo_gdn_step_d128_norm", &e),
+                 kcp = d->Kernel("halo_conv_l2norm_prefill", &e), ka = d->Kernel("halo_conv_state_advance", &e),
+                 kgp = d->Kernel("halo_gdn_prefill_d128_norm", &e);
+      const double steps = time([&] {
+        for (std::uint32_t t = 0; t < T; ++t) {
+          const rt::Arg c[] = {rt::Arg::Buf(in, std::size_t{t} * ch * 4), rt::Arg::Buf(cs), rt::Arg::Buf(cw), rt::Arg::Buf(conv),
+                               rt::Arg::Val(ch), rt::Arg::Val(kern), rt::Arg::Val(2 * kd), rt::Arg::Val(1e-6f)};
+          (void)d->Launch(kc, {ch / hd}, {hd}, c, &e);
+          const rt::Arg g[] = {rt::Arg::Buf(conv), rt::Arg::Buf(conv, kd * 4ull), rt::Arg::Buf(conv, 2ull * kd * 4),
+                               rt::Arg::Buf(ab, std::size_t{t} * nv * 4), rt::Arg::Buf(ab, std::size_t{t} * nv * 4), rt::Arg::Buf(hv),
+                               rt::Arg::Buf(hv), rt::Arg::Buf(st), rt::Arg::Buf(nw), rt::Arg::Buf(z, std::size_t{t} * vd * 4),
+                               rt::Arg::Buf(out, std::size_t{t} * vd * 4), rt::Arg::Val(nk), rt::Arg::Val(1e-6f), rt::Arg::Val(0u)};
+          (void)d->Launch(kg, {nv}, {hd}, g, &e);
+        }
+      });
+      const double chunk = time([&] {
+        const rt::Arg c[] = {rt::Arg::Buf(in), rt::Arg::Buf(cs), rt::Arg::Buf(cw), rt::Arg::Buf(conv), rt::Arg::Val(ch),
+                             rt::Arg::Val(kern), rt::Arg::Val(2 * kd), rt::Arg::Val(1e-6f)};
+        (void)d->Launch(kcp, {ch / hd, T}, {hd}, c, &e);
+        const rt::Arg a[] = {rt::Arg::Buf(in), rt::Arg::Buf(cs), rt::Arg::Val(ch), rt::Arg::Val(kern), rt::Arg::Val(T)};
+        (void)d->Launch(ka, {(ch + 255) / 256}, {256}, a, &e);
+        const rt::Arg g[] = {rt::Arg::Buf(conv), rt::Arg::Buf(conv, kd * 4ull), rt::Arg::Buf(conv, 2ull * kd * 4), rt::Arg::Buf(ab),
+                             rt::Arg::Buf(ab), rt::Arg::Buf(hv), rt::Arg::Buf(hv), rt::Arg::Buf(st), rt::Arg::Buf(nw), rt::Arg::Buf(z),
+                             rt::Arg::Buf(out), rt::Arg::Val(nk), rt::Arg::Val(1e-6f), rt::Arg::Val(0u), rt::Arg::Val(T),
+                             rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)};
+        (void)d->Launch(kgp, {nv}, {hd}, g, &e);
+      });
+      std::printf("deltanet T %5u: %8.1f us as steps, %8.1f us chunked (%.1fx), %.1f us per token chunked\n", T,
+                  steps * 1e6, chunk * 1e6, steps / chunk, chunk * 1e6 / T);
+      for (auto* b : {&in, &cs, &cw, &conv, &ab, &st, &nw, &z, &out, &hv}) d->Free(*b);
+    }
     return 0;
   }
   const int reps = argc > 1 ? std::atoi(argv[1]) : 20;

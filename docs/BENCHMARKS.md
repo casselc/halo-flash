@@ -110,3 +110,19 @@ shape; gufo's dense projections reach about 55%. What was tried:
   as a probe): 23 TOPS. The limit is staging (global to LDS and barriers),
   not the math; the next step is a deeper pipeline or direct-to-register
   operand loads.
+
+### DeltaNet over a prompt chunk (P4 kernels, 2026-10-04, `halo_gemm_bench deltanet`)
+
+One layer's conv + L2 and recurrence at the real sizes (16 q/k heads, 48 v
+heads, d 128, kernel 4), HIP:
+
+| T | T decode steps | chunked kernels | per token |
+|---:|---:|---:|---:|
+| 64 | 1.63 ms | 0.37 ms (4.5x) | 5.7 us |
+| 512 | 13.0 ms | 2.96 ms (4.4x) | 5.8 us |
+| 2048 | 51.2 ms | 12.0 ms (4.3x) | 5.8 us |
+
+Bit-identical to stepping (outputs and both states). Across 36 DeltaNet
+layers that is about 0.21 ms per prompt token, a ceiling near 4,800 tok/s
+for this part alone; the recurrence is still serial in T with one block per
+head (48 blocks), so the chunked parallel (WY) form is the next lever.

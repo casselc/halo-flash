@@ -1029,8 +1029,16 @@ why = "the second matrix's blocks start at its own row 0"
 [[mutant]]
 name = "p3-conv-l2-on-v-channels"
 file = "src/kernels/core.hip"
-find = '  if (blockIdx.x * blockDim.x < l2_channels) {  // block-uniform'
-replace = '  if (true) {  // block-uniform'
+find = '''  if (blockIdx.x * blockDim.x < l2_channels) {  // block-uniform
+    const float ss = BlockSum(v * v, scratch);
+    v *= 1.0f / sqrtf(ss + eps);
+  }
+  if (ch < channels) out[ch] = v;'''
+replace = '''  if (true) {  // block-uniform
+    const float ss = BlockSum(v * v, scratch);
+    v *= 1.0f / sqrtf(ss + eps);
+  }
+  if (ch < channels) out[ch] = v;'''
 suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuKernels.FusedDeltaNetPiecesMatchKernelSequences"
@@ -1059,8 +1067,12 @@ why = "beta rows come from the beta matrix"
 [[mutant]]
 name = "p3-conv-l2-as-rms"
 file = "src/kernels/core.hip"
-find = '    v *= 1.0f / sqrtf(ss + eps);'
-replace = '    v *= 1.0f / sqrtf(ss / 128.0f + eps);'
+find = '''    v *= 1.0f / sqrtf(ss + eps);
+  }
+  if (ch < channels) out[ch] = v;'''
+replace = '''    v *= 1.0f / sqrtf(ss / 128.0f + eps);
+  }
+  if (ch < channels) out[ch] = v;'''
 suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuKernels.FusedDeltaNetPiecesMatchKernelSequences"
@@ -1153,3 +1165,47 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuKernels.WmmaQ8GemmMatchesQuantizedReference"
 why = "prefill activations round to nearest, as the reference and the decode path do"
+
+# ---- P4 DeltaNet over a chunk -----------------------------------------------
+
+[[mutant]]
+name = "prefill-conv-window-shift"
+file = "src/kernels/core.hip"
+find = '''      // Window slot k holds input t - (kern - 1) + k.
+      const std::int64_t i = static_cast<std::int64_t>(t) - static_cast<std::int64_t>(kern - 1) + k;'''
+replace = '''      // Window slot k holds input t - (kern - 1) + k.
+      const std::int64_t i = static_cast<std::int64_t>(t) - static_cast<std::int64_t>(kern) + k;'''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.DeltaNetPrefillEqualsDecodeSteps"
+why = "token t's conv window ends at the token before it"
+
+[[mutant]]
+name = "prefill-conv-state-from-front"
+file = "src/kernels/core.hip"
+find = '''    const std::int64_t i = static_cast<std::int64_t>(tokens) - static_cast<std::int64_t>(kern - 1) + k;
+    next[k] = i >= 0'''
+replace = '''    const std::int64_t i = static_cast<std::int64_t>(k) - static_cast<std::int64_t>(kern - 1) + 1;
+    next[k] = i >= 0'''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.DeltaNetPrefillEqualsDecodeSteps"
+why = "the conv state after a chunk is its last kern - 1 inputs"
+
+[[mutant]]
+name = "prefill-conv-l2-on-v-channels"
+file = "src/kernels/core.hip"
+find = '''  if (blockIdx.x * blockDim.x < l2_channels) {  // block-uniform
+    const float ss = BlockSum(v * v, scratch);
+    v *= 1.0f / sqrtf(ss + eps);
+  }
+  if (ch < channels) out[static_cast<std::size_t>(t) * channels + ch] = v;'''
+replace = '''  if (true) {  // block-uniform
+    const float ss = BlockSum(v * v, scratch);
+    v *= 1.0f / sqrtf(ss + eps);
+  }
+  if (ch < channels) out[static_cast<std::size_t>(t) * channels + ch] = v;'''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.DeltaNetPrefillEqualsDecodeSteps"
+why = "only q and k are L2-normalized; v is not (prefill as decode)"

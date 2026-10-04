@@ -1017,3 +1017,93 @@ TEST(GpuKernels, WmmaF16LayoutProbe) {
     }
   for (auto* x : {&ab, &bb, &cb}) dev->Free(*x);
 }
+
+// P4 DeltaNet over a chunk: conv + L2 for T tokens, the conv state advanced
+// once, and the T-token recurrence with the state in registers must equal
+// T decode steps (halo_conv_l2norm + halo_gdn_step_d128_norm) exactly:
+// every output row and both final states, bit for bit.
+TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      constexpr std::uint32_t d = 128;
+      const std::uint32_t nk = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 2}));
+      const std::uint32_t nv = nk * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 3}));
+      const std::uint32_t kern = tc.draw(gs::sampled_from(std::vector<std::uint32_t>{2, 4}));
+      const std::uint32_t T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 24}));
+      const std::uint32_t mode = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = 1}));
+      const std::uint32_t kd = nk * d, vd = nv * d, ch = 2 * kd + vd;
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto vec = [&](std::size_t n, float amp) {
+        std::vector<float> v(n);
+        for (auto& x : v) {
+          seed = seed * 1664525u + 1013904223u;
+          x = amp * (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f);
+        }
+        return v;
+      };
+      const auto in = vec(std::size_t{T} * ch, 3.0f), cst = vec(std::size_t{kern - 1} * ch, 1.0f),
+                 cw = vec(std::size_t{ch} * kern, 0.5f), al = vec(std::size_t{T} * nv, 4.0f),
+                 be = vec(std::size_t{T} * nv, 4.0f), gst = vec(std::size_t{nv} * d * d, 0.2f), nw = vec(d, 1.0f),
+                 zv = vec(std::size_t{T} * vd, 4.0f), dtv = vec(nv, 2.0f);
+      auto av = vec(nv, 2.0f);
+      for (auto& x : av) x = -std::exp(x);
+      std::vector<rt::Buffer> owned;
+      const auto up = [&](const std::vector<float>& h) {
+        auto b = dev->Alloc(h.size() * 4, &error);
+        EXPECT_TRUE(dev->Upload(b, 0, h.data(), h.size() * 4, &error));
+        owned.push_back(b);
+        return b;
+      };
+      const auto zeros = [&](std::size_t n) { return up(std::vector<float>(n, 0.0f)); };
+      const auto launch = [&](const char* k, rt::Dim3 g, rt::Dim3 b, std::initializer_list<rt::Arg> a) {
+        ASSERT_TRUE(dev->Launch(dev->Kernel(k, &error), g, b, std::span<const rt::Arg>(a.begin(), a.size()), &error)) << k;
+      };
+      auto inb = up(in), cwb = up(cw), alb = up(al), beb = up(be), ab = up(av), dtb = up(dtv), nwb = up(nw), zb = up(zv);
+      auto cs1 = up(cst), cs2 = up(cst), gs1 = up(gst), gs2 = up(gst);
+      auto conv1 = zeros(ch), out1 = zeros(std::size_t{T} * vd), conv2 = zeros(std::size_t{T} * ch),
+           out2 = zeros(std::size_t{T} * vd);
+      // T decode steps.
+      for (std::uint32_t t = 0; t < T; ++t) {
+        launch("halo_conv_l2norm", {ch / d}, {d}, {rt::Arg::Buf(inb, std::size_t{t} * ch * 4), rt::Arg::Buf(cs1),
+                                                  rt::Arg::Buf(cwb), rt::Arg::Buf(conv1), rt::Arg::Val(ch),
+                                                  rt::Arg::Val(kern), rt::Arg::Val(2 * kd), rt::Arg::Val(1e-6f)});
+        launch("halo_gdn_step_d128_norm", {nv}, {d},
+               {rt::Arg::Buf(conv1), rt::Arg::Buf(conv1, kd * 4ull), rt::Arg::Buf(conv1, 2ull * kd * 4),
+                rt::Arg::Buf(alb, std::size_t{t} * nv * 4), rt::Arg::Buf(beb, std::size_t{t} * nv * 4), rt::Arg::Buf(ab),
+                rt::Arg::Buf(dtb), rt::Arg::Buf(gs1), rt::Arg::Buf(nwb), rt::Arg::Buf(zb, std::size_t{t} * vd * 4),
+                rt::Arg::Buf(out1, std::size_t{t} * vd * 4), rt::Arg::Val(nk), rt::Arg::Val(1e-6f), rt::Arg::Val(mode)});
+      }
+      // One chunk.
+      launch("halo_conv_l2norm_prefill", {ch / d, T}, {d}, {rt::Arg::Buf(inb), rt::Arg::Buf(cs2), rt::Arg::Buf(cwb),
+                                                           rt::Arg::Buf(conv2), rt::Arg::Val(ch), rt::Arg::Val(kern),
+                                                           rt::Arg::Val(2 * kd), rt::Arg::Val(1e-6f)});
+      launch("halo_conv_state_advance", {(ch + 255) / 256}, {256},
+             {rt::Arg::Buf(inb), rt::Arg::Buf(cs2), rt::Arg::Val(ch), rt::Arg::Val(kern), rt::Arg::Val(T)});
+      launch("halo_gdn_prefill_d128_norm", {nv}, {d},
+             {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(conv2, 2ull * kd * 4), rt::Arg::Buf(alb),
+              rt::Arg::Buf(beb), rt::Arg::Buf(ab), rt::Arg::Buf(dtb), rt::Arg::Buf(gs2), rt::Arg::Buf(nwb), rt::Arg::Buf(zb),
+              rt::Arg::Buf(out2), rt::Arg::Val(nk), rt::Arg::Val(1e-6f), rt::Arg::Val(mode), rt::Arg::Val(T),
+              rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)});
+      const auto get = [&](rt::Buffer b, std::size_t n) {
+        std::vector<float> h(n);
+        EXPECT_TRUE(dev->Download(b, 0, h.data(), n * 4, &error));
+        return h;
+      };
+      const auto same = [&](const std::vector<float>& x, const std::vector<float>& y, const char* what) {
+        ASSERT_EQ(x.size(), y.size());
+        for (std::size_t i = 0; i < x.size(); ++i)
+          ASSERT_EQ(std::bit_cast<std::uint32_t>(x[i]), std::bit_cast<std::uint32_t>(y[i]))
+              << rt::BackendName(backend) << " " << what << "[" << i << "] " << x[i] << " vs " << y[i] << " T " << T
+              << " kern " << kern;
+      };
+      same(get(out2, std::size_t{T} * vd), get(out1, std::size_t{T} * vd), "output");
+      same(get(cs2, cst.size()), get(cs1, cst.size()), "conv state");
+      same(get(gs2, gst.size()), get(gs1, gst.size()), "recurrent state");
+      for (auto& b : owned) dev->Free(b);
+    }, {.test_cases = 40});
+  }
+}
