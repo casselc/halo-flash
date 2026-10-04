@@ -511,7 +511,14 @@ remain:
   once per output tile, not per K stage; the A stage already stores `ds_store_b128`. Tried
   packing the dequant writes anyway: no instruction change. Nothing to gain.
 
-**4a. Split K in the mixer down GEMM (`halo_gemm_q8r_f16_m`, 320 x 10240).**
+**4a. Split K in the mixer down GEMM (`halo_gemm_q8r_f16_m`, 320 x 10240).** TRIED, NOT KEPT:
+measured +21.6 ms end to end (within noise; pinned, 3 rounds). The GEMM itself went from 1146 to
+1267 µs per call, plus 28 µs in the summing pass. The model was wrong: LDS limits `_m` to 2
+workgroups per WGP, so 40 slots, and the plain launch already filled 32. Its 1.15 ms against a
+0.41 ms math floor is not a parallelism problem. Next step: a thread trace of `_m` to separate
+per-stage overhead (dequant and two barriers per 64-K stage, 160 stages) from cache misses. The
+split quadrupled the weight working set across concurrent K ranges. Kernel A (3.3) removes this
+GEMM's separate pass anyway.
 - Hypothesis: it runs 32 workgroups on 40 CUs. The snapshot has it at 1.29 ms per call, against
   ~0.41 ms of math and ~0.2 ms of traffic. Splitting K four ways, one split per stream (4 x
   2560), gives 128 workgroups. The four partials (2.6 MB each) are summed in the existing
