@@ -86,6 +86,7 @@ if(HALO_GPU)
     src/rt/device.cpp
     src/rt/hip_device.cpp
     src/engine/qwen35_gpu.cpp
+    src/engine/flash_next_gpu.cpp
     ${HALO_GEN}/kernels/core_hsaco.cpp)
   target_include_directories(halo_gpu PUBLIC ${HALO_GEN})
   target_compile_definitions(halo_gpu PUBLIC __HIP_PLATFORM_AMD__ HALO_WITH_HIP=1)
@@ -146,7 +147,7 @@ if(HALO_BUILD_TESTS)
   target_compile_definitions(decide_tests PRIVATE
     HALO_DECIDE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/decide/data")
   if(HALO_GPU)
-    halo_test(gpu_tests tests/gpu/qwen35_gpu_test.cpp tests/gpu/quant_gpu_test.cpp)
+    halo_test(gpu_tests tests/gpu/qwen35_gpu_test.cpp tests/gpu/quant_gpu_test.cpp tests/gpu/flash_next_gpu_test.cpp)
     target_link_libraries(gpu_tests PRIVATE halo_gpu)
     target_link_libraries(decide_tests PRIVATE halo_gpu)
   endif()
