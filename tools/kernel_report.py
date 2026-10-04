@@ -3,9 +3,14 @@
 
 For every kernel: VGPRs, SGPRs, spills (VGPR/SGPR), scratch (private segment)
 bytes, LDS (group segment) bytes, and an occupancy estimate in waves per
-SIMD for gfx11 wave32 (1536 VGPRs per SIMD lane slot, allocated in granules
-of 16; at most 16 waves; LDS 128 KiB per WGP of 4 SIMDs). The estimate is a
-reading aid, not a measurement.
+SIMD for gfx1151 wave32 (1536 VGPRs per SIMD lane slot, allocated in granules
+of 24 -- LLVM's getVGPRAllocGranule for Feature1_5xVGPRs parts; at most 16
+waves; LDS 128 KiB per WGP of 4 SIMDs, allocated in 512-byte granules). It
+matches the compiler's own -Rpass-analysis=kernel-resource-usage occupancy
+for VGPR-limited kernels. The metadata .vgpr_count is the exact count used,
+and rocprofv3's arch_vgpr_count rounds to 8 (the descriptor encoding), so
+neither shows the 24-register allocation. The estimate is a reading aid, not
+a measurement.
 
   kernel_report.py --hsaco build/gpu/gen/core.hsaco [--readelf PATH] [--filter REGEX]
   kernel_report.py --hsaco ... --check tools/kernel_spill_allowlist.txt
@@ -107,13 +112,13 @@ def parse_maps(notes):
 
 def occupancy(k):
     v = max(k.get("vgpr_count", 0), 1)
-    granule = 16
+    granule = 24
     by_vgpr = min(16, 1536 // (math.ceil(v / granule) * granule))
     lds = k.get("group_segment_fixed_size", 0)
     wg = max(k.get("max_flat_workgroup_size", 256), 32)
     waves_per_block = math.ceil(wg / 32)
     if lds > 0:
-        blocks_per_wgp = (128 * 1024) // lds
+        blocks_per_wgp = (128 * 1024) // (math.ceil(lds / 512) * 512)
         by_lds = max(1, (blocks_per_wgp * waves_per_block) // 4)
         return min(by_vgpr, by_lds), ("lds" if by_lds < by_vgpr else "vgpr")
     return by_vgpr, "vgpr"
