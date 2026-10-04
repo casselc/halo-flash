@@ -553,6 +553,38 @@ faster.
   and the Postgres-side entities SQLite replaces) is the checklist for
   prompts, datasets, runs, evaluators, score configs and price matching.
 
+**Single-process deltas from the observability design** (measured in the
+halo-scope spike on libchdb 26.9.0, 2026-10-03).
+
+**Kept from the observability design:**
+- typed tables;
+- content-addressed payloads;
+- append-only scores;
+- inserts through a Null staging table and a materialized view. This is
+  still the cheapest path: RowBinary straight into LowCardinality columns
+  costs about twice as much per batch.
+
+**Dropped or changed, because they served fleet ingestion:**
+- **Observation layout.**
+  - Key: `(session_id, trace_id, start_time)`, with monthly partitions, a
+    bloom filter on `trace_id` and a minmax index on `start_time`.
+  - At 10M rows, session, trace and recent-50 lookups take 4-7 ms, against
+    5-31 ms for the time-first daily layout.
+- **No Buffer tables.** Their flushes bypass insert tokens.
+- **Exactly-once comes from the writer's own CRC-framed WAL.** The insert
+  token is the frame's position: log id plus sequence number.
+- **Batches cut at 10k rows or 1 s.** chDB CPU per row falls from about
+  46 µs at 250-row batches to about 6 µs at 10k.
+- **Payloads.**
+  - Hashes are unkeyed BLAKE3-128.
+  - The writer skips payloads it has already written durably. An agent
+    transcript that resends its history sent 95% fewer payload rows.
+  - A text index on lowercased content.
+
+**Process rules:**
+- Close every chDB connection and call `chdb_shutdown()` before exit.
+- TSan builds run without chDB: its threads crash inside TSan's allocator.
+
 **Harness annotation ABI (user, 2026-10-03).** This is not a generic
 tracing API. An embedding harness (samizdat or similar) attaches its own
 steps to engine-owned traces through a few typed calls, so tool executions
