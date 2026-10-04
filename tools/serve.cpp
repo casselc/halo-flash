@@ -40,6 +40,7 @@
 #include "scope/generation_observer.hpp"
 #include "scope/chdb.hpp"
 #include "scope/http_annotations.hpp"
+#include "scope/prompt_routes.hpp"
 #include "scope/trace_reader.hpp"
 #include "scope/metadata.hpp"
 #include "scope/response_store.hpp"
@@ -150,6 +151,7 @@ int main(int argc, char** argv) {
   if (scope) {
     scope::RegisterAnnotationRoutes(http, scope::AnnotatorOf(scope));  // harnesses in other processes
     traces->Register(http);                                            // GET /v1/scope/traces[/{id}]
+    scope::RegisterPromptRoutes(http, *metadata);                      // /v1/scope/prompts
   }
 #endif
   std::unique_ptr<StrandsEngine> decider;

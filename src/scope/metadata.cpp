@@ -152,6 +152,7 @@ bool MetadataStore::Exec(const char* sql, std::string* err) {
 
 std::int64_t MetadataStore::CreatePromptVersion(std::string_view name, std::string_view template_text,
                                                 std::string_view config_json, std::string* err) {
+  std::lock_guard<std::mutex> lk(mu_);
   if (!Exec("BEGIN IMMEDIATE", err)) return 0;
   std::int64_t version = 0;
   bool ok = true;
@@ -184,6 +185,7 @@ std::int64_t MetadataStore::CreatePromptVersion(std::string_view name, std::stri
 }
 
 bool MetadataStore::SetLabel(std::string_view name, std::string_view label, std::int64_t version, std::string* err) {
+  std::lock_guard<std::mutex> lk(mu_);
   Stmt l(db_,
          "INSERT INTO labels (prompt_id, label, version) SELECT id, ?, ? FROM prompts WHERE name = ? "
          "ON CONFLICT(prompt_id, label) DO UPDATE SET version = excluded.version, updated_at = excluded.updated_at");
@@ -199,6 +201,7 @@ bool MetadataStore::SetLabel(std::string_view name, std::string_view label, std:
 }
 
 std::optional<PromptVersion> MetadataStore::GetByLabel(std::string_view name, std::string_view label) {
+  std::lock_guard<std::mutex> lk(mu_);
   Stmt q(db_,
          "SELECT v.version, v.template, v.config FROM prompts p JOIN labels l ON l.prompt_id = p.id "
          "JOIN prompt_versions v ON v.prompt_id = p.id AND v.version = l.version WHERE p.name = ? AND l.label = ?");
@@ -208,6 +211,7 @@ std::optional<PromptVersion> MetadataStore::GetByLabel(std::string_view name, st
 }
 
 std::optional<PromptVersion> MetadataStore::GetByVersion(std::string_view name, std::int64_t version) {
+  std::lock_guard<std::mutex> lk(mu_);
   Stmt q(db_,
          "SELECT v.version, v.template, v.config FROM prompts p JOIN prompt_versions v ON v.prompt_id = p.id "
          "WHERE p.name = ? AND v.version = ?");
@@ -217,6 +221,7 @@ std::optional<PromptVersion> MetadataStore::GetByVersion(std::string_view name, 
 }
 
 std::vector<std::string> MetadataStore::LabelsOf(std::string_view name, std::int64_t version) {
+  std::lock_guard<std::mutex> lk(mu_);
   Stmt q(db_,
          "SELECT l.label FROM prompts p JOIN labels l ON l.prompt_id = p.id WHERE p.name = ? AND l.version = ? "
          "ORDER BY l.label");

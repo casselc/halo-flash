@@ -27,6 +27,7 @@ struct PromptVersion {
   std::string config_json;
 };
 
+/// Thread-safe: one connection, each method under a mutex.
 class MetadataStore {
  public:
   /// Opens (creating if missing) the database at `path`, sets WAL mode and
@@ -61,7 +62,7 @@ class MetadataStore {
   MetadataStore() = default;
   bool Exec(const char* sql, std::string* err);
   sqlite3* db_ = nullptr;
-  std::mutex mu_;  // the response methods may be called from any thread
+  std::mutex mu_;  // every public method may be called from any thread
 };
 
 }  // namespace halo::scope
