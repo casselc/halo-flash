@@ -23,10 +23,11 @@
   - routed experts stream at only 160–190 GB/s;
   - dense projections reach 30–34 of 59 TFLOPS.
 - **ds4** (C, MIT) has Flash-Next on Metal and CUDA only. Its `ds4_qwen4_cuda.cuh` (2.3k lines) is a compact kernel reference. It also contributes the n-gram disk reader, expert-streaming design, disk KV format and Alibaba-continuation quality fixtures.
-- **HRX** (Apache-2.0, v0.1.0, not built locally):
+- **HRX** (Apache-2.0, v0.1.0; built locally at P0):
   - GPU via libhrx: load HSACO, `hrx_stream_dispatch`, graphs, timeline semaphores, VMM.
   - CPU via an IREE task device.
-  - The NPU only via libamdf plus Loom `.xdna` images. No matmul has run on hardware yet.
+  - The NPU only via libamdf plus Loom `.xdna` images. (When this plan was written no matmul had run on the hardware; int8 GEMMs now run bit-exact, see `docs/N-LANE.md`.)
+  - libhrx v0.1.0 does not implement stream capture (`hrx_stream_begin_capture` returns unimplemented); graphs are built explicitly with `hrx_graph_add_*_node`.
   - Disk→device io_uring file reads exist in the HAL (`runtime/.../amdgpu/host_queue_file.c`) but are not exported by libhrx.
 
 **Model facts the design rests on** (from `config.json`):
@@ -79,7 +80,7 @@ halo-flash/
 
 **Runtime: HRX native first, HIP second.**
 - The kernels are written in HIP C++ and compiled with clang `--offload-arch=gfx1151` (device-only). The extracted HSACO is loaded through `hrx_executable_load_data(..., "amdgpu", "gfx1151")`.
-- Decode runs as one `hrx_graph` per batch shape. Positions and similar values sit in device buffers, gufo's approach, so graphs replay at any depth.
+- Decode runs as one `hrx_graph` per batch shape. Positions and similar values sit in device buffers, gufo's approach, so graphs replay at any depth. (Implemented for single-session decode: `rt::Device` capture, stream capture on HIP and an explicit node chain on HRX; the per-step values live in `src/kernels/step_params.h`.)
 - CPU work is ordered against the GPU queue with HRX timeline semaphores and `hrx_queue_host_call`, never with blocking syncs. That CPU work is the n-gram gather, sampling, grammar masks and MTP accept/reject bookkeeping.
 - A thin `rt::Device` interface also runs on ROCm HIP. Every op and the end-to-end path can then be A/B'd between HRX and ROCm, and HRX churn can't block progress.
 
@@ -172,6 +173,22 @@ halo-flash/
   - `ctest --preset gpu-test`;
   - `ctest --preset gpu-checks`.
 
+**Mutation testing (user, 2026-10-03).** Positive controls are standing gates,
+not one-off checks:
+- **Planted mutants:** `tests/mutants.toml` lists exact edits to kernels,
+  engine and host code, each with the test filter that must fail.
+  `tools/mutants.py` applies each one, rebuilds, runs and restores, and
+  refuses verdicts unless every suite passes unmutated with nothing skipped.
+  Every selected mutant must be killed. A unit test checks that every
+  mutant's anchor still matches exactly once, so refactors cannot silently
+  retire mutants.
+- **Generated mutants:** Mull (LLVM 21) on the host libraries, with a
+  baseline of accepted survivors keyed by function rather than line, as
+  in casselc/observability's `ci/mutants.py`. Device code is out of Mull's
+  reach, so kernels rely on planted mutants.
+- A mutant that survives is either a test gap, which gets a test, or is
+  shown equivalent and replaced. Equivalent mutants are noted in its `why`.
+
 ## Phases (each ends with a measured gate; no phase's speed claim counts until its quality gate passes)
 
 **Ordering against the weight download.** The weights are still downloading over a 50 Mbps line: about 165 GB, roughly 8 hours or more. Only shard 1, the MTP sidecar and mmproj are present so far, in `../gufo/models/qwen3.8-flash-next/`.
@@ -218,6 +235,14 @@ halo-flash/
   - logits within tolerance of the oracle;
   - greedy tokens identical to gufo on the fixtures;
   - long-context recall on ds4's 31K story test.
+- **Status (2026-10-03).** Done on the tiny models; the real-weight gates
+  wait for the download.
+  - Qwen3.5 (decider torso) and Flash-Next both match their CPU references
+    on HIP and HRX (0b9874a, 5f712b8). For Flash-Next that includes LoRA
+    and HF logits.
+  - Session snapshots, reset and prefill (2f8b4da) are checked by a
+    swarm-style Hegel program and a directed restore test.
+  - Prefill runs token by token. Batched prefill is P4.
 
 **P3 — Decode speed, the core.** This is where most of the effort goes.
 - Fused per-layer kernels:
@@ -229,6 +254,23 @@ halo-flash/
 - The whole step captured as one graph, with CPU work overlapped through semaphores.
 - **Quant-mix study:** dense Q8_0 against Q6/Q5-class formats, and an LM head at lower precision. A mix is adopted only if it passes the P1 NLL gate.
 - **Gate:** at least 35 tok/s at gufo's quantization mix. Per-mix numbers are reported separately.
+- **Status (2026-10-03).**
+  - Routing and QSA block selection run on the device with the reference's
+    tie rules (81e27fa).
+  - A step is captured as a graph and replayed with device-resident step
+    parameters. Each step is one upload (step parameters plus n-gram
+    rows), one graph launch, and a logits download only when wanted.
+  - Measured (`halo_step_stats`, tiny model, 8 layers): 373 launches per
+    step, about 10 µs each when launched eagerly. Scaled to the real model
+    that is about 4,100 launches per token, which caps eager decode near
+    24 tok/s. Graph replay and fusion are therefore the first P3 levers.
+  - HRX graph replay measured slower per node than HIP under load; this
+    needs a quiet-machine remeasurement.
+- **Order of work (2026-10-03):**
+  1. Device-side sampling, before fusion. Today each token downloads about
+     1 MB of logits and filters them on the host.
+  2. Then fusion.
+  3. Then the bandwidth-oriented GEMVs and the quant-mix study.
 
 **P4 — Prefill speed.**
 - WMMA int8 and F16 GEMMs for the dense projections.
@@ -287,6 +329,16 @@ halo-flash/
 1. **N1.** Build libamdf and Loom with XDNA enabled. Run the existing Strix Halo NPU5 CTS programs on this box.
 2. **N2.** Write and measure a Loom int8 and bf16 GEMM tile on AIE2P: throughput, submission latency, and GPU↔NPU handoff cost through libamdf shared memory.
 3. **N3.** Evaluate one candidate offload end-to-end. The first candidate is prefill dense projections running alongside the GPU's MoE work, since prefill is compute-bound. The second is the MTP draft layer during GPU verification.
+
+**Results (2026-10-03; details in `docs/N-LANE.md`).**
+- **N1 works.**
+- **N2 shelved the strands-decider offload by its pre-set gate.** Measured
+  1 TMAC/s or less; the gate needed latency within 3x of the GPU.
+- **N2b, hand-written Low kernels:** 8.14 TMAC/s marginal and 2.40 TMAC/s
+  end to end on all 32 tiles, bit-exact.
+  - Still blocked by missing array and runtime features: memory-tile
+    staging, cascade wiring, and multi-phase or continuation commands.
+  - The decider stays shelved until those land in hrx-system.
 - **Go only if** the end-to-end metric improves by at least 5% with identical outputs. Otherwise the result is recorded as a finding and the lane stays out of the hot path.
 
 ## Reuse map
@@ -371,7 +423,7 @@ these parts is allowed:
 
 | Part | What it changes | Runtime cost | Status |
 |---|---|---|---|
-| **LoRA / QLoRA deltas** on dense projections (attention, DeltaNet, shared expert, router) | behavior, format, tool use | a small low-rank matmul per adapted projection; several adapters resident, mixed in one batch | CPU reference with PEFT parity done (3088a3b); GPU next |
+| **LoRA / QLoRA deltas** on dense projections (attention, DeltaNet, shared expert, router) | behavior, format, tool use | a small low-rank matmul per adapted projection; several adapters resident, mixed in one batch | CPU reference with PEFT parity done (3088a3b); GPU on Qwen3.5 and Flash-Next (0b9874a, 5f712b8) |
 | **Replacement experts (ESFT)**: retrained copies of the k experts per layer the task data routes to most | domain knowledge LoRA on attention cannot reach | none: the session's expert table points at its copies | planned |
 | **Task heads**: pointer or classifier readouts, plus an optional LoRA on the last k layers | decisions, routing, scoring (`/v1/systemone` over the live session) | negligible, reuses the session's hidden states | the strands head runs today on Qwen3.5 |
 | **State / prefix tuning**: a learned initial DeltaNet state plus a KV prefix for the attention layers | persona, standing instructions, house style | none: a snapshot restore through the prefix cache | planned |
@@ -440,7 +492,8 @@ copied files.
   - `llm_scores`;
   - `engine_metrics`.
 - Every table is a MergeTree ordered for time and trace lookup, with a bloom
-  filter on trace id, a configurable TTL, and a Buffer table for live reads.
+  filter on trace id and a configurable TTL. (Sort keys and the Buffer table
+  were revised by measurement; see "Single-process deltas" below.)
 - **Observation fields.** Type (generation, span, event or decision), model,
   variant and adapter ids, prompt id and version, sampler parameters, exact
   input/output/cached token counts, TTFT, per-token latency percentiles, MTP
@@ -534,15 +587,16 @@ faster.
     into the typed table. chDB's stream insert cannot do `INSERT ... SELECT
     FROM input()`, and parsing straight into LowCardinality types costs about
     2×.
-  - Batches of 5k to 20k rows, or a Buffer table. Every chDB statement costs
-    about 1 to 1.5 ms of CPU, and every MergeTree part about 40 to 60 ms.
+  - Batches of up to 10k rows or 1 s (no Buffer table; see the deltas
+    below). Every chDB statement costs about 1 to 1.5 ms of CPU, and every
+    MergeTree part about 40 to 60 ms.
   - `non_replicated_deduplication_window` on every materialized-view target,
     so WAL replays stay exactly-once.
 - **One process owns the database.** chDB allows one data path per process,
   and no other process can open it, so all reads go through the engine's API.
-  That matches halo-scope's design. On chDB 26.7, sessions are closed at
-  shutdown but the engine stays alive until process exit, because it cannot
-  shut down cleanly with MergeTree tables.
+  That matches halo-scope's design. Clean shutdown works when every
+  connection is closed first and then `chdb_shutdown()` is called (libchdb
+  26.9.0). Exiting with a connection open segfaults.
 - **`engine_metrics`** uses a series table plus points tables
   (`DoubleDelta`/`Gorilla` codecs).
 - **Not adopted, because they serve multi-edge collection only:**
@@ -626,6 +680,83 @@ The same records feed the variant manifest's eval summary.
   corruption report.
 - A UI end-to-end smoke test.
 
-**N-lane update.** The strands-decider torso becomes candidate 1 for the NPU, ahead of the prefill offload: a 2B dense, compute-bound forward that would otherwise compete with the LLM for the GPU. The go/no-go rule is unchanged, and it adds that LLM decode tok/s must not regress while decisions run.
+**N-lane update.** The strands-decider torso becomes candidate 1 for the NPU, ahead of the prefill offload: a 2B dense, compute-bound forward that would otherwise compete with the LLM for the GPU. The go/no-go rule is unchanged, and it adds that LLM decode tok/s must not regress while decisions run. (Outcome: shelved after N2/N2b; see `docs/N-LANE.md`. The decider runs on the GPU.)
 
 **Downloads.** Qwen3.5-2B-Base (about 4 GB in BF16) and the strands-decider checkpoint, which competes with the Flash-Next download on the DSL line.
+
+## Addendum (2026-10-03): lessons from vLLM, SGLang, llama.cpp and others
+
+Agreed with the user. Each item names its phase; the tests follow the same
+rules as everything else (an oracle, Hegel properties, and planted mutants).
+
+1. **Radix prefix cache with recurrent-state checkpoints (P6).** From
+   SGLang's RadixAttention and its Mamba radix cache, and vLLM's hybrid
+   prefix caching.
+   - Attention KV is reusable at any token, but DeltaNet state is
+     reusable only where it was saved.
+   - During prefill, snapshot the recurrent state at fixed intervals (about
+     every 1-2K tokens) and at turn boundaries, into a radix tree keyed by
+     token prefix, with LRU eviction and the RAM and disk tiers.
+   - A new session restores the nearest checkpoint and prefills only the
+     gap.
+   - Property: restoring checkpoint c and prefilling the gap gives exactly
+     the state of a direct prefill.
+2. **Sampling on the device (P3, ahead of fusion; P5).** From vLLM and
+   FlashInfer's sort-free top-k/top-p.
+   - The kernel downloads only the token, plus top-k logprobs when
+     requested.
+   - `core/sampling` (the gufo semantics) is the oracle.
+   - The MTP accept/reject step and the residual draw also run on device.
+3. **Prompt-lookup (n-gram) drafting alongside MTP (P5).** From llama.cpp
+   lookup decoding and vLLM's n-gram speculation.
+   - Agent output copies heavily from its context, so matching the recent
+     suffix against the context gives long drafts almost for free.
+   - Drafts are verified in the same batched pass as MTP drafts.
+   - The drafter is chosen by recent acceptance.
+   - Property: under greedy decoding the output is identical to AR.
+4. **Grammar engine with jump-forward (P7).** From xgrammar (vLLM and
+   SGLang), llguidance (llama.cpp) and SGLang's jump-forward.
+   - Evaluate embedding llguidance (C API) or xgrammar rather than porting
+     gufo's JSON constraint.
+   - Tokens the grammar forces (the JSON skeleton of a tool call) are
+     appended as one prefill chunk instead of decoded one at a time.
+   - Properties:
+     - constrained outputs always parse;
+     - jump-forward output equals token-by-token constrained decoding.
+5. **Shared-prefix ("cascade") attention and prefix-aware scheduling (P6).**
+   From FlashInfer and SGLang.
+   - Batched sessions that share a prefix compute attention over it once
+     per batch.
+   - The scheduler prefers the longest cache match.
+6. **Graphs per batch-size bucket (P6).** From vLLM and SGLang graph
+   capture: batched decode replays a graph captured for its padded bucket.
+   Padding must never leak into outputs; this is already a stated
+   invariant.
+7. **Overlapped scheduling (P3/P6).** From SGLang's zero-overhead scheduler
+   and vLLM's async scheduling.
+   - Step N+1's host work (n-gram gather and prefetch, detokenization,
+     grammar masks, sampling bookkeeping) runs while the GPU executes step
+     N.
+   - It is ordered with semaphores, as already planned.
+8. **Reference parsers and metric names (P7).**
+   - vLLM and SGLang's Qwen3 tool-call and reasoning parsers provide
+     differential fixtures for our streaming parser.
+   - `/metrics` uses vLLM's Prometheus metric names, so existing
+     dashboards work.
+9. **Quant-mix study candidates (P3).**
+   - ExLlamaV3's EXL3 (QTIP trellis) gives better quality per bit at 3-4
+     bits, which means fewer bytes per token for the experts. It needs its
+     own dequant kernels and is gated by the P1 NLL check.
+   - llama.cpp's per-tensor overrides (`-ot`) are the model for P8
+     expert-placement configuration.
+
+**Considered and not adopted:**
+- Fully general paged KV. Our KV is about 24 KB per token over 12
+  attention layers; contiguous storage with copy-on-write fork pages is
+  enough.
+- Tensor and expert parallelism, and multi-node KV transfer
+  (Mooncake/LMCache). There is one device with unified memory.
+- ktransformers-style CPU expert offload. CPU and GPU share the memory
+  bandwidth.
+- llama.cpp context shifting. It re-rotates KV, which has no DeltaNet
+  equivalent.

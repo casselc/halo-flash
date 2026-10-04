@@ -9,8 +9,17 @@ It will serve an OpenAI-compatible completions endpoint and expose a C ABI for
 in-process embedding. The workload it is tuned for is a single user with a few
 concurrent sessions, usually sharing a long common context.
 
-Status: early bring-up. See [docs/PLAN.md](docs/PLAN.md) for the phased plan,
-targets and quality gates.
+Status: correctness bring-up.
+- The CPU references match HF transformers for Flash-Next and Qwen3.5,
+  including LoRA.
+- On the GPU (HIP and HRX), Flash-Next decodes the tiny test model with
+  graph replay and session snapshots.
+- The strands-decider runs end to end.
+- Speed work (P3) and the real-weight quality gates are next.
+
+See [docs/PLAN.md](docs/PLAN.md) for the phased plan, targets and quality
+gates, [docs/P0-BASELINES.md](docs/P0-BASELINES.md) for measurements, and
+[docs/N-LANE.md](docs/N-LANE.md) for NPU results.
 
 ## Building and testing
 
@@ -34,10 +43,26 @@ The tests are mostly properties and state machines written with Hegel. When a
 property fails, Hegel shrinks it to a minimal counterexample and prints a
 replay seed. Commit each one as a regression test.
 
+## Planted mutants
+
+Every entry in `tests/mutants.toml` is a deliberate defect that some test must
+catch:
+
+```sh
+HALO_TINY_HF_DIR=... HALO_TINY_QWEN35_DIR=... tools/mutants.py         # all
+tools/mutants.py -k snapshot                                           # by name
+python3 -m unittest tools/mutants_test.py                              # anchors still match
+```
+
+The runner refuses to judge unless each suite passes unmutated with nothing
+skipped. A mutant that doesn't compile is reported INVALID, never killed. When
+a mutant survives, add the missing test; if it is equivalent, replace it and
+say why in its `why`.
+
 ## System One decisions (strands-decider)
 
 `/v1/systemone` decisions run strands-decider-2B-hobson-v19 on the CPU
-reference today. To build its artifacts from the Hugging Face checkpoints
+reference or the GPU (`HALO_DECIDER_DEVICE=hip|hrx`). To build its artifacts from the Hugging Face checkpoints
 (`LLAMA_CPP` points at a llama.cpp checkout with qwen35 support), run:
 
 ```sh

@@ -32,6 +32,7 @@ add_library(halo_core STATIC
   src/core/gguf_writer.cpp
   src/core/quant.cpp
   src/core/json.cpp
+  src/core/sampling.cpp
 )
 target_include_directories(halo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -73,8 +74,9 @@ if(HALO_GPU)
     OUTPUT ${HALO_GEN}/core.hsaco
     COMMAND ${CMAKE_COMMAND} -E make_directory ${HALO_GEN}/kernels
     COMMAND ${HIPCC} -x hip --offload-arch=gfx1151 --offload-device-only --no-gpu-bundle-output
-            -O3 -std=c++20 -o ${HALO_GEN}/core.hsaco ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/core.hip
-    DEPENDS src/kernels/core.hip
+            -O3 -std=c++20 -I${CMAKE_CURRENT_SOURCE_DIR}/src
+            -o ${HALO_GEN}/core.hsaco ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/core.hip
+    DEPENDS src/kernels/core.hip src/kernels/step_params.h
     COMMENT "Compiling GPU kernels (gfx1151 HSACO)")
   add_custom_command(
     OUTPUT ${HALO_GEN}/kernels/core_hsaco.cpp ${HALO_GEN}/kernels/core_hsaco.hpp
@@ -136,7 +138,8 @@ if(HALO_BUILD_TESTS)
   halo_test(core_tests
     tests/core/gguf_test.cpp
     tests/core/quant_test.cpp
-    tests/core/json_test.cpp)
+    tests/core/json_test.cpp
+    tests/core/sampling_test.cpp)
   target_compile_definitions(core_tests PRIVATE
     HALO_CORE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/core/data")
   halo_test(text_tests

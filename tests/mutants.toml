@@ -6,6 +6,10 @@
 # `find` must occur exactly once in `file`. TOML literal strings ('...')
 # keep code verbatim.
 
+[suite.cpu-asan]
+build_dir = "build/cpu-asan"
+env = []
+
 [suite.gpu]
 build_dir = "build/gpu"
 env = ["HALO_TINY_HF_DIR", "HALO_TINY_QWEN35_DIR"]
@@ -30,8 +34,8 @@ why = "Flash-Next gates DeltaNet output with sigmoid, Qwen3.5 with SiLU"
 [[mutant]]
 name = "fn-qsa-extra-block"
 file = "src/engine/flash_next_gpu.cpp"
-find = 'rt::Arg::Val(complete), rt::Arg::Val(budget),'
-replace = 'rt::Arg::Val(complete), rt::Arg::Val(budget + 1),'
+find = 'rt::Arg::Buf(visible_), params, rt::Arg::Val(budget), rt::Arg::Val(ratio)}'
+replace = 'rt::Arg::Buf(visible_), params, rt::Arg::Val(budget + 1), rt::Arg::Val(ratio)}'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
@@ -90,8 +94,8 @@ why = "the PLE query is the wide residual, not the n-gram key"
 [[mutant]]
 name = "fn-pooled-block-rope-position"
 file = "src/engine/flash_next_gpu.cpp"
-find = '!rope(pooled_, 1, idim, s.blocks * ratio)'
-replace = '!rope(pooled_, 1, idim, (s.blocks + 1) * ratio - 1)'
+find = 'rope(pooled_, 1, idim, kHaloBlock, ratio)'
+replace = 'rope(pooled_, 1, idim, kHaloPosition, 1)'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
@@ -377,3 +381,132 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
 why = "the incomplete tail block is always visible"
+
+# ---- Captured decode graphs: per-step values live in device memory ----------
+
+[[mutant]]
+name = "fn-graph-pool-block-off-by-one"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'params[kHaloBlock] = position_ / ratio;'
+replace = 'params[kHaloBlock] = n_kv / ratio;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "each step pools the block holding its own token"
+
+[[mutant]]
+name = "fn-graph-kv-row-from-nkv"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'rope(k_, nkv, hd, kHaloPosition, 1) && append(s.k, k_, kHaloPosition, nkv * hd)'
+replace = 'rope(k_, nkv, hd, kHaloPosition, 1) && append(s.k, k_, kHaloNkv, nkv * hd)'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "the new K row lands at its position"
+
+[[mutant]]
+name = "fn-graph-pooled-rope-unscaled"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'rope(pooled_, 1, idim, kHaloBlock, ratio)'
+replace = 'rope(pooled_, 1, idim, kHaloBlock, 1)'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "pooled keys rotate at block * ratio, a token position"
+
+[[mutant]]
+name = "fn-graph-stale-upload"
+file = "src/engine/flash_next_gpu.cpp"
+find = '  if (!dev_.Upload(ple_emb_, 0, step_host_.data(), step_host_.size(), error)) return false;'
+replace = '  if (position_ == 0 && !dev_.Upload(ple_emb_, 0, step_host_.data(), step_host_.size(), error)) return false;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "a replayed graph must see this step's parameters, not those captured"
+
+[[mutant]]
+name = "fn-graph-wrong-variant"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'rt::Graph& g = graphs_[want ? 1 : 0];'
+replace = 'rt::Graph& g = graphs_[0];'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.RestoreAfterOverwritingHistory:FlashNextGpu.SnapshotsResetAndPrefillMatchReference"
+why = "a step that wants logits must replay the graph that computes them"
+timeout = 1200
+
+[[mutant]]
+name = "rt-hrx-capture-unchained"
+file = "src/rt/hrx_device.cpp"
+find = '      return Chain(hrx_graph_add_kernel_node(graph_, has_last_ ? &last_ : nullptr, has_last_ ? 1 : 0, &attrs, &last_),'
+replace = '      return Chain(hrx_graph_add_kernel_node(graph_, nullptr, 0, &attrs, &last_),'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "captured HRX nodes run in launch order (dependency chain)"
+
+# ---- Sampling (src/core/sampling.cpp) ---------------------------------------
+
+[[mutant]]
+name = "samp-top-p-keeps-one-more"
+file = "src/core/sampling.cpp"
+find = 'if (keep >= minimum && cumulative >= static_cast<double>(config.top_p)) {'
+replace = 'if (keep > minimum && cumulative >= static_cast<double>(config.top_p)) {'
+suite = "cpu-asan"
+binary = "core_tests"
+filter = "Sampling.*"
+why = "top-p stops at the first prefix reaching p (with the min_keep floor)"
+
+[[mutant]]
+name = "samp-min-p-strict"
+file = "src/core/sampling.cpp"
+find = 'candidates->at(keep).logit - maximum >= threshold) {'
+replace = 'candidates->at(keep).logit - maximum > threshold) {'
+suite = "cpu-asan"
+binary = "core_tests"
+filter = "Sampling.*"
+why = "min-p keeps tokens exactly at the threshold"
+
+[[mutant]]
+name = "samp-presence-penalty-sign"
+file = "src/core/sampling.cpp"
+find = """    logit -= config.presence_penalty;
+  return logit;"""
+replace = """    logit += config.presence_penalty;
+  return logit;"""
+suite = "cpu-asan"
+binary = "core_tests"
+filter = "Sampling.*"
+why = "presence penalty lowers a seen token"
+
+[[mutant]]
+name = "samp-repeat-window-prompt-overrun"
+file = "src/core/sampling.cpp"
+find = 'std::min(prompt_tokens.size(), config.repeat_last_n - tail.size()));'
+replace = 'std::min(prompt_tokens.size(), config.repeat_last_n));'
+suite = "cpu-asan"
+binary = "core_tests"
+filter = "Sampling.*"
+why = "the repeat window spans the last N tokens of prompt + generated"
+
+[[mutant]]
+name = "samp-residual-not-subtracted"
+file = "src/core/sampling.cpp"
+find = 'const double value = std::max(entry.value - q, 0.0);'
+replace = 'const double value = entry.value;'
+suite = "cpu-asan"
+binary = "core_tests"
+filter = "Sampling.*"
+why = "speculative rejection resamples from max(p - q, 0), or the target is biased"
+
+[[mutant]]
+name = "samp-copy-drops-rng"
+file = "src/core/sampling.cpp"
+find = """      rng_state_(other.rng_state_),
+      pending_sample_(other.pending_sample_) {}"""
+replace = """      rng_state_(0),
+      pending_sample_(other.pending_sample_) {}"""
+suite = "cpu-asan"
+binary = "core_tests"
+filter = "Sampling.*"
+why = "a copied state (speculative rollback) continues the same random stream"

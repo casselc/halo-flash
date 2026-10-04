@@ -51,12 +51,14 @@ class HipDevice final : public Device {
     b = {};
   }
   bool Upload(const Buffer& dst, std::size_t off, const void* src, std::size_t n, std::string* error) override {
+    if (capturing_) return Capturing(error);
     if (off + n > dst.bytes) return Bounds(error);
     return Ok(hipMemcpyHtoDAsync(static_cast<char*>(dst.device) + off, const_cast<void*>(src), n, stream_),
               "hipMemcpyHtoD", error) &&
            Synchronize(error);
   }
   bool Download(const Buffer& src, std::size_t off, void* dst, std::size_t n, std::string* error) override {
+    if (capturing_) return Capturing(error);
     if (off + n > src.bytes) return Bounds(error);
     return Ok(hipMemcpyDtoHAsync(dst, static_cast<char*>(src.device) + off, n, stream_), "hipMemcpyDtoH", error) &&
            Synchronize(error);
@@ -94,13 +96,44 @@ class HipDevice final : public Device {
                                     block.y, block.z, 0, stream_, params.data(), nullptr),
               "hipModuleLaunchKernel", error);
   }
-  bool Synchronize(std::string* error) override { return Ok(hipStreamSynchronize(stream_), "hipStreamSynchronize", error); }
+  bool Synchronize(std::string* error) override {
+    if (capturing_) return Capturing(error);
+    return Ok(hipStreamSynchronize(stream_), "hipStreamSynchronize", error);
+  }
+  bool BeginCapture(std::string* error) override {
+    if (!Ok(hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal), "hipStreamBeginCapture", error))
+      return false;
+    capturing_ = true;
+    return true;
+  }
+  bool EndCapture(Graph* out, std::string* error) override {
+    capturing_ = false;
+    hipGraph_t g = nullptr;
+    if (!Ok(hipStreamEndCapture(stream_, &g), "hipStreamEndCapture", error)) return false;
+    hipGraphExec_t exec = nullptr;
+    const bool ok = Ok(hipGraphInstantiate(&exec, g, nullptr, nullptr, 0), "hipGraphInstantiate", error);
+    (void)hipGraphDestroy(g);
+    if (ok) out->exec = exec;
+    return ok;
+  }
+  bool LaunchGraph(const Graph& graph, std::string* error) override {
+    return Ok(hipGraphLaunch(static_cast<hipGraphExec_t>(graph.exec), stream_), "hipGraphLaunch", error);
+  }
+  void FreeGraph(Graph& graph) noexcept override {
+    if (graph.exec) (void)hipGraphExecDestroy(static_cast<hipGraphExec_t>(graph.exec));
+    graph = {};
+  }
 
  private:
   static bool Bounds(std::string* error) {
     if (error) *error = "copy out of buffer bounds";
     return false;
   }
+  static bool Capturing(std::string* error) {
+    if (error) *error = "not capturable: transfer or synchronize during graph capture";
+    return false;
+  }
+  bool capturing_ = false;
   hipStream_t stream_ = nullptr;
   hipModule_t module_ = nullptr;
   std::vector<std::uint8_t> image_;

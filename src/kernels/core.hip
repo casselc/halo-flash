@@ -9,6 +9,8 @@
 
 #include <cstdint>
 
+#include "kernels/step_params.h"
+
 namespace {
 
 constexpr int kWarp = 32;
@@ -180,6 +182,10 @@ __device__ void Embed(const std::uint8_t* w, float* out, std::uint32_t token, st
                                            std::uint32_t cols, std::uint64_t row_bytes) {                           \
     MatVec<L>(w + ids[slot] * expert_bytes, x, y, rows, cols, row_bytes);                                         \
   }                                                                                                            \
+  extern "C" __global__ void NAME##_embed_p(const std::uint8_t* w, float* out, const std::uint32_t* params,       \
+                                            std::uint32_t cols, std::uint64_t row_bytes) {                          \
+    Embed<L>(w, out, params[kHaloToken], cols, row_bytes);                                                        \
+  }                                                                                                            \
   extern "C" __global__ void NAME##_embed(const std::uint8_t* w, float* out, std::uint32_t token,              \
                                           std::uint32_t cols, std::uint64_t row_bytes) {                       \
     Embed<L>(w, out, token, cols, row_bytes);                                                                  \
@@ -223,8 +229,8 @@ extern "C" __global__ void halo_l2norm(float* x, std::uint32_t d, float eps) {
 }
 
 // NEOX partial rotary embedding, in place; one block per head.
-extern "C" __global__ void halo_rope_neox(float* x, std::uint32_t head_dim, std::uint32_t rotary_dim,
-                                          std::uint32_t pos, float theta) {
+__device__ inline void RopeNeox(float* x, std::uint32_t head_dim, std::uint32_t rotary_dim, std::uint32_t pos,
+                                float theta) {
   float* v = x + blockIdx.x * head_dim;
   const std::uint32_t half = rotary_dim / 2;
   for (std::uint32_t i = threadIdx.x; i < half; i += blockDim.x) {
@@ -235,6 +241,16 @@ extern "C" __global__ void halo_rope_neox(float* x, std::uint32_t head_dim, std:
     v[i] = a * c - b * s;
     v[i + half] = a * s + b * c;
   }
+}
+extern "C" __global__ void halo_rope_neox(float* x, std::uint32_t head_dim, std::uint32_t rotary_dim,
+                                          std::uint32_t pos, float theta) {
+  RopeNeox(x, head_dim, rotary_dim, pos, theta);
+}
+// Position from the step parameters: params[slot] * scale.
+extern "C" __global__ void halo_rope_neox_p(float* x, const std::uint32_t* params, std::uint32_t head_dim,
+                                            std::uint32_t rotary_dim, std::uint32_t slot, std::uint32_t scale,
+                                            float theta) {
+  RopeNeox(x, head_dim, rotary_dim, params[slot] * scale, theta);
 }
 
 extern "C" __global__ void halo_add(float* y, const float* x, std::uint32_t n) {
@@ -255,6 +271,13 @@ extern "C" __global__ void halo_silu_mul(float* g, const float* up, std::uint32_
 extern "C" __global__ void halo_sigmoid_gate(float* x, const float* gate, std::uint32_t n) {
   for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
     x[i] *= Sigmoid(gate[i]);
+}
+
+// dst[params[slot] * stride + i] = src[i]: appends one row to a cache.
+extern "C" __global__ void halo_copy_at(float* dst, const float* src, const std::uint32_t* params, std::uint32_t slot,
+                                        std::uint32_t stride, std::uint32_t n) {
+  float* d = dst + static_cast<std::size_t>(params[slot]) * stride;
+  for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) d[i] = src[i];
 }
 
 extern "C" __global__ void halo_copy(float* dst, const float* src, std::uint32_t n) {
@@ -428,8 +451,12 @@ extern "C" __global__ void halo_ple_conv(const float* normalized, const float* g
 }
 
 // QSA: pooled[i] = mean over `ratio` raw indexer keys of one block.
-extern "C" __global__ void halo_pool_block(const float* raw, float* pooled, std::uint32_t block, std::uint32_t ratio,
-                                           std::uint32_t dim) {
+// The block is the one holding this step's token: pooled every step, so the
+// value written when the block completes is final, and an incomplete
+// block's slot is never read before then.
+extern "C" __global__ void halo_pool_block(const float* raw, float* pooled, const std::uint32_t* params,
+                                           std::uint32_t ratio, std::uint32_t dim) {
+  const std::uint32_t block = params[kHaloBlock];
   for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
     float acc = 0.0f;
     for (std::uint32_t t = 0; t < ratio; ++t) acc += raw[(block * ratio + t) * dim + i] / static_cast<float>(ratio);
@@ -438,8 +465,9 @@ extern "C" __global__ void halo_pool_block(const float* raw, float* pooled, std:
 }
 
 // QSA block scores: score[b] = sum_heads relu(<q_h, k_b>). One thread per block.
-extern "C" __global__ void halo_qsa_scores(const float* q, const float* blocks, float* score, std::uint32_t heads,
-                                           std::uint32_t dim, std::uint32_t n_blocks) {
+extern "C" __global__ void halo_qsa_scores(const float* q, const float* blocks, float* score,
+                                           const std::uint32_t* params, std::uint32_t heads, std::uint32_t dim) {
+  const std::uint32_t n_blocks = params[kHaloComplete];
   for (std::uint32_t b = blockIdx.x * blockDim.x + threadIdx.x; b < n_blocks; b += gridDim.x * blockDim.x) {
     float acc = 0.0f;
     for (std::uint32_t h = 0; h < heads; ++h) {
@@ -454,9 +482,10 @@ extern "C" __global__ void halo_qsa_scores(const float* q, const float* blocks, 
 // Attention over a list of visible positions (QSA selection), GQA, gated.
 extern "C" __global__ void halo_attention_select(const float* q, const float* kc, const float* vc, const float* gate,
                                                  const std::uint32_t* visible, float* out, float* scores,
-                                                 std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t hd,
-                                                 std::uint32_t n, std::uint32_t max_n) {
+                                                 const std::uint32_t* params, std::uint32_t num_heads,
+                                                 std::uint32_t num_kv_heads, std::uint32_t hd, std::uint32_t max_n) {
   __shared__ float scratch[32];
+  const std::uint32_t n = params[kHaloNVisible];
   const std::uint32_t h = blockIdx.x, kvh = h / (num_heads / num_kv_heads);
   const float* qh = q + h * hd;
   float* sc = scores + static_cast<std::size_t>(h) * max_n;
@@ -587,8 +616,9 @@ __device__ inline std::uint32_t BlockScan(std::uint32_t flag, std::uint32_t* buf
 // (equal scores: lower block first, i.e. the reference's stable sort), in
 // position order, expanded to their `ratio` token positions, then the
 // incomplete tail [n*ratio, n_kv). One block; blockDim a power of two.
-extern "C" __global__ void halo_qsa_select(const float* score, std::uint32_t* visible, std::uint32_t n, std::uint32_t k,
-                                           std::uint32_t ratio, std::uint32_t n_kv) {
+extern "C" __global__ void halo_qsa_select(const float* score, std::uint32_t* visible, const std::uint32_t* params,
+                                           std::uint32_t k, std::uint32_t ratio) {
+  const std::uint32_t n = params[kHaloComplete], n_kv = params[kHaloNkv];
   __shared__ std::uint32_t hist[256];
   __shared__ std::uint32_t buf[1024];
   __shared__ std::uint32_t prefix, prefix_mask, remaining;

@@ -161,7 +161,7 @@ TEST(FlashNextGpu, RandomSequencesMatchReference) {
   }, {.test_cases = 25});
 }
 
-// Session state, swarm style: each case enables a random subset of the
+// Session state, swarm style (graph replay and eager launches mixed): each case enables a random subset of the
 // operations, then runs a random program of them. The model is the CPU
 // reference, copied into the same snapshot slots. Every logits output must
 // match, so restore == replay and chunked prefill == token-at-a-time.
@@ -180,6 +180,7 @@ TEST(FlashNextGpu, SnapshotsResetAndPrefillMatchReference) {
     std::string error;
     auto gpu = engine::FlashNextGpu::Create(dev, *t->weights, t->ngram.get(), lora, kMaxContext, &error);
     ASSERT_TRUE(gpu) << error;
+    gpu->SetUseGraphs(tc.draw(gs::booleans()));
     std::optional<model::ReferenceModel> cpu;
     cpu.emplace(*t->weights, t->ngram.get(), kMaxContext);
     cpu->SetAdapter(lora);
@@ -189,7 +190,7 @@ TEST(FlashNextGpu, SnapshotsResetAndPrefillMatchReference) {
       s = gpu->NewSnapshot(&error);
       ASSERT_TRUE(s) << error;
     }
-    enum Op { kStep, kPrefill, kSave, kRestore, kReset, kOps };
+    enum Op { kStep, kPrefill, kSave, kRestore, kReset, kToggleGraphs, kOps };
     bool enabled[kOps];
     for (bool& e : enabled) e = tc.draw(gs::booleans());
     enabled[kStep] = true;  // the program must make progress
@@ -207,8 +208,9 @@ TEST(FlashNextGpu, SnapshotsResetAndPrefillMatchReference) {
     for (int i = 0; i < ops; ++i) {
       // Weighted toward long histories and forks: a stale-state bug shows
       // only after save, divergence past the save point, then restore.
-      const int pick = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 9}));
-      const Op op = pick < 3 ? kStep : pick < 6 ? kPrefill : pick < 7 ? kSave : pick < 9 ? kRestore : kReset;
+      const int pick = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 10}));
+      const Op op = pick < 3 ? kStep : pick < 6 ? kPrefill : pick < 7 ? kSave : pick < 9 ? kRestore : pick < 10 ? kReset
+                                                                                                           : kToggleGraphs;
       if (!enabled[op]) continue;
       const int slot = tc.draw(gs::integers<int>({.min_value = 0, .max_value = kSlots - 1}));
       switch (op) {
@@ -247,6 +249,9 @@ TEST(FlashNextGpu, SnapshotsResetAndPrefillMatchReference) {
           ASSERT_TRUE(gpu->Reset(&error)) << error;
           cpu->Reset();
           break;
+        case kToggleGraphs:  // graph replay and eager launches share all state
+          gpu->SetUseGraphs(tc.draw(gs::booleans()));
+          break;
         case kOps: break;
       }
       ASSERT_EQ(gpu->Position(), cpu->Position());
@@ -254,10 +259,14 @@ TEST(FlashNextGpu, SnapshotsResetAndPrefillMatchReference) {
   }, {.test_cases = 100});
 }
 
-// Directed: restoring a snapshot after an unrelated, longer history has
-// overwritten every row the snapshot covers. A plain fork-and-continue never
-// rewrites rows below the save point, so it cannot see a snapshot that drops
-// some of them; the random programs above reach this shape only rarely.
+// Directed: restoring a snapshot after an unrelated history.
+// - A longer one overwrites every row the snapshot covers. A plain
+//   fork-and-continue never rewrites rows below the save point, so it
+//   cannot see a snapshot that drops some of them.
+// - A shorter one leaves a partially pooled QSA block in a slot the
+//   snapshot holds complete, so a restore that copies too few pooled
+//   blocks scores a corrupted block.
+// The random programs above reach these shapes only rarely.
 TEST(FlashNextGpu, RestoreAfterOverwritingHistory) {
   Tiny* t = LoadTiny();
   if (!t) GTEST_SKIP() << "set HALO_TINY_HF_DIR";
@@ -267,7 +276,8 @@ TEST(FlashNextGpu, RestoreAfterOverwritingHistory) {
   const auto tokens = ReadTokens(t->dir + "/tokens.i32");  // 48 tokens
   const std::span<const std::int32_t> all(tokens);
   for (auto& dev : devices) {
-    for (std::size_t save_at : {1, 9, 13, 20}) {
+    const std::pair<std::size_t, std::size_t> cases[] = {{1, 9}, {9, 17}, {13, 21}, {20, 28}, {20, 10}, {30, 6}, {28, 13}};
+    for (auto [save_at, other] : cases) {
       std::string error;
       auto gpu = engine::FlashNextGpu::Create(*dev, *t->weights, t->ngram.get(), nullptr, 48, &error);
       ASSERT_TRUE(gpu) << error;
@@ -279,13 +289,13 @@ TEST(FlashNextGpu, RestoreAfterOverwritingHistory) {
       for (std::size_t i = 0; i < save_at; ++i) ASSERT_TRUE(cpu.Step(tokens[i], {}, {}, &error));
       ASSERT_TRUE(gpu->Save(*snap, &error)) << error;
       ASSERT_TRUE(gpu->Reset(&error)) << error;
-      ASSERT_TRUE(gpu->Prefill(all.last(save_at + 8), {}, &error)) << error;  // different, longer history
+      ASSERT_TRUE(gpu->Prefill(all.last(other), {}, &error)) << error;  // a different history
       ASSERT_TRUE(gpu->Restore(*snap, &error)) << error;
       for (std::size_t i = save_at; i < save_at + 12; ++i) {
         ASSERT_TRUE(gpu->Step(tokens[i], gl, &error)) << error;
         ASSERT_TRUE(cpu.Step(tokens[i], cl, {}, &error)) << error;
         ASSERT_LT(RelL2(gl, cl.data()), 1e-4) << rt::BackendName(dev->backend()) << " saved at " << save_at
-                                              << ", position " << i;
+                                              << " after " << other << " other tokens, position " << i;
       }
     }
   }

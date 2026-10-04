@@ -25,6 +25,14 @@ class Manifest(unittest.TestCase):
         self.assertTrue(ms)
         self.assertTrue(all(m.suite in suites for m in ms))
 
+    def test_every_anchor_matches_exactly_once(self):
+        # A refactor that moves mutated code makes its mutant INVALID; catch
+        # that here, without a build or a GPU.
+        _, ms = mutants.load(os.path.join(mutants.ROOT, "tests", "mutants.toml"))
+        for m in ms:
+            with open(os.path.join(mutants.ROOT, m.file)) as f:
+                self.assertEqual(f.read().count(m.find), 1, m.name)
+
     def test_rejects_duplicates_unknown_suites_and_noops(self):
         for bad in (SUITE + MUTANT.format(name="a", find="x", suite="s") * 2,
                     SUITE + MUTANT.format(name="a", find="x", suite="nope"),

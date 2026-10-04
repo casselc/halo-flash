@@ -75,17 +75,26 @@ class HrxDevice final : public Device {
     b = {};
   }
   bool Upload(const Buffer& dst, std::size_t off, const void* src, std::size_t n, std::string* error) override {
+    if (capturing_) return Capturing(error);
     if (off + n > dst.bytes) return Bounds(error);
     return Ok(hrx_stream_synchronize(stream_), "sync", error) &&
            Ok(hrx_synchronous_h2d(dev_, src, static_cast<hrx_buffer_t>(dst.handle), off, n), "h2d", error);
   }
   bool Download(const Buffer& src, std::size_t off, void* dst, std::size_t n, std::string* error) override {
+    if (capturing_) return Capturing(error);
     if (off + n > src.bytes) return Bounds(error);
     return Ok(hrx_stream_synchronize(stream_), "sync", error) &&
            Ok(hrx_synchronous_d2h(dev_, static_cast<hrx_buffer_t>(src.handle), off, dst, n), "d2h", error);
   }
   bool Fill(const Buffer& dst, std::uint8_t v, std::string* error) override {
     const std::uint32_t pattern = v * 0x01010101u;
+    if (capturing_) {
+      const hrx_graph_fill_buffer_node_attrs_t attrs = {
+          {static_cast<hrx_buffer_t>(dst.handle), 0, dst.bytes}, pattern, 4};
+      return Chain(
+          hrx_graph_add_fill_buffer_node(graph_, has_last_ ? &last_ : nullptr, has_last_ ? 1 : 0, &attrs, &last_),
+          "hrx_graph_add_fill_buffer_node", error);
+    }
     return Ok(hrx_stream_fill_buffer(stream_, static_cast<hrx_buffer_t>(dst.handle), 0, dst.bytes, &pattern, 4),
               "fill", error);
   }
@@ -110,17 +119,68 @@ class HrxDevice final : public Device {
       }
     }
     const hrx_dispatch_config_t cfg = {{grid.x, grid.y, grid.z}, {block.x, block.y, block.z}, 0};
+    if (capturing_) {
+      const hrx_graph_kernel_node_attrs_t attrs = {exe_,           static_cast<uint32_t>(k), cfg,
+                                                   constants.data(), constants.size(),         bindings.data(),
+                                                   bindings.size(),  HRX_DISPATCH_FLAG_NONE};
+      return Chain(hrx_graph_add_kernel_node(graph_, has_last_ ? &last_ : nullptr, has_last_ ? 1 : 0, &attrs, &last_),
+                   "hrx_graph_add_kernel_node", error);
+    }
     return Ok(hrx_stream_dispatch(stream_, exe_, static_cast<uint32_t>(k), &cfg, constants.data(), constants.size(),
                                   bindings.data(), bindings.size(), HRX_DISPATCH_FLAG_NONE),
               "hrx_stream_dispatch", error);
   }
-  bool Synchronize(std::string* error) override { return Ok(hrx_stream_synchronize(stream_), "sync", error); }
+  bool Synchronize(std::string* error) override {
+    if (capturing_) return Capturing(error);
+    return Ok(hrx_stream_synchronize(stream_), "sync", error);
+  }
+  // libhrx v0.1.0 does not implement stream capture, so capture builds the
+  // graph explicitly: each launch or fill becomes a node depending on the
+  // previous one, the same order the stream would execute.
+  bool BeginCapture(std::string* error) override {
+    if (!Ok(hrx_graph_create(dev_, 0, &graph_), "hrx_graph_create", error)) return false;
+    capturing_ = true;
+    has_last_ = false;
+    return true;
+  }
+  bool EndCapture(Graph* out, std::string* error) override {
+    capturing_ = false;
+    hrx_graph_exec_t exec = nullptr;
+    const bool ok = capture_ok_ && Ok(hrx_graph_instantiate(graph_, 0, &exec), "hrx_graph_instantiate", error);
+    if (!capture_ok_ && error) *error = "a launch failed during capture";
+    hrx_graph_release(graph_);
+    graph_ = nullptr;
+    capture_ok_ = true;
+    if (ok) out->exec = exec;
+    return ok;
+  }
+  bool LaunchGraph(const Graph& graph, std::string* error) override {
+    return Ok(hrx_graph_exec_launch(static_cast<hrx_graph_exec_t>(graph.exec), stream_), "hrx_graph_exec_launch",
+              error);
+  }
+  void FreeGraph(Graph& graph) noexcept override {
+    if (graph.exec) hrx_graph_exec_release(static_cast<hrx_graph_exec_t>(graph.exec));
+    graph = {};
+  }
 
  private:
   static bool Bounds(std::string* error) {
     if (error) *error = "copy out of buffer bounds";
     return false;
   }
+  static bool Capturing(std::string* error) {
+    if (error) *error = "not capturable: transfer or synchronize during graph capture";
+    return false;
+  }
+  bool Chain(hrx_status_t s, const char* what, std::string* error) {
+    const bool ok = Ok(s, what, error);
+    has_last_ = has_last_ || ok;
+    capture_ok_ = capture_ok_ && ok;
+    return ok;
+  }
+  bool capturing_ = false, has_last_ = false, capture_ok_ = true;
+  hrx_graph_t graph_ = nullptr;
+  hrx_graph_node_t last_{};
   hrx_device_t dev_ = nullptr;
   hrx_stream_t stream_ = nullptr;
   hrx_executable_t exe_ = nullptr;

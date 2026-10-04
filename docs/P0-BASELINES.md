@@ -104,5 +104,12 @@ upstreamed.
    spec and returns 40, the raw CU count. HIP reports 20, because the shim
    halves it on RDNA.
 
+4. **Stream capture is not implemented in libhrx v0.1.0.**
+   `hrx_stream_begin_capture` returns "not yet implemented". This is
+   documented behaviour, not a defect. Explicit graph building
+   (`hrx_graph_add_kernel_node` and friends) works, and node attributes are
+   copied at record time. `rt::HrxDevice` records captures as a dependent
+   node chain.
+
 Still to measure in P0: host-call round trip, and NVMe random-read IOPS on the
 dedicated drive, once it is installed.

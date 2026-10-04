@@ -65,6 +65,15 @@ struct Dim3 {
 /// An opaque kernel handle from LoadModule/Kernel.
 using KernelId = std::int32_t;
 
+/// An instantiated, replayable launch sequence (HIP graph exec or HRX graph
+/// exec), recorded by stream capture. Arguments, including buffer bindings
+/// and scalar values, are frozen at capture; per-replay values must live in
+/// device memory.
+struct Graph {
+  void* exec = nullptr;
+  explicit operator bool() const noexcept { return exec != nullptr; }
+};
+
 class Device {
  public:
   virtual ~Device() = default;
@@ -85,6 +94,13 @@ class Device {
   [[nodiscard]] virtual bool Launch(KernelId kernel, Dim3 grid, Dim3 block, std::span<const Arg> args,
                                     std::string* error) = 0;
   [[nodiscard]] virtual bool Synchronize(std::string* error) = 0;
+
+  /// Launches and fills between Begin/EndCapture are recorded instead of run.
+  /// Uploads, downloads and Synchronize are not capturable and fail inside.
+  [[nodiscard]] virtual bool BeginCapture(std::string* error) = 0;
+  [[nodiscard]] virtual bool EndCapture(Graph* out, std::string* error) = 0;
+  [[nodiscard]] virtual bool LaunchGraph(const Graph& graph, std::string* error) = 0;
+  virtual void FreeGraph(Graph& graph) noexcept = 0;
 };
 
 }  // namespace halo::rt

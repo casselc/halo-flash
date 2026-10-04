@@ -3,7 +3,8 @@ Each adapted file says so in its header; full license texts are in licenses/.
 
 - gufo (Copyright (c) 2026 gufo contributors): src/core/gguf.{hpp,cpp},
   src/core/quant.{hpp,cpp}, the BPE merge loop in src/text/tokenizer.cpp, and
-  src/model/{config,weights,ngram,cpu_ops,reference}.{hpp,cpp}.
+  src/model/{config,weights,ngram,cpu_ops,reference}.{hpp,cpp}, and
+  src/core/sampling.{hpp,cpp} (without its JSON grammar constraint).
 - llama.cpp / ggml (Copyright (c) 2023-2026 The ggml authors): quantized block
   layouts and dequantization in src/core/quant.cpp (via gufo).
 - ds4 / DwarfStar (Copyright (c) 2026 the ds4.c authors): design references for

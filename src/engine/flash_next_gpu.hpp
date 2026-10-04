@@ -35,6 +35,8 @@ class FlashNextGpu {
   /// Token at a time for now (P4 batches it); any chunking is equivalent.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error);
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
+  /// Graph replay (default) or eager launches; both run the same sequence.
+  void SetUseGraphs(bool on) noexcept { use_graphs_ = on; }
 
   /// A device-resident copy of the whole sequence state: DeltaNet recurrent
   /// and conv state, attention KV, QSA indexer keys and pooled blocks, PLE
@@ -74,7 +76,10 @@ class FlashNextGpu {
               std::string* error);
   bool GroupedNorm(const rt::Buffer& x, const model::TensorRef& w, const rt::Buffer& y, std::string* error);
   bool HcMix(const model::HcMixer& m, bool inject, std::string* error);
-  bool Ple(const model::LayerWeights& l, std::int32_t token, std::string* error);
+  bool Ple(const model::LayerWeights& l, std::string* error);
+  /// Emits one whole step (everything after the host upload) as device
+  /// work; run eagerly or captured into a graph.
+  bool Record(bool logits, std::string* error);
   bool Linear(const model::LayerWeights& l, LinearState& s, std::string* error);
   bool Attention(const model::LayerWeights& l, AttnState& s, std::string* error);
   bool Moe(const model::LayerWeights& l, std::string* error);
@@ -90,6 +95,10 @@ class FlashNextGpu {
   const model::ModelWeights& w_;
   model::NgramTable* ngram_;
   std::uint32_t max_context_ = 0, position_ = 0;
+  bool use_graphs_ = true;
+  rt::Graph graphs_[2];  ///< [0] without the LM head, [1] with it
+  std::size_t params_offset_ = 0;
+  std::vector<std::uint8_t> step_host_;  ///< n-gram rows, then step parameters
   model::NgramHistory ngram_history_;
   std::unordered_map<const void*, DevTensor> tensors_;
   std::unordered_map<const void*, DevLora> lora_;

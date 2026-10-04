@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "kernels/core_hsaco.hpp"
+#include "kernels/step_params.h"
 #include "rt/device.hpp"
 
 namespace gs = hegel::generators;
@@ -85,10 +86,15 @@ TEST(GpuSelect, QsaSelectionMatchesReferenceRule) {
     ASSERT_TRUE(sb && vb) << error;
     ASSERT_TRUE(dev.Upload(sb, 0, score.data(), n * 4ull, &error)) << error;
     ASSERT_TRUE(dev.Fill(vb, 0xEE, &error)) << error;
+    std::uint32_t params[kHaloStepParamCount] = {};
+    params[kHaloComplete] = n;
+    params[kHaloNkv] = n_kv;
+    auto pb = dev.Alloc(sizeof(params), &error);
+    ASSERT_TRUE(pb && dev.Upload(pb, 0, params, sizeof(params), &error)) << error;
     const auto kid = dev.Kernel("halo_qsa_select", &error);
-    const rt::Arg args[] = {rt::Arg::Buf(sb), rt::Arg::Buf(vb), rt::Arg::Val(n), rt::Arg::Val(k), rt::Arg::Val(ratio),
-                            rt::Arg::Val(n_kv)};
+    const rt::Arg args[] = {rt::Arg::Buf(sb), rt::Arg::Buf(vb), rt::Arg::Buf(pb), rt::Arg::Val(k), rt::Arg::Val(ratio)};
     ASSERT_TRUE(dev.Launch(kid, {1}, {1024}, args, &error)) << error;
+    dev.Free(pb);
     std::vector<std::uint32_t> got(want.size() + 1);
     ASSERT_TRUE(dev.Download(vb, 0, got.data(), got.size() * 4, &error)) << error;
     dev.Free(sb);

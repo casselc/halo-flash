@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <numeric>
 
 #include "kernels/core_hsaco.hpp"
+#include "kernels/step_params.h"
 
 namespace halo::engine {
 
@@ -39,6 +41,7 @@ std::unique_ptr<FlashNextGpu> FlashNextGpu::Create(rt::Device& device, const mod
 }
 
 FlashNextGpu::~FlashNextGpu() {
+  for (auto& g : graphs_) dev_.FreeGraph(g);
   for (auto& [_, t] : tensors_) dev_.Free(t.buf);
   for (auto& b : owned_) dev_.Free(b);
 }
@@ -57,7 +60,7 @@ bool FlashNextGpu::Upload(const model::TensorRef& t, std::string* error) {
   if (!d.buf || !dev_.Upload(d.buf, 0, t.data, bytes, error)) return false;
   if (const char* k = MatVecKernel(t.type)) {
     d.matvec = dev_.Kernel(k, error);
-    d.embed = dev_.Kernel(std::string(k) + "_embed", error);
+    d.embed = dev_.Kernel(std::string(k) + "_embed_p", error);
     d.expert = dev_.Kernel(std::string(k) + "_expert", error);
   }
   tensors_.emplace(t.data, d);
@@ -140,7 +143,13 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   inject_ = Scratch(c.hc_count, error);
   block_out_ = Scratch(H, error);
   embd_ = Scratch(H, error);
-  ple_emb_ = Scratch(c.PleEmbeddingDim(), error);
+  // One upload per step: n-gram rows first (read in place by the PLE
+  // matvecs), then the step parameters at a 64-byte aligned offset.
+  params_offset_ = (std::size_t{c.PleEmbeddingDim()} * 4 + 63) / 64 * 64;
+  step_host_.assign(params_offset_ + 64, 0);
+  ple_emb_ = dev_.Alloc(step_host_.size(), error);
+  if (!ple_emb_) return false;
+  owned_.push_back(ple_emb_);
   ple_key_ = Scratch(D, error);
   ple_value_ = Scratch(H, error);
   ple_query_ = Scratch(D, error);
@@ -218,17 +227,10 @@ bool FlashNextGpu::HcMix(const model::HcMixer& m, bool inject, std::string* erro
          (!inject || MatVec(m.inject, 0, xn_, inject_, error));
 }
 
-bool FlashNextGpu::Ple(const model::LayerWeights& l, std::int32_t token, std::string* error) {
+bool FlashNextGpu::Ple(const model::LayerWeights& l, std::string* error) {
   const auto& c = w_.config;
-  std::vector<std::uint32_t> rows(c.ple_heads);
-  model::HashNgramRows(c, ngram_history_, std::span<const std::int32_t>(&token, 1), rows);
-  std::vector<float> emb(c.PleEmbeddingDim());
-  if (!ngram_ || !ngram_->Read(rows, emb)) {
-    if (error) *error = "n-gram table read failed";
-    return false;
-  }
   const std::uint32_t D = c.HcDim();
-  return dev_.Upload(ple_emb_, 0, emb.data(), emb.size() * 4, error) && MatVec(l.ple_key, 0, ple_emb_, ple_key_, error) &&
+  return MatVec(l.ple_key, 0, ple_emb_, ple_key_, error) &&
          MatVec(l.ple_value, 0, ple_emb_, ple_value_, error) && GroupedNorm(ple_key_, l.ple_norm_key, ple_key_, error) &&
          GroupedNorm(res_, l.ple_norm_query, ple_query_, error) &&
          Launch("halo_ple_gate", {c.hc_count}, {kBlock},
@@ -276,64 +278,53 @@ bool FlashNextGpu::Attention(const model::LayerWeights& l, AttnState& s, std::st
                    rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(0)},
                   error);
   };
-  const auto rope = [&](const rt::Buffer& x, std::uint32_t heads, std::uint32_t dim, std::uint32_t pos) {
-    return Launch("halo_rope_neox", {heads}, {64},
-                  {rt::Arg::Buf(x), rt::Arg::Val(dim), rt::Arg::Val(c.rotary_dim), rt::Arg::Val(pos),
-                   rt::Arg::Val(c.rope_theta)},
+  // Positions come from the step parameters (captured graphs replay at any
+  // position): rope at params[slot] * scale, cache rows at params[slot].
+  const rt::Arg params = rt::Arg::Buf(ple_emb_, params_offset_);
+  const auto rope = [&](const rt::Buffer& x, std::uint32_t heads, std::uint32_t dim, std::uint32_t slot,
+                        std::uint32_t scale) {
+    return Launch("halo_rope_neox_p", {heads}, {64},
+                  {rt::Arg::Buf(x), params, rt::Arg::Val(dim), rt::Arg::Val(c.rotary_dim), rt::Arg::Val(slot),
+                   rt::Arg::Val(scale), rt::Arg::Val(c.rope_theta)},
                   error);
   };
-  const std::size_t kv_off = std::size_t{position_} * nkv * hd * 4;
-  if (!MatVec(l.attn_q, 0, mixed_, qg_, error) || !MatVec(l.attn_k, 0, mixed_, k_, error) ||
-      !MatVec(l.attn_v, 0, mixed_, v_, error) ||
-      !Launch("halo_split_qgate", {nh}, {kBlock},
-              {rt::Arg::Buf(qg_), rt::Arg::Buf(q_), rt::Arg::Buf(gate_), rt::Arg::Val(hd)}, error) ||
-      !norm(q_, l.attn_q_norm, nh, hd) || !norm(k_, l.attn_k_norm, nkv, hd) || !rope(q_, nh, hd, position_) ||
-      !rope(k_, nkv, hd, position_) ||
-      !Launch("halo_copy", {Blocks(nkv * hd)}, {kBlock}, {rt::Arg::Buf(s.k, kv_off), rt::Arg::Buf(k_), rt::Arg::Val(nkv * hd)},
-              error) ||
-      !Launch("halo_copy", {Blocks(nkv * hd)}, {kBlock}, {rt::Arg::Buf(s.v, kv_off), rt::Arg::Buf(v_), rt::Arg::Val(nkv * hd)},
-              error))
-    return false;
-  // QSA indexer: raw keys cached; complete blocks pooled, normalized, rotated.
-  if (!MatVec(l.indexer_q, 0, mixed_, iq_, error) || !MatVec(l.indexer_k, 0, mixed_, ik_, error) ||
-      !Launch("halo_copy", {Blocks(idim)}, {kBlock},
-              {rt::Arg::Buf(s.index_k, std::size_t{position_} * idim * 4), rt::Arg::Buf(ik_), rt::Arg::Val(idim)},
-              error) ||
-      !norm(iq_, l.indexer_q_norm, c.indexer_heads, idim) || !rope(iq_, c.indexer_heads, idim, position_))
-    return false;
-  const std::uint32_t n_kv = position_ + 1, ratio = c.compress_ratio, complete = n_kv / ratio;
-  while (s.blocks < complete) {
-    const rt::Buffer dst = s.block_k;
-    if (!Launch("halo_pool_block", {1}, {128},
-                {rt::Arg::Buf(s.index_k), rt::Arg::Buf(pooled_), rt::Arg::Val(s.blocks), rt::Arg::Val(ratio),
-                 rt::Arg::Val(idim)},
-                error) ||
-        !norm(pooled_, l.indexer_k_norm, 1, idim) || !rope(pooled_, 1, idim, s.blocks * ratio) ||
-        !Launch("halo_copy", {Blocks(idim)}, {kBlock},
-                {rt::Arg::Buf(dst, std::size_t{s.blocks} * idim * 4), rt::Arg::Buf(pooled_), rt::Arg::Val(idim)},
-                error))
-      return false;
-    ++s.blocks;
-  }
-  // Selection on device with the reference's rule; the visible count
-  // depends only on the position.
-  const std::uint32_t budget = c.indexer_top_k / ratio;
-  const std::uint32_t n_visible = complete <= budget ? n_kv : budget * ratio + (n_kv - complete * ratio);
-  if (complete > budget &&
-      !Launch("halo_qsa_scores", {Blocks(complete)}, {kBlock},
-              {rt::Arg::Buf(iq_), rt::Arg::Buf(s.block_k), rt::Arg::Buf(block_scores_), rt::Arg::Val(c.indexer_heads),
-               rt::Arg::Val(idim), rt::Arg::Val(complete)},
-              error))
-    return false;
-  if (!Launch("halo_qsa_select", {1}, {1024},
-              {rt::Arg::Buf(block_scores_), rt::Arg::Buf(visible_), rt::Arg::Val(complete), rt::Arg::Val(budget),
-               rt::Arg::Val(ratio), rt::Arg::Val(n_kv)},
-              error))
-    return false;
-  return Launch("halo_attention_select", {nh}, {kBlock},
+  const auto append = [&](const rt::Buffer& cache, const rt::Buffer& row, std::uint32_t slot, std::uint32_t n) {
+    return Launch("halo_copy_at", {Blocks(n)}, {kBlock},
+                  {rt::Arg::Buf(cache), rt::Arg::Buf(row), params, rt::Arg::Val(slot), rt::Arg::Val(n), rt::Arg::Val(n)},
+                  error);
+  };
+  const std::uint32_t ratio = c.compress_ratio, budget = c.indexer_top_k / ratio;
+  const std::uint32_t max_blocks = max_context_ / ratio + 1;
+  return MatVec(l.attn_q, 0, mixed_, qg_, error) && MatVec(l.attn_k, 0, mixed_, k_, error) &&
+         MatVec(l.attn_v, 0, mixed_, v_, error) &&
+         Launch("halo_split_qgate", {nh}, {kBlock},
+                {rt::Arg::Buf(qg_), rt::Arg::Buf(q_), rt::Arg::Buf(gate_), rt::Arg::Val(hd)}, error) &&
+         norm(q_, l.attn_q_norm, nh, hd) && norm(k_, l.attn_k_norm, nkv, hd) && rope(q_, nh, hd, kHaloPosition, 1) &&
+         rope(k_, nkv, hd, kHaloPosition, 1) && append(s.k, k_, kHaloPosition, nkv * hd) &&
+         append(s.v, v_, kHaloPosition, nkv * hd) &&
+         // QSA indexer: raw keys cached; the block holding this token is
+         // pooled, normalized and rotated at its start every step, final
+         // once complete (incomplete slots are never scored).
+         MatVec(l.indexer_q, 0, mixed_, iq_, error) && MatVec(l.indexer_k, 0, mixed_, ik_, error) &&
+         append(s.index_k, ik_, kHaloPosition, idim) && norm(iq_, l.indexer_q_norm, c.indexer_heads, idim) &&
+         rope(iq_, c.indexer_heads, idim, kHaloPosition, 1) &&
+         Launch("halo_pool_block", {1}, {128},
+                {rt::Arg::Buf(s.index_k), rt::Arg::Buf(pooled_), params, rt::Arg::Val(ratio), rt::Arg::Val(idim)},
+                error) &&
+         norm(pooled_, l.indexer_k_norm, 1, idim) && rope(pooled_, 1, idim, kHaloBlock, ratio) &&
+         append(s.block_k, pooled_, kHaloBlock, idim) &&
+         // Selection on device with the reference's rule.
+         Launch("halo_qsa_scores", {std::min(Blocks(max_blocks), 64u)}, {kBlock},
+                {rt::Arg::Buf(iq_), rt::Arg::Buf(s.block_k), rt::Arg::Buf(block_scores_), params,
+                 rt::Arg::Val(c.indexer_heads), rt::Arg::Val(idim)},
+                error) &&
+         Launch("halo_qsa_select", {1}, {1024},
+                {rt::Arg::Buf(block_scores_), rt::Arg::Buf(visible_), params, rt::Arg::Val(budget), rt::Arg::Val(ratio)},
+                error) &&
+         Launch("halo_attention_select", {nh}, {kBlock},
                 {rt::Arg::Buf(q_), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v), rt::Arg::Buf(gate_), rt::Arg::Buf(visible_),
-                 rt::Arg::Buf(ctx_), rt::Arg::Buf(scores_), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(hd),
-                 rt::Arg::Val(n_visible), rt::Arg::Val(max_context_)},
+                 rt::Arg::Buf(ctx_), rt::Arg::Buf(scores_), params, rt::Arg::Val(nh), rt::Arg::Val(nkv),
+                 rt::Arg::Val(hd), rt::Arg::Val(max_context_)},
                 error) &&
          MatVec(l.attn_out, 0, ctx_, block_out_, error);
 }
@@ -378,14 +369,10 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
                 {rt::Arg::Buf(block_out_), rt::Arg::Buf(ed_), rt::Arg::Buf(sgate_), rt::Arg::Val(H)}, error);
 }
 
-bool FlashNextGpu::Step(std::int32_t token, std::span<float> logits, std::string* error) {
+bool FlashNextGpu::Record(bool logits, std::string* error) {
   const auto& c = w_.config;
-  if (position_ >= max_context_ || token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size) {
-    if (error) *error = position_ >= max_context_ ? "context is full" : "token out of range";
-    return false;
-  }
   const auto& emb = tensors_.at(w_.token_embd.data);
-  const rt::Arg eargs[] = {rt::Arg::Buf(emb.buf), rt::Arg::Buf(embd_), rt::Arg::Val<std::uint32_t>(token),
+  const rt::Arg eargs[] = {rt::Arg::Buf(emb.buf), rt::Arg::Buf(embd_), rt::Arg::Buf(ple_emb_, params_offset_),
                            rt::Arg::Val(c.hidden_size), rt::Arg::Val<std::uint64_t>(w_.token_embd.RowBytes())};
   if (!dev_.Launch(emb.embed, {Blocks(c.hidden_size)}, {kBlock}, eargs, error) ||
       !Launch("halo_broadcast", {Blocks(c.HcDim())}, {kBlock},
@@ -399,18 +386,66 @@ bool FlashNextGpu::Step(std::int32_t token, std::span<float> logits, std::string
   };
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
     const auto& l = w_.layers[il];
-    if (c.IsPleLayer(il) && !Ple(l, token, error)) return false;
+    if (c.IsPleLayer(il) && !Ple(l, error)) return false;
     if (!HcMix(l.hc_attn, true, error)) return false;
     if (l.linear ? !Linear(l, linear_[il], error) : !Attention(l, attn_[il], error)) return false;
     if (!combine() || !HcMix(l.hc_ffn, true, error) || !Moe(l, error) || !combine()) return false;
   }
-  if (!logits.empty()) {
-    if (!HcMix(w_.hc_head, false, error) || !MatVec(w_.output, 0, mixed_, logits_, error) ||
-        !dev_.Download(logits_, 0, logits.data(), c.vocab_size * 4, error))
-      return false;
+  return !logits || (HcMix(w_.hc_head, false, error) && MatVec(w_.output, 0, mixed_, logits_, error));
+}
+
+bool FlashNextGpu::Step(std::int32_t token, std::span<float> logits, std::string* error) {
+  const auto& c = w_.config;
+  if (position_ >= max_context_ || token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size) {
+    if (error) *error = position_ >= max_context_ ? "context is full" : "token out of range";
+    return false;
   }
+  // Host side of the step: n-gram rows and the step parameters, uploaded
+  // together; everything else is device work (captured once, replayed).
+  model::NgramHistory history = ngram_history_;
+  if (c.ple_layer >= 0) {
+    std::vector<std::uint32_t> rows(c.ple_heads);
+    model::HashNgramRows(c, history, std::span<const std::int32_t>(&token, 1), rows);
+    const std::span<float> emb(reinterpret_cast<float*>(step_host_.data()), c.PleEmbeddingDim());
+    if (!ngram_ || !ngram_->Read(rows, emb)) {
+      if (error) *error = "n-gram table read failed";
+      return false;
+    }
+  }
+  const std::uint32_t ratio = c.compress_ratio, budget = c.indexer_top_k / ratio;
+  const std::uint32_t n_kv = position_ + 1, complete = n_kv / ratio;
+  std::uint32_t params[kHaloStepParamCount] = {};
+  params[kHaloToken] = static_cast<std::uint32_t>(token);
+  params[kHaloPosition] = position_;
+  params[kHaloNkv] = n_kv;
+  params[kHaloComplete] = complete;
+  params[kHaloBlock] = position_ / ratio;
+  params[kHaloNVisible] = complete <= budget ? n_kv : budget * ratio + (n_kv - complete * ratio);
+  std::memcpy(step_host_.data() + params_offset_, params, sizeof(params));
+  if (!dev_.Upload(ple_emb_, 0, step_host_.data(), step_host_.size(), error)) return false;
+
+  const bool want = !logits.empty();
+  if (use_graphs_) {
+    rt::Graph& g = graphs_[want ? 1 : 0];
+    if (!g) {
+      if (!dev_.BeginCapture(error)) return false;
+      const bool recorded = Record(want, error);
+      std::string end_error;
+      const bool ended = dev_.EndCapture(&g, &end_error);
+      if (!recorded || !ended) {
+        if (recorded && error) *error = end_error;
+        return false;
+      }
+    }
+    if (!dev_.LaunchGraph(g, error)) return false;
+  } else if (!Record(want, error)) {
+    return false;
+  }
+  if (want && !dev_.Download(logits_, 0, logits.data(), c.vocab_size * 4, error)) return false;
+  ngram_history_ = history;
+  for (auto& s : attn_) s.blocks = complete;
   ++position_;
-  return dev_.Synchronize(error);
+  return true;
 }
 
 template <typename F>
