@@ -88,7 +88,9 @@ killed, so keep the minimum generous when the machine is busy. Set the
 fixture variables first (`HALO_TINY_HF_DIR`, `HALO_TINY_QWEN35_DIR`,
 `HALO_DECIDER_TOKENIZER_GGUF`), or the tests that need them skip and their
 mutants survive. The end-to-end decider test (`HALO_DECIDER_MODELS_DIR`) is
-too slow to run per mutant; leave it unset.
+too slow to run per mutant; leave it unset. A full run takes about 2.5 hours
+with 28 workers (core 10 min, text 22, decide 27, model 88), mostly the -O0
+n-gram and window-fitting tests.
 
 `check` fails on a survivor that is not in `tests/mull-baseline.txt`. A
 survivor's key is its file, enclosing function and mutator, so it does not move

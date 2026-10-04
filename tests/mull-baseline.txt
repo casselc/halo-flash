@@ -1,0 +1,895 @@
+# Accepted Mull survivors: `<file> <function> <mutator> [#n] | reason`.
+# Checked by tools/mull_survivors.py check (see README, "Mutation testing with Mull").
+# Reasons: "equivalent"/"unobservable" = no test can tell; "gap, not fixed" = a real
+# test gap left for later; "not triaged" = survivors of code new to this run.
+
+# src/core/gguf.cpp
+src/core/gguf.cpp GgufReader::GetQuantizationLabel cxx_replace_scalar_call | equivalent: Mull's 42 becomes false for a bool call, and an empty map also has total 0
+src/core/gguf.cpp GgufReader::GgufReader cxx_assign_const #2 | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::GgufReader cxx_assign_const #3 | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/core/gguf.cpp GgufReader::GgufReader cxx_assign_const | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::OpenMemory cxx_assign_const #2 | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/core/gguf.cpp GgufReader::OpenMemory cxx_assign_const | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::OpenSingleFile cxx_assign_const | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::OpenSingleFile cxx_le_to_lt | equivalent: open() returns -1 or >= 3, and an empty file fails ParseHeaders anyway
+src/core/gguf.cpp GgufReader::OpenSingleFile cxx_lt_to_le | equivalent: open() returns -1 or >= 3, and an empty file fails ParseHeaders anyway
+src/core/gguf.cpp GgufReader::OpenSingleFile cxx_ne_to_eq #2 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::OpenSingleFile cxx_ne_to_eq #3 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::OpenSingleFile cxx_ne_to_eq | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::OpenSingleFile cxx_replace_scalar_call #2 | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::OpenSingleFile cxx_replace_scalar_call #3 | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::OpenSingleFile cxx_replace_scalar_call #4 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::OpenSingleFile cxx_replace_scalar_call | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::OpenSplitFileSet cxx_assign_const #2 | unobservable: the combined reader's version/alignment are not used after tensors are bound (tests compare tensor data)
+src/core/gguf.cpp GgufReader::OpenSplitFileSet cxx_assign_const | unobservable: the combined reader's version/alignment are not used after tensors are bound (tests compare tensor data)
+src/core/gguf.cpp GgufReader::OpenSplitFileSet cxx_gt_to_ge #2 | overflow guard on summed shard sizes: unreachable with real files
+src/core/gguf.cpp GgufReader::OpenSplitFileSet cxx_gt_to_ge | overflow guard on summed shard sizes: unreachable with real files
+src/core/gguf.cpp GgufReader::OpenSplitFileSet cxx_ne_to_eq #2 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::OpenSplitFileSet cxx_ne_to_eq | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::OpenSplitFileSet cxx_replace_scalar_call #2 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::OpenSplitFileSet cxx_replace_scalar_call #3 | overflow guard on summed shard sizes: unreachable with real files
+src/core/gguf.cpp GgufReader::OpenSplitFileSet cxx_replace_scalar_call #4 | overflow guard on summed shard sizes: unreachable with real files
+src/core/gguf.cpp GgufReader::OpenSplitFileSet cxx_replace_scalar_call #5 | equivalent: false re-opens nothing new (the slot is filled); the message text only
+src/core/gguf.cpp GgufReader::OpenSplitFileSet cxx_replace_scalar_call | equivalent: false re-opens nothing new (the slot is filled); the message text only
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_assign_const | equivalent: dead in the skip branch, which only 8- and 16-bit integer arrays reach (wider types are decoded above)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_div_to_mul #2 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_div_to_mul #3 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_div_to_mul #4 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_div_to_mul #5 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_div_to_mul #6 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_div_to_mul | host-memory budget for descriptor counts (128 MiB): only reachable with huge headers, which the file-size bound rejects first
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_eq_to_ne #2 | equivalent: dead in the skip branch, which only 8- and 16-bit integer arrays reach (wider types are decoded above)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_eq_to_ne #3 | equivalent: dead in the skip branch, which only 8- and 16-bit integer arrays reach (wider types are decoded above)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_eq_to_ne #4 | equivalent: dead in the skip branch, which only 8- and 16-bit integer arrays reach (wider types are decoded above)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_eq_to_ne | equivalent: only changes the per-item bound of a prefilter that ReadPod/ReadString enforce again
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_gt_to_ge #2 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_gt_to_ge #3 | equivalent or untested edge: 2^32 is no valid alignment either way, type 65535 is unknown either way; 65535-byte tensor names are not tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_gt_to_ge #4 | equivalent or untested edge: 2^32 is no valid alignment either way, type 65535 is unknown either way; 65535-byte tensor names are not tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_gt_to_ge #5 | equivalent or untested edge: 2^32 is no valid alignment either way, type 65535 is unknown either way; 65535-byte tensor names are not tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_gt_to_ge #6 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_gt_to_ge #7 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_gt_to_ge #8 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_gt_to_ge | host-memory budget for descriptor counts (128 MiB): only reachable with huge headers, which the file-size bound rejects first
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #10 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #11 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #12 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #13 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #14 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #15 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #16 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #17 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #18 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #19 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #2 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #20 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #21 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #22 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #23 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #24 | equivalent: dead in the skip branch, which only 8- and 16-bit integer arrays reach (wider types are decoded above)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #25 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #26 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #3 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #4 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #5 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #6 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #7 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #8 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const #9 | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_mul_to_div | host-memory budget for descriptor counts (128 MiB): only reachable with huge headers, which the file-size bound rejects first
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_ne_to_eq #10 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_ne_to_eq #2 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_ne_to_eq #3 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_ne_to_eq #4 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_ne_to_eq #5 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_ne_to_eq #6 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_ne_to_eq #7 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_ne_to_eq #8 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_ne_to_eq #9 | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_ne_to_eq | unobservable: changes only which error message is written; the rejection itself is tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_remove_void_call #2 | equivalent: reserve() and capacity hints change no result
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_remove_void_call #3 | equivalent: reserve() and capacity hints change no result
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_remove_void_call | equivalent: reserve() and capacity hints change no result
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_replace_scalar_call #2 | host-memory budget for descriptor counts (128 MiB): only reachable with huge headers, which the file-size bound rejects first
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_replace_scalar_call #3 | host-memory budget for descriptor counts (128 MiB): only reachable with huge headers, which the file-size bound rejects first
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_replace_scalar_call #4 | gap, not fixed: tensor names near the 65535-byte limit are not tested
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_replace_scalar_call #5 | host-memory budget for descriptor counts (128 MiB): only reachable with huge headers, which the file-size bound rejects first
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_replace_scalar_call | host-memory budget for descriptor counts (128 MiB): only reachable with huge headers, which the file-size bound rejects first
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_sub_assign_to_add_assign | host-memory budget for descriptor counts (128 MiB): only reachable with huge headers, which the file-size bound rejects first
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_sub_to_add #2 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_sub_to_add #3 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_sub_to_add #4 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_sub_to_add #5 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_sub_to_add #6 | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::ParseHeaders cxx_sub_to_add | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp GgufReader::operator= cxx_assign_const #2 | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::operator= cxx_assign_const #3 | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::operator= cxx_assign_const #4 | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::operator= cxx_assign_const #5 | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::operator= cxx_assign_const #6 | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::operator= cxx_assign_const #7 | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::operator= cxx_assign_const #8 | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/core/gguf.cpp GgufReader::operator= cxx_assign_const | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::operator= cxx_ge_to_gt | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::operator= cxx_ge_to_lt | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::operator= cxx_gt_to_ge | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::operator= cxx_gt_to_le | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::operator= cxx_ne_to_eq #2 | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::operator= cxx_ne_to_eq | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::operator= cxx_replace_scalar_call | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::~GgufReader cxx_ge_to_gt | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::~GgufReader cxx_ge_to_lt | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::~GgufReader cxx_gt_to_ge | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::~GgufReader cxx_gt_to_le | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::~GgufReader cxx_ne_to_eq | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp GgufReader::~GgufReader cxx_replace_scalar_call | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/core/gguf.cpp ReadPod cxx_gt_to_ge | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp ReadPod cxx_sub_to_add | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+src/core/gguf.cpp ReadString cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/core/gguf.cpp ReadString cxx_sub_to_add | equivalent: a later check rejects the same input (any out-of-bounds read shows only under cpu-asan)
+
+# src/core/json.cpp
+src/core/json.cpp Dump cxx_assign_const #2 | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/core/json.cpp Dump cxx_assign_const | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/core/json.cpp Parser::Hex4 cxx_gt_to_ge | equivalent: a string still needs its closing quote after the last byte
+src/core/json.cpp Parser::ParseArray cxx_lt_to_le #2 | equivalent: s_[size()] of the std::string-backed input is NUL, which never matches
+src/core/json.cpp Parser::ParseArray cxx_lt_to_le | equivalent: s_[size()] of the std::string-backed input is NUL, which never matches
+src/core/json.cpp Parser::ParseArray cxx_remove_void_call | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+src/core/json.cpp Parser::ParseNumber cxx_init_const #2 | equivalent: the initial value is overwritten before it is read
+src/core/json.cpp Parser::ParseNumber cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/core/json.cpp Parser::ParseNumber cxx_replace_scalar_call | equivalent: from_chars stops at the delimiter after the lexeme either way
+src/core/json.cpp Parser::ParseObject cxx_ge_to_gt #2 | equivalent: s_[size()] of the std::string-backed input is NUL, which never matches
+src/core/json.cpp Parser::ParseObject cxx_ge_to_gt | equivalent: s_[size()] of the std::string-backed input is NUL, which never matches
+src/core/json.cpp Parser::ParseObject cxx_lt_to_le #2 | equivalent: s_[size()] of the std::string-backed input is NUL, which never matches
+src/core/json.cpp Parser::ParseObject cxx_lt_to_le #3 | equivalent: s_[size()] of the std::string-backed input is NUL, which never matches
+src/core/json.cpp Parser::ParseObject cxx_lt_to_le | equivalent: s_[size()] of the std::string-backed input is NUL, which never matches
+src/core/json.cpp Parser::ParseObject cxx_remove_void_call | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+src/core/json.cpp Parser::ParseString cxx_and_to_or | equivalent: the decoded code point is only range-checked, the raw bytes are copied; these leads never yield an overlong or out-of-range value
+src/core/json.cpp Parser::ParseString cxx_assign_const #2 | equivalent: the decoded code point is only range-checked, the raw bytes are copied; these leads never yield an overlong or out-of-range value
+src/core/json.cpp Parser::ParseString cxx_assign_const #3 | equivalent: the decoded code point is only range-checked, the raw bytes are copied; these leads never yield an overlong or out-of-range value
+src/core/json.cpp Parser::ParseString cxx_assign_const #4 | equivalent: the decoded code point is only range-checked, the raw bytes are copied; these leads never yield an overlong or out-of-range value
+src/core/json.cpp Parser::ParseString cxx_assign_const | equivalent: the decoded code point is only range-checked, the raw bytes are copied; these leads never yield an overlong or out-of-range value
+src/core/json.cpp Parser::ParseString cxx_gt_to_ge | equivalent: a string still needs its closing quote after the last byte
+src/core/json.cpp Parser::ParseString cxx_sub_to_add | equivalent: the extra high bits fall outside the 21 bits UTF-8 encoding keeps
+src/core/json.cpp PythonFloatRepr cxx_gt_to_ge | equivalent: both sides of this boundary give the same result
+src/core/json.cpp PythonFloatRepr cxx_lt_to_le #2 | equivalent: both sides of this boundary give the same result
+src/core/json.cpp PythonFloatRepr cxx_lt_to_le | equivalent: both sides of this boundary give the same result
+src/core/json.cpp Value::MakeObject cxx_remove_void_call | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+
+# src/core/quant.cpp
+src/core/quant.cpp Fp16ToFloat cxx_init_const #2 | equivalent: the initial value is overwritten before it is read
+src/core/quant.cpp Fp16ToFloat cxx_init_const #3 | equivalent: the initial value is overwritten before it is read
+src/core/quant.cpp Fp16ToFloat cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/core/quant.cpp Q4Value cxx_init_const #2 | equivalent: the initial value is overwritten before it is read
+src/core/quant.cpp Q4Value cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/core/quant.cpp Q5Value cxx_init_const #2 | equivalent: the initial value is overwritten before it is read
+src/core/quant.cpp Q5Value cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/core/quant.cpp Q6Value cxx_init_const #2 | equivalent: the initial value is overwritten before it is read
+src/core/quant.cpp Q6Value cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/core/quant.cpp QuantizedRowBytes cxx_init_const | equivalent: the initial value is overwritten before it is read
+
+# src/core/sampling.cpp
+src/core/sampling.cpp ApplyMinP cxx_le_to_lt #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyMinP cxx_le_to_lt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyMinP cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyMinP cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyMinP cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyPenalties cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyTopK cxx_lt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyTopK cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyTopK cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyTopK cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyTopP cxx_ge_to_gt #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyTopP cxx_ge_to_gt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyTopP cxx_le_to_lt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyTopP cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyTopP cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyTopP cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp ApplyTopP cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp BuildDistribution cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp DistributionWithPenalties cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp DistributionWithPenalties cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp DistributionWithPenalties cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp DistributionWithPenalties cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp DistributionWithPenalties cxx_replace_scalar_call #4 | equivalent: reserve() and capacity hints change no result
+src/core/sampling.cpp DistributionWithPenalties cxx_replace_scalar_call #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp DistributionWithPenalties cxx_replace_scalar_call #6 | equivalent: reserve() and capacity hints change no result
+src/core/sampling.cpp DistributionWithPenalties cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp InitialRngState cxx_lshift_to_rshift | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp InitialRngState cxx_xor_to_or | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp IsBetterCandidate cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp IsBetterCandidate cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp IsBetterProbability cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp IsBetterProbability cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp NextRandom cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp NextRandom cxx_rshift_to_lshift #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp NextRandom cxx_rshift_to_lshift | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp NextRandom cxx_xor_assign_to_or_assign #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp NextRandom cxx_xor_assign_to_or_assign #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp NextRandom cxx_xor_assign_to_or_assign | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp Penalize cxx_le_to_lt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SampleLogits cxx_assign_const #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SampleLogits cxx_assign_const #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SampleLogits cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SampleLogits cxx_eq_to_ne | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SampleLogits cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SampleLogits cxx_gt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SampleLogits cxx_ne_to_eq #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SampleLogits cxx_ne_to_eq | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SampleLogits cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SampleLogits cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SampleResidual cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Accept cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Accept cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::CanSelectArgmax cxx_ne_to_eq | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::CanSelectArgmax cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::CanSelectArgmax cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::CopyDrawStateFrom cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::DeferSample cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_eq_to_ne | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_gt_to_ge #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_gt_to_ge #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_init_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_lt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_ne_to_eq | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_pre_inc_to_pre_dec | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_replace_scalar_call #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_replace_scalar_call #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_replace_scalar_call #6 | equivalent: reserve() and capacity hints change no result
+src/core/sampling.cpp SamplerState::Distribution cxx_replace_scalar_call #7 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Distribution cxx_sub_to_add | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::LinearDistribution cxx_div_to_mul | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::LinearDistribution cxx_ge_to_gt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::LinearDistribution cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::LinearDistribution cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::LinearDistribution cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::LinearDistribution cxx_replace_scalar_call #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::LinearDistribution cxx_replace_scalar_call #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::LinearDistribution cxx_replace_scalar_call | equivalent: reserve() and capacity hints change no result
+src/core/sampling.cpp SamplerState::LinearDistribution cxx_sub_to_add | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_add_assign_to_sub_assign #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_add_assign_to_sub_assign | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_assign_const #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_assign_const #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_div_to_mul #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_div_to_mul | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_ge_to_gt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_le #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #2 | equivalent: the initial value is overwritten before it is read
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #4 | equivalent: the initial value is overwritten before it is read
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #6 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #7 | equivalent: the initial value is overwritten before it is read
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #8 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_ge #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_ge #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_ge #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le #6 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_minus_to_noop | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_mul_to_div | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_pre_inc_to_pre_dec #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_pre_inc_to_pre_dec | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #3 | equivalent: reserve() and capacity hints change no result
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #5 | equivalent: reserve() and capacity hints change no result
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #6 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #7 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #10 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #11 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #12 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #13 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #14 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #15 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #16 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #6 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #7 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #8 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #9 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call | equivalent: reserve() and capacity hints change no result
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_sub_to_add #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_sub_to_add | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::RebuildPenaltyCounts cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::RebuildPenaltyCounts cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::ResetHistory cxx_remove_void_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::ResetHistory cxx_remove_void_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::ResetHistory cxx_remove_void_call #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::ResetHistory cxx_remove_void_call #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::ResetHistory cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Sample cxx_eq_to_ne | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Sample cxx_ge_to_gt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Sample cxx_ge_to_lt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Sample cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Sample cxx_remove_void_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Sample cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Sample cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Sample cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Sample cxx_replace_scalar_call #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Sample cxx_replace_scalar_call #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Sample cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::SampleGreedy cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::SampleGreedy cxx_init_const #2 | equivalent: the initial value is overwritten before it is read
+src/core/sampling.cpp SamplerState::SampleGreedy cxx_init_const #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::SampleGreedy cxx_init_const #4 | equivalent: the initial value is overwritten before it is read
+src/core/sampling.cpp SamplerState::SampleGreedy cxx_init_const #5 | equivalent: the initial value is overwritten before it is read
+src/core/sampling.cpp SamplerState::SampleGreedy cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/core/sampling.cpp SamplerState::SampleGreedy cxx_minus_to_noop | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::SampleGreedy cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::SampleGreedy cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::SampleGreedy cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::SetRngState cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::SetRngState cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::TrimHistory cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::Uniform cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::operator= cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::operator= cxx_eq_to_ne | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::operator= cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingConfig::Validate cxx_le_to_lt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingConfig::Validate cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingConfig::can_use_unmodified_argmax cxx_eq_to_ne | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingConfig::can_use_unmodified_argmax cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingConfig::penalties_enabled cxx_ne_to_eq #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingConfig::penalties_enabled cxx_ne_to_eq | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingConfig::uses_random_sampling cxx_gt_to_ge #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingConfig::uses_random_sampling cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingConfig::uses_random_sampling cxx_gt_to_le #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingConfig::uses_random_sampling cxx_gt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingConfig::uses_random_sampling cxx_ne_to_eq | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::Sample cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::Sample cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::Sample cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::SampleResidual cxx_gt_to_ge #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::SampleResidual cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::SampleResidual cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::SampleResidual cxx_replace_scalar_call | equivalent: reserve() and capacity hints change no result
+src/core/sampling.cpp SamplingDistribution::SamplingDistribution cxx_div_assign_to_mul_assign | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::SamplingDistribution cxx_eq_to_ne | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::SamplingDistribution cxx_gt_to_ge #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::SamplingDistribution cxx_gt_to_ge #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::SamplingDistribution cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::SamplingDistribution cxx_gt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::SamplingDistribution cxx_lt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::SamplingDistribution cxx_lt_to_le #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::SamplingDistribution cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::SamplingDistribution cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplingDistribution::best_token cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SoftmaxWeights cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SoftmaxWeights cxx_replace_scalar_call #2 | equivalent: reserve() and capacity hints change no result
+src/core/sampling.cpp SoftmaxWeights cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SoftmaxWeights cxx_sub_to_add | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp TokenProbability cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp TokenProbability cxx_ge_to_gt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp TokenProbability cxx_ge_to_lt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp TokenProbability cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp TokenProbability cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+
+# src/decide/decider.cpp
+src/decide/decider.cpp LayerNorm cxx_sub_to_add #2 | equivalent: sum of (v+m)(v-m) equals sum of (v-m)^2 when m is the mean
+src/decide/decider.cpp LayerNorm cxx_sub_to_add | equivalent: sum of (v+m)(v-m) equals sum of (v-m)^2 when m is the mean
+src/decide/decider.cpp ReadF32 cxx_mul_to_div | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp ReadF32 cxx_ne_to_eq #2 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp ReadF32 cxx_ne_to_eq | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp ReadF32 cxx_replace_scalar_call | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_add_assign_to_sub_assign | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_init_const #2 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_init_const #3 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_init_const #4 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_init_const #5 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_init_const #6 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_init_const | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_lt_to_ge #2 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_lt_to_ge | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_lt_to_le #2 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_lt_to_le | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_pre_inc_to_pre_dec #2 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_pre_inc_to_pre_dec | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_remove_void_call #2 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_remove_void_call #3 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_remove_void_call #4 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_remove_void_call #5 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_remove_void_call #6 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_remove_void_call #7 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_remove_void_call #8 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_remove_void_call | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_replace_scalar_call #10 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_replace_scalar_call #11 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_replace_scalar_call #12 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_replace_scalar_call #2 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_replace_scalar_call #3 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_replace_scalar_call #4 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_replace_scalar_call #5 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_replace_scalar_call #6 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_replace_scalar_call #7 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_replace_scalar_call #8 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_replace_scalar_call #9 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Evaluate cxx_replace_scalar_call | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_assign_const #2 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_assign_const #3 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_assign_const #4 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_assign_const #5 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_assign_const | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_eq_to_ne | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_init_const | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_mul_to_div #2 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_mul_to_div | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #10 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #11 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #12 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #13 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #14 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #15 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #16 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #17 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #18 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #19 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #2 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #20 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #3 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #4 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #5 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #6 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #7 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #8 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call #9 | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Open cxx_replace_scalar_call | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+src/decide/decider.cpp StrandsDecider::Temperature cxx_eq_to_ne | needs the 2B strands-decider model on CPU (StrandsDecider.AnswersMatchPythonEngine), too slow to run under Mull
+
+# src/decide/systemone.cpp
+src/decide/systemone.cpp AnswerToJson cxx_remove_void_call #2 | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+src/decide/systemone.cpp AnswerToJson cxx_remove_void_call #3 | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+src/decide/systemone.cpp AnswerToJson cxx_remove_void_call #4 | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+src/decide/systemone.cpp AnswerToJson cxx_remove_void_call #5 | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+src/decide/systemone.cpp AnswerToJson cxx_remove_void_call #6 | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+src/decide/systemone.cpp AnswerToJson cxx_remove_void_call #7 | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+src/decide/systemone.cpp AnswerToJson cxx_remove_void_call #8 | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+src/decide/systemone.cpp AnswerToJson cxx_remove_void_call #9 | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+src/decide/systemone.cpp AnswerToJson cxx_remove_void_call | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+src/decide/systemone.cpp DeriveConfidence cxx_le_to_lt | equivalent: n == 1 or sigma == sigma_max == floor give the same clamped value; (i+m)(i-m) equals the variance term
+src/decide/systemone.cpp DeriveScoreConfidence cxx_div_to_mul | equivalent: n == 1 or sigma == sigma_max == floor give the same clamped value; (i+m)(i-m) equals the variance term
+src/decide/systemone.cpp DeriveScoreConfidence cxx_gt_to_ge | equivalent: n == 1 or sigma == sigma_max == floor give the same clamped value; (i+m)(i-m) equals the variance term
+src/decide/systemone.cpp DeriveScoreConfidence cxx_le_to_lt #2 | equivalent: n == 1 or sigma == sigma_max == floor give the same clamped value; (i+m)(i-m) equals the variance term
+src/decide/systemone.cpp DeriveScoreConfidence cxx_le_to_lt | equivalent: n == 1 or sigma == sigma_max == floor give the same clamped value; (i+m)(i-m) equals the variance term
+src/decide/systemone.cpp DeriveScoreConfidence cxx_sub_to_add #2 | equivalent: n == 1 or sigma == sigma_max == floor give the same clamped value; (i+m)(i-m) equals the variance term
+src/decide/systemone.cpp DeriveScoreConfidence cxx_sub_to_add | equivalent: n == 1 or sigma == sigma_max == floor give the same clamped value; (i+m)(i-m) equals the variance term
+src/decide/systemone.cpp FitTokens cxx_ge_to_gt | equivalent at equality (cut/budget of exactly the size), or needs a single-token option span that real prompts never produce
+src/decide/systemone.cpp FitTokens cxx_gt_to_ge #2 | equivalent at equality (cut/budget of exactly the size), or needs a single-token option span that real prompts never produce
+src/decide/systemone.cpp FitTokens cxx_gt_to_ge #3 | equivalent at equality (cut/budget of exactly the size), or needs a single-token option span that real prompts never produce
+src/decide/systemone.cpp FitTokens cxx_gt_to_ge | equivalent at equality (cut/budget of exactly the size), or needs a single-token option span that real prompts never produce
+src/decide/systemone.cpp FitTokens cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/decide/systemone.cpp FitTokens cxx_le_to_lt | equivalent at equality (cut/budget of exactly the size), or needs a single-token option span that real prompts never produce
+src/decide/systemone.cpp FitTokens cxx_lt_to_le | equivalent at equality (cut/budget of exactly the size), or needs a single-token option span that real prompts never produce
+src/decide/systemone.cpp FitTokens cxx_remove_void_call | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+src/decide/systemone.cpp ParseRequest cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/decide/systemone.cpp ParseRequest cxx_replace_scalar_call | equivalent: Mull's 42 is false for a bool; the error text only
+src/decide/systemone.cpp PyRound cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/decide/systemone.cpp RenderQuestion cxx_remove_void_call | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+
+# src/model/config.cpp
+src/model/config.cpp Config::FromGguf cxx_assign_const #2 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_assign_const #3 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_assign_const | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_div_to_mul #2 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_div_to_mul | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_ge_to_gt #2 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_ge_to_gt #3 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_ge_to_gt #4 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_ge_to_gt | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_ge_to_lt | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_gt_to_ge #2 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_gt_to_ge #3 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_gt_to_ge #4 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_gt_to_ge #5 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_gt_to_ge #6 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_gt_to_ge #7 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_gt_to_ge #8 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_gt_to_ge | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_le_to_lt #2 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_le_to_lt | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_lt_to_le #2 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_lt_to_le | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_ne_to_eq #2 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_ne_to_eq | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #10 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #11 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #12 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #13 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #14 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #15 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #16 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #17 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #18 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #19 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #2 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #3 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #4 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #5 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #6 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #7 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #8 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call #9 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_remove_void_call | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_replace_scalar_call | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_sub_to_add #2 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::FromGguf cxx_sub_to_add | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ge_to_gt | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ge_to_lt | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_gt_to_ge | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_gt_to_le | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #10 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #11 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #12 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #13 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #14 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #15 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #16 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #17 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #18 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #19 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #2 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #20 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #21 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #22 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #23 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #24 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #25 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #3 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #4 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #5 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #6 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #7 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #8 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq #9 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Config::IsFlashNextGeometry cxx_ne_to_eq | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.cpp Reader::F32 cxx_remove_void_call | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Reader::Fail cxx_assign_const | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/model/config.cpp Reader::Fail cxx_ne_to_eq | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Reader::U32 cxx_remove_void_call | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Reader::U64Array cxx_remove_void_call #2 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Reader::U64Array cxx_remove_void_call #3 | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.cpp Reader::U64Array cxx_remove_void_call | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+
+# src/model/config.hpp
+src/model/config.hpp Config::IsLinearLayer cxx_lt_to_le | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.hpp Config::IsPleLayer cxx_ge_to_gt | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #10 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #11 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #12 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #13 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #14 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #15 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #16 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #17 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #18 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #19 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #2 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #20 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #3 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #4 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #5 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #6 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #7 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #8 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne #9 | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::MtpMatches cxx_eq_to_ne | gap, not fixed: compares against the full Flash-Next geometry, which no test model has
+src/model/config.hpp Config::PleConvHistory cxx_sub_to_add | gap, not fixed: config validation is tested on valid tiny models only; each rejection needs its own malformed GGUF
+
+# src/model/cpu_ops.cpp
+src/model/cpu_ops.cpp DequantizeQ5_1 cxx_add_to_sub | not triaged in this trial (CPU reference oracle)
+src/model/cpu_ops.cpp DequantizeRow cxx_init_const #2 | equivalent: the initial value is overwritten before it is read
+src/model/cpu_ops.cpp DequantizeRow cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/model/cpu_ops.cpp DequantizeRow cxx_remove_void_call | unreachable: ModelWeights::Bind rejects every format this switch does not decode
+src/model/cpu_ops.cpp DequantizeRow cxx_replace_scalar_call | unreachable: ModelWeights::Bind rejects every format this switch does not decode
+src/model/cpu_ops.cpp DotRow cxx_init_const #2 | not triaged in this trial (CPU reference oracle)
+src/model/cpu_ops.cpp DotRow cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/model/cpu_ops.cpp DotRow cxx_lt_to_ge | not triaged in this trial (CPU reference oracle)
+src/model/cpu_ops.cpp DotRow cxx_lt_to_le | not triaged in this trial (CPU reference oracle)
+src/model/cpu_ops.cpp DotRow cxx_pre_inc_to_pre_dec | not triaged in this trial (CPU reference oracle)
+src/model/cpu_ops.cpp L2Norm cxx_add_to_sub | unobservable: eps (1e-6) against sums of squares of order 1 is below the HF tolerance
+src/model/cpu_ops.cpp MatVec cxx_add_to_sub | equivalent: only changes how rows are split across threads
+src/model/cpu_ops.cpp MatVec cxx_ge_to_gt | equivalent: only changes how rows are split across threads
+src/model/cpu_ops.cpp MatVec cxx_lt_to_le #2 | equivalent: only changes how rows are split across threads
+src/model/cpu_ops.cpp MatVec cxx_lt_to_le | equivalent: only changes how rows are split across threads
+src/model/cpu_ops.cpp MatVec cxx_mul_to_div | equivalent: only changes how rows are split across threads
+src/model/cpu_ops.cpp MatVec cxx_replace_scalar_call | equivalent: only changes how rows are split across threads
+src/model/cpu_ops.cpp MatVec cxx_sub_to_add | equivalent: only changes how rows are split across threads
+src/model/cpu_ops.cpp Softplus cxx_gt_to_ge | equivalent: at x == 20, x and log1p(exp(x)) agree to float precision
+
+# src/model/lora.cpp
+src/model/lora.cpp LoraAdapter::Bind cxx_replace_scalar_call | gap, not fixed: an adapter with no tensors
+
+# src/model/ngram.cpp
+src/model/ngram.cpp HashNgramRows cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/model/ngram.cpp HashNgramRows cxx_lt_to_le | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp HashNgramRows cxx_mul_to_div | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp HashNgramRows cxx_pre_inc_to_pre_dec | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::DecodeRow cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/model/ngram.cpp NgramTable::Open cxx_assign_const #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Open cxx_assign_const #3 | unobservable: fd/mapping release and moved-from bookkeeping; a leak, not a result
+src/model/ngram.cpp NgramTable::Open cxx_assign_const | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Open cxx_ge_to_gt | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Open cxx_ge_to_lt | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Open cxx_lt_to_ge | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Open cxx_lt_to_le #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Open cxx_lt_to_le #3 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Open cxx_lt_to_le | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Open cxx_ne_to_eq #2 | unobservable: changes only which error message is written; the rejection itself is tested
+src/model/ngram.cpp NgramTable::Open cxx_ne_to_eq | unobservable: changes only which error message is written; the rejection itself is tested
+src/model/ngram.cpp NgramTable::Open cxx_pre_inc_to_pre_dec | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Open cxx_replace_scalar_call #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Open cxx_replace_scalar_call | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadCached cxx_eq_to_ne #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadCached cxx_eq_to_ne | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadCached cxx_mul_to_div | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadCached cxx_remove_void_call | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadCached cxx_replace_scalar_call | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_add_assign_to_sub_assign | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_add_to_sub #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_add_to_sub | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_assign_const #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_assign_const | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_eq_to_ne #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_eq_to_ne | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_ge_to_gt | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_le_to_lt | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_lt_to_ge | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_lt_to_le #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_lt_to_le | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_mul_to_div | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_ne_to_eq #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_ne_to_eq #3 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_ne_to_eq | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_rem_to_div | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_remove_void_call | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_replace_scalar_call #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_replace_scalar_call #3 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_replace_scalar_call | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_sub_to_add #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_sub_to_add #3 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::ReadOne cxx_sub_to_add | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::StartRead cxx_assign_const | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/model/ngram.cpp NgramTable::StartRead cxx_div_to_mul | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::StartRead cxx_ge_to_gt #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::StartRead cxx_ge_to_gt | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::StartRead cxx_ge_to_lt | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::StartRead cxx_lt_to_ge | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::StartRead cxx_lt_to_le | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::StartRead cxx_remove_void_call #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::StartRead cxx_remove_void_call | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::StartRead cxx_replace_scalar_call #2 | equivalent: reserve() and capacity hints change no result
+src/model/ngram.cpp NgramTable::StartRead cxx_replace_scalar_call #3 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::StartRead cxx_replace_scalar_call #4 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::StartRead cxx_replace_scalar_call | equivalent: reserve() and capacity hints change no result
+src/model/ngram.cpp NgramTable::WaitRead cxx_assign_const | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/model/ngram.cpp NgramTable::WaitRead cxx_remove_void_call #2 | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::WaitRead cxx_remove_void_call | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Worker cxx_assign_const | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Worker cxx_ge_to_gt | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Worker cxx_ge_to_lt | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Worker cxx_lt_to_le | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Worker cxx_pre_inc_to_pre_dec | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Worker cxx_replace_scalar_call | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::Worker cxx_sub_to_add | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::~NgramTable cxx_ge_to_gt | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+src/model/ngram.cpp NgramTable::~NgramTable cxx_ge_to_lt | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+
+# src/model/ngram.hpp
+src/model/ngram.hpp NgramHistory::Reset cxx_remove_void_call | not triaged: n-gram table I/O (O_DIRECT vs buffered by TMPDIR filesystem, cache, worker thread); path and timing dependent
+
+# src/model/weights.cpp
+src/model/weights.cpp Binder::Fail cxx_assign_const | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/model/weights.cpp Binder::Fail cxx_ne_to_eq | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_eq_to_ne | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_ge_to_gt | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_gt_to_ge | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_init_const #2 | equivalent: the initial value is overwritten before it is read
+src/model/weights.cpp Binder::Get cxx_init_const | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_lt_to_le #2 | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_lt_to_le | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_pre_inc_to_pre_dec | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_remove_void_call #2 | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_remove_void_call #3 | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_remove_void_call #4 | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_remove_void_call | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_replace_scalar_call #2 | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_replace_scalar_call #3 | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_replace_scalar_call | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Get cxx_sub_to_add | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp Binder::Layer cxx_mul_to_div | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp ModelWeights::Bind cxx_ge_to_gt | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp ModelWeights::Bind cxx_lt_to_le | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp ModelWeights::Bind cxx_remove_void_call #2 | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp ModelWeights::Bind cxx_remove_void_call | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp ModelWeights::Bind cxx_replace_scalar_call | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp MtpWeights::Bind cxx_assign_const | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp MtpWeights::Bind cxx_remove_void_call | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp MtpWeights::Bind cxx_replace_scalar_call #2 | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp MtpWeights::Bind cxx_replace_scalar_call | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.cpp TensorRef::RowBytes cxx_div_to_mul | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+
+# src/model/weights.hpp
+src/model/weights.hpp MtpTrace::Valid cxx_ne_to_eq #2 | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.hpp MtpTrace::Valid cxx_ne_to_eq | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.hpp MtpTrace::Valid cxx_replace_scalar_call #2 | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.hpp MtpTrace::Valid cxx_replace_scalar_call #3 | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.hpp MtpTrace::Valid cxx_replace_scalar_call #4 | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.hpp MtpTrace::Valid cxx_replace_scalar_call | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.hpp TensorRef::SizeBytes cxx_mul_to_div #2 | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.hpp TensorRef::SizeBytes cxx_mul_to_div | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+src/model/weights.hpp TensorRef::SizeBytes cxx_replace_scalar_call | gap, not fixed: weight binding is tested on valid tiny models only; rejections and MTP traces untested
+
+# src/text/chat_template.cpp
+src/text/chat_template.cpp IsPySpace cxx_ge_to_gt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp PyStr cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp PyStr cxx_gt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp PyStr cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp PyStr cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp PyStrip cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp PyStrip cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Renderer::FlashNext cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Renderer::FlashNext cxx_sub_to_add | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Renderer::Qwen35 cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Renderer::RenderContent cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Renderer::RenderContent cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Renderer::RenderContent cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Renderer::Run cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Renderer::ToolCalls cxx_assign_const | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/text/chat_template.cpp Renderer::ToolCalls cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Sha256 cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Sha256 cxx_xor_to_or #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Sha256 cxx_xor_to_or | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Truthy cxx_ne_to_eq | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Truthy cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Truthy cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Truthy cxx_replace_scalar_call #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Truthy cxx_replace_scalar_call #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/chat_template.cpp Truthy cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+
+# src/text/tokenizer.cpp
+src/text/tokenizer.cpp ContractionEnd cxx_assign_const #2 | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/text/tokenizer.cpp ContractionEnd cxx_assign_const | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/text/tokenizer.cpp PieceEnd cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/text/tokenizer.cpp PieceEnd cxx_replace_scalar_call | equivalent: letters already returned through the word branch before this test
+src/text/tokenizer.cpp Tokenizer::Encode cxx_div_to_mul | equivalent: reserve() and capacity hints change no result
+src/text/tokenizer.cpp Tokenizer::Encode cxx_gt_to_ge | equivalent: the extra iteration or empty span adds no token
+src/text/tokenizer.cpp Tokenizer::Encode cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/text/tokenizer.cpp Tokenizer::Encode cxx_lt_to_le #2 | equivalent: the extra iteration or empty span adds no token
+src/text/tokenizer.cpp Tokenizer::Encode cxx_lt_to_le | equivalent: the extra iteration or empty span adds no token
+src/text/tokenizer.cpp Tokenizer::Encode cxx_replace_scalar_call #2 | equivalent: the special-token path with no specials, or a larger scratch array, gives the same tokens
+src/text/tokenizer.cpp Tokenizer::Encode cxx_replace_scalar_call #3 | equivalent: the special-token path with no specials, or a larger scratch array, gives the same tokens
+src/text/tokenizer.cpp Tokenizer::Encode cxx_replace_scalar_call | equivalent: reserve() and capacity hints change no result
+src/text/tokenizer.cpp Tokenizer::EncodeOrdinaryWithOffsets cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/text/tokenizer.cpp Tokenizer::EncodeWithOffsets cxx_assign_const | equivalent: char_of[size] is never read for non-empty spans
+src/text/tokenizer.cpp Tokenizer::EncodeWithOffsets cxx_gt_to_ge #2 | equivalent: the extra iteration or empty span adds no token
+src/text/tokenizer.cpp Tokenizer::EncodeWithOffsets cxx_gt_to_ge | equivalent: the extra iteration or empty span adds no token
+src/text/tokenizer.cpp Tokenizer::EncodeWithOffsets cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/text/tokenizer.cpp Tokenizer::EncodeWithOffsets cxx_lt_to_le #2 | equivalent: the extra iteration or empty span adds no token
+src/text/tokenizer.cpp Tokenizer::EncodeWithOffsets cxx_lt_to_le | equivalent: the extra iteration or empty span adds no token
+src/text/tokenizer.cpp Tokenizer::FromGguf cxx_replace_scalar_call #2 | equivalent: reserve() and capacity hints change no result
+src/text/tokenizer.cpp Tokenizer::FromGguf cxx_replace_scalar_call | equivalent: an empty vocabulary is rejected later; 2^32 tokens is unreachable; clear() of an already empty string
+src/text/tokenizer.cpp Tokenizer::FromVocabulary cxx_ge_to_gt | equivalent: an empty vocabulary is rejected later; 2^32 tokens is unreachable; clear() of an already empty string
+src/text/tokenizer.cpp Tokenizer::FromVocabulary cxx_gt_to_ge | equivalent: specials of equal length never prefix each other, so the order among them does not matter
+src/text/tokenizer.cpp Tokenizer::FromVocabulary cxx_remove_void_call | equivalent: an empty vocabulary is rejected later; 2^32 tokens is unreachable; clear() of an already empty string
+src/text/tokenizer.cpp Tokenizer::FromVocabulary cxx_replace_scalar_call #2 | equivalent: an empty vocabulary is rejected later; 2^32 tokens is unreachable; clear() of an already empty string
+src/text/tokenizer.cpp Tokenizer::FromVocabulary cxx_replace_scalar_call #3 | equivalent: reserve() and capacity hints change no result
+src/text/tokenizer.cpp Tokenizer::FromVocabulary cxx_replace_scalar_call #4 | equivalent: reserve() and capacity hints change no result
+src/text/tokenizer.cpp Tokenizer::FromVocabulary cxx_replace_scalar_call | equivalent: an empty vocabulary is rejected later; 2^32 tokens is unreachable; clear() of an already empty string
+src/text/tokenizer.cpp Tokenizer::MergePiece cxx_assign_const | equivalent: equal ranks come from the same pair and are still popped leftmost first; a merged-away slot is never read again
+src/text/tokenizer.cpp Tokenizer::MergePiece cxx_gt_to_ge #2 | equivalent: equal ranks come from the same pair and are still popped leftmost first; a merged-away slot is never read again
+src/text/tokenizer.cpp Tokenizer::MergePiece cxx_gt_to_ge | equivalent: equal ranks come from the same pair and are still popped leftmost first; a merged-away slot is never read again
+src/text/tokenizer.cpp UnByteLevel cxx_remove_void_call | equivalent: an empty vocabulary is rejected later; 2^32 tokens is unreachable; clear() of an already empty string
+
+# src/text/tokenizer.hpp
+src/text/tokenizer.hpp Tokenizer::PairHash::operator() cxx_lshift_to_rshift | hash quality only: changes bucket distribution, not lookups
+src/text/tokenizer.hpp Tokenizer::PairHash::operator() cxx_xor_to_or | hash quality only: changes bucket distribution, not lookups
+
+# src/text/tool_call_parser.cpp
+src/text/tool_call_parser.cpp ArgumentValue cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ArgumentValue cxx_eq_to_ne | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ArgumentValue cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ArgumentValue cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ArgumentValue cxx_replace_scalar_call #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ArgumentValue cxx_replace_scalar_call #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ArgumentValue cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp CallParser::Json cxx_assign_const #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp CallParser::Json cxx_assign_const #3 | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/text/tool_call_parser.cpp CallParser::Json cxx_assign_const | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/text/tool_call_parser.cpp CallParser::Json cxx_init_const #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp CallParser::Json cxx_init_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp CallParser::Json cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp CallParser::Json cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp CallParser::ParamValue cxx_remove_void_call #2 | Mull's remove_void_call here hits a temporary's destructor on the line, not the named call (a test that needs the call passes)
+src/text/tool_call_parser.cpp CallParser::ParamValue cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp CallParser::ParamValue cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp CallParser::ParamValue cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp CallParser::Run cxx_add_assign_to_sub_assign | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp CallParser::Run cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp CallParser::Run cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp CallParser::Run cxx_replace_scalar_call #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp CallParser::Run cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp IncompleteUtf8Tail cxx_ge_to_gt #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp IncompleteUtf8Tail cxx_ge_to_gt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp IncompleteUtf8Tail cxx_ge_to_lt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp IncompleteUtf8Tail cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp IncompleteUtf8Tail cxx_le_to_gt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp IncompleteUtf8Tail cxx_le_to_lt #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp IncompleteUtf8Tail cxx_le_to_lt #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp IncompleteUtf8Tail cxx_le_to_lt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp PartialSuffix cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp PartialSuffix cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp PartialSuffix cxx_sub_to_add | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::Finish cxx_remove_void_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::Finish cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::Run cxx_init_const | equivalent: the initial value is overwritten before it is read
+src/text/tool_call_parser.cpp ToolCallStreamParser::StepBadCall cxx_ge_to_gt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::StepBadCall cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::StepBadCall cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::StepBadCall cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::StepCall cxx_ge_to_gt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::StepText cxx_assign_const | equivalent: Mull stores 42 into a bool, which reads back as false, the value stored here
+src/text/tool_call_parser.cpp ToolCallStreamParser::StepText cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::ToolCallStreamParser cxx_add_to_sub #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::ToolCallStreamParser cxx_add_to_sub | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::ToolCallStreamParser cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::ToolCallStreamParser cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::ToolCallStreamParser cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::ToolCallStreamParser cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp ToolCallStreamParser::ToolCallStreamParser cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp TrimSpace cxx_remove_void_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp TrimSpace cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp TypeMatches cxx_replace_scalar_call #10 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp TypeMatches cxx_replace_scalar_call #11 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp TypeMatches cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp TypeMatches cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp TypeMatches cxx_replace_scalar_call #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp TypeMatches cxx_replace_scalar_call #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp TypeMatches cxx_replace_scalar_call #6 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp TypeMatches cxx_replace_scalar_call #7 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp TypeMatches cxx_replace_scalar_call #8 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp TypeMatches cxx_replace_scalar_call #9 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/text/tool_call_parser.cpp TypeMatches cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+
+# src/text/unicode.cpp
+src/text/unicode.cpp Compose cxx_lt_to_le | equivalent: the boundary or class value is never reached with Unicode 9 tables (e.g. no combining class between 1 and 7)
+src/text/unicode.cpp DecodeUtf8 cxx_assign_const | equivalent: C2..DF leads never decode below U+0080
+src/text/unicode.cpp DecomposeInto cxx_ge_to_gt | equivalent: the boundary or class value is never reached with Unicode 9 tables (e.g. no combining class between 1 and 7)
+src/text/unicode.cpp NfcAligned cxx_gt_to_ge #2 | alignment bookkeeping for the ASCII fast path and empty NFC runs: callers pass an empty origin vector and no fixture yields an empty run
+src/text/unicode.cpp NfcAligned cxx_gt_to_ge | alignment bookkeeping for the ASCII fast path and empty NFC runs: callers pass an empty origin vector and no fixture yields an empty run
+src/text/unicode.cpp NfcAligned cxx_gt_to_le | alignment bookkeeping for the ASCII fast path and empty NFC runs: callers pass an empty origin vector and no fixture yields an empty run
+src/text/unicode.cpp NfcAligned cxx_lt_to_le #2 | alignment bookkeeping for the ASCII fast path and empty NFC runs: callers pass an empty origin vector and no fixture yields an empty run
+src/text/unicode.cpp NfcAligned cxx_lt_to_le | alignment bookkeeping for the ASCII fast path and empty NFC runs: callers pass an empty origin vector and no fixture yields an empty run
+src/text/unicode.cpp NfcAligned cxx_remove_void_call #2 | alignment bookkeeping for the ASCII fast path and empty NFC runs: callers pass an empty origin vector and no fixture yields an empty run
+src/text/unicode.cpp NfcAligned cxx_remove_void_call | alignment bookkeeping for the ASCII fast path and empty NFC runs: callers pass an empty origin vector and no fixture yields an empty run
+src/text/unicode.cpp NfcAligned cxx_replace_scalar_call #2 | equivalent: reserve() and capacity hints change no result
+src/text/unicode.cpp NfcAligned cxx_replace_scalar_call #3 | alignment bookkeeping for the ASCII fast path and empty NFC runs: callers pass an empty origin vector and no fixture yields an empty run
+src/text/unicode.cpp NfcAligned cxx_replace_scalar_call #4 | alignment bookkeeping for the ASCII fast path and empty NFC runs: callers pass an empty origin vector and no fixture yields an empty run
+src/text/unicode.cpp NfcAligned cxx_replace_scalar_call | alignment bookkeeping for the ASCII fast path and empty NFC runs: callers pass an empty origin vector and no fixture yields an empty run
+src/text/unicode.cpp NfcAligned cxx_sub_to_add | alignment bookkeeping for the ASCII fast path and empty NFC runs: callers pass an empty origin vector and no fixture yields an empty run
+src/text/unicode.cpp NfcWithChanges cxx_assign_const | equivalent: the boundary or class value is never reached with Unicode 9 tables (e.g. no combining class between 1 and 7)
+src/text/unicode.cpp NfcWithChanges cxx_lt_to_le | equivalent: the boundary or class value is never reached with Unicode 9 tables (e.g. no combining class between 1 and 7)
