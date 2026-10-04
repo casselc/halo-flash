@@ -4274,29 +4274,32 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
   const std::uint32_t r0 = blockIdx.y * BM, t0 = blockIdx.x * BN;
   const std::uint32_t wr = wave % WM, wt = wave / WM;
   const std::uint32_t nblk = cols / 32;
-  int4 ra[AP];
+  // Native vectors, not HIP's int4/uint4: those are structs, and LLVM's
+  // promote-alloca leaves arrays of them in scratch (here rb, carried across
+  // the K loop), which made the prefetch synchronous.
+  halo_v4i ra[AP];
   std::uint16_t rd[AP];
-  uint4 rb[BP];
+  halo_v4i rb[BP];
   const auto load = [&](std::uint32_t k0) {
 #pragma unroll
     for (std::uint32_t p = 0; p < AP; ++p) {
       const std::uint32_t i = tid + p * NT, row = i / APR, part = i % APR;  // part: 16 values
       const std::size_t r = min(r0 + row, rows - 1);
-      ra[p] = *reinterpret_cast<const int4*>(qs + r * qstride + k0 + part * 16);
+      ra[p] = *reinterpret_cast<const halo_v4i*>(qs + r * qstride + k0 + part * 16);
       rd[p] = d[r * nblk + (k0 + part * 16) / 32];
     }
 #pragma unroll
     for (std::uint32_t p = 0; p < BP; ++p) {
       const std::uint32_t i = tid + p * NT, tok = i / BPR, part = i % BPR;  // part: 8 values
-      rb[p] = *reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(min(t0 + tok, tokens - 1)) * cols + k0 + part * 8);
+      rb[p] = *reinterpret_cast<const halo_v4i*>(x + static_cast<std::size_t>(min(t0 + tok, tokens - 1)) * cols + k0 + part * 8);
     }
   };
   const auto store = [&] {
 #pragma unroll
     for (std::uint32_t p = 0; p < AP; ++p) {
       const std::uint32_t i = tid + p * NT, row = i / APR, part = i % APR;
-      const std::uint32_t w[4] = {static_cast<std::uint32_t>(ra[p].x), static_cast<std::uint32_t>(ra[p].y),
-                                  static_cast<std::uint32_t>(ra[p].z), static_cast<std::uint32_t>(ra[p].w)};
+      const std::uint32_t w[4] = {static_cast<std::uint32_t>(ra[p][0]), static_cast<std::uint32_t>(ra[p][1]),
+                                  static_cast<std::uint32_t>(ra[p][2]), static_cast<std::uint32_t>(ra[p][3])};
       const _Float16 sc = AsH2(rd[p]).x;
       const halo_h2 s2 = {sc, sc}, bias = {1152, 1152};
       _Float16* dst = As + row * RS + part * 16;
@@ -4314,7 +4317,7 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
 #pragma unroll
     for (std::uint32_t p = 0; p < BP; ++p) {
       const std::uint32_t i = tid + p * NT, tok = i / BPR, part = i % BPR;
-      *reinterpret_cast<uint4*>(Bs + tok * RS + part * 8) = rb[p];
+      *reinterpret_cast<halo_v4i*>(Bs + tok * RS + part * 8) = rb[p];
     }
   };
   halo_v8f acc[TM][TN] = {};

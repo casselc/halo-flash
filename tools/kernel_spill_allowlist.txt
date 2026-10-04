@@ -11,9 +11,3 @@ halo_gdn_prefill_d128_norm
 # Generic per-element Q6_K fragments in the grouped gate/up (no Q6_K experts
 # in the Flash-Next quant mix; the path exists for other mixes).
 halo_moe_gate_up_grouped_q6_k
-# Scratch without spills: private arrays the compiler did not keep in
-# registers. Open: in hot loops these cost memory traffic. (Forcing the
-# staging lambdas inline did not remove it and added a spill.)
-halo_gemm_q8r_f16_l
-halo_gemm_q8r_f16_s
-halo_gemm_q8r_f16_mix
