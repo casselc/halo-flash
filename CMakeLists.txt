@@ -49,7 +49,9 @@ target_link_libraries(halo_text PUBLIC halo_core)
 add_library(halo_server STATIC
   src/server/openai_request.cpp
   src/server/openai_response.cpp
+  src/server/http.cpp
 )
+target_link_libraries(halo_server PUBLIC Threads::Threads)
 target_link_libraries(halo_server PUBLIC halo_core halo_text)
 
 # --- decide: System One decision API ---------------------------------------
@@ -158,7 +160,8 @@ if(HALO_BUILD_TESTS)
     tests/text/tool_call_parser_test.cpp)
   halo_test(server_tests
     tests/server/openai_request_test.cpp
-    tests/server/openai_response_test.cpp)
+    tests/server/openai_response_test.cpp
+    tests/server/http_test.cpp)
   target_link_libraries(server_tests PRIVATE halo_server)
   halo_test(decide_tests
     tests/decide/systemone_test.cpp
