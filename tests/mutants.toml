@@ -602,8 +602,12 @@ why = "device penalties match the CPU's"
 [[mutant]]
 name = "ds-top-p-strict-crossing"
 file = "src/kernels/core.hip"
-find = '    const Cut cross = RadixSelect(key, rid, w, L, target, false, s);'
-replace = '    const Cut cross = RadixSelect(key, rid, w, L, target, true, s);'
+find = """
+    const auto target = static_cast<std::uint64_t>(static_cast<double>(p.top_p) * static_cast<double>(z));
+    const Cut cross = RadixSelect(key, rid, w, L, target, false, s);"""
+replace = """
+    const auto target = static_cast<std::uint64_t>(static_cast<double>(p.top_p) * static_cast<double>(z));
+    const Cut cross = RadixSelect(key, rid, w, L, target, true, s);"""
 suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuSample.*"
@@ -612,9 +616,73 @@ why = "top-p keeps through the first token whose cumulative mass reaches p (>=)"
 [[mutant]]
 name = "ds-top-k-ignores-min-keep"
 file = "src/kernels/core.hip"
-find = '    size = min(n_valid, max(p.top_k, floor_of(n_valid)));'
-replace = '    size = min(n_valid, p.top_k);'
+find = """
+  if (!linear && p.top_k > 0) {
+    size = min(n_valid, max(p.top_k, floor_of(n_valid)));"""
+replace = """
+  if (!linear && p.top_k > 0) {
+    size = min(n_valid, p.top_k);"""
 suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuSample.*"
 why = "top-k keeps at least min_keep tokens"
+
+# ---- Fast sampler (halo_sample_blocks / halo_sample_final) ------------------
+
+[[mutant]]
+name = "fs-skip-candidate-verification"
+file = "src/kernels/core.hip"
+find = '  if (!exact || !prefix_ok) {'
+replace = '  if (false) {'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuFastSample.*"
+why = "a kept set that may reach past the candidates must fall back to the exact kernel"
+
+[[mutant]]
+name = "fs-final-ignores-temperature"
+file = "src/kernels/core.hip"
+find = '    const double sc = static_cast<double>(static_cast<float>(v) * (1.0f / p.temperature) + GumbelNoise(p.rng, t));'
+replace = '    const double sc = static_cast<double>(static_cast<float>(v) + GumbelNoise(p.rng, t));'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuFastSample.*"
+why = "Gumbel-max samples softmax(v / T): the temperature scales the logits"
+
+[[mutant]]
+name = "fs-blocks-ignore-temperature"
+file = "src/kernels/core.hip"
+find = '    double g = valid ? static_cast<double>(v * inv_t + GumbelNoise(p.rng, i)) : -INFINITY;'
+replace = '    double g = valid ? static_cast<double>(v + GumbelNoise(p.rng, i)) : -INFINITY;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuFastSample.*"
+why = "plain temperature sampling scales the logits too"
+
+[[mutant]]
+name = "fs-total-mass-not-rescaled"
+file = "src/kernels/core.hip"
+find = '        if (blocks[b].valid) zd += blocks[b].mass * exp((static_cast<double>(blocks[b].max_v) - mx) / T);'
+replace = '        if (blocks[b].valid) zd += blocks[b].mass;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuFastSample.*"
+why = "block masses are relative to each block's max; top-p over the vocabulary needs them on one scale"
+
+[[mutant]]
+name = "fs-greedy-tie-higher-token"
+file = "src/kernels/core.hip"
+find = '''    if (ov > bv || (ov == bv && ot < bt)) {
+      bv = ov;
+      bt = ot;
+    }
+    nvalid += __shfl_xor(nvalid, o, kWarp);'''
+replace = '''    if (ov > bv || (ov == bv && ot > bt)) {
+      bv = ov;
+      bt = ot;
+    }
+    nvalid += __shfl_xor(nvalid, o, kWarp);'''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuFastSample.*"
+why = "greedy ties go to the lower token, as on the CPU"

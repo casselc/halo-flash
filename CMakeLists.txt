@@ -159,6 +159,8 @@ if(HALO_BUILD_TESTS)
     target_link_libraries(decide_tests PRIVATE halo_gpu)
     add_executable(halo_step_stats tools/step_stats.cpp)
     target_link_libraries(halo_step_stats PRIVATE halo_gpu)
+    add_executable(halo_sample_bench tools/sample_bench.cpp)
+    target_link_libraries(halo_sample_bench PRIVATE halo_gpu)
   endif()
   halo_test(model_tests
     tests/model/reference_hf_test.cpp

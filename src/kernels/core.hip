@@ -790,6 +790,9 @@ extern "C" __global__ void __launch_bounds__(1024)
                 std::uint32_t* rid, std::uint64_t* w, HaloSampleOut* out) {
   __shared__ SampleShared s;
   const HaloSampleParams p = *params;
+  // Fallback mode: run only when the fast sampler asked for the exact one.
+  if (p.fallback_only && out->token != HALO_SAMPLE_FALLBACK) return;
+  __syncthreads();
   const std::uint32_t V = p.vocab, NP = p.n_penalties;
   for (std::uint32_t i = threadIdx.x; i < HALO_SAMPLE_MAX_VOCAB / 32; i += blockDim.x) s.bitmap[i] = 0;
   if (threadIdx.x == 0) s.count = 0;
@@ -939,4 +942,444 @@ extern "C" __global__ void __launch_bounds__(1024)
     token = kIdMax - RadixSelect(key, rid, w, L, target, true, s, linear).rid;
   }
   if (threadIdx.x == 0) *out = {token, kept, rng};
+}
+
+// ---- Fast sampler: distribution-exact, multi-block ---------------------------
+
+namespace {
+
+__device__ inline std::uint32_t OrderedKey32(float f) {
+  if (f == 0.0f) f = 0.0f;
+  const std::uint32_t b = __float_as_uint(f);
+  return (b >> 31) ? ~b : (b | 0x80000000u);
+}
+__device__ inline float FromOrderedKey32(std::uint32_t k) {
+  return __uint_as_float((k >> 31) ? (k & 0x7FFFFFFFu) : ~k);
+}
+
+// Gumbel(0, 1) noise for `token`, keyed by the request's RNG state: a
+// counter-based hash, so every block draws its tokens' noise independently
+// and the result does not depend on the launch shape.
+// Single precision: u has 24 bits, so the noise is capped near 17.3; a token
+// would need a logit gap beyond ~20 temperatures to be affected, which has
+// probability around e^-20.
+__device__ inline float GumbelNoise(std::uint64_t key, std::uint32_t token) {
+  std::uint64_t z = key ^ (0x9e3779b97f4a7c15ull * (static_cast<std::uint64_t>(token) + 1));
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+  z ^= z >> 31;
+  const float u = (static_cast<float>(z >> 40) + 0.5f) * 0x1.0p-24f;  // (0, 1)
+  return -__logf(-__logf(u));
+}
+
+__device__ inline double PenalizedLogit(const float* logits, std::uint32_t i, const HaloSampleParams& p,
+                                        const HaloPenalty* pen) {
+  double v = logits[i];
+  if (p.n_penalties == 0) return v;
+  std::uint32_t lo = 0, hi = p.n_penalties;  // the list is sorted by token
+  while (lo < hi) {
+    const std::uint32_t mid = (lo + hi) / 2;
+    if (pen[mid].token < i) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < p.n_penalties && pen[lo].token == i ? Penalize(v, p, pen[lo]) : v;
+}
+
+// Candidates per block: top-k needs top_k (floored by min_keep) of them;
+// other filters use the full HALO_SAMPLE_TOPK.
+__device__ inline std::uint32_t BlockKeep(const HaloSampleParams& p) {
+  const std::uint32_t k = p.top_k > 0 ? max(p.top_k, max(p.min_keep, 1u)) : HALO_SAMPLE_TOPK;
+  return min(k, HALO_SAMPLE_TOPK);
+}
+
+}  // namespace
+
+// Stage 1: one block of HALO_SAMPLE_BLOCK threads per HALO_SAMPLE_BLOCK
+// tokens. Per block: max and argmax, softmax mass relative to the block max,
+// the best Gumbel score (plain temperature sampling), and the block's top
+// candidates in sampling order (bitonic sort of (value, token) composites).
+extern "C" __global__ void __launch_bounds__(1024)
+    halo_sample_blocks(const float* logits, const HaloSampleParams* params, const HaloPenalty* pen,
+                       HaloSampleBlock* blocks, std::uint64_t* candidates) {
+  __shared__ std::uint64_t sorted[HALO_SAMPLE_BLOCK];
+  __shared__ double red_d[32];
+  __shared__ float red_f[32];
+  __shared__ std::uint32_t red_u[32], red_g[32];
+  const HaloSampleParams p = *params;
+  const std::uint32_t i = blockIdx.x * HALO_SAMPLE_BLOCK + threadIdx.x;
+  const bool valid = i < p.vocab && isfinite(logits[i]);
+  const float v = valid ? static_cast<float>(PenalizedLogit(logits, i, p, pen)) : -INFINITY;
+  const std::uint32_t lane = threadIdx.x % kWarp, warp = threadIdx.x / kWarp, warps = blockDim.x / kWarp;
+
+  // Max and argmax (ties to the lower token); valid count.
+  float bv = v;
+  std::uint32_t bt = valid ? i : 0xFFFFFFFFu, nvalid = valid;
+  for (int o = kWarp / 2; o > 0; o >>= 1) {
+    const float ov = __shfl_xor(bv, o, kWarp);
+    const std::uint32_t ot = __shfl_xor(bt, o, kWarp);
+    if (ov > bv || (ov == bv && ot < bt)) {
+      bv = ov;
+      bt = ot;
+    }
+    nvalid += __shfl_xor(nvalid, o, kWarp);
+  }
+  if (lane == 0) {
+    red_f[warp] = bv;
+    red_u[warp] = bt;
+    red_g[warp] = nvalid;
+  }
+  __syncthreads();
+  float mx = -INFINITY;
+  std::uint32_t amx = 0xFFFFFFFFu, total_valid = 0;
+  for (std::uint32_t w = 0; w < warps; ++w) {
+    if (red_f[w] > mx || (red_f[w] == mx && red_u[w] < amx)) {
+      mx = red_f[w];
+      amx = red_u[w];
+    }
+    total_valid += red_g[w];
+  }
+  __syncthreads();
+
+  // Mass and Gumbel score (temperature > 0), deterministic reductions.
+  double mass = 0, gscore = -INFINITY;
+  std::uint32_t gid = 0xFFFFFFFFu;
+  if (p.temperature > 0.0f && total_valid > 0) {
+    const float inv_t = 1.0f / p.temperature;
+    double e = valid ? static_cast<double>(__expf((v - mx) * inv_t)) : 0.0;
+    double g = valid ? static_cast<double>(v * inv_t + GumbelNoise(p.rng, i)) : -INFINITY;
+    std::uint32_t gi = valid ? i : 0xFFFFFFFFu;
+    for (int o = kWarp / 2; o > 0; o >>= 1) {
+      e += __shfl_xor(e, o, kWarp);
+      const double og = __shfl_xor(g, o, kWarp);
+      const std::uint32_t oi = __shfl_xor(gi, o, kWarp);
+      if (og > g || (og == g && oi < gi)) {
+        g = og;
+        gi = oi;
+      }
+    }
+    if (lane == 0) {
+      red_d[warp] = e;
+      red_u[warp] = gi;
+    }
+    __syncthreads();
+    for (std::uint32_t w = 0; w < warps; ++w) mass += red_d[w];
+    __syncthreads();
+    if (lane == 0) red_d[warp] = g;
+    __syncthreads();
+    for (std::uint32_t w = 0; w < warps; ++w)
+      if (red_d[w] > gscore || (red_d[w] == gscore && red_u[w] < gid)) {
+        gscore = red_d[w];
+        gid = red_u[w];
+      }
+    __syncthreads();
+  }
+
+  // Candidates (only when a filter needs them): bitonic sort of composites,
+  // descending.
+  const bool filters = p.temperature > 0.0f && (p.top_k > 0 || p.top_p < 1.0f || p.min_p > 0.0f);
+  if (!filters) {
+    if (threadIdx.x == 0) blocks[blockIdx.x] = {mass, gscore, mx, amx, gid, total_valid, 0, 0, 0};
+    return;
+  }
+  sorted[threadIdx.x] = valid ? (static_cast<std::uint64_t>(OrderedKey32(v)) << 32) | (kIdMax - i) : 0;
+  __syncthreads();
+  for (std::uint32_t k = 2; k <= HALO_SAMPLE_BLOCK; k <<= 1)
+    for (std::uint32_t j = k >> 1; j > 0; j >>= 1) {
+      const std::uint32_t t = threadIdx.x, partner = t ^ j;
+      if (partner > t) {
+        const bool descending = (t & k) == 0;
+        const std::uint64_t a = sorted[t], b = sorted[partner];
+        if (descending ? a < b : a > b) {
+          sorted[t] = b;
+          sorted[partner] = a;
+        }
+      }
+      __syncthreads();
+    }
+  const std::uint32_t keep = min(BlockKeep(p), total_valid);
+  if (threadIdx.x < keep) candidates[blockIdx.x * HALO_SAMPLE_TOPK + threadIdx.x] = sorted[threadIdx.x];
+  if (threadIdx.x == 0)
+    blocks[blockIdx.x] = {mass, gscore, mx, amx, gid, total_valid, keep, 0,
+                          keep < HALO_SAMPLE_BLOCK ? sorted[keep] : 0};
+}
+
+// Stage 2: one block of 1024 threads. Greedy and plain temperature finish
+// from the block results; otherwise the filters run over the candidates
+// with core/sampling's semantics and a Gumbel-max draw picks the token.
+// Every filter decision must be provably confined to the candidates (a
+// top-k they fully contain, or a cut above every excluded token);
+// otherwise the token is HALO_SAMPLE_FALLBACK and the exact kernel runs.
+extern "C" __global__ void __launch_bounds__(1024)
+    halo_sample_final(const HaloSampleParams* params, const HaloSampleBlock* blocks, const std::uint64_t* candidates,
+                      std::uint32_t n_blocks, std::uint64_t* key, std::uint32_t* rid, std::uint64_t* w,
+                      HaloSampleOut* out) {
+  __shared__ SampleShared s;
+  __shared__ std::uint32_t offset[1025];  // candidate prefix offsets per block
+  const HaloSampleParams p = *params;
+  // Block summaries, reduced in parallel (one thread per block): global
+  // max/argmax, valid count, best Gumbel score and the excluded maximum.
+  {
+    float mx = -INFINITY;
+    std::uint32_t amx = 0xFFFFFFFFu, valid = 0, gid = 0xFFFFFFFFu, kept = 0;
+    double g = -INFINITY;
+    std::uint64_t excluded = 0;
+    for (std::uint32_t b = threadIdx.x; b < n_blocks; b += blockDim.x) {
+      const HaloSampleBlock k = blocks[b];
+      kept += k.kept;
+      if (k.valid == 0) continue;
+      valid += k.valid;
+      if (k.max_v > mx || (k.max_v == mx && k.argmax < amx)) {
+        mx = k.max_v;
+        amx = k.argmax;
+      }
+      if (k.gumbel > g || (k.gumbel == g && k.gumbel_id < gid)) {
+        g = k.gumbel;
+        gid = k.gumbel_id;
+      }
+      excluded = max(excluded, k.excluded);
+    }
+    // Candidate offsets: blocks are <= 1024, so one per thread.
+    std::uint32_t total;
+    const std::uint32_t mine = threadIdx.x < n_blocks ? blocks[threadIdx.x].kept : 0;
+    const std::uint32_t at = BlockScan(mine, s.bitmap, &total);
+    if (threadIdx.x < n_blocks) offset[threadIdx.x] = at;
+    if (threadIdx.x == 0) offset[n_blocks] = total;
+    for (int o = kWarp / 2; o > 0; o >>= 1) {
+      const float omx = __shfl_xor(mx, o, kWarp);
+      const std::uint32_t oam = __shfl_xor(amx, o, kWarp);
+      if (omx > mx || (omx == mx && oam < amx)) {
+        mx = omx;
+        amx = oam;
+      }
+      const double og = __shfl_xor(g, o, kWarp);
+      const std::uint32_t ogi = __shfl_xor(gid, o, kWarp);
+      if (og > g || (og == g && ogi < gid)) {
+        g = og;
+        gid = ogi;
+      }
+      valid += __shfl_xor(valid, o, kWarp);
+      excluded = max(excluded, static_cast<std::uint64_t>(__shfl_xor(static_cast<unsigned long long>(excluded), o, kWarp)));
+    }
+    __shared__ float w_mx[32];
+    __shared__ std::uint32_t w_amx[32], w_valid[32], w_gid[32];
+    __shared__ double w_g[32];
+    __shared__ std::uint64_t w_ex[32];
+    const std::uint32_t lane = threadIdx.x % kWarp, warp = threadIdx.x / kWarp;
+    if (lane == 0) {
+      w_mx[warp] = mx;
+      w_amx[warp] = amx;
+      w_valid[warp] = valid;
+      w_gid[warp] = gid;
+      w_g[warp] = g;
+      w_ex[warp] = excluded;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float bm = -INFINITY;
+      std::uint32_t ba = 0xFFFFFFFFu, bv = 0, bgi = 0xFFFFFFFFu;
+      double bg = -INFINITY;
+      std::uint64_t be = 0;
+      for (std::uint32_t k = 0; k < blockDim.x / kWarp; ++k) {
+        if (w_mx[k] > bm || (w_mx[k] == bm && w_amx[k] < ba)) {
+          bm = w_mx[k];
+          ba = w_amx[k];
+        }
+        if (w_g[k] > bg || (w_g[k] == bg && w_gid[k] < bgi)) {
+          bg = w_g[k];
+          bgi = w_gid[k];
+        }
+        bv += w_valid[k];
+        be = max(be, w_ex[k]);
+      }
+      s.max_v = bm;
+      s.argmax = ba;
+      s.valid = bv;
+      s.count = total;
+      s.nonzero = bgi;
+      s.pre_key = be;
+    }
+    (void)kept;
+  }
+  __syncthreads();
+  const double mx = s.max_v;
+  const std::uint32_t n_valid = s.valid, L_total = s.count;
+  const std::uint64_t excluded32 = s.pre_key;
+  const std::uint64_t next_rng = [&] {
+    std::uint64_t v = p.rng == 0 ? 0x9e3779b97f4a7c15ull : p.rng;
+    v ^= v >> 12;
+    v ^= v << 25;
+    v ^= v >> 27;
+    return v;
+  }();
+  if (n_valid == 0 || p.temperature == 0.0f) {
+    if (threadIdx.x == 0) *out = {n_valid ? s.argmax : 0xFFFFFFFFu, n_valid ? 1u : 0u, p.rng};
+    return;
+  }
+  if (p.top_k == 0 && p.top_p >= 1.0f && p.min_p <= 0.0f) {  // plain temperature
+    if (threadIdx.x == 0) *out = {s.nonzero, n_valid, next_rng};
+    return;
+  }
+  __syncthreads();
+
+  // Gather candidates (all, including zero-weight ones: they count for
+  // top-k and floors). Keys in the double domain, as the exact kernel.
+  const double T = p.temperature, scale = static_cast<double>(1ull << HALO_SAMPLE_FIXED_BITS);
+  const std::uint32_t L = L_total;
+  for (std::uint32_t j = threadIdx.x; j < L; j += blockDim.x) {
+    std::uint32_t lo = 0, hi = n_blocks;  // the block holding flat index j
+    while (hi - lo > 1) {
+      const std::uint32_t mid = (lo + hi) / 2;
+      if (offset[mid] <= j) lo = mid;
+      else hi = mid;
+    }
+    const std::uint64_t c = candidates[lo * HALO_SAMPLE_TOPK + (j - offset[lo])];
+    const float v = FromOrderedKey32(static_cast<std::uint32_t>(c >> 32));
+    key[j] = OrderedKey(static_cast<double>(v));
+    rid[j] = static_cast<std::uint32_t>(c);
+    w[j] = static_cast<std::uint64_t>(exp((static_cast<double>(v) - mx) / T) * scale + 0.5);
+  }
+  __syncthreads();
+  // Every token above `excluded` (in sampling order) is a candidate.
+  const Cut ex = excluded32 == 0 ? Cut{0, 0}
+                                 : Cut{OrderedKey(static_cast<double>(FromOrderedKey32(
+                                           static_cast<std::uint32_t>(excluded32 >> 32)))),
+                                       static_cast<std::uint32_t>(excluded32)};
+  const auto above_excluded = [&](const Cut& c) {
+    return excluded32 == 0 || c.key > ex.key || (c.key == ex.key && c.rid > ex.rid);
+  };
+  const auto floor_of = [&](std::uint32_t size) { return min(size, max(p.min_keep, 1u)); };
+  Cut cut{0, 0};
+  std::uint32_t kept = L, size = n_valid;
+  bool prefix_ok = excluded32 == 0;  // the kept prefix consists of candidates
+  bool exact = true;
+  const auto cut_at_count = [&](std::uint32_t c) {
+    if (c < kept) {
+      cut = RadixSelect(key, rid, nullptr, L, c, false, s);
+      kept = c;
+      prefix_ok = prefix_ok || above_excluded(cut);
+    } else if (!prefix_ok) {
+      exact = false;  // the cut lies past the candidates
+    }
+  };
+  if (p.top_k > 0) {
+    size = min(n_valid, max(p.top_k, floor_of(n_valid)));
+    if (size <= BlockKeep(p)) {  // every block holds its share of the global top `size`
+      cut_at_count(size);
+      prefix_ok = true;
+    } else {
+      exact = false;
+    }
+  }
+  if (exact && p.top_p < 1.0f && size > 1) {
+    std::uint64_t z;
+    if (p.top_k > 0) {
+      z = MassAbove(key, rid, w, L, cut, s);
+    } else {  // all valid tokens: rescale each block's mass to the global max
+      double zd = 0;
+      for (std::uint32_t b = 0; b < n_blocks; ++b)
+        if (blocks[b].valid) zd += blocks[b].mass * exp((static_cast<double>(blocks[b].max_v) - mx) / T);
+      z = static_cast<std::uint64_t>(zd * scale + 0.5);
+    }
+    const auto target = static_cast<std::uint64_t>(static_cast<double>(p.top_p) * static_cast<double>(z));
+    if (MassAbove(key, rid, w, L, Cut{0, 0}, s) < target) {
+      exact = false;  // the crossing lies past the candidates
+    } else {
+      const Cut cross = RadixSelect(key, rid, w, L, target, false, s);
+      if (!prefix_ok && !above_excluded(cross)) {
+        exact = false;
+      } else {
+        const auto through = static_cast<std::uint32_t>(MassAbove(key, rid, nullptr, L, cross, s));
+        const std::uint32_t minimum = floor_of(size);
+        if (through >= minimum) {
+          cut = cross;
+          kept = through;
+          size = through;
+          prefix_ok = true;
+        } else {
+          size = minimum;
+          cut_at_count(minimum);
+        }
+      }
+    }
+  }
+  if (exact && p.min_p > 0.0f && size > 1) {
+    const double min_p_cut = mx + T * log(static_cast<double>(p.min_p));
+    // All tokens passing min-p are candidates when the excluded maximum fails it.
+    const bool all_passing_known =
+        excluded32 == 0 || static_cast<double>(FromOrderedKey32(static_cast<std::uint32_t>(excluded32 >> 32))) < min_p_cut;
+    if (!prefix_ok && !all_passing_known) {
+      exact = false;
+    } else {
+      if (threadIdx.x == 0) s.mass = 0;
+      __syncthreads();
+      unsigned long long local = 0;
+      for (std::uint32_t i = threadIdx.x; i < L; i += blockDim.x) {
+        if (!AtOrAbove(key[i], rid[i], cut)) continue;
+        const std::uint64_t k = key[i];
+        const double v = __longlong_as_double(static_cast<long long>((k >> 63) ? (k & ~(1ull << 63)) : ~k));
+        local += v >= min_p_cut;
+      }
+      atomicAdd(&s.mass, local);
+      __syncthreads();
+      const auto pass = static_cast<std::uint32_t>(s.mass);
+      __syncthreads();
+      const std::uint32_t passing = min(pass, size);
+      size = min(max(passing, floor_of(size)), size);
+      // A cut at the last passing token lies above every excluded token
+      // when all passing tokens are known; a min_keep floor below it does
+      // not, so cut_at_count checks that one against the excluded maximum.
+      if (all_passing_known && size == passing) {
+        if (size < kept) {
+          cut = RadixSelect(key, rid, nullptr, L, size, false, s);
+          kept = size;
+        }
+        prefix_ok = true;
+      } else {
+        cut_at_count(size);
+      }
+    }
+  }
+  if (!exact || !prefix_ok) {
+    if (threadIdx.x == 0) *out = {HALO_SAMPLE_FALLBACK, 0, p.rng};
+    return;
+  }
+
+  // Gumbel-max over the kept candidates: an exact draw from the softmax
+  // restricted to them.
+  double g = -INFINITY;
+  std::uint32_t gi = 0xFFFFFFFFu;
+  for (std::uint32_t i = threadIdx.x; i < L; i += blockDim.x) {
+    if (!AtOrAbove(key[i], rid[i], cut)) continue;
+    const std::uint32_t t = kIdMax - rid[i];
+    const std::uint64_t k = key[i];
+    const double v = __longlong_as_double(static_cast<long long>((k >> 63) ? (k & ~(1ull << 63)) : ~k));
+    const double sc = static_cast<double>(static_cast<float>(v) * (1.0f / p.temperature) + GumbelNoise(p.rng, t));
+    if (sc > g || (sc == g && t < gi)) {
+      g = sc;
+      gi = t;
+    }
+  }
+  for (int o = kWarp / 2; o > 0; o >>= 1) {
+    const double og = __shfl_xor(g, o, kWarp);
+    const std::uint32_t oi = __shfl_xor(gi, o, kWarp);
+    if (og > g || (og == g && oi < gi)) {
+      g = og;
+      gi = oi;
+    }
+  }
+  if (threadIdx.x % kWarp == 0) {
+    s.red_d[threadIdx.x / kWarp] = g;
+    s.red_u[threadIdx.x / kWarp] = gi;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    double bg = -INFINITY;
+    std::uint32_t bi = 0xFFFFFFFFu;
+    for (std::uint32_t k = 0; k < blockDim.x / kWarp; ++k)
+      if (s.red_d[k] > bg || (s.red_d[k] == bg && s.red_u[k] < bi)) {
+        bg = s.red_d[k];
+        bi = s.red_u[k];
+      }
+    *out = {bi, kept, next_rng};
+  }
 }

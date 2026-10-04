@@ -22,6 +22,8 @@ struct HaloSampleParams {
   uint32_t n_penalties;
   uint32_t vocab;
   uint64_t rng;  // RNG state before this draw
+  uint32_t fallback_only;  // exact kernel: run only if the fast path asked
+  uint32_t pad;
 };
 
 // One entry per penalized token, as core/sampling's TokenPenalty.
@@ -32,8 +34,28 @@ struct HaloPenalty {
   uint32_t pad;
 };
 
+// Fast sampler (halo_sample_blocks + halo_sample_final): distribution-exact
+// rather than draw-identical. Each block of HALO_SAMPLE_BLOCK tokens keeps
+// its top HALO_SAMPLE_TOPK candidates; the final kernel works on those and
+// requests the exact kernel when the kept set might reach past them.
+#define HALO_SAMPLE_BLOCK 1024u
+#define HALO_SAMPLE_TOPK 256u
+#define HALO_SAMPLE_FALLBACK 0xFFFFFFFEu
+
+struct HaloSampleBlock {
+  double mass;       // sum exp((v - max_v) / T) over the block's valid tokens
+  double gumbel;     // best v / T + Gumbel noise (plain temperature sampling)
+  float max_v;
+  uint32_t argmax;   // ties: lower token
+  uint32_t gumbel_id;
+  uint32_t valid;
+  uint32_t kept;     // candidates written (<= HALO_SAMPLE_TOPK)
+  uint32_t pad;
+  uint64_t excluded; // composite key of the best token not kept (0: none)
+};
+
 struct HaloSampleOut {
-  uint32_t token;  // 0xFFFFFFFF: no finite logit
+  uint32_t token;  // 0xFFFFFFFF: no finite logit; HALO_SAMPLE_FALLBACK: exact kernel pending
   uint32_t live;   // kept tokens with nonzero fixed-point weight
   uint64_t rng;    // RNG state after this draw
 };
