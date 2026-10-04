@@ -5,6 +5,7 @@
 
 #include <hegel/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -121,4 +122,26 @@ TEST(Quant, EncodedSizesMatchBlockLayouts) {
   EXPECT_EQ(q::EncodedSizeBytes(GgmlType::kBF16, 3), 6U);
   float out[32];
   EXPECT_FALSE(q::DequantizeRow(GgmlType::kQ2_K, nullptr, out, 256));
+}
+
+// Regression (found by UBSan through the n-gram table test): rows can start at
+// any byte offset, and every format must decode identically there.
+TEST(Quant, DequantizeIsOffsetIndependent) {
+  hegel::test([](hegel::TestCase& tc) {
+    const auto type = tc.draw(gs::sampled_from({GgmlType::kF16, GgmlType::kBF16, GgmlType::kF32,
+                                                GgmlType::kQ8_0, GgmlType::kQ4_K, GgmlType::kIQ4_NL}));
+    const std::size_t block = std::max<std::size_t>(1, q::QuantizedBlockElements(type));
+    const std::size_t k = block * tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 3}));
+    const auto row = type == GgmlType::kF32 || type == GgmlType::kF16 || type == GgmlType::kBF16
+                         ? tc.draw(gs::binary({.min_size = q::EncodedSizeBytes(type, k),
+                                               .max_size = q::EncodedSizeBytes(type, k)}))
+                         : DrawBlocks(tc, type, k / block);
+    const auto shift = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 7}));
+    std::vector<std::uint8_t> shifted(row.size() + shift);
+    std::memcpy(shifted.data() + shift, row.data(), row.size());
+    std::vector<float> a(k), b(k);
+    ASSERT_TRUE(q::DequantizeRow(type, row.data(), a.data(), k));
+    ASSERT_TRUE(q::DequantizeRow(type, shifted.data() + shift, b.data(), k));
+    ASSERT_EQ(std::memcmp(a.data(), b.data(), k * sizeof(float)), 0);
+  });
 }

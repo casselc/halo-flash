@@ -691,14 +691,16 @@ bool DequantizeRow(core::GgmlType type, const void* src, float* dst,
     case core::GgmlType::kF32:
       std::memcpy(dst, src, k * sizeof(float));
       return true;
-    case core::GgmlType::kF16: {
-      const auto* h = static_cast<const std::uint16_t*>(src);
-      for (std::size_t i = 0; i < k; ++i) dst[i] = Fp16ToFloat(h[i]);
-      return true;
-    }
+    case core::GgmlType::kF16:
     case core::GgmlType::kBF16: {
-      const auto* h = static_cast<const std::uint16_t*>(src);
-      for (std::size_t i = 0; i < k; ++i) dst[i] = Bf16ToFloat(h[i]);
+      // Rows may start at any byte offset (tables inside a file, unaligned
+      // tensor views), so load each half through memcpy.
+      const auto* bytes = static_cast<const std::uint8_t*>(src);
+      for (std::size_t i = 0; i < k; ++i) {
+        std::uint16_t h;
+        std::memcpy(&h, bytes + 2 * i, 2);
+        dst[i] = type == core::GgmlType::kF16 ? Fp16ToFloat(h) : Bf16ToFloat(h);
+      }
       return true;
     }
     case core::GgmlType::kQ8_0: DequantizeQ8_0(src, dst, k); return true;
