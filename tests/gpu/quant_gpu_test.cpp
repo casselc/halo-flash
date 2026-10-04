@@ -647,7 +647,20 @@ TEST(GpuKernels, FusedHcMixerMatchesKernelSequence) {
       };
       expect_close(get(xn2, D), get(xn1, D), "xn");
       expect_close(get(m2, H), get(m1, H), "mixed");
-      if (with_inject) expect_close(get(i2, hc), get(i1, hc), "inject");
+      if (with_inject) {
+        // Inject logits are single dot products of length hc * H, which can
+        // cancel to a small result (with hc = 1, a vector of one); bound the
+        // two summation orders by the terms' magnitude instead:
+        // |a - b| <= 1e-5 * sum_j |w_ij x_j| (found by Hegel: 1.02e-5 relative
+        // at hc 1, H 1888).
+        const auto got = get(i2, hc), want = get(i1, hc), xn = get(xn1, D);
+        for (std::uint32_t r = 0; r < hc; ++r) {
+          double mag = 0;
+          for (std::uint32_t j = 0; j < D; ++j) mag += std::fabs(double(inj[std::size_t{r} * D + j]) * xn[j]);
+          ASSERT_LE(std::fabs(double(got[r]) - want[r]), 1e-5 * mag + 1e-30)
+              << "inject " << r << " (hc " << hc << ", H " << H << ", L " << L << ")";
+        }
+      }
       for (auto* b : {&rb, &nb, &ib, &draw, &uraw, &dqs, &dd, &uqs, &ud, &xn1, &lo1, &g1, &m1, &i1, &xn2, &lo2, &m2, &i2, &ip, &sc})
         dev->Free(*b);
     }, {.test_cases = 80});
