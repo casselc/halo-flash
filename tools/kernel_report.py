@@ -18,6 +18,13 @@ a measurement.
 --check exits 1 when a kernel spills or uses scratch and is not listed in
 the allowlist (one kernel name per line, '#' comments), or when a listed
 kernel no longer spills (so the list stays honest).
+
+  kernel_report.py --compile HIPCC --source core.hip --include src [--readelf PATH]
+
+--compile recompiles the source with -Rpass-analysis=kernel-resource-usage
+and exits 1 unless this tool's waves/SIMD estimate equals the compiler's
+own occupancy for every kernel of that compile (it keeps the estimate
+honest: the VGPR granule was once 16 here).
 """
 
 import argparse
@@ -26,6 +33,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 
 def readelf_path(arg):
@@ -124,13 +132,60 @@ def occupancy(k):
     return by_vgpr, "vgpr"
 
 
+def compiler_occupancy(remarks):
+    occ, cur = {}, None
+    for m in re.finditer(r"remark:\s+([A-Za-z \[\]/]+?): (\S+) \[", remarks):
+        key, val = m.groups()
+        if key == "Function Name":
+            cur = val
+        elif key.startswith("Occupancy") and cur:
+            occ[cur] = int(val)
+    return occ
+
+
+def compare_with_compiler(args):
+    if not args.source:
+        sys.exit("--compile needs --source")
+    with tempfile.TemporaryDirectory() as tmp:
+        hsaco = f"{tmp}/k.hsaco"
+        cmd = [args.compile, "-x", "hip", "--offload-arch=gfx1151", "--offload-device-only", "--no-gpu-bundle-output",
+               "-O3", "-std=c++20", "-Rpass-analysis=kernel-resource-usage", "-o", hsaco, args.source]
+        cmd += [f"-I{i}" for i in args.include]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode:
+            sys.exit(r.stderr[-4000:])
+        notes = subprocess.run([readelf_path(args.readelf), "--notes", hsaco], check=True,
+                               capture_output=True, text=True).stdout
+    kernels = parse_maps(notes)
+    occ = compiler_occupancy(r.stderr)
+    bad = []
+    for k in kernels:
+        ours, lim = occupancy(k)
+        theirs = occ.get(k["name"])
+        if theirs != ours:
+            bad.append(f"{k['name']}: estimate {ours} ({lim}), compiler {theirs} "
+                       f"(vgpr {k.get('vgpr_count', 0)}, lds {k.get('group_segment_fixed_size', 0)}, "
+                       f"wg {k.get('max_flat_workgroup_size', 0)})")
+    for b in bad:
+        print(b)
+    print(f"{len(kernels)} kernels, {len(occ)} compiler occupancies, {len(bad)} mismatches")
+    return 1 if bad or not kernels else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--hsaco", required=True)
+    ap.add_argument("--hsaco")
+    ap.add_argument("--compile", metavar="HIPCC", help="recompile --source and compare occupancy with the compiler's")
+    ap.add_argument("--source")
+    ap.add_argument("--include", action="append", default=[])
     ap.add_argument("--readelf")
     ap.add_argument("--filter", default="")
     ap.add_argument("--check", metavar="ALLOWLIST")
     args = ap.parse_args()
+    if args.compile:
+        return compare_with_compiler(args)
+    if not args.hsaco:
+        ap.error("--hsaco is required")
     notes = subprocess.run([readelf_path(args.readelf), "--notes", args.hsaco], check=True,
                            capture_output=True, text=True).stdout
     kernels = parse_maps(notes)

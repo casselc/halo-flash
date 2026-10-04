@@ -404,5 +404,14 @@ if(TARGET halo_gpu)
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/kernel_report.py
                      --hsaco ${HALO_GEN}/core.hsaco --readelf ${HALO_LLVM_READELF}
                      --check ${CMAKE_CURRENT_SOURCE_DIR}/tools/kernel_spill_allowlist.txt)
+    # The occupancy estimate against the compiler's own (recompiles core.hip).
+    add_test(NAME kernel_occupancy_model
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/kernel_report.py
+                     --compile ${HIPCC} --source ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/core.hip
+                     --include ${CMAKE_CURRENT_SOURCE_DIR}/src --readelf ${HALO_LLVM_READELF})
+    if(DEFINED ENV{HIP_DEVICE_LIB_PATH})  # hipcc needs it outside the dev shell too
+      set_tests_properties(kernel_occupancy_model PROPERTIES
+                           ENVIRONMENT "HIP_DEVICE_LIB_PATH=$ENV{HIP_DEVICE_LIB_PATH}")
+    endif()
   endif()
 endif()
