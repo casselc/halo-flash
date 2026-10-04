@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "core/json.hpp"
@@ -349,6 +350,24 @@ TEST(SystemOne, CriteriaCountLimits) {
   const Request n = MustParse(R"({"state":"s","questions":{"q":{"instructions":"i","criteria":{"true":null}}}})");
   ASSERT_EQ(n.questions[0].criteria.size(), 1U);
   EXPECT_FALSE(n.questions[0].criteria[0].second.has_value());
+  // Untyped: the noul attempt reads "true" before failing on "maybe"; the
+  // choice it falls back to must not keep that partial read.
+  const Request c = MustParse(R"({"state":"s","questions":{"q":{"instructions":"i","criteria":{"true":"a","maybe":"b"}}}})");
+  EXPECT_EQ(c.questions[0].kind, Kind::kChoice);
+  EXPECT_EQ(c.questions[0].criteria.size(), 2U);
+}
+
+// Python's round(x, n) on the exact binary value, ties to even (values from
+// CPython). The readout fixture's 1e-4 tolerance cannot tell rounded from
+// unrounded values, so Mull could disable the rounding unnoticed.
+TEST(SystemOne, PyRoundMatchesCPython) {
+  const std::vector<std::tuple<double, int, double>> cases = {
+      {0.123456, 4, 0.1235}, {0.5, 0, 0.0},       {1.5, 0, 2.0},        {2.5, 0, 2.0},
+      {2.675, 2, 2.67},      {0.28965, 4, 0.2897}, {-0.00005, 4, -0.0001}, {1e-5, 4, 0.0},
+      {123.456789, 4, 123.4568}, {0.99995, 4, 1.0}};
+  for (const auto& [x, n, want] : cases) EXPECT_EQ(PyRound(x, n), want) << x << " " << n;
+  EXPECT_TRUE(std::isnan(PyRound(std::nan(""), 4)));
+  EXPECT_EQ(PyRound(INFINITY, 4), INFINITY);
 }
 
 TEST(SystemOne, ScoreConfidenceEdges) {
