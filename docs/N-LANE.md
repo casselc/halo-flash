@@ -59,3 +59,53 @@ The limits are in the toolchain, not the silicon.
 Together these put the arithmetic above 10 TMAC/s. Rerun the same gate
 when either lands. Until then the decider runs on the GPU, scheduled
 between LLM decode steps (P9).
+
+## N2b — hand-written Low kernels (2026-10-03): INCONCLUSIVE, stays shelved
+
+Question: would better code generation pass the N2 gate? Hand-written Low
+code, no compiler changes. Every configuration was bit-exact against an
+independent oracle. The wrong oracles (swapped K slices, transposed weight
+blocks, a missing chain slice) each mismatched more than 99.9% of the
+2,097,152 outputs.
+
+- **Inner loop: about 1.29 cycles per `mmul` statically, versus ~10 from
+  the compiler.**
+  - Straight-line code; post-increment A loads co-issued with `mmul`; each
+    A fragment reused across 4 accumulators.
+  - About 300 GMAC/s per tile measured.
+  - Loops are unusable: the bundle planner drains the pipeline at every
+    backedge, which is 3.3x slower.
+  - The floor is one 512-bit load per cycle. Undetermined whether that is
+    the hardware or the planner's model of it.
+- **All 32 tiles: 8.14 TMAC/s marginal, 2.40 end to end** (int8, K=2048).
+  - Layout: a K-chain, 4 tiles per column, each holding a 512-wide K slice
+    and seeding its accumulators from the previous tile's partial sum.
+  - Inputs: four A streams, each multicast across the 8 columns.
+  - Fixed cost per command: 0.39 ms with 32 tiles.
+- **Gate:**
+  - GEMM of at least 1 TMAC/s: **pass**.
+  - A decider layer in one or a few commands: **blocked**. It needs at
+    least 4 commands per layer at 0.39 ms or more each.
+  - Latency within 3x of the GPU: **fail** today, by about 62-75 ms
+    against a budget of 30-60 ms at 50 tokens, and about 250-300 ms against
+    90-135 ms at 300 tokens. With the missing features below, the
+    projection is about 34 ms and 61 ms, which passes.
+
+**Blockers, by owner.**
+
+1. **Loom AIE2P array planner.**
+   - Memory-tile buffering. Weights must stream (about 57 MB per layer
+     against 512 KB of tile memory per command), and only 16 DRAM stream
+     channels exist for 32 tiles.
+   - Cascade wiring between tiles.
+2. **XDNA runtime, image and firmware contract.** Multi-phase programs,
+   or continuation commands that keep tile state. Today the non-GEMM ops
+   between linears force separate commands, and each command reloads its
+   program and weights.
+3. **Lowering (non-blocking).** Post-increment `vector.mma` lowering, full
+   unrolling within 16 KB of program memory, 1x4 A reuse, and a fix for the
+   backedge drain. That would give about 3x per tile from the compiler alone.
+
+**Reopen when 1 and 2 land.** Then rebuild the K-chain with streamed
+weights and rerun the gate. Note that even with them, the decider would
+take 36-55 GB/s of the memory bandwidth the GPU LLM uses.
