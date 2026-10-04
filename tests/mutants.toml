@@ -12,7 +12,7 @@ env = []
 
 [suite.gpu]
 build_dir = "build/gpu"
-env = ["HALO_TINY_HF_DIR", "HALO_TINY_QWEN35_DIR", "HALO_SMALL_QUANT_DIR"]
+env = ["HALO_TINY_HF_DIR", "HALO_TINY_QWEN35_DIR", "HALO_SMALL_QUANT_DIR", "HALO_DECIDER_MODELS_DIR"]
 
 [suite.cpu]
 build_dir = "build/cpu-debug"
@@ -1209,3 +1209,27 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuKernels.DeltaNetPrefillEqualsDecodeSteps"
 why = "only q and k are L2-normalized; v is not (prefill as decode)"
+
+# ---- P4 prefill on the decider torso (BF16 weights, FP16 WMMA) ------------
+
+[[mutant]]
+name = "prefill-bf16-halves-swapped"
+file = "src/kernels/core.hip"
+find = '''      h0[2 * i] = static_cast<_Float16>(bf(aw[i] & 0xFFFFu));
+      h0[2 * i + 1] = static_cast<_Float16>(bf(aw[i] >> 16));'''
+replace = '''      h0[2 * i] = static_cast<_Float16>(bf(aw[i] >> 16));
+      h0[2 * i + 1] = static_cast<_Float16>(bf(aw[i] & 0xFFFFu));'''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Qwen35Gpu.DeciderTorsoPrefillMatchesSteps"
+why = "little-endian: the low half of each 32-bit word is the earlier BF16 value"
+
+[[mutant]]
+name = "prefill-qwen35-rope-at-chunk-start"
+file = "src/engine/qwen35_gpu.cpp"
+find = '''        const std::uint32_t pos = position_ + t;'''
+replace = '''        const std::uint32_t pos = position_;'''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Qwen35Gpu.DeciderTorsoPrefillMatchesSteps"
+why = "each token of a chunk is rotated and cached at its own position"

@@ -124,3 +124,71 @@ TEST(Qwen35Gpu, DeciderTorsoWithLoraMatchesCpuReference) {
     std::printf("%s: worst relative L2 %.3g (2B + LoRA)\n", rt::BackendName(b), worst);
   }
 }
+
+// P4 chunked prefill on the decider torso (2B + LoRA): every position's
+// hidden state from Prefill against Step, on chunks that straddle the
+// kMaxChunk boundary, and a continuation (Prefill after Prefill) against
+// stepping the whole sequence. Fixed in advance: relative L2 < 2e-2 per
+// position (Prefill rounds GEMM inputs to fp16; Step keeps fp32) and cosine
+// > 0.9998.
+TEST(Qwen35Gpu, DeciderTorsoPrefillMatchesSteps) {
+  const char* dir = std::getenv("HALO_DECIDER_MODELS_DIR");
+  if (!dir) GTEST_SKIP() << "set HALO_DECIDER_MODELS_DIR";
+  std::string error;
+  const std::string d = dir;
+  auto reader = core::GgufReader::OpenFile(d + "/Qwen3.5-2B-Base-BF16.gguf", &error);
+  ASSERT_TRUE(reader) << error;
+  auto lora_file = core::GgufReader::OpenFile(d + "/strands-decider-lora-f32.gguf", &error);
+  ASSERT_TRUE(lora_file) << error;
+  auto w = model::Qwen35Weights::Bind(*reader, &error);
+  ASSERT_TRUE(w) << error;
+  auto lora = model::LoraAdapter::Bind(*lora_file, *reader, &error);
+  ASSERT_TRUE(lora) << error;
+  const std::size_t H = w->config.hidden_size;
+  std::vector<std::int32_t> tokens;
+  for (std::uint32_t i = 0; i < engine::Qwen35Gpu::kMaxChunk + 37; ++i)
+    tokens.push_back(static_cast<std::int32_t>((i * 7919 + 13) % 150000));
+  for (auto b : Backends()) {
+    auto dev = rt::Device::Create(b, &error);
+    ASSERT_TRUE(dev) << error;
+    auto step = engine::Qwen35Gpu::Create(*dev, *w, &*lora, 1024, &error);
+    auto pre = engine::Qwen35Gpu::Create(*dev, *w, &*lora, 1024, &error);
+    ASSERT_TRUE(step && pre) << error;
+    std::vector<float> want(tokens.size() * H), got(tokens.size() * H);
+    for (std::size_t i = 0; i < tokens.size(); ++i)
+      ASSERT_TRUE(step->Step(tokens[i], std::span<float>(want.data() + i * H, H), {}, &error)) << error;
+    // Two calls: a short head, then the rest (crosses a chunk boundary).
+    const std::size_t head = 11;
+    ASSERT_TRUE(pre->Prefill(std::span<const std::int32_t>(tokens.data(), head), std::span<float>(got.data(), head * H), &error))
+        << error;
+    ASSERT_TRUE(pre->Prefill(std::span<const std::int32_t>(tokens.data() + head, tokens.size() - head),
+                             std::span<float>(got.data() + head * H, (tokens.size() - head) * H), &error))
+        << error;
+    EXPECT_EQ(pre->Position(), tokens.size());
+    double worst = 0, worst_cos = 1;
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      double dd = 0, mm = 0, gg = 0, dot = 0;
+      for (std::size_t j = 0; j < H; ++j) {
+        const double a = got[i * H + j], e = want[i * H + j];
+        dd += (a - e) * (a - e);
+        mm += e * e;
+        gg += a * a;
+        dot += a * e;
+      }
+      const double rel = std::sqrt(dd / mm), cos = dot / std::sqrt(mm * gg);
+      worst = std::max(worst, rel);
+      worst_cos = std::min(worst_cos, cos);
+      ASSERT_LT(rel, 2e-2) << rt::BackendName(b) << " position " << i;
+      ASSERT_GT(cos, 0.9998) << rt::BackendName(b) << " position " << i;
+    }
+    // Decoding after a prefill continues exactly as after stepping (same
+    // state), up to the prefill's rounding.
+    std::vector<float> hs(H), hp(H);
+    ASSERT_TRUE(step->Step(42, hs, {}, &error) && pre->Step(42, hp, {}, &error)) << error;
+    double dd = 0, mm = 0;
+    for (std::size_t j = 0; j < H; ++j) dd += (hp[j] - hs[j]) * (hp[j] - hs[j]), mm += hs[j] * hs[j];
+    EXPECT_LT(std::sqrt(dd / mm), 2e-2);
+    std::printf("%s: prefill vs steps over %zu tokens: worst relative L2 %.3g, worst cosine %.6f; next step %.3g\n",
+                rt::BackendName(b), tokens.size(), worst, worst_cos, std::sqrt(dd / mm));
+  }
+}

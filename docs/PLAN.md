@@ -447,6 +447,13 @@ the 2B decider resident together. Measured warm: 3.5 s for an 83-token
 request, about 42 ms per token, because the Qwen3.5 GPU path still prefills a
 token at a time; the reference reports 115 ms per question on an RTX 3090.
 Batched prefill (P4 kernels, BF16 weights) is the fix.
+Done the same night: `Qwen35Gpu::Prefill` runs a chunk as T-token GEMMs
+(`halo_gemm_bf16_f16`: BF16 weights on FP16 WMMA, fp32 accumulation; LoRA
+through `halo_gemm_f32_rows`), the DeltaNet chunk kernels, and attention a
+token at a time. Hidden states match stepping to 5e-4 relative L2; the
+decider parity test against the Python engine passes (worst difference
+0.0018 of the 0.01 budget). The same request now takes 225 ms (was 3.5 s);
+a three-question 248-token request 0.61 s (was 10.6 s).
 
 **P10: variants, first-class (supersedes "LoRA inference"; user, 2026-10-03).**
 

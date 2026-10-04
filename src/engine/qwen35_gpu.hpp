@@ -27,6 +27,13 @@ class Qwen35Gpu {
   /// Runs `token` at the next position; `hidden` / `logits` (optional) receive
   /// the final normalized hidden state and the LM head output.
   [[nodiscard]] bool Step(std::int32_t token, std::span<float> hidden, std::span<float> logits, std::string* error);
+  /// Runs `tokens` at the next positions as one chunk (P4): projections as
+  /// T-token GEMMs (BF16 weights on FP16 WMMA, fp32 accumulation), DeltaNet
+  /// with the chunk kernels, attention a token at a time. `hidden`
+  /// (optional, tokens.size() x hidden_size) receives every position's final
+  /// normalized hidden state. Long inputs run in chunks of kMaxChunk.
+  [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> hidden, std::string* error);
+  static constexpr std::uint32_t kMaxChunk = 256;
   /// Saves / restores the whole sequence state (recurrent state, conv
   /// history, KV cache, position) in device memory, for prefix forking.
   /// Rewinds to an empty sequence (position 0, zero recurrent state).
@@ -55,6 +62,11 @@ class Qwen35Gpu {
   bool Upload(const model::TensorRef& t, std::string* error);
   rt::Buffer Scratch(std::size_t floats, std::string* error);
   bool MatVec(const model::TensorRef& t, const rt::Buffer& x, const rt::Buffer& y, std::string* error);
+  /// y[T][rows] = x[T][cols] W^T (+ LoRA), for T <= kMaxChunk.
+  bool Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::Buffer& y, std::uint32_t tokens,
+            std::string* error);
+  bool PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> hidden, std::string* error);
+  bool AllocChunk(std::string* error);
   bool Launch(const char* kernel, rt::Dim3 grid, rt::Dim3 block, std::initializer_list<rt::Arg> args,
               std::string* error);
 
@@ -69,6 +81,11 @@ class Qwen35Gpu {
   // Activations.
   rt::Buffer res_, xn_, out_, g_, up_, qkv_, conv_out_, z_, alpha_, beta_, gdn_out_, qg_, q_, gate_, k_, v_, ctx_,
       scores_, logits_, lora_tmp_, lora_out_;
+  // Chunk activations, [kMaxChunk][dim] (allocated on the first Prefill).
+  struct Chunk {
+    rt::Buffer res, xn, out, g, up, qkv, conv, z, alpha, beta, gdn, qg, q, gate, k, v, ctx, lora_tmp, lora_out;
+  } chunk_;
+  bool chunk_ready_ = false;
 };
 
 }  // namespace halo::engine

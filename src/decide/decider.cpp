@@ -142,16 +142,21 @@ std::optional<json::Value> StrandsDecider::Evaluate(const Request& r, std::strin
   if (gpu_) {
     // The GPU model is reused across requests: rewind by restoring an empty
     // state, run the state prefix once, save it, and restore it per question.
+    // Each part is one chunked prefill (P4); the question's hidden states
+    // come back for every position.
     if (!gpu_->Reset(error)) return std::nullopt;
-    for (auto id : fit->state_ids)
-      if (!gpu_->Step(static_cast<std::int32_t>(id), {}, {}, error)) return std::nullopt;
+    const std::vector<std::int32_t> state(fit->state_ids.begin(), fit->state_ids.end());
+    if (!gpu_->Prefill(state, {}, error)) return std::nullopt;
     if (!gpu_->SaveState(error)) return std::nullopt;
+    std::vector<float> rows;
     for (std::size_t q = 0; q < rqs.size(); ++q) {
       if (q > 0 && !gpu_->RestoreState(error)) return std::nullopt;
-      for (auto id : fit->question_ids[q]) {
-        if (!gpu_->Step(static_cast<std::int32_t>(id), h, {}, error)) return std::nullopt;
-        hidden_by_q[q].push_back(h);
-      }
+      const std::vector<std::int32_t> ids(fit->question_ids[q].begin(), fit->question_ids[q].end());
+      rows.resize(ids.size() * c.hidden_size);
+      if (!gpu_->Prefill(ids, rows, error)) return std::nullopt;
+      for (std::size_t i = 0; i < ids.size(); ++i)
+        hidden_by_q[q].emplace_back(rows.begin() + static_cast<std::ptrdiff_t>(i * c.hidden_size),
+                                    rows.begin() + static_cast<std::ptrdiff_t>((i + 1) * c.hidden_size));
     }
   }
 #endif

@@ -2700,3 +2700,124 @@ extern "C" __global__ void __launch_bounds__(128)
 #pragma unroll
   for (std::uint32_t i = 0; i < d; ++i) S[i * d] = s[i];
 }
+
+// ---- P4: prefill GEMMs for BF16 / F32 weights (Qwen3.5 torso) ----------------
+//
+// y[t][r] = sum_c W[r][c] x[t][c], W BF16 [rows][cols], x fp32 [T][cols], on
+// FP16 WMMA: weights are converted to fp16 (exact unless below fp16's range)
+// and activations rounded to fp16 while staging into LDS; products
+// accumulate in fp32. Block tile 128 rows x 64 tokens, 32 x 32 per wave, K
+// staged 32 at a time and double-buffered.
+//   grid (ceil(T / 64), ceil(rows / 128)), block 256; cols % 32 == 0.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_bf16_f16(const std::uint16_t* w, const float* x, float* y, std::uint32_t rows, std::uint32_t cols,
+                       std::uint32_t tokens) {
+  constexpr std::uint32_t BR = 128, BT = 64, BK = 32, RS = BK + 8;  // rows padded against bank conflicts
+  __shared__ __attribute__((aligned(16))) _Float16 As[2][BR * RS];
+  __shared__ __attribute__((aligned(16))) _Float16 Bs[2][BT * RS];
+  const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const std::uint32_t r0 = blockIdx.y * BR, t0 = blockIdx.x * BT;
+  const std::uint32_t nblk = cols / BK;
+  const std::uint32_t wr = wave % 4, wt = wave / 4;
+  // Staging: A 128 rows x 32 bf16 = 256 threads x 16 values; B 64 tokens x 32
+  // floats = 256 threads x 8 values.
+  const std::uint32_t a_row = tid / 2, a_half = tid % 2;
+  const std::uint16_t* a_src = w + static_cast<std::size_t>(min(r0 + a_row, rows - 1)) * cols + a_half * 16;
+  const std::uint32_t b_tok = tid / 4, b_q = tid % 4;
+  const float* b_src = x + static_cast<std::size_t>(min(t0 + b_tok, tokens - 1)) * cols + b_q * 8;
+  typedef _Float16 v8h __attribute__((ext_vector_type(8)));
+  struct Regs {
+    halo_v4i a0, a1;  // 16 bf16
+    float4 b0, b1;
+  };
+  const auto load = [&](std::uint32_t b, Regs& r) {
+    r.a0 = *reinterpret_cast<const halo_v4i*>(a_src + b * BK);
+    r.a1 = *reinterpret_cast<const halo_v4i*>(a_src + b * BK + 8);
+    r.b0 = *reinterpret_cast<const float4*>(b_src + b * BK);
+    r.b1 = *reinterpret_cast<const float4*>(b_src + b * BK + 4);
+  };
+  const auto bf = [](std::uint32_t bits16) { return __uint_as_float(bits16 << 16); };
+  const auto store = [&](const Regs& r, std::uint32_t p) {
+    const std::uint32_t* aw = reinterpret_cast<const std::uint32_t*>(&r.a0);
+    const std::uint32_t* aw1 = reinterpret_cast<const std::uint32_t*>(&r.a1);
+    v8h h0, h1;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      h0[2 * i] = static_cast<_Float16>(bf(aw[i] & 0xFFFFu));
+      h0[2 * i + 1] = static_cast<_Float16>(bf(aw[i] >> 16));
+      h1[2 * i] = static_cast<_Float16>(bf(aw1[i] & 0xFFFFu));
+      h1[2 * i + 1] = static_cast<_Float16>(bf(aw1[i] >> 16));
+    }
+    *reinterpret_cast<v8h*>(&As[p][a_row * RS + a_half * 16]) = h0;
+    *reinterpret_cast<v8h*>(&As[p][a_row * RS + a_half * 16 + 8]) = h1;
+    const v8h bh = {static_cast<_Float16>(r.b0.x), static_cast<_Float16>(r.b0.y), static_cast<_Float16>(r.b0.z),
+                    static_cast<_Float16>(r.b0.w), static_cast<_Float16>(r.b1.x), static_cast<_Float16>(r.b1.y),
+                    static_cast<_Float16>(r.b1.z), static_cast<_Float16>(r.b1.w)};
+    *reinterpret_cast<v8h*>(&Bs[p][b_tok * RS + b_q * 8]) = bh;
+  };
+  halo_v8f acc[2][2] = {};
+  {
+    Regs r;
+    load(0, r);
+    store(r, 0);
+  }
+  __syncthreads();
+  for (std::uint32_t b = 0, p = 0; b < nblk; ++b, p ^= 1) {
+    Regs next;
+    const bool more = b + 1 < nblk;
+    if (more) load(b + 1, next);
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      halo_v16h a[2], bv[2];
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const _Float16* ap = &As[p][(wr * 32 + i * 16 + lane % 16) * RS + h * 16];
+        const _Float16* bp = &Bs[p][(wt * 32 + i * 16 + lane % 16) * RS + h * 16];
+        const v8h a_lo = *reinterpret_cast<const v8h*>(ap), a_hi = *reinterpret_cast<const v8h*>(ap + 8);
+        const v8h b_lo = *reinterpret_cast<const v8h*>(bp), b_hi = *reinterpret_cast<const v8h*>(bp + 8);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          a[i][e] = a_lo[e];
+          a[i][e + 8] = a_hi[e];
+          bv[i][e] = b_lo[e];
+          bv[i][e + 8] = b_hi[e];
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int k = 0; k < 2; ++k) acc[i][k] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], bv[k], acc[i][k]);
+    }
+    if (more) store(next, p ^ 1);
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < 2; ++i)
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+      const std::uint32_t t = t0 + wt * 32 + k * 16 + lane % 16;
+      if (t >= tokens) continue;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint32_t r = r0 + wr * 32 + i * 16 + 2 * j + lane / 16;
+        if (r < rows) y[static_cast<std::size_t>(t) * rows + r] = acc[i][k][j];
+      }
+    }
+}
+
+// y[t][r] = sum_c W[r][c] x[t][c] for F32 W with few rows or columns (LoRA
+// factors, small projections): one thread per output, x row in LDS.
+//   grid (ceil(rows / 256), T), block 256; cols <= 8192
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_f32_rows(const float* w, const float* x, float* y, std::uint32_t rows, std::uint32_t cols) {
+  __shared__ float xs[8192];
+  const std::uint32_t t = blockIdx.y;
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[static_cast<std::size_t>(t) * cols + i];
+  __syncthreads();
+  const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  const float* wr = w + static_cast<std::size_t>(r) * cols;
+  float acc = 0.0f;
+  for (std::uint32_t c = 0; c < cols; ++c) acc += wr[c] * xs[c];
+  y[static_cast<std::size_t>(t) * rows + r] = acc;
+}

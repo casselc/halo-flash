@@ -267,6 +267,213 @@ bool Qwen35Gpu::Step(std::int32_t token, std::span<float> hidden, std::span<floa
   return hidden.empty() && logits.empty() ? dev_.Synchronize(error) : true;
 }
 
+bool Qwen35Gpu::AllocChunk(std::string* error) {
+  if (chunk_ready_) return true;
+  const auto& c = w_.config;
+  const std::size_t T = kMaxChunk, H = c.hidden_size, F = c.ffn, nh = c.num_heads, nkv = c.num_kv_heads,
+                    hd = c.head_dim;
+  std::uint32_t max_rank = 1;
+  for (const auto& [_, l] : lora_) max_rank = std::max(max_rank, l.rank);
+  const std::size_t widest =
+      std::max({H, F, static_cast<std::size_t>(c.ConvChannels()), 2 * nh * hd, std::size_t{c.ssm_num_v_heads}});
+  auto& k = chunk_;
+  for (auto* b : {&k.res, &k.xn, &k.out}) *b = Scratch(T * H, error);
+  k.g = Scratch(T * F, error);
+  k.up = Scratch(T * F, error);
+  k.qkv = Scratch(T * c.ConvChannels(), error);
+  k.conv = Scratch(T * c.ConvChannels(), error);
+  k.z = Scratch(T * c.ValueDim(), error);
+  k.alpha = Scratch(T * c.ssm_num_v_heads, error);
+  k.beta = Scratch(T * c.ssm_num_v_heads, error);
+  k.gdn = Scratch(T * c.ValueDim(), error);
+  k.qg = Scratch(T * 2 * nh * hd, error);
+  k.q = Scratch(T * nh * hd, error);
+  k.gate = Scratch(T * nh * hd, error);
+  k.k = Scratch(T * nkv * hd, error);
+  k.v = Scratch(T * nkv * hd, error);
+  k.ctx = Scratch(T * nh * hd, error);
+  k.lora_tmp = Scratch(T * max_rank, error);
+  k.lora_out = Scratch(T * widest, error);
+  for (const auto* b : {&k.res, &k.xn, &k.out, &k.g, &k.up, &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg,
+                        &k.q, &k.gate, &k.k, &k.v, &k.ctx, &k.lora_tmp, &k.lora_out})
+    if (!*b) return false;
+  chunk_ready_ = true;
+  return true;
+}
+
+bool Qwen35Gpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::Buffer& y, std::uint32_t tokens,
+                     std::string* error) {
+  const auto& d = tensors_.at(t.data);
+  const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
+  if (t.type == core::GgmlType::kBF16 && cols % 32 == 0) {
+    if (!Launch("halo_gemm_bf16_f16", {(tokens + 63) / 64, (rows + 127) / 128}, {256},
+                {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                 rt::Arg::Val(tokens)},
+                error))
+      return false;
+  } else if (t.type == core::GgmlType::kF32 && cols <= 8192) {
+    if (!Launch("halo_gemm_f32_rows", {Blocks(rows), tokens}, {kBlock},
+                {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols)}, error))
+      return false;
+  } else {
+    // Other formats: a token at a time through the decode matvec.
+    if (d.matvec < 0) {
+      if (error) *error = "no GPU matvec for " + std::string(t.name);
+      return false;
+    }
+    for (std::uint32_t i = 0; i < tokens; ++i) {
+      const rt::Arg args[] = {rt::Arg::Buf(d.buf), rt::Arg::Buf(x, std::size_t{i} * cols * 4),
+                              rt::Arg::Buf(y, std::size_t{i} * rows * 4), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                              rt::Arg::Val<std::uint64_t>(t.RowBytes())};
+      if (!dev_.Launch(d.matvec, {Blocks(rows, kBlock / 32)}, {kBlock}, args, error)) return false;
+    }
+  }
+  if (auto it = lora_.find(t.data); it != lora_.end()) {
+    const auto& l = it->second;
+    if (!Launch("halo_gemm_f32_rows", {Blocks(l.rank), tokens}, {kBlock},
+                {rt::Arg::Buf(l.a), rt::Arg::Buf(x), rt::Arg::Buf(chunk_.lora_tmp), rt::Arg::Val(l.rank),
+                 rt::Arg::Val(cols)},
+                error) ||
+        !Launch("halo_gemm_f32_rows", {Blocks(rows), tokens}, {kBlock},
+                {rt::Arg::Buf(l.b), rt::Arg::Buf(chunk_.lora_tmp), rt::Arg::Buf(chunk_.lora_out), rt::Arg::Val(rows),
+                 rt::Arg::Val(l.rank)},
+                error) ||
+        !Launch("halo_axpy", {Blocks(std::size_t{rows} * tokens)}, {kBlock},
+                {rt::Arg::Buf(y), rt::Arg::Buf(chunk_.lora_out), rt::Arg::Val(l.scale), rt::Arg::Val(rows * tokens)},
+                error))
+      return false;
+  }
+  return true;
+}
+
+bool Qwen35Gpu::Prefill(std::span<const std::int32_t> tokens, std::span<float> hidden, std::string* error) {
+  const std::size_t H = w_.config.hidden_size;
+  if (!hidden.empty() && hidden.size() != tokens.size() * H) {
+    if (error) *error = "hidden must hold tokens x hidden_size floats";
+    return false;
+  }
+  for (std::size_t i = 0; i < tokens.size(); i += kMaxChunk) {
+    const std::size_t n = std::min<std::size_t>(kMaxChunk, tokens.size() - i);
+    if (!PrefillChunk(tokens.subspan(i, n), hidden.empty() ? hidden : hidden.subspan(i * H, n * H), error))
+      return false;
+  }
+  return true;
+}
+
+bool Qwen35Gpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> hidden, std::string* error) {
+  const auto& c = w_.config;
+  const auto T = static_cast<std::uint32_t>(tokens.size());
+  if (T == 0) return true;
+  if (position_ + T > max_context_) {
+    if (error) *error = "context is full";
+    return false;
+  }
+  for (auto t : tokens)
+    if (t < 0 || static_cast<std::uint32_t>(t) >= c.vocab_size) {
+      if (error) *error = "token out of range";
+      return false;
+    }
+  if (c.ssm_head_dim != 128 || c.ConvChannels() % 128 != 0) {
+    if (error) *error = "Prefill needs DeltaNet head dim 128";
+    return false;
+  }
+  if (!AllocChunk(error)) return false;
+  auto& K = chunk_;
+  const std::uint32_t H = c.hidden_size, nh = c.num_heads, nkv = c.num_kv_heads, hd = c.head_dim;
+  const auto& emb = tensors_.at(w_.token_embd.data);
+  for (std::uint32_t t = 0; t < T; ++t) {
+    const rt::Arg eargs[] = {rt::Arg::Buf(emb.buf), rt::Arg::Buf(K.res, std::size_t{t} * H * 4),
+                             rt::Arg::Val<std::uint32_t>(static_cast<std::uint32_t>(tokens[t])), rt::Arg::Val(H),
+                             rt::Arg::Val<std::uint64_t>(w_.token_embd.RowBytes())};
+    if (!dev_.Launch(emb.embed, {Blocks(H)}, {kBlock}, eargs, error)) return false;
+  }
+  const auto norm = [&](const rt::Buffer& x, const model::TensorRef& w, const rt::Buffer& y, std::uint32_t nvec,
+                        std::uint32_t d) {
+    return Launch("halo_rmsnorm", {nvec}, {kBlock},
+                  {rt::Arg::Buf(x), rt::Arg::Buf(tensors_.at(w.data).buf), rt::Arg::Buf(y), rt::Arg::Val(d),
+                   rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(0)},
+                  error);
+  };
+  const auto buf = [&](const model::TensorRef& t) { return rt::Arg::Buf(tensors_.at(t.data).buf); };
+  for (std::uint32_t l = 0; l < c.num_layers; ++l) {
+    const auto& L = w_.layers[l];
+    auto& S = layers_[l];
+    if (!norm(K.res, L.attn_norm, K.xn, T, H)) return false;
+    if (L.linear) {
+      const std::uint32_t ch = c.ConvChannels(), kd = c.KeyDim(), vd = c.ValueDim(), nv = c.ssm_num_v_heads;
+      if (!Gemm(L.ssm_qkv, K.xn, K.qkv, T, error) || !Gemm(L.ssm_gate, K.xn, K.z, T, error) ||
+          !Gemm(L.ssm_alpha, K.xn, K.alpha, T, error) || !Gemm(L.ssm_beta, K.xn, K.beta, T, error) ||
+          !Launch("halo_conv_l2norm_prefill", {ch / 128, T}, {128},
+                  {rt::Arg::Buf(K.qkv), rt::Arg::Buf(S.conv), buf(L.ssm_conv1d), rt::Arg::Buf(K.conv), rt::Arg::Val(ch),
+                   rt::Arg::Val(c.ssm_conv_kernel), rt::Arg::Val(2 * kd), rt::Arg::Val(1e-6F)},
+                  error) ||
+          !Launch("halo_conv_state_advance", {Blocks(ch)}, {kBlock},
+                  {rt::Arg::Buf(K.qkv), rt::Arg::Buf(S.conv), rt::Arg::Val(ch), rt::Arg::Val(c.ssm_conv_kernel),
+                   rt::Arg::Val(T)},
+                  error) ||
+          !Launch("halo_gdn_prefill_d128_norm", {nv}, {128},
+                  {rt::Arg::Buf(K.conv), rt::Arg::Buf(K.conv, kd * 4ull), rt::Arg::Buf(K.conv, 2ull * kd * 4),
+                   rt::Arg::Buf(K.alpha), rt::Arg::Buf(K.beta), buf(L.ssm_a), buf(L.ssm_dt), rt::Arg::Buf(S.state),
+                   buf(L.ssm_norm), rt::Arg::Buf(K.z), rt::Arg::Buf(K.gdn), rt::Arg::Val(c.ssm_num_k_heads),
+                   rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(0), rt::Arg::Val(T), rt::Arg::Val(ch),
+                   rt::Arg::Val(ch), rt::Arg::Val(vd)},
+                  error) ||
+          !Gemm(L.ssm_out, K.gdn, K.out, T, error))
+        return false;
+    } else {
+      if (!Gemm(L.attn_q, K.xn, K.qg, T, error) || !Gemm(L.attn_k, K.xn, K.k, T, error) ||
+          !Gemm(L.attn_v, K.xn, K.v, T, error) || !norm(K.k, L.attn_k_norm, K.k, T * nkv, hd))
+        return false;
+      for (std::uint32_t t = 0; t < T; ++t) {
+        const std::uint32_t pos = position_ + t;
+        const std::size_t qo = std::size_t{t} * nh * hd * 4, ko = std::size_t{t} * nkv * hd * 4,
+                          kv_off = std::size_t{pos} * nkv * hd * 4;
+        if (!Launch("halo_split_qgate", {nh}, {kBlock},
+                    {rt::Arg::Buf(K.qg, std::size_t{t} * 2 * nh * hd * 4), rt::Arg::Buf(K.q, qo), rt::Arg::Buf(K.gate, qo),
+                     rt::Arg::Val(hd)},
+                    error) ||
+            !Launch("halo_rmsnorm", {nh}, {kBlock},
+                    {rt::Arg::Buf(K.q, qo), buf(L.attn_q_norm), rt::Arg::Buf(K.q, qo), rt::Arg::Val(hd),
+                     rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(0)},
+                    error) ||
+            !Launch("halo_rope_neox", {nh}, {64},
+                    {rt::Arg::Buf(K.q, qo), rt::Arg::Val(hd), rt::Arg::Val(c.rotary_dim), rt::Arg::Val(pos),
+                     rt::Arg::Val(c.rope_theta)},
+                    error) ||
+            !Launch("halo_rope_neox", {nkv}, {64},
+                    {rt::Arg::Buf(K.k, ko), rt::Arg::Val(hd), rt::Arg::Val(c.rotary_dim), rt::Arg::Val(pos),
+                     rt::Arg::Val(c.rope_theta)},
+                    error) ||
+            !Launch("halo_copy", {Blocks(nkv * hd)}, {kBlock},
+                    {rt::Arg::Buf(S.k, kv_off), rt::Arg::Buf(K.k, ko), rt::Arg::Val(nkv * hd)}, error) ||
+            !Launch("halo_copy", {Blocks(nkv * hd)}, {kBlock},
+                    {rt::Arg::Buf(S.v, kv_off), rt::Arg::Buf(K.v, ko), rt::Arg::Val(nkv * hd)}, error) ||
+            !Launch("halo_attention_decode", {nh}, {kBlock},
+                    {rt::Arg::Buf(K.q, qo), rt::Arg::Buf(S.k), rt::Arg::Buf(S.v), rt::Arg::Buf(K.gate, qo),
+                     rt::Arg::Buf(K.ctx, qo), rt::Arg::Buf(scores_), rt::Arg::Val(nh), rt::Arg::Val(nkv),
+                     rt::Arg::Val(hd), rt::Arg::Val(pos + 1), rt::Arg::Val(max_context_)},
+                    error))
+          return false;
+      }
+      if (!Gemm(L.attn_out, K.ctx, K.out, T, error)) return false;
+    }
+    if (!Launch("halo_add", {Blocks(std::size_t{T} * H)}, {kBlock},
+                {rt::Arg::Buf(K.res), rt::Arg::Buf(K.out), rt::Arg::Val(T * H)}, error) ||
+        !norm(K.res, L.post_attention_norm, K.xn, T, H) || !Gemm(L.ffn_gate, K.xn, K.g, T, error) ||
+        !Gemm(L.ffn_up, K.xn, K.up, T, error) ||
+        !Launch("halo_silu_mul", {Blocks(std::size_t{T} * c.ffn)}, {kBlock},
+                {rt::Arg::Buf(K.g), rt::Arg::Buf(K.up), rt::Arg::Val(T * c.ffn)}, error) ||
+        !Gemm(L.ffn_down, K.g, K.out, T, error) ||
+        !Launch("halo_add", {Blocks(std::size_t{T} * H)}, {kBlock},
+                {rt::Arg::Buf(K.res), rt::Arg::Buf(K.out), rt::Arg::Val(T * H)}, error))
+      return false;
+  }
+  if (!norm(K.res, w_.output_norm, K.xn, T, H)) return false;
+  position_ += T;
+  if (!hidden.empty()) return dev_.Download(K.xn, 0, hidden.data(), hidden.size() * sizeof(float), error);
+  return dev_.Synchronize(error);
+}
+
 bool Qwen35Gpu::Reset(std::string* error) {
   for (auto& s : layers_) {
     if (s.conv && (!dev_.Fill(s.conv, 0, error) || !dev_.Fill(s.state, 0, error))) return false;
