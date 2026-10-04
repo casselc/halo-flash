@@ -78,6 +78,9 @@ class FlashNextGpu {
   /// Repacked Q8_0 projections as int8 WMMA GEMMs (activations quantized per
   /// token and 32 values); off, they run through the decode GEMVs per token.
   static inline bool prefill_int8_gemm_ = true;
+  /// Repacked Q8_0 projections on FP16 WMMA (weights dequantized while
+  /// staging, fp16 activations); takes precedence over prefill_int8_gemm_.
+  static inline bool prefill_f16_gemm_ = true;
   /// Routed experts of a chunk grouped by expert (one GEMM per expert's
   /// tokens) instead of token by token.
   static inline bool prefill_grouped_moe_ = true;
@@ -87,6 +90,13 @@ class FlashNextGpu {
   /// The batched attention on FP16 WMMA tiles with an online softmax (head
   /// dim 256); off, the decode kernel's arithmetic per token.
   static inline bool prefill_wmma_attention_ = true;
+  /// DeltaNet recurrence with each state column over 4 lanes (2 blocks per
+  /// head), its inputs staged and prefetched per 8 tokens, and a separate
+  /// gated norm; exact mode keeps the fused kernel, bit-identical to
+  /// stepping. In the real workload 389 -> ~206 ms per 2048-token prefill
+  /// (A/B on device time); a lone-kernel bench understates this, running at
+  /// ~950 MHz instead of ~2.7 GHz.
+  static inline bool prefill_split_gdn_ = true;
   /// Runs `tokens` in order; `logits` (optional) receives the last position's.
   /// P4: in chunks of prefill_chunk_ tokens, the dense projections as T-token
   /// GEMMs and the rest row-batched or token by token (prefill_chunk.cpp);
@@ -167,7 +177,8 @@ class FlashNextGpu {
     rt::Buffer qkv, conv, z, alpha, beta, gdn, qg, q, gate_a, k, v, ctx, iq, ik;
     rt::Buffer router, ids, wts, eg, eu, ed, sgate;
     rt::Buffer sorted, pos, tiles, ntiles, hp, yp, x16;
-    rt::Buffer pa, pb;  // PLE key and normalized rows  // grouped experts (hp, x16 fp16)
+    rt::Buffer pa, pb;  // PLE key and normalized rows
+    rt::Buffer xh, mh;  // fp16 activations: per GEMM, and the shared `mixed`  // grouped experts (hp, x16 fp16)
     rt::Buffer bscores, vis, ascores;                // batched attention, kAttnSub tokens at a time
     std::size_t params_offset = 0;  // in `host`: per-token step params after the n-gram rows
     std::uint32_t cap = 0;  // tokens the buffers hold
@@ -182,13 +193,18 @@ class FlashNextGpu {
   bool PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error);
   /// y[T][rows] = W x[T][cols]: int8 GEMM for repacked Q8 (x quantized here),
   /// BF16 / F32 GEMMs, else the decode GEMV per token.
+  /// x16: x already converted to fp16 rows (shared by several GEMMs), or null.
   bool Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::Buffer& y, std::uint32_t tokens,
-            std::string* error);
+            std::string* error, const rt::Buffer* x16 = nullptr);
   bool HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_t tokens, std::string* error);
   bool PleChunk(const model::LayerWeights& l, std::uint32_t tokens, std::string* error);
   bool LinearChunk(const model::LayerWeights& l, LinearState& s, std::uint32_t tokens, std::string* error);
   bool AttentionBatched(const model::LayerWeights& l, AttnState& s, std::uint32_t T, std::string* error);
   bool AttentionChunk(const model::LayerWeights& l, AttnState& s, std::uint32_t tokens, std::string* error);
+  bool MixUp(const model::HcMixer& m, std::uint32_t T, std::string* error);
+  bool Half(const rt::Buffer& x, const rt::Buffer& out, std::uint32_t n, std::string* error);
+  bool MixedHalf(std::uint32_t T, std::string* error);
+  const rt::Buffer* MixedH() const;
   bool GroupedMoeFits(const model::LayerWeights& l) const;
   bool GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std::string* error);
   bool SharedExpertChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error);
@@ -209,6 +225,13 @@ class FlashNextGpu {
   rt::Buffer sample_block_out_, sample_candidates_, sample_key_, sample_rid_, sample_w_, sample_out_;
   model::NgramHistory ngram_history_;
   std::unordered_map<const void*, DevTensor> tensors_;
+  // P4: the mixers' up projections with rows index-major (4 i + s), for the
+  // GEMM fused with the stream mix; and whether ck_.mh holds `mixed` in fp16.
+  struct PermutedUp {
+    rt::Buffer qs, d;
+  };
+  std::unordered_map<const void*, PermutedUp> hc_up_perm_;
+  bool mh_valid_ = false;
   rt::FileUploader* loader_ = nullptr;  ///< during Init: weights read from their files
   std::unordered_map<const void*, DevLora> lora_;
   std::unordered_map<std::string, rt::KernelId> kernels_;

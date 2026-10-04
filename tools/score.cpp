@@ -9,6 +9,7 @@
 //
 //   halo_score --model <shard-00001.gguf> --fixtures <dir> [--device hip|hrx|cpu] [--limit N]
 //              [--prefill 1] [--prefill-int8 0|1]   (prompts through the batched prefill)
+//              [--start N]   (skip the first N cases: resume an interrupted run)
 
 #include <chrono>
 #include <cmath>
@@ -63,6 +64,7 @@ int main(int argc, char** argv) {
   int limit = 1 << 30;
   bool eager = true;  // graph replay is the default once instantiation is fast on the real model
   bool prefill = false;
+  int start = 0;  // --start N: skip the manifest's first N cases (resume an interrupted run)
   bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
   setvbuf(stdout, nullptr, _IOLBF, 0);
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -74,6 +76,7 @@ int main(int argc, char** argv) {
     else if (a == "--eager") eager = std::string(argv[i + 1]) == "1";
     else if (a == "--int8-moe") engine::FlashNextGpu::int8_act_moe_ = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill") prefill = std::string(argv[i + 1]) == "1";
+    else if (a == "--start") start = std::atoi(argv[i + 1]);
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill-int8") engine::FlashNextGpu::prefill_int8_gemm_ = std::string(argv[i + 1]) == "1";
     else return std::fprintf(stderr, "unknown option %s\n", a.c_str()), 2;
@@ -126,6 +129,10 @@ int main(int argc, char** argv) {
   const auto t0 = std::chrono::steady_clock::now();
   while (std::getline(manifest, line) && static_cast<int>(cases) < limit) {
     if (line.empty() || line[0] == '#') continue;
+    if (start > 0) {
+      --start;
+      continue;
+    }
     std::stringstream ls(line);
     std::string id, pf, cf, rf;
     std::getline(ls, id, '\t');

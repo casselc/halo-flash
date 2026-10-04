@@ -1,6 +1,7 @@
 #include "engine/flash_next_gpu.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -91,6 +92,15 @@ bool FlashNextGpu::Launch(const char* name, rt::Dim3 grid, rt::Dim3 block, std::
     if (id < 0) return false;
     it = kernels_.emplace(name, id).first;
   }
+  // HALO_PREFILL_SKIP (profiling by ablation): comma-separated kernel names
+  // that are not launched. Results are wrong; wall time shows what the
+  // kernels cost at the clocks and overlap of the real workload, which a
+  // synchronize after every launch (halo_run --profile) does not.
+  static const std::string skip = [] {
+    const char* v = std::getenv("HALO_PREFILL_SKIP");
+    return v ? "," + std::string(v) + "," : std::string();
+  }();
+  if (!skip.empty() && skip.find("," + std::string(name) + ",") != std::string::npos) return true;
   return dev_.Launch(it->second, grid, block, std::span<const rt::Arg>(args.begin(), args.size()), error);
 }
 

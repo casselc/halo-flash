@@ -85,6 +85,8 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   k.yp = f(pairs * H);
   k.x16 = f(T * H / 2 + 1);
   k.pa = f(T * D);
+  k.xh = f(T * max_cols / 2 + 1);
+  k.mh = f(T * H / 2 + 1);
   k.pb = f(T * D);
   const std::size_t sub = std::min<std::size_t>(T, kAttnSub);
   k.bscores = f(sub * (max_context_ / c.compress_ratio + 1));
@@ -97,19 +99,64 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   for (const auto* b : {&k.res, &k.xn, &k.lo, &k.gate, &k.mixed, &k.inject, &k.block_out, &k.embd, &k.xq, &k.xd,
                         &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg, &k.q, &k.gate_a, &k.k, &k.v, &k.ctx,
                         &k.iq, &k.ik, &k.router, &k.ids, &k.wts, &k.eg, &k.eu, &k.ed, &k.sgate, &k.host,
-                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16, &k.pa, &k.pb,
+                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16, &k.pa, &k.pb, &k.xh, &k.mh,
                         &k.bscores, &k.vis, &k.ascores})
     if (!*b) return false;
+  // Index-major copies of the mixers' up projections (fused GEMM + mix).
+  if (c.hc_count == 4)
+    for (const auto& l : w_.layers)
+      for (const auto* m : {&l.hc_attn, &l.hc_ffn}) {
+        const auto& t = m->up;
+        const auto& dt = tensors_.at(t.data);
+        if (!dt.qs || t.rows != std::uint64_t{4} * H || t.cols % 64 != 0 || hc_up_perm_.contains(t.data)) continue;
+        const auto rows = static_cast<std::uint32_t>(t.rows), nblk = static_cast<std::uint32_t>(t.cols / 32);
+        PermutedUp p{dev_.Alloc(std::size_t{rows} * dt.qstride, error), dev_.Alloc(std::size_t{rows} * nblk * 2, error)};
+        if (!p.qs || !p.d) return false;
+        owned_.push_back(p.qs);
+        owned_.push_back(p.d);
+        if (!Launch("halo_permute_hc_rows", {rows}, {64},
+                    {rt::Arg::Buf(dt.qs), rt::Arg::Buf(dt.d), rt::Arg::Buf(p.qs), rt::Arg::Buf(p.d),
+                     rt::Arg::Val(static_cast<std::uint32_t>(H)), rt::Arg::Val(dt.qstride), rt::Arg::Val(nblk)},
+                    error))
+          return false;
+        hc_up_perm_.emplace(t.data, p);
+      }
+  if (!dev_.Synchronize(error)) return false;
   k.cap = static_cast<std::uint32_t>(T);
   ck_ready_ = true;
   return true;
 }
 
+// `mixed` in fp16 for the GEMMs that share it (only when the FP16 route runs).
+bool FlashNextGpu::MixedHalf(std::uint32_t T, std::string* error) {
+  return !prefill_f16_gemm_ || prefill_exact_projections_ || mh_valid_ ||
+         Half(ck_.mixed, ck_.mh, T * w_.config.hidden_size, error);
+}
+const rt::Buffer* FlashNextGpu::MixedH() const {
+  return prefill_f16_gemm_ && !prefill_exact_projections_ ? &ck_.mh : nullptr;
+}
+
+bool FlashNextGpu::Half(const rt::Buffer& x, const rt::Buffer& out, std::uint32_t n, std::string* error) {
+  return Launch("halo_f16_rows", {Blocks(n)}, {kBlock}, {rt::Arg::Buf(x), rt::Arg::Buf(out), rt::Arg::Val(n)}, error);
+}
+
 bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::Buffer& y, std::uint32_t T,
-                        std::string* error) {
+                        std::string* error, const rt::Buffer* x16) {
   const auto& d = tensors_.at(t.data);
   const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
   const bool per_token = prefill_exact_projections_ || lora_.contains(t.data);
+  // Tile by shape: all rows in one block for <= 320 rows with long K (the
+  // activations dominate), 64-row tiles up to 512, 256-row tiles beyond.
+  const bool tall = rows <= 320 && cols >= 4096, small = !tall && rows <= 512;
+  const std::uint32_t bm = tall ? 320 : small ? 64 : 256, bn = tall ? 64 : 128;
+  if (!per_token && prefill_f16_gemm_ && d.qs && cols % (small ? 128 : 64) == 0 && d.qstride % 16 == 0) {
+    if (!x16 && !Half(x, ck_.xh, T * cols, error)) return false;
+    return Launch(tall ? "halo_gemm_q8r_f16_m" : small ? "halo_gemm_q8r_f16_s" : "halo_gemm_q8r_f16_l",
+                  {(T + bn - 1) / bn, (rows + bm - 1) / bm}, {256},
+                  {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(x16 ? *x16 : ck_.xh), rt::Arg::Buf(y),
+                   rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride), rt::Arg::Val(T)},
+                  error);
+  }
   if (!per_token && prefill_int8_gemm_ && d.qs && cols % 32 == 0 && d.qstride % 16 == 0) {
     return Launch("halo_quantize_q8_rows", {T}, {256},
                   {rt::Arg::Buf(x), rt::Arg::Buf(ck_.xq), rt::Arg::Buf(ck_.xd), rt::Arg::Val(cols)}, error) &&
@@ -148,12 +195,32 @@ bool FlashNextGpu::HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_
          Launch("halo_scale_silu", {Blocks(std::size_t{T} * low)}, {kBlock},
                 {rt::Arg::Buf(ck_.lo), rt::Arg::Val(1.0F / static_cast<float>(c.hc_count)), rt::Arg::Val(T * low)},
                 error) &&
-         Gemm(m.up, ck_.lo, ck_.gate, T, error) &&
+         MixUp(m, T, error) && (!inject || Gemm(m.inject, ck_.xn, ck_.inject, T, error));
+}
+
+// gate = up(lo), mixed = sum_s xn * sigmoid(gate) / hc: one fused GEMM on the
+// FP16 route (also leaving `mixed` in fp16 for the GEMMs that read it),
+// otherwise the GEMM and the row kernel.
+bool FlashNextGpu::MixUp(const model::HcMixer& m, std::uint32_t T, std::string* error) {
+  const auto& c = w_.config;
+  const std::uint32_t H = c.hidden_size, low = c.hc_low_rank;
+  const auto it = hc_up_perm_.find(m.up.data);
+  mh_valid_ = prefill_f16_gemm_ && !prefill_exact_projections_ && it != hc_up_perm_.end() && !lora_.contains(m.up.data);
+  if (mh_valid_) {
+    const auto& dt = tensors_.at(m.up.data);
+    const auto rows = static_cast<std::uint32_t>(m.up.rows);
+    return Half(ck_.lo, ck_.xh, T * low, error) &&
+           Launch("halo_gemm_q8r_f16_mix", {(T + 127) / 128, (rows + 255) / 256}, {256},
+                  {rt::Arg::Buf(it->second.qs), rt::Arg::Buf(it->second.d), rt::Arg::Buf(ck_.xh), rt::Arg::Buf(ck_.mixed),
+                   rt::Arg::Val(rows), rt::Arg::Val(low), rt::Arg::Val(dt.qstride), rt::Arg::Val(T),
+                   rt::Arg::Buf(ck_.xn), rt::Arg::Buf(ck_.mh)},
+                  error);
+  }
+  return Gemm(m.up, ck_.lo, ck_.gate, T, error) &&
          Launch("halo_hc_mix_rows", {Blocks(std::size_t{T} * H)}, {kBlock},
                 {rt::Arg::Buf(ck_.xn), rt::Arg::Buf(ck_.gate), rt::Arg::Buf(ck_.mixed), rt::Arg::Val(c.hc_count),
                  rt::Arg::Val(H), rt::Arg::Val(T)},
-                error) &&
-         (!inject || Gemm(m.inject, ck_.xn, ck_.inject, T, error));
+                error);
 }
 
 bool FlashNextGpu::PleChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error) {
@@ -189,7 +256,8 @@ bool FlashNextGpu::PleChunk(const model::LayerWeights& l, std::uint32_t T, std::
 bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std::uint32_t T, std::string* error) {
   const auto& c = w_.config;
   const std::uint32_t ch = c.SsmConvChannels(), kd = c.SsmKeyDim(), vd = c.SsmValueDim();
-  return Gemm(l.ssm_qkv, ck_.mixed, ck_.qkv, T, error) && Gemm(l.ssm_gate, ck_.mixed, ck_.z, T, error) &&
+  return MixedHalf(T, error) && Gemm(l.ssm_qkv, ck_.mixed, ck_.qkv, T, error, MixedH()) &&
+         Gemm(l.ssm_gate, ck_.mixed, ck_.z, T, error, MixedH()) &&
          Gemm(l.ssm_alpha, ck_.mixed, ck_.alpha, T, error) && Gemm(l.ssm_beta, ck_.mixed, ck_.beta, T, error) &&
          Launch("halo_conv_l2norm_prefill", {ch / 128, T}, {128},
                 {rt::Arg::Buf(ck_.qkv), rt::Arg::Buf(s.conv), rt::Arg::Buf(tensors_.at(l.ssm_conv1d.data).buf),
@@ -200,14 +268,26 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
                 {rt::Arg::Buf(ck_.qkv), rt::Arg::Buf(s.conv), rt::Arg::Val(ch), rt::Arg::Val(c.ssm_conv_kernel),
                  rt::Arg::Val(T)},
                 error) &&
-         Launch("halo_gdn_prefill_d128_norm", {c.ssm_num_v_heads}, {128},
+         (prefill_split_gdn_ && !prefill_exact_projections_
+              ? Launch("halo_gdn_prefill_split", {2, c.ssm_num_v_heads}, {256},
+                       {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull), rt::Arg::Buf(ck_.conv, 2ull * kd * 4),
+                        rt::Arg::Buf(ck_.alpha), rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
+                        rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(s.state), rt::Arg::Buf(ck_.gdn),
+                        rt::Arg::Val(c.ssm_num_k_heads), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch),
+                        rt::Arg::Val(vd)},
+                       error) &&
+                    Launch("halo_gated_norm", {T * c.ssm_num_v_heads}, {128},
+                           {rt::Arg::Buf(ck_.gdn), rt::Arg::Buf(tensors_.at(l.ssm_norm.data).buf), rt::Arg::Buf(ck_.z),
+                            rt::Arg::Val(c.ssm_head_dim), rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(1)},
+                           error)
+              : Launch("halo_gdn_prefill_d128_norm", {c.ssm_num_v_heads}, {128},
                 {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull), rt::Arg::Buf(ck_.conv, 2ull * kd * 4),
                  rt::Arg::Buf(ck_.alpha), rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
                  rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(s.state),
                  rt::Arg::Buf(tensors_.at(l.ssm_norm.data).buf), rt::Arg::Buf(ck_.z), rt::Arg::Buf(ck_.gdn),
                  rt::Arg::Val(c.ssm_num_k_heads), rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(1),
                  rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)},
-                error) &&
+                error)) &&
          Gemm(l.ssm_out, ck_.gdn, ck_.block_out, T, error);
 }
 
@@ -223,8 +303,8 @@ bool FlashNextGpu::AttentionChunk(const model::LayerWeights& l, AttnState& s, st
                    rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(0)},
                   error);
   };
-  if (!Gemm(l.attn_q, ck_.mixed, ck_.qg, T, error) || !Gemm(l.attn_k, ck_.mixed, ck_.k, T, error) ||
-      !Gemm(l.attn_v, ck_.mixed, ck_.v, T, error) || !Gemm(l.indexer_q, ck_.mixed, ck_.iq, T, error) ||
+  if (!MixedHalf(T, error) || !Gemm(l.attn_q, ck_.mixed, ck_.qg, T, error, MixedH()) ||
+      !Gemm(l.attn_k, ck_.mixed, ck_.k, T, error, MixedH()) || !Gemm(l.attn_v, ck_.mixed, ck_.v, T, error, MixedH()) || !Gemm(l.indexer_q, ck_.mixed, ck_.iq, T, error) ||
       !Gemm(l.indexer_k, ck_.mixed, ck_.ik, T, error) ||
       !Launch("halo_split_qgate", {T * nh}, {kBlock},
               {rt::Arg::Buf(ck_.qg), rt::Arg::Buf(ck_.q), rt::Arg::Buf(ck_.gate_a), rt::Arg::Val(hd)}, error) ||
@@ -501,7 +581,8 @@ bool FlashNextGpu::SharedExpertChunk(const model::LayerWeights& l, std::uint32_t
   const auto& c = w_.config;
   const std::uint32_t H = c.hidden_size;
   const std::uint32_t sff = c.shared_expert_ff;
-  return Gemm(l.shexp_gate, ck_.mixed, ck_.eg, T, error) && Gemm(l.shexp_up, ck_.mixed, ck_.eu, T, error) &&
+  return MixedHalf(T, error) && Gemm(l.shexp_gate, ck_.mixed, ck_.eg, T, error, MixedH()) &&
+         Gemm(l.shexp_up, ck_.mixed, ck_.eu, T, error, MixedH()) &&
          Launch("halo_silu_mul", {Blocks(std::size_t{T} * sff)}, {kBlock},
                 {rt::Arg::Buf(ck_.eg), rt::Arg::Buf(ck_.eu), rt::Arg::Val(T * sff)}, error) &&
          Gemm(l.shexp_down, ck_.eg, ck_.ed, T, error) && Gemm(l.shexp_gate_inp, ck_.mixed, ck_.sgate, T, error) &&

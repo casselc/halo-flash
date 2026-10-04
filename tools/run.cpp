@@ -141,6 +141,7 @@ int main(int argc, char** argv) {
     else if (a == "--int8-moe") engine::FlashNextGpu::int8_act_moe_ = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill-bench") prefill_bench = std::atoi(argv[i + 1]);
     else if (a == "--prefill-file") prefill_file = argv[i + 1];
+    else if (a == "--split-gdn") engine::FlashNextGpu::prefill_split_gdn_ = std::string(argv[i + 1]) == "1";
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill-warm") prefill_warm = argv[i + 1];
     else if (a == "--reps") reps = std::max(1, std::atoi(argv[i + 1]));

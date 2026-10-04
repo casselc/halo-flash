@@ -129,6 +129,21 @@ it after the engine changes nothing).
 | direct n-gram reads | 567 |
 | resident n-gram table | 600 |
 
+### Prefill on gufo's protocol, resident n-gram table (P4, 2026-10-04, idle)
+
+Each step's prediction was written down before measuring.
+
+| Change | Predicted | Measured |
+|---|---|---|
+| (start) | | 600 tok/s, device 3.41 s |
+| FP16-route dense GEMMs (Q8_0 dequantized while staging, 3 tile shapes), fused mixer up + mix, lane-split DeltaNet (first version) | 750-770 | 706 |
+| DeltaNet split: inputs staged per 8 tokens, next stage prefetched; on by default | ~760 | **739** |
+
+How each was decided (the measurement that misled first, then the one that decided):
+- DeltaNet: a lone-kernel bench said 1.02-1.4x; it runs at ~950 MHz while the real workload holds ~2.7 GHz. An in-engine A/B of device time decided it: fused 2,954 ms, split 2,771 ms (the recurrence 389 -> ~206 ms). Register usage: the fused prefill kernel uses 256 VGPRs with 29 spills; the decode step kernel 256 with 153 spills (a decode lead).
+- Dense GEMMs, per shape at T = 2048 (idle `halo_gemm_bench model`): FP16 route 25-30 TFLOPS on the large shapes against int8's 13-19 TOPS; the mixer's 320 x 10240 down projection 0.76 ms with all 320 rows in one tile (activations read once) against 1.85 ms in 64-row tiles. Best of the two routes per shape: 595 ms per prefill against int8's 1,026.
+- Ablation (`HALO_PREFILL_SKIP`, device time with the kernels not launched): routed experts 604 ms, DeltaNet (fused) 389, attention 238, large dense GEMM tiles 194 (the synchronizing profiler said 443).
+
 gufo is at 1599. The dense int8 GEMMs (about 13.5 TFLOP per 2048 tokens)
 run near 13 TOPS and the grouped experts near 5-7 TFLOPS; both have to
 roughly double for parity.

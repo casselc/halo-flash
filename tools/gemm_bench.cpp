@@ -95,8 +95,27 @@ int main(int argc, char** argv) {
                              rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)};
         (void)d->Launch(kgp, {nv}, {hd}, g, &e);
       });
-      std::printf("deltanet T %5u: %8.1f us as steps, %8.1f us chunked (%.1fx), %.1f us per token chunked\n", T,
-                  steps * 1e6, chunk * 1e6, steps / chunk, chunk * 1e6 / T);
+      // The recurrence alone, fused (bit-identical) and lane-split (+ gated norm).
+      const auto ksp = d->Kernel("halo_gdn_prefill_split", &e), kn = d->Kernel("halo_gated_norm", &e);
+      const double fused = time([&] {
+        const rt::Arg g[] = {rt::Arg::Buf(conv), rt::Arg::Buf(conv, kd * 4ull), rt::Arg::Buf(conv, 2ull * kd * 4), rt::Arg::Buf(ab),
+                             rt::Arg::Buf(ab), rt::Arg::Buf(hv), rt::Arg::Buf(hv), rt::Arg::Buf(st), rt::Arg::Buf(nw), rt::Arg::Buf(z),
+                             rt::Arg::Buf(out), rt::Arg::Val(nk), rt::Arg::Val(1e-6f), rt::Arg::Val(0u), rt::Arg::Val(T),
+                             rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)};
+        (void)d->Launch(kgp, {nv}, {hd}, g, &e);
+      });
+      const double split = time([&] {
+        const rt::Arg g[] = {rt::Arg::Buf(conv), rt::Arg::Buf(conv, kd * 4ull), rt::Arg::Buf(conv, 2ull * kd * 4), rt::Arg::Buf(ab),
+                             rt::Arg::Buf(ab), rt::Arg::Buf(hv), rt::Arg::Buf(hv), rt::Arg::Buf(st), rt::Arg::Buf(out),
+                             rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)};
+        (void)d->Launch(ksp, {2, nv}, {256}, g, &e);
+        const rt::Arg n[] = {rt::Arg::Buf(out), rt::Arg::Buf(nw), rt::Arg::Buf(z), rt::Arg::Val(hd), rt::Arg::Val(1e-6f),
+                             rt::Arg::Val(0u)};
+        (void)d->Launch(kn, {T * nv}, {hd}, n, &e);
+      });
+      std::printf("deltanet T %5u: %8.1f us as steps, %8.1f us chunked (%.1fx), %.1f us per token chunked; "
+                  "recurrence fused %8.1f us, lane-split %8.1f us (%.2fx)\n",
+                  T, steps * 1e6, chunk * 1e6, steps / chunk, chunk * 1e6 / T, fused * 1e6, split * 1e6, fused / split);
       for (auto* b : {&in, &cs, &cw, &conv, &ab, &st, &nw, &z, &out, &hv}) d->Free(*b);
     }
     return 0;
@@ -162,7 +181,7 @@ int main(int argc, char** argv) {
         Shape{"attn kv   512x2560", 512, 2560, 24},   Shape{"hc down   320x10240", 320, 10240, 96},
         Shape{"hc up   10240x320", 10240, 320, 96},   Shape{"shexp gu  640x2560", 640, 2560, 96},
         Shape{"shexp dn 2560x640", 2560, 640, 48}};
-    double total = 0;
+    double total = 0, total_f16 = 0;
     if (model && be != rt::Backend::kHip) break;
     for (const Shape s : model ? all : base) {
       std::vector<std::uint8_t> raw(std::size_t{s.rows} * (s.cols / 32) * 34);
@@ -200,9 +219,32 @@ int main(int argc, char** argv) {
         (void)d->Synchronize(&e);
         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / reps;
         if (model) {
+          // The FP16 route: fp16 activations (converted once), weights
+          // dequantized while staging.
+          auto xh = d->Alloc(x.size() * 2, &e);
+          const auto kh = d->Kernel("halo_f16_rows", &e);
+          const rt::Arg ha[] = {rt::Arg::Buf(xb), rt::Arg::Buf(xh), rt::Arg::Val(static_cast<std::uint32_t>(x.size()))};
+          (void)d->Launch(kh, {static_cast<std::uint32_t>((x.size() + 255) / 256)}, {256}, ha, &e);
+          const bool tall = s.rows <= 320 && s.cols >= 4096, small = !tall && s.rows <= 512;
+          const std::uint32_t bm = tall ? 320 : small ? 64 : 256, bn = tall ? 64 : 128;
+          const auto kf = d->Kernel(tall ? "halo_gemm_q8r_f16_m" : small ? "halo_gemm_q8r_f16_s" : "halo_gemm_q8r_f16_l", &e);
+          const rt::Arg fa[] = {rt::Arg::Buf(qs), rt::Arg::Buf(dd), rt::Arg::Buf(xh), rt::Arg::Buf(yb),
+                                rt::Arg::Val(s.rows), rt::Arg::Val(s.cols), rt::Arg::Val(s.cols), rt::Arg::Val(T)};
+          const auto runf = [&] {
+            (void)d->Launch(kf, {(T + bn - 1) / bn, (s.rows + bm - 1) / bm}, {256}, fa, &e);
+          };
+          for (int i = 0; i < 3; ++i) runf();
+          (void)d->Synchronize(&e);
+          const auto t1 = std::chrono::steady_clock::now();
+          for (int i = 0; i < reps; ++i) runf();
+          (void)d->Synchronize(&e);
+          const double secf = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count() / reps;
+          d->Free(xh);
           total += sec * s.count;
-          std::printf("%-20s %9.1f us  %6.2f TOPS  x %3u = %7.1f ms\n", s.name, sec * 1e6,
-                      2.0 * s.rows * s.cols * T / sec / 1e12, s.count, 1e3 * sec * s.count);
+          total_f16 += std::min(sec, secf) * s.count;
+          std::printf("%-20s int8 %8.1f us %6.2f TOPS | fp16 %8.1f us %6.2f TFLOPS | x %3u = %6.1f / %6.1f ms\n", s.name,
+                      sec * 1e6, 2.0 * s.rows * s.cols * T / sec / 1e12, secf * 1e6,
+                      2.0 * s.rows * s.cols * T / secf / 1e12, s.count, 1e3 * sec * s.count, 1e3 * secf * s.count);
         } else {
           std::printf("%s %-20s T %5u  %9.1f us  %6.2f TOPS  %9.0f tok/s\n", rt::BackendName(be), s.name, T, sec * 1e6,
                       2.0 * s.rows * s.cols * T / sec / 1e12, T / sec);
@@ -211,6 +253,8 @@ int main(int argc, char** argv) {
       }
       for (auto* b : {&rb, &qs, &dd}) d->Free(*b);
     }
-    if (model) std::printf("total per 2048-token prefill: %.1f ms\n", 1e3 * total);
+    if (model)
+      std::printf("total per 2048-token prefill: int8 %.1f ms, best of int8/fp16 per shape %.1f ms\n", 1e3 * total,
+                  1e3 * total_f16);
   }
 }
