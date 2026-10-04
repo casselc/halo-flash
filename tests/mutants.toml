@@ -816,3 +816,24 @@ binary = "gpu_tests"
 filter = "GpuQuant.FusedMoeMatchesCpuComposition"
 why = "each slot's down projection reads its own hidden activations"
 timeout = 1200
+
+[[mutant]]
+name = "p3-rowblock-ignores-x"
+file = "src/kernels/core.hip"
+find = '  for (std::uint32_t c = threadIdx.x; c < cols; c += blockDim.x) acc += row[c] * x[c];'
+replace = '  for (std::uint32_t c = threadIdx.x; c < cols; c += blockDim.x) acc += row[c];'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "small-row F32 matvecs (router, alpha/beta, inject) multiply by x"
+
+[[mutant]]
+name = "p3-gdn-transposed-index"
+file = "src/kernels/core.hip"
+find = '  float* S = state + static_cast<std::size_t>(h) * d * d + j;'
+replace = '  float* S = state + static_cast<std::size_t>(h) * d * d + j * d;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "the key-major state layout is indexed S[i * d + j]"
+timeout = 1200

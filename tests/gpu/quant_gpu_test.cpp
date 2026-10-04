@@ -132,7 +132,7 @@ TEST(GpuQuant, RepackedQ8GemvMatchesCpuDequant) {
     if (!dev) continue;
     ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
     hegel::test([&](hegel::TestCase& tc) {
-      const std::size_t cols = 32 * tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 256}));
+      const std::size_t cols = 32 * tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 384}));
       const std::size_t rows = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 40}));
       const std::size_t experts = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 3}));
       const std::size_t row_bytes = cols / 32 * 34;
@@ -169,7 +169,7 @@ TEST(GpuQuant, RepackedQ8GemvMatchesCpuDequant) {
                             rt::Arg::Val(static_cast<std::uint32_t>(experts * rows)),
                             rt::Arg::Val(static_cast<std::uint32_t>(cols)), rt::Arg::Val(qstride)};
       ASSERT_TRUE(dev->Launch(dev->Kernel("halo_repack_q8_0", &error), {64}, {256}, ra, &error)) << error;
-      const bool as_expert = tc.draw(gs::booleans());
+      const bool as_expert = cols <= 8192 && tc.draw(gs::booleans());  // expert kernels hold 8192 columns
       const auto R = static_cast<std::uint32_t>(rows), C = static_cast<std::uint32_t>(cols);
       if (as_expert) {
         const rt::Arg a[] = {rt::Arg::Buf(qs), rt::Arg::Buf(d), rt::Arg::Buf(ib), rt::Arg::Buf(xb), rt::Arg::Buf(yb),
@@ -179,7 +179,9 @@ TEST(GpuQuant, RepackedQ8GemvMatchesCpuDequant) {
         const rt::Arg a[] = {rt::Arg::Buf(qs, std::size_t{pick} * rows * qstride),
                              rt::Arg::Buf(d, std::size_t{pick} * rows * (cols / 32) * 2), rt::Arg::Buf(xb),
                              rt::Arg::Buf(yb), rt::Arg::Val(R), rt::Arg::Val(C), rt::Arg::Val(qstride)};
-        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemv_q8r", &error), {(R + 7) / 8}, {256}, a, &error)) << error;
+        ASSERT_TRUE(dev->Launch(dev->Kernel(cols > 8192 ? "halo_gemv_q8r_wide" : "halo_gemv_q8r", &error), {(R + 7) / 8},
+                                {256}, a, &error))
+            << error;
       }
       std::vector<float> got(rows);
       ASSERT_TRUE(dev->Download(yb, 0, got.data(), rows * 4, &error)) << error;

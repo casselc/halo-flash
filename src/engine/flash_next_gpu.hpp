@@ -59,6 +59,7 @@ class FlashNextGpu {
   static inline bool repack_q8_ = true;
   static inline bool block_gemv_ = true;  ///< P3 Q4_K / Q5_1 GEMVs
   static inline bool fused_moe_ = true;   ///< P3 routed experts in three launches
+  static inline bool small_row_kernels_ = true;  ///< P3 block-per-row F32 matvec for few rows
   /// Runs `tokens` in order; `logits` (optional) receives the last position's.
   /// Token at a time for now (P4 batches it); any chunking is equivalent.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error);

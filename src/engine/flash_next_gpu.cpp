@@ -104,10 +104,14 @@ bool FlashNextGpu::MatVec(const model::TensorRef& t, std::uint64_t expert, const
   const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
   if (d.qs) {
     const std::size_t e = expert;
-    if (!Launch("halo_gemv_q8r", {Blocks(rows, 8)}, {256},
+    if (!Launch(cols > 8192 ? "halo_gemv_q8r_wide" : "halo_gemv_q8r", {Blocks(rows, 8)}, {256},
                 {rt::Arg::Buf(d.qs, e * rows * d.qstride), rt::Arg::Buf(d.d, e * rows * (cols / 32) * 2),
                  rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride)},
                 error))
+      return false;
+  } else if (t.type == core::GgmlType::kF32 && rows <= 1024 && expert == 0 && small_row_kernels_) {
+    if (!Launch("halo_matvec_f32_rowblock", {rows}, {256},
+                {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols)}, error))
       return false;
   } else {
     const rt::Arg args[] = {rt::Arg::Buf(d.buf, expert * t.RowBytes() * t.rows), rt::Arg::Buf(x), rt::Arg::Buf(y),
@@ -282,7 +286,9 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
 }
 
 bool FlashNextGpu::RepackQ8(const model::TensorRef& t, DevTensor& d, std::string* error) {
-  if (t.type != core::GgmlType::kQ8_0 || d.qs || t.cols % 32 != 0 || t.cols > 8192) return true;
+  // Expert kernels hold x for up to 8192 columns; dense ones up to 12288.
+  if (t.type != core::GgmlType::kQ8_0 || d.qs || t.cols % 32 != 0 || t.cols > (t.experts > 1 ? 8192u : 12288u))
+    return true;
   const std::uint64_t rows = t.rows * t.experts;
   const auto cols = static_cast<std::uint32_t>(t.cols);
   d.qstride = (cols + 15) / 16 * 16;

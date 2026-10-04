@@ -307,27 +307,38 @@ extern "C" __global__ void halo_conv_step(const float* in, float* state, const f
 }
 
 // One Gated DeltaNet decode step. One block per value head, one thread per
-// state row j (blockDim == d). State S[h][j][i]: j over value dim, i over key.
+// value index j (blockDim == d). The state is stored key-major,
+// S[h][i][j] (i over key, j over value), so at every step of the loops the
+// threads of a wave touch consecutive addresses. (Row-major S[h][j][i] made
+// each thread walk its own row: 512-byte strides across lanes.)
 extern "C" __global__ void halo_gdn_step(const float* q, const float* k, const float* v, const float* alpha,
                                          const float* beta, const float* a, const float* dt, float* state, float* out,
                                          std::uint32_t num_k_heads, std::uint32_t d) {
+  __shared__ float ks[256], qs[256];
   const std::uint32_t h = blockIdx.x, j = threadIdx.x;
-  if (j >= d) return;
   const float* qh = q + (h % num_k_heads) * d;
   const float* kh = k + (h % num_k_heads) * d;
+  for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) {
+    ks[i] = kh[i];
+    qs[i] = qh[i];
+  }
+  __syncthreads();
+  if (j >= d) return;
   const float decay = expf(a[h] * Softplus(alpha[h] + dt[h]));
   const float b = Sigmoid(beta[h]);
-  float* row = state + (static_cast<std::size_t>(h) * d + j) * d;
+  float* S = state + static_cast<std::size_t>(h) * d * d + j;
   float u = 0.0f;
   for (std::uint32_t i = 0; i < d; ++i) {
-    row[i] *= decay;
-    u += row[i] * kh[i];
+    const float s = S[i * d] * decay;
+    S[i * d] = s;
+    u += s * ks[i];
   }
   const float delta = (v[h * d + j] - u) * b;
   float o = 0.0f;
   for (std::uint32_t i = 0; i < d; ++i) {
-    row[i] += delta * kh[i];
-    o += row[i] * qh[i];
+    const float s = S[i * d] + delta * ks[i];
+    S[i * d] = s;
+    o += s * qs[i];
   }
   out[h * d + j] = o / sqrtf(static_cast<float>(d));
 }
@@ -1414,10 +1425,10 @@ constexpr std::uint32_t kGemvMaxCols = 8192;
 // One wave per row; the block's x lives in LDS (cols <= kGemvMaxCols). Each lane
 // loads 16 int8 at a time (half a Q8_0 block), so a wave covers 512 columns
 // per iteration.
-template <int kRowsPerBlock>
+template <int kRowsPerBlock, std::uint32_t kMaxCols = kGemvMaxCols>
 __device__ void GemvQ8r(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y, std::uint32_t rows,
                         std::uint32_t cols, std::uint32_t qstride) {
-  __shared__ float xs[kGemvMaxCols];
+  __shared__ float xs[kMaxCols];
   for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
   __syncthreads();
   const std::uint32_t r = blockIdx.x * kRowsPerBlock + threadIdx.x / kWarp;
@@ -1446,6 +1457,30 @@ extern "C" __global__ void __launch_bounds__(256)
     halo_gemv_q8r(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y, std::uint32_t rows,
                   std::uint32_t cols, std::uint32_t qstride) {
   GemvQ8r<8>(qs, d, x, y, rows, cols, qstride);
+}
+
+// Inputs wider than kGemvMaxCols (the hyper-connection down projections read
+// all hc streams: 4 x 2560 = 10240 columns). A separate kernel, so the
+// common case keeps its smaller LDS footprint and occupancy.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_wide(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y, std::uint32_t rows,
+                       std::uint32_t cols, std::uint32_t qstride) {
+  GemvQ8r<8, 12288>(qs, d, x, y, rows, cols, qstride);
+}
+
+// Few output rows over long inputs (router 512, DeltaNet alpha/beta 48,
+// hyper-connection inject 4): one 256-thread block per row instead of one
+// wave, so the launch has enough blocks to fill the GPU.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_matvec_f32_rowblock(const float* w, const float* x, float* y, std::uint32_t rows, std::uint32_t cols) {
+  __shared__ float scratch[32];
+  const std::uint32_t r = blockIdx.x;
+  if (r >= rows) return;
+  const float* row = w + static_cast<std::size_t>(r) * cols;
+  float acc = 0.0f;
+  for (std::uint32_t c = threadIdx.x; c < cols; c += blockDim.x) acc += row[c] * x[c];
+  acc = BlockSum(acc, scratch);
+  if (threadIdx.x == 0) y[r] = acc;
 }
 
 // Stacked experts: matrix ids[slot] of a [experts][rows][cols] repacked tensor.
