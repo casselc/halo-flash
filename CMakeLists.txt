@@ -166,6 +166,8 @@ if(HALO_BUILD_TESTS)
     target_link_libraries(halo_run PRIVATE halo_gpu halo_text)
     add_executable(halo_score tools/score.cpp)
     target_link_libraries(halo_score PRIVATE halo_gpu halo_text)
+    add_executable(halo_graph_bench tools/graph_bench.cpp)
+    target_link_libraries(halo_graph_bench PRIVATE halo_gpu)
   endif()
   halo_test(model_tests
     tests/model/reference_hf_test.cpp

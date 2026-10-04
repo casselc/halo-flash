@@ -1383,3 +1383,178 @@ extern "C" __global__ void __launch_bounds__(1024)
     *out = {bi, kept, next_rng};
   }
 }
+
+// ---- P3: bandwidth-oriented GEMV, Q8_0 repacked ------------------------------
+//
+// Q8_0 stores 34-byte blocks (fp16 scale + 32 int8), so rows are not even
+// 2-byte aligned and the P2 kernel decodes one element per load. At load
+// time each Q8_0 matrix is repacked once into int8 rows padded to 16 bytes
+// (`qs`, row stride `qstride`) and a separate fp16 scale array (`d`, one per
+// 32 columns, row stride cols / 32). The GEMV then streams 16 bytes per lane
+// per load.
+
+extern "C" __global__ void halo_repack_q8_0(const std::uint8_t* raw, std::int8_t* qs, std::uint16_t* d,
+                                            std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride) {
+  const std::uint32_t blocks = cols / 32;
+  const std::uint64_t total = static_cast<std::uint64_t>(rows) * blocks;
+  for (std::uint64_t b = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x; b < total;
+       b += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+    const std::uint64_t r = b / blocks, k = b % blocks;
+    const std::uint8_t* src = raw + (r * blocks + k) * 34;
+    d[r * blocks + k] = U16(src);
+    std::int8_t* dst = qs + r * qstride + k * 32;
+    for (int i = 0; i < 32; ++i) dst[i] = static_cast<std::int8_t>(src[2 + i]);
+  }
+}
+
+namespace {
+
+constexpr std::uint32_t kGemvMaxCols = 8192;
+
+// One wave per row; the block's x lives in LDS (cols <= kGemvMaxCols). Each lane
+// loads 16 int8 at a time (half a Q8_0 block), so a wave covers 512 columns
+// per iteration.
+template <int kRowsPerBlock>
+__device__ void GemvQ8r(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y, std::uint32_t rows,
+                        std::uint32_t cols, std::uint32_t qstride) {
+  __shared__ float xs[kGemvMaxCols];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  const std::uint32_t r = blockIdx.x * kRowsPerBlock + threadIdx.x / kWarp;
+  if (r >= rows) return;
+  const std::uint32_t lane = threadIdx.x % kWarp;
+  const std::int8_t* row = qs + static_cast<std::size_t>(r) * qstride;
+  const std::uint16_t* scales = d + static_cast<std::size_t>(r) * (cols / 32);
+  float acc = 0.0f;
+  for (std::uint32_t c = lane * 16; c < cols; c += kWarp * 16) {
+    const int4 q = *reinterpret_cast<const int4*>(row + c);
+    const float s = F16(scales[c / 32]);
+    const std::int8_t* v = reinterpret_cast<const std::int8_t*>(&q);
+    const float* xv = xs + c;
+    float part = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) part += static_cast<float>(v[i]) * xv[i];
+    acc += s * part;
+  }
+  acc = WarpSum(acc);
+  if (lane == 0) y[r] = acc;
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y, std::uint32_t rows,
+                  std::uint32_t cols, std::uint32_t qstride) {
+  GemvQ8r<8>(qs, d, x, y, rows, cols, qstride);
+}
+
+// Stacked experts: matrix ids[slot] of a [experts][rows][cols] repacked tensor.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_expert(const std::int8_t* qs, const std::uint16_t* d, const std::uint32_t* ids, const float* x,
+                         float* y, std::uint32_t slot, std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride) {
+  const std::size_t e = ids[slot];
+  GemvQ8r<8>(qs + e * rows * qstride, d + e * rows * (cols / 32), x, y, rows, cols, qstride);
+}
+
+// ---- P3: bandwidth GEMV for the expert formats (Q4_K, Q5_1) ------------------
+//
+// One wave per row, x in LDS. Q4_K: a lane takes one 64-value chunk of a
+// 256-value super-block (32 bytes of nibbles, two 6-bit scale/min pairs);
+// Q5_1: a lane takes one 32-value block (24 bytes). The block minimum is
+// applied once per block: d*sc*sum(q*x) - dmin*m*sum(x).
+
+namespace {
+
+struct DotQ4K {
+  static constexpr std::uint32_t kItemValues = 64;
+  __device__ static float Item(const std::uint8_t* row, const float* xs, std::uint32_t item) {
+    const std::uint32_t sb = item / 4, c = item % 4;
+    const std::uint8_t* b = row + sb * 144;
+    std::uint32_t sc0, m0, sc1, m1;
+    ScaleMinK4(2 * c, b + 4, sc0, m0);
+    ScaleMinK4(2 * c + 1, b + 4, sc1, m1);
+    const int4 qa = *reinterpret_cast<const int4*>(b + 16 + c * 32);
+    const int4 qb = *reinterpret_cast<const int4*>(b + 16 + c * 32 + 16);
+    const std::uint8_t* q0 = reinterpret_cast<const std::uint8_t*>(&qa);
+    const std::uint8_t* q1 = reinterpret_cast<const std::uint8_t*>(&qb);
+    const float* x = xs + sb * 256 + c * 64;
+    float lo = 0, hi = 0, xlo = 0, xhi = 0;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      lo += static_cast<float>(q0[j] & 0xF) * x[j];
+      hi += static_cast<float>(q0[j] >> 4) * x[32 + j];
+      xlo += x[j];
+      xhi += x[32 + j];
+    }
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      lo += static_cast<float>(q1[j] & 0xF) * x[16 + j];
+      hi += static_cast<float>(q1[j] >> 4) * x[48 + j];
+      xlo += x[16 + j];
+      xhi += x[48 + j];
+    }
+    const float d = F16(U16(b)), dmin = F16(U16(b + 2));
+    return d * (static_cast<float>(sc0) * lo + static_cast<float>(sc1) * hi) -
+           dmin * (static_cast<float>(m0) * xlo + static_cast<float>(m1) * xhi);
+  }
+  static constexpr std::uint32_t kRowBytesPer256 = 144;
+};
+
+struct DotQ5_1 {
+  static constexpr std::uint32_t kItemValues = 32;
+  __device__ static float Item(const std::uint8_t* row, const float* xs, std::uint32_t item) {
+    const std::uint8_t* b = row + item * 24;
+    const std::uint32_t qh = static_cast<std::uint32_t>(b[4]) | (static_cast<std::uint32_t>(b[5]) << 8) |
+                             (static_cast<std::uint32_t>(b[6]) << 16) | (static_cast<std::uint32_t>(b[7]) << 24);
+    // 16 nibble bytes at an 8-byte aligned offset: two 8-byte loads.
+    const uint2 qa = *reinterpret_cast<const uint2*>(b + 8);
+    const uint2 qb = *reinterpret_cast<const uint2*>(b + 16);
+    std::uint8_t q[16];
+    *reinterpret_cast<uint2*>(q) = qa;
+    *reinterpret_cast<uint2*>(q + 8) = qb;
+    const float* x = xs + item * 32;
+    float s = 0, sx = 0;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      const float lo = static_cast<float>((q[j] & 0xF) | (((qh >> j) & 1) << 4));
+      const float hi = static_cast<float>((q[j] >> 4) | (((qh >> (j + 16)) & 1) << 4));
+      s += lo * x[j] + hi * x[16 + j];
+      sx += x[j] + x[16 + j];
+    }
+    return F16(U16(b)) * s + F16(U16(b + 2)) * sx;
+  }
+};
+
+template <typename Fmt>
+__device__ void GemvBlocks(const std::uint8_t* w, std::uint64_t row_bytes, const float* x, float* y, std::uint32_t rows,
+                           std::uint32_t cols) {
+  __shared__ float xs[kGemvMaxCols];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  const std::uint32_t r = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp;
+  if (r >= rows) return;
+  const std::uint32_t lane = threadIdx.x % kWarp, items = cols / Fmt::kItemValues;
+  const std::uint8_t* row = w + r * row_bytes;
+  float acc = 0;
+  for (std::uint32_t i = lane; i < items; i += kWarp) acc += Fmt::Item(row, xs, i);
+  acc = WarpSum(acc);
+  if (lane == 0) y[r] = acc;
+}
+
+}  // namespace
+
+#define HALO_GEMV_BLOCKS(NAME, FMT)                                                                            \
+  extern "C" __global__ void __launch_bounds__(256)                                                            \
+      NAME(const std::uint8_t* w, const float* x, float* y, std::uint32_t rows, std::uint32_t cols,            \
+           std::uint64_t row_bytes) {                                                                          \
+    GemvBlocks<FMT>(w, row_bytes, x, y, rows, cols);                                                           \
+  }                                                                                                            \
+  extern "C" __global__ void __launch_bounds__(256)                                                            \
+      NAME##_expert(const std::uint8_t* w, const std::uint32_t* ids, const float* x, float* y,                 \
+                    std::uint32_t slot, std::uint64_t expert_bytes, std::uint32_t rows, std::uint32_t cols,    \
+                    std::uint64_t row_bytes) {                                                                 \
+    GemvBlocks<FMT>(w + ids[slot] * expert_bytes, row_bytes, x, y, rows, cols);                                \
+  }
+
+HALO_GEMV_BLOCKS(halo_gemv_q4_k, DotQ4K)
+HALO_GEMV_BLOCKS(halo_gemv_q5_1, DotQ5_1)

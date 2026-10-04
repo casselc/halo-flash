@@ -721,3 +721,65 @@ binary = "gpu_tests"
 filter = "FlashNextGpu.StepSampleMatchesCpuSamplerInLockstep"
 why = "the advanced RNG state comes back with the token"
 timeout = 1200
+
+# ---- P3 bandwidth GEMV (repacked Q8_0) ---------------------------------------
+
+[[mutant]]
+name = "p3-q8r-scale-misread"
+file = "src/kernels/core.hip"
+find = '    d[r * blocks + k] = U16(src);'
+replace = '    d[r * blocks + k] = U16(src + 1);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.*"
+why = "the repack keeps each block's fp16 scale"
+
+[[mutant]]
+name = "p3-q8r-scale-dropped"
+file = "src/kernels/core.hip"
+find = '    acc += s * part;'
+replace = '    acc += part;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.*"
+why = "each half block is scaled by its block's scale"
+
+[[mutant]]
+name = "p3-q8r-expert-offset"
+file = "src/kernels/core.hip"
+find = '  GemvQ8r<8>(qs + e * rows * qstride, d + e * rows * (cols / 32), x, y, rows, cols, qstride);'
+replace = '  GemvQ8r<8>(qs + e * rows * qstride, d, x, y, rows, cols, qstride);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.*"
+why = "an expert reads its own scales"
+
+[[mutant]]
+name = "p3-q4k-scales-swapped"
+file = "src/kernels/core.hip"
+find = '    return d * (static_cast<float>(sc0) * lo + static_cast<float>(sc1) * hi) -'
+replace = '    return d * (static_cast<float>(sc1) * lo + static_cast<float>(sc0) * hi) -'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.*"
+why = "low nibbles use the even sub-block's scale, high nibbles the odd one's"
+
+[[mutant]]
+name = "p3-q4k-min-dropped"
+file = "src/kernels/core.hip"
+find = '           dmin * (static_cast<float>(m0) * xlo + static_cast<float>(m1) * xhi);'
+replace = '           0.0f * dmin * (static_cast<float>(m0) * xlo + static_cast<float>(m1) * xhi);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.*"
+why = "Q4_K subtracts each sub-block's minimum times the sum of its x"
+
+[[mutant]]
+name = "p3-q5-1-high-bit"
+file = "src/kernels/core.hip"
+find = '      const float hi = static_cast<float>((q[j] >> 4) | (((qh >> (j + 16)) & 1) << 4));'
+replace = '      const float hi = static_cast<float>((q[j] >> 4) | (((qh >> j) & 1) << 4));'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.*"
+why = "values 16..31 take their fifth bit from qh bits 16..31"

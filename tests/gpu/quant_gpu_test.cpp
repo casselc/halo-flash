@@ -122,3 +122,145 @@ TEST(GpuQuant, MatVecMatchesCpuDequantForEveryFormat) {
     }, {.test_cases = 200});
   }
 }
+
+// P3 Q8_0 path: repack at load, then the bandwidth GEMV (dense and expert),
+// against the CPU dequantizer on random matrices up to the LDS width.
+TEST(GpuQuant, RepackedQ8GemvMatchesCpuDequant) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      const std::size_t cols = 32 * tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 256}));
+      const std::size_t rows = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 40}));
+      const std::size_t experts = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 3}));
+      const std::size_t row_bytes = cols / 32 * 34;
+      std::vector<std::uint8_t> w(experts * rows * row_bytes);
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      for (auto& b : w) { seed = seed * 1664525u + 1013904223u; b = static_cast<std::uint8_t>(seed >> 24); }
+      for (std::size_t r = 0; r < experts * rows; ++r)
+        for (std::size_t b = 0; b < cols / 32; ++b) {
+          const auto h = FiniteHalf(tc);
+          std::memcpy(w.data() + r * row_bytes + b * 34, &h, 2);
+        }
+      std::vector<float> x(cols);
+      for (std::size_t i = 0; i < cols; ++i) x[i] = std::cos(static_cast<float>(i) * 0.11f);
+      const std::uint32_t pick = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = static_cast<std::uint32_t>(experts - 1)}));
+
+      model::TensorRef t;
+      t.data = w.data();
+      t.type = GgmlType::kQ8_0;
+      t.cols = cols;
+      t.rows = rows;
+      t.experts = experts;
+      std::vector<float> want(rows);
+      model::cpu::MatVec(t, pick, x, want);
+
+      const auto qstride = static_cast<std::uint32_t>(cols);
+      auto raw = dev->Alloc(w.size(), &error), qs = dev->Alloc(experts * rows * qstride, &error),
+           d = dev->Alloc(experts * rows * (cols / 32) * 2, &error), xb = dev->Alloc(cols * 4, &error),
+           yb = dev->Alloc(rows * 4, &error), ib = dev->Alloc(4, &error);
+      ASSERT_TRUE(raw && qs && d && xb && yb && ib) << error;
+      ASSERT_TRUE(dev->Upload(raw, 0, w.data(), w.size(), &error)) << error;
+      ASSERT_TRUE(dev->Upload(xb, 0, x.data(), cols * 4, &error)) << error;
+      ASSERT_TRUE(dev->Upload(ib, 0, &pick, 4, &error)) << error;
+      const rt::Arg ra[] = {rt::Arg::Buf(raw), rt::Arg::Buf(qs), rt::Arg::Buf(d),
+                            rt::Arg::Val(static_cast<std::uint32_t>(experts * rows)),
+                            rt::Arg::Val(static_cast<std::uint32_t>(cols)), rt::Arg::Val(qstride)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_repack_q8_0", &error), {64}, {256}, ra, &error)) << error;
+      const bool as_expert = tc.draw(gs::booleans());
+      const auto R = static_cast<std::uint32_t>(rows), C = static_cast<std::uint32_t>(cols);
+      if (as_expert) {
+        const rt::Arg a[] = {rt::Arg::Buf(qs), rt::Arg::Buf(d), rt::Arg::Buf(ib), rt::Arg::Buf(xb), rt::Arg::Buf(yb),
+                             rt::Arg::Val(0u), rt::Arg::Val(R), rt::Arg::Val(C), rt::Arg::Val(qstride)};
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemv_q8r_expert", &error), {(R + 7) / 8}, {256}, a, &error)) << error;
+      } else {
+        const rt::Arg a[] = {rt::Arg::Buf(qs, std::size_t{pick} * rows * qstride),
+                             rt::Arg::Buf(d, std::size_t{pick} * rows * (cols / 32) * 2), rt::Arg::Buf(xb),
+                             rt::Arg::Buf(yb), rt::Arg::Val(R), rt::Arg::Val(C), rt::Arg::Val(qstride)};
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemv_q8r", &error), {(R + 7) / 8}, {256}, a, &error)) << error;
+      }
+      std::vector<float> got(rows);
+      ASSERT_TRUE(dev->Download(yb, 0, got.data(), rows * 4, &error)) << error;
+      for (auto* b : {&raw, &qs, &d, &xb, &yb, &ib}) dev->Free(*b);
+      for (std::size_t r = 0; r < rows; ++r) {
+        double mag = 0;
+        std::vector<float> row(cols);
+        model::cpu::DequantizeRow(t, pick, r, row.data());
+        for (std::size_t i = 0; i < cols; ++i) mag += std::fabs(static_cast<double>(row[i]) * x[i]);
+        ASSERT_LE(std::fabs(got[r] - want[r]), 1e-5 * mag + 1e-6)
+            << (as_expert ? "expert" : "dense") << " row " << r << " cols " << cols << " got " << got[r] << " want " << want[r];
+      }
+    }, {.test_cases = 150});
+  }
+}
+
+// P3 expert formats: the block-wise bandwidth GEMVs (Q4_K, Q5_1), dense and
+// expert, against the CPU dequantizer.
+TEST(GpuQuant, BlockGemvMatchesCpuDequant) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      const bool q4k = tc.draw(gs::booleans());
+      const std::size_t block = q4k ? 256 : 32, bytes = q4k ? 144 : 24;
+      const std::size_t cols = block * tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = q4k ? 32ul : 256ul}));
+      const std::size_t rows = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 40}));
+      const std::size_t experts = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 3}));
+      const std::size_t row_bytes = cols / block * bytes;
+      std::vector<std::uint8_t> w(experts * rows * row_bytes);
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      for (auto& b : w) { seed = seed * 1664525u + 1013904223u; b = static_cast<std::uint8_t>(seed >> 24); }
+      for (std::size_t r = 0; r < experts * rows; ++r)
+        for (std::size_t b = 0; b < cols / block; ++b)
+          for (std::size_t off : {0, 2}) {
+            const auto h = FiniteHalf(tc);
+            std::memcpy(w.data() + r * row_bytes + b * bytes + off, &h, 2);
+          }
+      std::vector<float> x(cols);
+      for (std::size_t i = 0; i < cols; ++i) x[i] = std::sin(static_cast<float>(i) * 0.23f) + 0.1f;
+      const auto pick = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = static_cast<std::uint32_t>(experts - 1)}));
+      model::TensorRef t;
+      t.data = w.data();
+      t.type = q4k ? GgmlType::kQ4_K : GgmlType::kQ5_1;
+      t.cols = cols;
+      t.rows = rows;
+      t.experts = experts;
+      std::vector<float> want(rows);
+      model::cpu::MatVec(t, pick, x, want);
+      auto wb = dev->Alloc(w.size(), &error), xb = dev->Alloc(cols * 4, &error), yb = dev->Alloc(rows * 4, &error),
+           ib = dev->Alloc(4, &error);
+      ASSERT_TRUE(wb && xb && yb && ib) << error;
+      ASSERT_TRUE(dev->Upload(wb, 0, w.data(), w.size(), &error)) << error;
+      ASSERT_TRUE(dev->Upload(xb, 0, x.data(), cols * 4, &error)) << error;
+      ASSERT_TRUE(dev->Upload(ib, 0, &pick, 4, &error)) << error;
+      const auto R = static_cast<std::uint32_t>(rows), C = static_cast<std::uint32_t>(cols);
+      const std::string name = q4k ? "halo_gemv_q4_k" : "halo_gemv_q5_1";
+      const bool as_expert = tc.draw(gs::booleans());
+      if (as_expert) {
+        const rt::Arg a[] = {rt::Arg::Buf(wb), rt::Arg::Buf(ib), rt::Arg::Buf(xb), rt::Arg::Buf(yb), rt::Arg::Val(0u),
+                             rt::Arg::Val<std::uint64_t>(rows * row_bytes), rt::Arg::Val(R), rt::Arg::Val(C),
+                             rt::Arg::Val<std::uint64_t>(row_bytes)};
+        ASSERT_TRUE(dev->Launch(dev->Kernel(name + "_expert", &error), {(R + 7) / 8}, {256}, a, &error)) << error;
+      } else {
+        const rt::Arg a[] = {rt::Arg::Buf(wb, std::size_t{pick} * rows * row_bytes), rt::Arg::Buf(xb), rt::Arg::Buf(yb),
+                             rt::Arg::Val(R), rt::Arg::Val(C), rt::Arg::Val<std::uint64_t>(row_bytes)};
+        ASSERT_TRUE(dev->Launch(dev->Kernel(name, &error), {(R + 7) / 8}, {256}, a, &error)) << error;
+      }
+      std::vector<float> got(rows);
+      ASSERT_TRUE(dev->Download(yb, 0, got.data(), rows * 4, &error)) << error;
+      for (auto* b : {&wb, &xb, &yb, &ib}) dev->Free(*b);
+      for (std::size_t r = 0; r < rows; ++r) {
+        double mag = 0;
+        std::vector<float> row(cols);
+        model::cpu::DequantizeRow(t, pick, r, row.data());
+        for (std::size_t i = 0; i < cols; ++i) mag += std::fabs(static_cast<double>(row[i]) * x[i]);
+        ASSERT_LE(std::fabs(got[r] - want[r]), 1e-5 * mag + 1e-6)
+            << name << (as_expert ? " expert" : "") << " row " << r << " cols " << cols << " got " << got[r] << " want " << want[r];
+      }
+    }, {.test_cases = 200});
+  }
+}

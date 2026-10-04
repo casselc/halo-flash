@@ -9,7 +9,9 @@
 // Output: one line per generated token (id, top-2 logit margin, piece),
 // then the decoded text and timing.
 
+#include <algorithm>
 #include <chrono>
+#include <map>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -56,12 +58,59 @@ double RelL2(const std::vector<float>& a, const std::vector<float>& b) {
   return std::sqrt(d / m);
 }
 
+// --profile: every launch is followed by a synchronize and timed, then
+// accumulated per kernel name (eager mode). The per-launch floor (launch +
+// sync of an empty grid) is reported so it can be subtracted.
+struct Profiling final : rt::Device {
+  std::unique_ptr<rt::Device> d;
+  std::map<rt::KernelId, std::string> names;
+  std::map<std::string, std::pair<double, long>> time;  // seconds, launches
+  bool on = false;
+  rt::Backend backend() const noexcept override { return d->backend(); }
+  rt::Buffer Alloc(std::size_t b, std::string* e) override { return d->Alloc(b, e); }
+  void Free(rt::Buffer& b) noexcept override { d->Free(b); }
+  bool Upload(const rt::Buffer& a, std::size_t o, const void* s, std::size_t b, std::string* e) override {
+    return d->Upload(a, o, s, b, e);
+  }
+  bool Download(const rt::Buffer& a, std::size_t o, void* s, std::size_t b, std::string* e) override {
+    return d->Download(a, o, s, b, e);
+  }
+  bool Fill(const rt::Buffer& a, std::uint8_t v, std::string* e) override { return Timed("(fill)", [&] { return d->Fill(a, v, e); }); }
+  void* AllocHost(std::size_t b, std::string* e) override { return d->AllocHost(b, e); }
+  void FreeHost(void* p) noexcept override { d->FreeHost(p); }
+  bool LoadModule(std::span<const std::uint8_t> h, std::string* e) override { return d->LoadModule(h, e); }
+  rt::KernelId Kernel(std::string_view n, std::string* e) override {
+    const auto id = d->Kernel(n, e);
+    names[id] = std::string(n);
+    return id;
+  }
+  bool Launch(rt::KernelId k, rt::Dim3 g, rt::Dim3 b, std::span<const rt::Arg> a, std::string* e) override {
+    return Timed(names[k], [&] { return d->Launch(k, g, b, a, e); });
+  }
+  bool Synchronize(std::string* e) override { return d->Synchronize(e); }
+  bool BeginCapture(std::string* e) override { return d->BeginCapture(e); }
+  bool EndCapture(rt::Graph* g, std::string* e) override { return d->EndCapture(g, e); }
+  bool LaunchGraph(const rt::Graph& g, std::string* e) override { return d->LaunchGraph(g, e); }
+  void FreeGraph(rt::Graph& g) noexcept override { d->FreeGraph(g); }
+  template <typename F>
+  bool Timed(const std::string& name, F&& f) {
+    if (!on) return f();
+    std::string e;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = f() && d->Synchronize(&e);
+    auto& [secs, n] = time[name];
+    secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    ++n;
+    return ok;
+  }
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
   std::string model, prompt = "The capital of France is", device = "hip";
   int n = 16;
-  bool eager = false;
+  bool eager = false, profile = false;
   setvbuf(stdout, nullptr, _IOLBF, 0);
   std::uint32_t max_context = 512;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -72,6 +121,7 @@ int main(int argc, char** argv) {
     else if (a == "--n") n = std::atoi(argv[i + 1]);
     else if (a == "--max-context") max_context = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--eager") eager = std::string(argv[i + 1]) == "1";
+    else if (a == "--profile") profile = std::string(argv[i + 1]) == "1";
     else {
       std::fprintf(stderr, "unknown option %s\n", a.c_str());
       return 2;
@@ -105,6 +155,12 @@ int main(int argc, char** argv) {
   if (use_gpu) {
     dev = rt::Device::Create(backend, &error);
     if (!dev) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    if (profile) {
+      auto p = std::make_unique<Profiling>();
+      p->d = std::move(dev);
+      dev = std::move(p);
+      eager = true;
+    }
     const auto tu = std::chrono::steady_clock::now();
     std::vector<rt::FileSource> sources;
     for (const auto& r : reader->GetMappedRegions()) sources.push_back({r.data, r.size, r.file_descriptor});
@@ -133,6 +189,7 @@ int main(int argc, char** argv) {
       return std::fprintf(stderr, "gpu: %s\n", error.c_str()), 1;
     if (step < 2 || step + 1 == ids.size())
       std::printf("step %zu: %.3f s\n", step, std::chrono::duration<double>(std::chrono::steady_clock::now() - st).count());
+    if (profile && step == ids.size()) static_cast<Profiling*>(dev.get())->on = true;  // after warm-up
     if (!want) continue;
     const Top2 top = Argmax(gpu ? lg : lc);
     std::string line;
@@ -154,5 +211,19 @@ int main(int argc, char** argv) {
   std::printf("%zu steps in %.2f s (%.2f steps/s)%s\n", ids.size() + generated.size() - 1, secs,
               (ids.size() + generated.size() - 1) / secs,
               cpu && gpu ? (" worst relL2 " + std::to_string(worst)).c_str() : "");
+  if (profile) {
+    auto* p = static_cast<Profiling*>(dev.get());
+    std::vector<std::pair<std::string, std::pair<double, long>>> rows(p->time.begin(), p->time.end());
+    std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.second.first > b.second.first; });
+    double total = 0;
+    long launches = 0;
+    for (auto& r : rows) total += r.second.first, launches += r.second.second;
+    const auto steps = static_cast<double>(generated.size() - 1);
+    std::printf("profile over %.0f steps: %.1f ms/step, %.0f launches/step (each timed with a synchronize)\n", steps,
+                1e3 * total / steps, launches / steps);
+    for (auto& [name, v] : rows)
+      std::printf("  %-28s %8.2f ms/step %6.1f%%  %7.0f launches/step  %7.1f us/launch\n", name.c_str(),
+                  1e3 * v.first / steps, 100 * v.first / total, v.second / steps, 1e6 * v.first / v.second);
+  }
   std::printf("total %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }

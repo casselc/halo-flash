@@ -54,6 +54,10 @@ class FlashNextGpu {
   /// when needed. Exact: draw-identical to core/sampling (debugging).
   enum class SamplingMode { kFast, kExact };
   void SetSamplingMode(SamplingMode m) noexcept { sampling_mode_ = m; }
+  /// P3 kernels: repack Q8_0 weights at load for the bandwidth GEMV
+  /// (default). Must be set before Create's upload, so it is a static knob.
+  static inline bool repack_q8_ = true;
+  static inline bool block_gemv_ = true;  ///< P3 Q4_K / Q5_1 GEMVs
   /// Runs `tokens` in order; `logits` (optional) receives the last position's.
   /// Token at a time for now (P4 batches it); any chunking is equivalent.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error);
@@ -75,7 +79,11 @@ class FlashNextGpu {
   struct DevTensor {
     rt::Buffer buf;
     rt::KernelId matvec = -1, embed = -1, expert = -1;
+    // P3: Q8_0 repacked into aligned int8 rows (`qs`) and fp16 scales (`d`).
+    rt::Buffer qs, d;
+    std::uint32_t qstride = 0;
   };
+  bool RepackQ8(const model::TensorRef& t, DevTensor& d, std::string* error);
   struct DevLora {
     const model::LoraPair* pair = nullptr;
     float scale = 0;

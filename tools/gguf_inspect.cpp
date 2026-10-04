@@ -1,3 +1,4 @@
+#include <cstdlib>
 // Prints a GGUF file's metadata keys and a per-type tensor summary, and
 // dequantizes the first row of every tensor whose type has a CPU dequantizer
 // (a cheap end-to-end check of the reader and the quant oracle on real files).
@@ -22,7 +23,13 @@ int main(int argc, char** argv) {
     }
     std::map<std::string, std::pair<std::size_t, std::uint64_t>> by_type;
     std::size_t deq_ok = 0, deq_skip = 0, nonfinite = 0;
+    std::map<std::string, std::pair<std::size_t, std::uint64_t>> by_class;  // name without blk.N + type
     for (const auto& t : r->GetTensors()) {
+      std::string name(t.name);
+      if (name.starts_with("blk.")) name = "blk.*" + name.substr(name.find('.', 4));
+      auto& k = by_class[name + "  " + std::string(halo::core::ToString(t.type))];
+      ++k.first;
+      k.second += t.size_bytes;
       auto& e = by_type[std::string(halo::core::ToString(t.type))];
       ++e.first;
       e.second += t.size_bytes;
@@ -39,6 +46,9 @@ int main(int argc, char** argv) {
                 std::string(r->GetMetadataString("general.architecture").value_or("?")).c_str(),
                 (unsigned long long)r->GetMetadataCount(), (unsigned long long)r->GetTensorCount(),
                 (unsigned long long)r->GetAlignment());
+    if (std::getenv("GGUF_INSPECT_CLASSES"))
+      for (const auto& [k, e] : by_class)
+        std::printf("    %-48s %5zu tensors %10.1f MiB\n", k.c_str(), e.first, e.second / 1048576.0);
     for (const auto& [type, e] : by_type) {
       std::printf("  %-8s %5zu tensors %10.1f MiB\n", type.c_str(), e.first, e.second / 1048576.0);
     }

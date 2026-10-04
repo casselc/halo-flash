@@ -45,7 +45,11 @@ std::unique_ptr<FlashNextGpu> FlashNextGpu::Create(rt::Device& device, const mod
 
 FlashNextGpu::~FlashNextGpu() {
   for (auto& g : graphs_) dev_.FreeGraph(g);
-  for (auto& [_, t] : tensors_) dev_.Free(t.buf);
+  for (auto& [_, t] : tensors_) {
+    dev_.Free(t.buf);
+    dev_.Free(t.qs);
+    dev_.Free(t.d);
+  }
   for (auto& b : owned_) dev_.Free(b);
 }
 
@@ -66,6 +70,14 @@ bool FlashNextGpu::Upload(const model::TensorRef& t, std::string* error) {
     d.matvec = dev_.Kernel(k, error);
     d.embed = dev_.Kernel(std::string(k) + "_embed_p", error);
     d.expert = dev_.Kernel(std::string(k) + "_expert", error);
+    // P3 bandwidth GEMVs (same argument layout) where the row fits in LDS.
+    const char* fast = t.type == core::GgmlType::kQ4_K && t.cols % 256 == 0 && t.cols <= 8192   ? "halo_gemv_q4_k"
+                       : t.type == core::GgmlType::kQ5_1 && t.cols % 32 == 0 && t.cols <= 8192 ? "halo_gemv_q5_1"
+                                                                                               : nullptr;
+    if (fast && block_gemv_) {
+      d.matvec = dev_.Kernel(fast, error);
+      d.expert = dev_.Kernel(std::string(fast) + "_expert", error);
+    }
   }
   tensors_.emplace(t.data, d);
   return true;
@@ -90,9 +102,18 @@ bool FlashNextGpu::MatVec(const model::TensorRef& t, std::uint64_t expert, const
     return false;
   }
   const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
-  const rt::Arg args[] = {rt::Arg::Buf(d.buf, expert * t.RowBytes() * t.rows), rt::Arg::Buf(x), rt::Arg::Buf(y),
-                          rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val<std::uint64_t>(t.RowBytes())};
-  if (!dev_.Launch(d.matvec, {Blocks(rows, kBlock / 32)}, {kBlock}, args, error)) return false;
+  if (d.qs) {
+    const std::size_t e = expert;
+    if (!Launch("halo_gemv_q8r", {Blocks(rows, 8)}, {256},
+                {rt::Arg::Buf(d.qs, e * rows * d.qstride), rt::Arg::Buf(d.d, e * rows * (cols / 32) * 2),
+                 rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride)},
+                error))
+      return false;
+  } else {
+    const rt::Arg args[] = {rt::Arg::Buf(d.buf, expert * t.RowBytes() * t.rows), rt::Arg::Buf(x), rt::Arg::Buf(y),
+                            rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val<std::uint64_t>(t.RowBytes())};
+    if (!dev_.Launch(d.matvec, {Blocks(rows, kBlock / 32)}, {kBlock}, args, error)) return false;
+  }
   // LoRA: y += (alpha / r) * B (A x), on dense projections, as the reference.
   if (auto it = lora_.find(t.data); it != lora_.end()) {
     const auto& [pair, scale] = it->second;
@@ -148,6 +169,30 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   // Weights queued by Upload() are read from their files in parallel now.
   if (!loader.Run(std::max(4u, std::min(16u, std::thread::hardware_concurrency() / 2)), error)) return false;
   loader_ = nullptr;
+  // P3: repack Q8_0 matrices for the bandwidth GEMV (the embedding keeps its
+  // raw rows for the gather).
+  if (repack_q8_) {
+    std::vector<const model::TensorRef*> all;
+    const auto collect = [&](const model::TensorRef& t) {
+      if (!t.empty()) all.push_back(&t);
+    };
+    const auto mixer = [&](const model::HcMixer& m) {
+      collect(m.down);
+      collect(m.up);
+    };
+    collect(w_.output);
+    mixer(w_.hc_head);
+    for (const auto& l : w_.layers) {
+      mixer(l.hc_attn);
+      mixer(l.hc_ffn);
+      for (const auto* t : {&l.ssm_qkv, &l.ssm_gate, &l.ssm_out, &l.attn_q, &l.attn_k, &l.attn_v, &l.attn_out,
+                            &l.ple_key, &l.ple_value, &l.ffn_gate_exps, &l.ffn_up_exps, &l.ffn_down_exps,
+                            &l.shexp_gate, &l.shexp_up, &l.shexp_down})
+        collect(*t);
+    }
+    for (const auto* t : all)
+      if (t->data != w_.token_embd.data && !RepackQ8(*t, tensors_.at(t->data), error)) return false;
+  }
   const std::size_t H = c.hidden_size, D = c.HcDim();
   res_ = Scratch(D, error);
   xn_ = Scratch(D, error);
@@ -232,6 +277,24 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
     }
   }
   return dev_.Synchronize(error);
+}
+
+bool FlashNextGpu::RepackQ8(const model::TensorRef& t, DevTensor& d, std::string* error) {
+  if (t.type != core::GgmlType::kQ8_0 || d.qs || t.cols % 32 != 0 || t.cols > 8192) return true;
+  const std::uint64_t rows = t.rows * t.experts;
+  const auto cols = static_cast<std::uint32_t>(t.cols);
+  d.qstride = (cols + 15) / 16 * 16;
+  d.qs = dev_.Alloc(rows * d.qstride, error);
+  d.d = dev_.Alloc(rows * (cols / 32) * 2, error);
+  if (!d.qs || !d.d) return false;
+  if (!Launch("halo_repack_q8_0", {std::min<std::uint32_t>(Blocks(rows * (cols / 32)), 4096)}, {kBlock},
+              {rt::Arg::Buf(d.buf), rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Val(static_cast<std::uint32_t>(rows)),
+               rt::Arg::Val(cols), rt::Arg::Val(d.qstride)},
+              error) ||
+      !dev_.Synchronize(error))
+    return false;
+  dev_.Free(d.buf);  // the raw copy is no longer read
+  return true;
 }
 
 bool FlashNextGpu::GroupedNorm(const rt::Buffer& x, const model::TensorRef& w, const rt::Buffer& y, std::string* error) {
@@ -362,6 +425,11 @@ bool FlashNextGpu::ExpertMatVec(const model::TensorRef& t, std::uint32_t slot, c
                                 const rt::Buffer& y, std::string* error) {
   const auto& d = tensors_.at(t.data);
   const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
+  if (d.qs)
+    return Launch("halo_gemv_q8r_expert", {Blocks(rows, 8)}, {256},
+                  {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(x), rt::Arg::Buf(y),
+                   rt::Arg::Val(slot), rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride)},
+                  error);
   const rt::Arg args[] = {rt::Arg::Buf(d.buf), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(x), rt::Arg::Buf(y),
                           rt::Arg::Val(slot), rt::Arg::Val<std::uint64_t>(t.RowBytes() * t.rows),
                           rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val<std::uint64_t>(t.RowBytes())};

@@ -60,12 +60,15 @@ std::uint32_t Argmax(const std::vector<float>& l) {
 int main(int argc, char** argv) {
   std::string model, fixtures, device = "hip";
   int limit = 1 << 30;
+  bool eager = true;  // graph replay is the default once instantiation is fast on the real model
+  setvbuf(stdout, nullptr, _IOLBF, 0);
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
     if (a == "--model") model = argv[i + 1];
     else if (a == "--fixtures") fixtures = argv[i + 1];
     else if (a == "--device") device = argv[i + 1];
     else if (a == "--limit") limit = std::atoi(argv[i + 1]);
+    else if (a == "--eager") eager = std::string(argv[i + 1]) == "1";
     else return std::fprintf(stderr, "unknown option %s\n", a.c_str()), 2;
   }
   if (model.empty() || fixtures.empty())
@@ -96,6 +99,7 @@ int main(int argc, char** argv) {
     for (const auto& r : reader->GetMappedRegions()) sources.push_back({r.data, r.size, r.file_descriptor});
     if (dev) gpu = engine::FlashNextGpu::Create(*dev, *weights, ngram.get(), nullptr, kMaxContext, &error, sources);
     if (!gpu) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    gpu->SetUseGraphs(!eager);
   }
   const auto step = [&](std::int32_t token, std::span<float> logits) {
     return cpu ? cpu->Step(token, logits, {}, &error) : gpu->Step(token, logits, &error);
