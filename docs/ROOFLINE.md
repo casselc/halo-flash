@@ -405,6 +405,27 @@ The router row is new to the ranking. At 1.79 ms per call it runs about 9x slowe
 issue allows (~0.2 ms). That is a kernel problem, not a precision one, so it can be fixed without
 touching routing numerics.
 
+### 4.2 Trace survey at 4116d65 (`tools/trace_kernel.sh`, 3rd in-engine dispatch of each)
+
+Shares of the traced waves' cycles (one CU's SIMD). "vmcnt" is waiting on global memory and
+"lgkmcnt" on LDS or scalar loads.
+
+| Kernel (ms per prefill) | vmcnt | lgkmcnt + LDS | barrier | VALU | WMMA | Reading |
+|---|---:|---:|---:|---:|---:|---|
+| `hc_combine_norm_rows` (198) | 90% | 2% | 4% | 1% | — | streaming-bound: fix structurally (kernel A, 3.3), not in-kernel |
+| `gdn_prefill_split` (298) | 1% | 64% | 26% | 5% | — | serial LDS round trips plus barriers, and SIMDs idle as long as busy (96 workgroups): keep the chain in registers/DPP and raise parallelism |
+| `moe_gate_up_grouped_q4_k` (283) | 29% | 7% | 9% | 39% | 10% | dequant VALU-bound as much as memory: why the 6th wave (item 2) bought nothing. Cheaper dequant, or a pre-dequantized layout, is the lever |
+| `moe_down_grouped_q5_1` (226) | 31% | 3% | 16% | 36% | 2% | same as gate/up, plus barriers |
+| `gemm_q8r_f16_mix` (166) | 86% | 5% | 2% | 4% | 0.4% | the epilogue's `xn` reads (`vmcnt(3)` x248), as section 3.3 predicted |
+| `gemm_q8r_f16_m` (110) | 73% | 5% | 17% | 3% | 0.3% | one `vmcnt(0)` per K stage: the prefetch of 1 stage covers too little latency (why split-K didn't help) |
+| `attention_wmma_mq` (87) | 48% | 11% | 28% | 7% | 0.7% | K/V streaming and barriers |
+| `moe_combine_grouped` (40) | 88% | 4% | — | — | — | streaming |
+| `conv_l2norm_prefill` (47) | 69% | 2% | 5% | 3% | — | streaming, plus 20% scalar/branch |
+
+Across the board: WMMA issue is under 10% everywhere. No kernel is compute-bound. The common
+remedies are deeper prefetch (more bytes in flight per wave), less traffic (fusion), and for
+the experts, cheaper dequant.
+
 ## 5. Decode (single token)
 
 **Bytes per token** (BENCHMARKS):
