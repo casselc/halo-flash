@@ -1,0 +1,327 @@
+# Planted mutants: defects the tests must catch, for code Mull cannot mutate
+# (GPU kernels compiled to HSACO) and for engine state the tests were written
+# against. Run with tools/mutants.py; every mutant must be killed. Add one
+# whenever a test is written for a bug class, and keep `why` specific.
+#
+# `find` must occur exactly once in `file`. TOML literal strings ('...')
+# keep code verbatim.
+
+[suite.gpu]
+build_dir = "build/gpu"
+env = ["HALO_TINY_HF_DIR", "HALO_TINY_QWEN35_DIR"]
+
+# Filters. Directed tests first: --gtest_fail_fast stops before Hegel shrinks.
+#   forward: tiny Flash-Next vs reference + transformers, random sequences, tiny Qwen3.5
+#   state:   snapshots, reset, prefill
+#   quant:   every matvec format vs CPU dequantization
+
+# ---- Flash-Next engine (src/engine/flash_next_gpu.cpp) ----------------------
+
+[[mutant]]
+name = "fn-gdn-gate-silu"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'rt::Arg::Val(d), rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(1)}'
+replace = 'rt::Arg::Val(d), rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(0)}'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "Flash-Next gates DeltaNet output with sigmoid, Qwen3.5 with SiLU"
+
+[[mutant]]
+name = "fn-qsa-extra-block"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'order.resize(budget);'
+replace = 'order.resize(budget + 1);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "QSA keeps exactly top_k / ratio complete blocks"
+
+[[mutant]]
+name = "fn-lora-off"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'if (auto it = lora_.find(t.data); it != lora_.end()) {'
+replace = 'if (auto it = lora_.find(t.data); false && it != lora_.end()) {'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "an adapter that silently does nothing"
+
+[[mutant]]
+name = "fn-ple-dilation"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'rt::Arg::Val(c.ple_conv_kernel), rt::Arg::Val(c.ple_ngram_size)},'
+replace = 'rt::Arg::Val(c.ple_conv_kernel), rt::Arg::Val(1u)},'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "the PLE conv is dilated by the n-gram size"
+
+[[mutant]]
+name = "fn-moe-no-renorm"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'rt::Arg::Val(logits[e] / sum)'
+replace = 'rt::Arg::Val(logits[e])'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "top-k expert weights are renormalized to sum to 1"
+
+[[mutant]]
+name = "fn-shared-expert-ungated"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'rt::Arg::Val(1.0F / (1.0F + std::exp(-sg)))'
+replace = 'rt::Arg::Val(1.0F)'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "the shared expert has its own scalar sigmoid gate"
+
+[[mutant]]
+name = "fn-ple-query-from-mixed"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'GroupedNorm(res_, l.ple_norm_query, ple_query_, error)'
+replace = 'GroupedNorm(ple_key_, l.ple_norm_query, ple_query_, error)'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "the PLE query is the wide residual, not the n-gram key"
+
+[[mutant]]
+name = "fn-pooled-block-rope-position"
+file = "src/engine/flash_next_gpu.cpp"
+find = '!rope(pooled_, 1, idim, s.blocks * ratio)'
+replace = '!rope(pooled_, 1, idim, (s.blocks + 1) * ratio - 1)'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "pooled indexer keys rotate at the block start, not its end"
+
+[[mutant]]
+name = "fn-snapshot-blocks-not-restored"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'for (std::size_t l = 0; l < attn_.size(); ++l) attn_[l].blocks = snap.blocks_[l];'
+replace = ''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.RestoreAfterOverwritingHistory:FlashNextGpu.SnapshotsResetAndPrefillMatchReference"
+why = "pooled QSA blocks belong to the restored history"
+timeout = 1200
+
+[[mutant]]
+name = "fn-snapshot-ngram-not-restored"
+file = "src/engine/flash_next_gpu.cpp"
+find = '  ngram_history_ = snap.ngram_history_;'
+replace = ''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.RestoreAfterOverwritingHistory:FlashNextGpu.SnapshotsResetAndPrefillMatchReference"
+why = "the n-gram hash window is sequence state"
+timeout = 1200
+
+[[mutant]]
+name = "fn-snapshot-last-k-row"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'f(s.k, pos * c.AttentionKvDim())'
+replace = 'f(s.k, (pos ? pos - 1 : 0) * c.AttentionKvDim())'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.RestoreAfterOverwritingHistory:FlashNextGpu.SnapshotsResetAndPrefillMatchReference"
+why = "off-by-one in the saved K range (escaped the random programs)"
+timeout = 1200
+
+[[mutant]]
+name = "fn-snapshot-last-v-row"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'f(s.v, pos * c.AttentionKvDim())'
+replace = 'f(s.v, (pos ? pos - 1 : 0) * c.AttentionKvDim())'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.RestoreAfterOverwritingHistory:FlashNextGpu.SnapshotsResetAndPrefillMatchReference"
+why = "off-by-one in the saved V range"
+timeout = 1200
+
+[[mutant]]
+name = "fn-snapshot-last-indexer-row"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'f(s.index_k, pos * c.indexer_head_dim)'
+replace = 'f(s.index_k, (pos ? pos - 1 : 0) * c.indexer_head_dim)'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.RestoreAfterOverwritingHistory:FlashNextGpu.SnapshotsResetAndPrefillMatchReference"
+why = "off-by-one in the saved raw indexer keys"
+timeout = 1200
+
+[[mutant]]
+name = "fn-reset-keeps-ple-history"
+file = "src/engine/flash_next_gpu.cpp"
+find = '  return dev_.Fill(ple_history_, 0, error) && dev_.Synchronize(error);'
+replace = '  return dev_.Synchronize(error);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.RestoreAfterOverwritingHistory:FlashNextGpu.SnapshotsResetAndPrefillMatchReference"
+why = "reset must clear the PLE conv history"
+timeout = 1200
+
+[[mutant]]
+name = "fn-prefill-first-logits"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'i + 1 == tokens.size() ? logits : std::span<float>{}'
+replace = 'i == 0 ? logits : std::span<float>{}'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.RestoreAfterOverwritingHistory:FlashNextGpu.SnapshotsResetAndPrefillMatchReference"
+why = "prefill returns the last position's logits"
+timeout = 1200
+
+# ---- Kernels (src/kernels/core.hip) ------------------------------------------
+
+[[mutant]]
+name = "k-hc-combine-scale"
+file = "src/kernels/core.hip"
+find = '* 2.0f * Sigmoid(inject[s]'
+replace = '* 1.0f * Sigmoid(inject[s]'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "2*sigmoid centres the scatter weights on 1"
+
+[[mutant]]
+name = "k-hc-mix-mean"
+file = "src/kernels/core.hip"
+find = 'mixed[i] = acc / static_cast<float>(hc);'
+replace = 'mixed[i] = acc;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "the mixer averages streams"
+
+[[mutant]]
+name = "k-scale-silu-scale"
+file = "src/kernels/core.hip"
+find = 'x[i] = Silu(x[i] * scale);'
+replace = 'x[i] = Silu(x[i]);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "low-rank mixer divides by hc before SiLU"
+
+[[mutant]]
+name = "k-ple-gate-sign"
+file = "src/kernels/core.hip"
+find = '(sc < 0.0f ? -1.0f :'
+replace = '(sc < 0.0f ? 1.0f :'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "signed square root keeps the similarity's sign"
+
+[[mutant]]
+name = "k-ple-conv-history-shift"
+file = "src/kernels/core.hip"
+find = 'for (std::uint32_t t = 0; t + 1 < hist; ++t)'
+replace = 'for (std::uint32_t t = 0; t + 2 < hist; ++t)'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "the whole PLE conv history shifts each token"
+
+[[mutant]]
+name = "k-qsa-no-relu"
+file = "src/kernels/core.hip"
+find = 'acc += fmaxf(0.0f, dot);'
+replace = 'acc += dot;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "block scores sum ReLU'd per-head dots"
+
+[[mutant]]
+name = "k-attention-select-unscaled"
+file = "src/kernels/core.hip"
+find = 'sc[j] = dot * scale;'
+replace = 'sc[j] = dot;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "softmax temperature 1/sqrt(head_dim)"
+
+[[mutant]]
+name = "k-pool-block-drops-token"
+file = "src/kernels/core.hip"
+find = 'for (std::uint32_t t = 0; t < ratio; ++t) acc +='
+replace = 'for (std::uint32_t t = 0; t + 1 < ratio; ++t) acc +='
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "pooling covers every token of the block (sum-vs-mean is equivalent: RMSNorm follows)"
+
+[[mutant]]
+name = "k-rope-sign"
+file = "src/kernels/core.hip"
+find = 'v[i] = a * c - b * s;'
+replace = 'v[i] = a * c + b * s;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "rotation direction"
+
+[[mutant]]
+name = "k-gdn-decay-no-dt"
+file = "src/kernels/core.hip"
+find = 'expf(a[h] * Softplus(alpha[h] + dt[h]))'
+replace = 'expf(a[h] * Softplus(alpha[h]))'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "decay includes the dt bias"
+
+[[mutant]]
+name = "k-l2norm-as-rms"
+file = "src/kernels/core.hip"
+find = '1.0f / sqrtf(ss + eps)'
+replace = '1.0f / sqrtf(ss / static_cast<float>(d) + eps)'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "DeltaNet q/k use L2 norm, not RMS"
+
+[[mutant]]
+name = "k-q4k-nibble-index"
+file = "src/kernels/core.hip"
+find = 'b[16 + chunk * 32 + l]'
+replace = 'b[16 + chunk * 32 + (l ^ 1)]'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.*"
+why = "Q4_K quant byte addressing"
+
+[[mutant]]
+name = "k-q6k-offset"
+file = "src/kernels/core.hip"
+find = ') - 32;'
+replace = ') - 31;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.*"
+why = "Q6_K values are centred at 32"
+
+[[mutant]]
+name = "k-q5-1-min-sign"
+file = "src/kernels/core.hip"
+find = 'F16(U16(b)) + F16(U16(b + 2))'
+replace = 'F16(U16(b)) - F16(U16(b + 2))'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.*"
+why = "Q5_1 adds its block minimum"
+
+[[mutant]]
+name = "k-iq4nl-table"
+file = "src/kernels/core.hip"
+find = '-127, -104'
+replace = '-127, -103'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.*"
+why = "one IQ4_NL codebook entry off by one"

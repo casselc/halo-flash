@@ -8,3 +8,5 @@ leak-*
 timeout-*
 *.hsaco
 models/
+tools/__pycache__/
+.claude/
