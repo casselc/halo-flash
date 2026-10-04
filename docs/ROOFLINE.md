@@ -547,6 +547,34 @@ GEMM's separate pass anyway.
 - Prediction: 0.5-0.65 ms per call, so **-60 to -75 ms** over 96 calls. This is a step toward
   kernel A in 3.3.
 
+**4c. Mixer restructuring (R1-R3, 2026-10-04).** Done so far, each with identical long-set
+quality:
+
+| Step | Predicted | Measured | Kept |
+|---|---|---|---|
+| R1: combine_norm issues all loads first (e2b034b) | -55..-65 | -7 | yes: real; the kernel was already near bandwidth (~190 GB/s) |
+| R2a: combine_norm skips fp32 xn; the mix epilogue rebuilds it (b507480) | -35..-45 | **-34.8** | yes |
+| R2b: block-wide mix epilogue with contiguous reads, then with all loads batched | -85..-105 | +0.3, +12.6 | no |
+| Mix GEMM KS 64 -> 32: LDS 55 -> 30 KB, 4 -> 7 waves (32127d0) | -35..-40 | **-38.1** | yes |
+| R3: `_m` two stages in flight (clamped refill, LDS-only barrier) | -35..-45 | -1.4, +1.5 | no |
+
+What settled R2b and R3 was ablation inside the real kernel, not traces:
+- **Mix:** without its epilogue loads, mix runs at 0.60 ms per call instead of 1.92. The same
+  reads run at ~230 GB/s in a microbenchmark (`halo_gemm_bench memory`, column blocks), so the
+  limit was bytes in flight at 2 blocks per WGP, which KS = 32 fixed.
+- **`_m`:** 1044 us per call; 667 without weight loads, 466 without the `xh` loads. The `xh`
+  read (42 MB, 128-byte pieces per token per stage, 32 blocks) costs ~0.58 ms and does not
+  respond to prefetch depth. Next: kernel A of section 3.3 (combine + norm + down), so xh is
+  neither written (42 MB) nor read back. Expected about -50 to -70 ms; trace and ablate a
+  prototype before predicting more closely.
+
+Also found:
+- `__syncthreads()` on gfx11 waits for all outstanding global loads (its workgroup fence), so a
+  prefetch survives only until the next barrier. An LDS-only fence
+  (`__builtin_amdgcn_fence(..., "workgroup", "local")`) avoids that.
+- A GEMM tile whose stage does not split evenly over 256 threads silently skipped rows; it is
+  now a `static_assert`.
+
 **4b. Router F32 GEMM (`f32_tiled [32x8]`, 512 x 2560 x 2048 per layer).** DONE, partly. A
 trace first: 52% of cycles in `s_waitcnt vmcnt`, 33% at barriers, ~4% in FMAs. With a 32-wide K
 step and a one-stage register prefetch it measured **-36.5 ms** against a predicted -65 to -85:
