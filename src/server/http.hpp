@@ -107,6 +107,8 @@ class HttpServer {
 
   /// Exact-path routes; register before Start().
   void Route(std::string method, std::string path, HttpHandler handler);
+  /// Paths starting with `prefix` that match no exact route.
+  void RoutePrefix(std::string method, std::string prefix, HttpHandler handler);
   /// Binds, listens and starts the accept thread.
   [[nodiscard]] bool Start(std::string* error);
   /// Stops accepting, closes connections (streams see their writer fail),
@@ -122,6 +124,7 @@ class HttpServer {
 
   HttpServerOptions opt_;
   std::map<std::pair<std::string, std::string>, HttpHandler> routes_;
+  std::vector<std::pair<std::pair<std::string, std::string>, HttpHandler>> prefix_routes_;
   int listen_fd_ = -1;
   int port_ = 0;
   std::atomic<bool> stopping_{false};

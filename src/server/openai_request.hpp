@@ -75,7 +75,9 @@ struct GenerationRequest {
   bool parallel_tool_calls = true;
   ResponseFormat format;
 
-  // Responses state.
+  // Responses state. `has_instructions`: messages[0] is the instructions'
+  // system message (instructions do not carry over to continuations).
+  bool has_instructions = false;
   bool store = true;
   std::string previous_response_id;
   bool truncation_auto = false;

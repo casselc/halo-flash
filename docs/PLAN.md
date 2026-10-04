@@ -848,8 +848,14 @@ parser's events: Chat chunks and completions, Responses events (numbered,
 every item added then done) and response objects, raw Completions text.
 Properties: streamed deltas concatenate to the final object, streaming and
 non-streaming builds agree, and a Responses output sent back as input items
-is the assistant turn Chat reports. The HTTP layer and the response store
-come next.
+is the assistant turn Chat reports. `src/server/http` is the HTTP/1.1
+layer (incremental parser, keep-alive, chunked SSE, bounded connections);
+`src/server/openai_service` serves `/v1/models`, `/v1/completions`,
+`/v1/chat/completions`, `/v1/responses` and `GET /v1/responses/{id}` over
+a `TextGenerator` interface, with stop sequences (byte-at-a-time semantics,
+chunking-independent) and an in-memory response store for
+`previous_response_id`. Next: the Flash-Next `TextGenerator` (tokenizer,
+engine session, sampler), the SQLite store and session binding.
 
 **Context management and compaction (P6 with P12 evals).**
 1. **Truncation** (`truncation: "auto"`): drop the oldest items over budget.

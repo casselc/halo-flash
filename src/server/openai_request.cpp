@@ -608,7 +608,10 @@ std::optional<GenerationRequest> ParseResponsesRequest(const json::Value& body, 
       !ParseToolChoice(p, r))
     return std::nullopt;
   ResponsesInput in(p);
-  if (const Value* v = p.Get("instructions"); v && !in.Instructions(*v)) return std::nullopt;
+  if (const Value* v = p.Get("instructions")) {
+    if (!in.Instructions(*v)) return std::nullopt;
+    r.has_instructions = true;
+  }
   const Value* input = p.Get("input");
   if (!input) return p.Fail("input", "input is required"), std::nullopt;
   if (input->is(Kind::kString)) {

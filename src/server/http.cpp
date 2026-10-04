@@ -213,6 +213,10 @@ void HttpServer::Route(std::string method, std::string path, HttpHandler handler
   routes_[{std::move(method), std::move(path)}] = std::move(handler);
 }
 
+void HttpServer::RoutePrefix(std::string method, std::string prefix, HttpHandler handler) {
+  prefix_routes_.push_back({{std::move(method), std::move(prefix)}, std::move(handler)});
+}
+
 bool HttpServer::Start(std::string* error) {
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (listen_fd_ < 0) return *error = std::string("socket: ") + std::strerror(errno), false;
@@ -303,14 +307,25 @@ HttpResponse HttpServer::Dispatch(const HttpRequest& req) {
       return r;
     }
   }
-  const auto it = routes_.find({req.method, req.path});
-  if (it == routes_.end()) {
-    for (const auto& [key, h] : routes_)
-      if (key.second == req.path) return HttpResponse::Json(405, ErrorJson("method not allowed"));
-    return HttpResponse::Json(404, ErrorJson("no route for " + req.path));
+  const HttpHandler* handler = nullptr;
+  if (const auto it = routes_.find({req.method, req.path}); it != routes_.end()) handler = &it->second;
+  bool other_method = false;
+  if (!handler) {
+    for (const auto& [key, h] : routes_) other_method |= key.second == req.path;
+    for (const auto& [key, h] : prefix_routes_) {
+      if (!req.path.starts_with(key.second) || other_method) continue;
+      if (key.first == req.method) {
+        handler = &h;
+        break;
+      }
+      other_method = true;
+    }
   }
+  if (!handler)
+    return other_method ? HttpResponse::Json(405, ErrorJson("method not allowed"))
+                        : HttpResponse::Json(404, ErrorJson("no route for " + req.path));
   try {
-    return it->second(req);
+    return (*handler)(req);
   } catch (const std::exception& e) {
     return HttpResponse::Json(500, ErrorJson(std::string("internal error: ") + e.what()));
   }
