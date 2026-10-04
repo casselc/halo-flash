@@ -235,6 +235,13 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
       }
     };
     TextGenerator::Params params{run->prompt, run->req.sampling, run->req.max_tokens};
+    if (opt_.on_activity) opt_.on_activity(true);
+    struct Done {
+      const std::function<void(bool)>& f;
+      ~Done() {
+        if (f) f(false);
+      }
+    } done{opt_.on_activity};
     GenerationRecord rec;
     rec.start_ns = NowNs();
     std::int64_t last_ns = 0;

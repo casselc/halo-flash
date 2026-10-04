@@ -8,7 +8,7 @@
 // --decider-dir serves POST /v1/systemone with strands-decider-2B (the
 // directory holds Qwen3.5-2B-Base-BF16.gguf and the strands-decider-*.gguf
 // files, as the decider tests expect).
-// Endpoints: GET /health, /v1/models, /v1/responses/{id};
+// Endpoints: GET /health, /metrics (Prometheus, vLLM names), /v1/models, /v1/responses/{id};
 //            POST /v1/completions, /v1/chat/completions, /v1/responses.
 
 #include <csignal>
@@ -26,6 +26,7 @@
 #include "rt/device.hpp"
 #include "server/flash_next_generator.hpp"
 #include "server/http.hpp"
+#include "server/metrics.hpp"
 #include "server/openai_service.hpp"
 #include "server/systemone_service.hpp"
 #include "text/tokenizer.hpp"
@@ -98,6 +99,11 @@ int main(int argc, char** argv) {
   server::FlashNextGenerator generator(*engine, *tok, max_context);
   server::ServiceOptions so;
   so.model_id = model_id;
+  server::Metrics metrics(model_id);
+  server::FanOut observers;
+  observers.Add(&metrics);
+  so.observer = &observers;
+  so.on_activity = [&metrics](bool started) { started ? metrics.Started() : metrics.Finished(); };
 #if HALO_WITH_SCOPE
   halo_scope* scope = nullptr;
   std::unique_ptr<scope::GenerationObserver> observed;
@@ -110,7 +116,7 @@ int main(int argc, char** argv) {
                             scope_wal.empty() ? nullptr : scope_wal.c_str(), err, sizeof err);
     if (!scope) return std::fprintf(stderr, "halo-scope: %s\n", err), 1;
     observed = std::make_unique<scope::GenerationObserver>(scope::AnnotatorOf(scope));
-    so.observer = observed.get();
+    observers.Add(observed.get());
   }
 #else
   if (!scope_dir.empty()) return std::fprintf(stderr, "--scope-dir needs a build with HALO_SCOPE=ON\n"), 2;
@@ -118,6 +124,7 @@ int main(int argc, char** argv) {
   server::OpenAiService service(generator, so);
   server::HttpServer http({.host = host, .port = port, .api_key = api_key});
   service.Register(http);
+  metrics.Register(http);
   std::unique_ptr<StrandsEngine> decider;
   if (!decider_dir.empty()) {
     const std::string& d = decider_dir;

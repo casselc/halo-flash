@@ -83,6 +83,9 @@ struct ServiceOptions {
   std::size_t max_stored_responses = 1000;  // oldest evicted first
   /// Told about every generation (optional; must outlive the service).
   GenerationObserver* observer = nullptr;
+  /// Called when a generation starts and ends (optional), e.g. for the
+  /// requests-running gauge.
+  std::function<void(bool started)> on_activity;
   /// Ids and timestamps; tests pass deterministic ones.
   std::function<std::string()> new_id;
   std::function<std::int64_t()> now_s;

@@ -52,6 +52,7 @@ add_library(halo_server STATIC
   src/server/http.cpp
   src/server/openai_service.cpp
   src/server/systemone_service.cpp
+  src/server/metrics.cpp
 )
 target_link_libraries(halo_server PUBLIC Threads::Threads)
 target_link_libraries(halo_server PUBLIC halo_core halo_text halo_decide)
@@ -165,7 +166,8 @@ if(HALO_BUILD_TESTS)
     tests/server/openai_response_test.cpp
     tests/server/http_test.cpp
     tests/server/openai_service_test.cpp
-    tests/server/systemone_service_test.cpp)
+    tests/server/systemone_service_test.cpp
+    tests/server/metrics_test.cpp)
   target_link_libraries(server_tests PRIVATE halo_server)
   halo_test(decide_tests
     tests/decide/systemone_test.cpp
