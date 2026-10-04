@@ -778,3 +778,58 @@ rules as everything else (an oracle, Hegel properties, and planted mutants).
   bandwidth.
 - llama.cpp context shifting. It re-rotates KV, which has no DeltaNet
   equivalent.
+
+## Addendum (2026-10-03): Responses API, stateful sessions, compaction
+
+Agreed with the user. The model is not tied to an endpoint: every API
+renders into the same chat template and parses the output back. vLLM and
+SGLang already serve `/v1/responses` for open models.
+
+**P7 extension: `/v1/responses` as the primary stateful API for harnesses.**
+Completions and Chat Completions remain for compatibility.
+- **Input.** A plain string or typed items: messages, `function_call_output`
+  and reasoning items. Also `instructions`, function tools, `tool_choice` and
+  the sampling settings.
+- **Mappings onto the template and grammar.**
+  - `reasoning.effort` maps onto Flash-Next's reasoning-effort system block.
+  - `text.format` (JSON schema) uses the P7 grammar engine.
+  - Built-in hosted tools are out of scope; function tools only.
+- **Streaming.** Typed SSE events: output text, function-call argument and
+  reasoning deltas. They are produced from the streaming tool-call parser's
+  events.
+- **Response store.** `store`, `previous_response_id` and conversations live
+  in SQLite, in the halo-scope metadata store. Each stored response links to
+  its trace.
+- **Session binding.** A response id maps to a live engine session or a
+  radix-cache checkpoint (P6). An evicted state is rebuilt by re-rendering
+  the stored items and prefilling them.
+- **Why it matters for this model.** Flash-Next's template keeps past
+  thinking by default. Chat Completions clients usually drop
+  `reasoning_content` when resending history, so the rendered history
+  diverges from the cached prefix and the cache misses from the first
+  assistant turn. Stored responses keep reasoning items and continue the
+  live session, so only new items are prefilled.
+- **Tests.**
+  - The OpenAI SDK functional suite.
+  - Property: a stateful continuation (`previous_response_id`) yields
+    exactly the tokens of a stateless resend of the full history.
+  - Stateful swarm tests over store, evict, rebuild and continue.
+
+**Context management and compaction (P6 with P12 evals).**
+1. **Truncation** (`truncation: "auto"`): drop the oldest items over budget.
+   This costs a re-prefill of the changed prefix.
+2. **Summarizing compaction.** Past a threshold, the model or a cheap
+   variant summarizes older turns into a compaction item.
+   - The re-prefill of the compacted prefix runs in the background while
+     the session is idle.
+   - The radix cache keeps both versions until the compacted one is warm.
+   - OpenAI's compaction wire format is to be checked against the current
+     API documentation before it is matched.
+3. **Model-specific compaction (research, gated by evals).** The DeltaNet
+   layers carry a fixed-size state; only the 12 attention layers' KV grows,
+   and QSA reads at most `indexer_top_k` tokens per step.
+   - Evict old attention KV blocks that QSA rarely selects, keeping the
+     recurrent state intact.
+   - It is lossy, so it ships only if halo-scope experiments (task metrics
+     and LLM-as-judge on long agent transcripts) show no regression at the
+     chosen budget.
