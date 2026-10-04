@@ -31,6 +31,7 @@ add_library(halo_core STATIC
   src/core/gguf.cpp
   src/core/gguf_writer.cpp
   src/core/quant.cpp
+  src/core/json.cpp
 )
 target_include_directories(halo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -85,7 +86,10 @@ if(HALO_BUILD_TESTS)
 
   halo_test(core_tests
     tests/core/gguf_test.cpp
-    tests/core/quant_test.cpp)
+    tests/core/quant_test.cpp
+    tests/core/json_test.cpp)
+  target_compile_definitions(core_tests PRIVATE
+    HALO_CORE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/core/data")
   halo_test(text_tests
     tests/text/tokenizer_test.cpp)
   halo_test(model_tests
@@ -106,6 +110,9 @@ if(HALO_FUZZ)
   add_executable(tokenizer_fuzz fuzz/tokenizer_fuzz.cpp)
   target_link_options(tokenizer_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
   target_link_libraries(tokenizer_fuzz PRIVATE halo_text)
+  add_executable(json_fuzz fuzz/json_fuzz.cpp)
+  target_link_options(json_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_link_libraries(json_fuzz PRIVATE halo_core)
   add_executable(gguf_seed fuzz/gguf_seed.cpp)
   target_link_libraries(gguf_seed PRIVATE halo_core)
 endif()
