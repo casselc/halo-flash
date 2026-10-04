@@ -72,7 +72,8 @@ cmake --preset mull && cmake --build --preset mull
 export CI=1                     # Hegel derandomizes under CI: same inputs for every mutant
 for t in core text decide model; do
   $MULL_ROOT/usr/bin/mull-runner-21 --reporters SQLite --reporters IDE --report-dir build/mull/report \
-    --report-name $t --allow-surviving --no-output --minimum-timeout 60000 build/mull/${t}_tests
+    --report-name $t --allow-surviving --no-output --timeout 120000 --minimum-timeout 60000 \
+    build/mull/${t}_tests
 done
 python3 tools/mull_survivors.py summary build/mull/report/*.sqlite
 python3 tools/mull_survivors.py keys build/mull/report/*.sqlite > build/mull/survivors.txt
@@ -81,7 +82,8 @@ python3 tools/mull_survivors.py check tests/mull-baseline.txt build/mull/survivo
 
 Delete the `.sqlite` reports before a rerun: Mull appends to them. A mutant's
 timeout is ten times the unmutated run or `--minimum-timeout`, whichever is
-larger (`--timeout` bounds only the unmutated run); a timeout counts as
+larger (`--timeout` bounds only the unmutated warm-up and baseline runs, and
+its 3-second default fails them); a timeout counts as
 killed, so keep the minimum generous when the machine is busy. Set the
 fixture variables first (`HALO_TINY_HF_DIR`, `HALO_TINY_QWEN35_DIR`,
 `HALO_DECIDER_TOKENIZER_GGUF`), or the tests that need them skip and their

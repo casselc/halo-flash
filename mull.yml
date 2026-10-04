@@ -6,8 +6,8 @@ mutators:
 # Host code that parses untrusted input or computes model numerics. Paths are
 # regexes matched against absolute source paths.
 includePaths:
-  - .*/src/core/(gguf|json|quant)\.(cpp|hpp)$
-  - .*/src/text/(tokenizer|unicode)\.(cpp|hpp)$
+  - .*/src/core/(gguf|json|quant|sampling)\.(cpp|hpp)$
+  - .*/src/text/(tokenizer|unicode|chat_template|tool_call_parser)\.(cpp|hpp)$
   - .*/src/decide/(systemone|decider)\.(cpp|hpp)$
   - .*/src/model/(cpu_ops|lora|ngram|config|weights)\.(cpp|hpp)$
 excludePaths:
