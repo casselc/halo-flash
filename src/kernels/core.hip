@@ -3690,24 +3690,56 @@ __device__ void MoeGateUp(const std::uint8_t* gate, const std::uint8_t* up, std:
   for (std::uint32_t i = threadIdx.x; i < kMoeTile; i += blockDim.x) tok[i] = sorted[first + (i < n ? i : 0)] / k;
   halo_v8f ag[kMoeRowTiles][kMoeSub] = {}, au[kMoeRowTiles][kMoeSub] = {};
   static_assert(kMoeRowTiles == 1, "stage prefetch holds one row tile's weights");
+  // Software pipeline over stages: while a stage is multiplied out, the next
+  // stage's weights (header and quant bytes) and activation pieces load into
+  // registers; staging into LDS then only stores registers. (Thread trace:
+  // per-fragment weight loads were 74% of the time, then the synchronous
+  // activation staging the largest remaining wait.)
+  constexpr std::uint32_t kXp = kMoeTile * (kMoeKs / 8) / 256;  // activation pieces per thread
+  __syncthreads();  // tok[] written
+  // Four named registers, unconditional (all kMoeTile rows: tok[] repeats
+  // the first token past n, and those rows are never written out). As an
+  // array the compiler kept xr in scratch and indexed it with a runtime
+  // counter in the store loop (kernel_report: 80 B), unroll pragma or not.
+  static_assert(kXp == 4, "four activation pieces per thread per stage");
+  uint4 xr0, xr1, xr2, xr3;
+  const auto x_at = [&](std::uint32_t p, std::uint32_t k0) {
+    const std::uint32_t i = threadIdx.x + p * 256, r = i / (kMoeKs / 8), c = (i % (kMoeKs / 8)) * 8;
+    return *reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(tok[r]) * H + k0 + c);
+  };
+  const auto bs_at = [&](std::uint32_t p) {
+    const std::uint32_t i = threadIdx.x + p * 256, r = i / (kMoeKs / 8), c = (i % (kMoeKs / 8)) * 8;
+    return reinterpret_cast<uint4*>(Bs + r * kMoeRs + c);
+  };
+#define HALO_MOE_LOAD_X(K0) \
+  xr0 = x_at(0, (K0));      \
+  xr1 = x_at(1, (K0));      \
+  xr2 = x_at(2, (K0));      \
+  xr3 = x_at(3, (K0));
+  auto hg = Frag16<L>::LoadHdr(g[0], 0), hu = Frag16<L>::LoadHdr(u[0], 0);
+  auto sg = Frag16<L>::LoadStage(g[0], 0), su = Frag16<L>::LoadStage(u[0], 0);
+  HALO_MOE_LOAD_X(0)
   for (std::uint32_t k0 = 0; k0 < H; k0 += kMoeKs) {
-    // This stage's weights first: their loads are in flight during the
-    // activation staging and its barriers (thread trace: 74% of the
-    // kernel's time was waiting on per-fragment weight loads).
-    const auto hg = Frag16<L>::LoadHdr(g[0], k0), hu = Frag16<L>::LoadHdr(u[0], k0);
-    const auto sg = Frag16<L>::LoadStage(g[0], k0), su = Frag16<L>::LoadStage(u[0], k0);
+    __syncthreads();  // the previous stage's LDS reads are done
+    *bs_at(0) = xr0;
+    *bs_at(1) = xr1;
+    *bs_at(2) = xr2;
+    *bs_at(3) = xr3;
     __syncthreads();
-    for (std::uint32_t i = threadIdx.x; i < subs * 16 * kMoeKs / 8; i += blockDim.x) {
-      const std::uint32_t r = i / (kMoeKs / 8), c = (i % (kMoeKs / 8)) * 8;
-      *reinterpret_cast<uint4*>(Bs + r * kMoeRs + c) =
-          *reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(tok[r]) * H + k0 + c);
+    const auto cg = hg, cu = hu;
+    const auto csg = sg, csu = su;
+    if (k0 + kMoeKs < H) {  // next stage, in flight during the math below
+      hg = Frag16<L>::LoadHdr(g[0], k0 + kMoeKs);
+      hu = Frag16<L>::LoadHdr(u[0], k0 + kMoeKs);
+      sg = Frag16<L>::LoadStage(g[0], k0 + kMoeKs);
+      su = Frag16<L>::LoadStage(u[0], k0 + kMoeKs);
+      HALO_MOE_LOAD_X(k0 + kMoeKs)
     }
-    __syncthreads();
 #pragma unroll
     for (std::uint32_t rt = 0; rt < kMoeRowTiles; ++rt) {
 #pragma unroll
       for (std::uint32_t kk = 0; kk < kMoeKs; kk += 16) {
-        const halo_v16h fg = Frag16<L>::GetS(g[rt], k0, kk, hg, sg), fu = Frag16<L>::GetS(u[rt], k0, kk, hu, su);
+        const halo_v16h fg = Frag16<L>::GetS(g[rt], k0, kk, cg, csg), fu = Frag16<L>::GetS(u[rt], k0, kk, cu, csu);
 #pragma unroll
         for (std::uint32_t h = 0; h < kMoeSub; ++h) {
           if (h >= subs) break;
@@ -3732,6 +3764,8 @@ __device__ void MoeGateUp(const std::uint8_t* gate, const std::uint8_t* up, std:
       }
     }
 }
+
+#undef HALO_MOE_LOAD_X
 
 // down: yp[pair][r] = down_e[r] . hp[pair]; the tile's pairs are contiguous.
 // load(e, row, k0, ks) returns a stage of weights (loaded before the
