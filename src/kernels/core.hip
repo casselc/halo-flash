@@ -3124,9 +3124,14 @@ extern "C" __global__ void halo_rmsnorm_rows(const float* x, const float* w_all,
 // and a re-read. Same arithmetic as the two kernels: each thread combines
 // and squares the values at i = threadIdx.x + k * blockDim.x, as the norm
 // kernel reads them. grid (T * hc), block 256; h <= 16 * 256.
+// With iw (the next mixer's F32 inject weights, irows <= 8 rows of hc * h),
+// each block also writes this stream's partial dot products of its normalized
+// row with them, ipart[(t * hc + s) * irows + r]; halo_inject_reduce sums the
+// streams (replacing that projection's GEMM, which re-read every row).
 extern "C" __global__ void __launch_bounds__(256)
     halo_hc_combine_norm_rows(float* res, const float* out, const float* inject, const float* w_all, float* y,
-                              _Float16* y16, std::uint32_t hc, std::uint32_t h, float eps) {
+                              _Float16* y16, std::uint32_t hc, std::uint32_t h, float eps, const float* iw,
+                              float* ipart, std::uint32_t irows) {
   __shared__ float scratch[32];
   const std::size_t v = blockIdx.x, t = v / hc, row = v * h;
   const std::uint32_t st = static_cast<std::uint32_t>(v % hc);
@@ -3146,6 +3151,7 @@ extern "C" __global__ void __launch_bounds__(256)
   }
   ss = BlockSum(ss, scratch);
   const float scale = 1.0f / sqrtf(ss / static_cast<float>(h) + eps);
+  float ip[8] = {};
 #pragma unroll
   for (std::uint32_t k = 0; k < 16; ++k) {
     const std::uint32_t i = threadIdx.x + k * blockDim.x;
@@ -3153,26 +3159,69 @@ extern "C" __global__ void __launch_bounds__(256)
       const float yv = vals[k] * scale * w[i];
       y[row + i] = yv;
       if (y16) y16[row + i] = static_cast<_Float16>(yv);
+      if (iw) {
+#pragma unroll
+        for (std::uint32_t r = 0; r < 8; ++r)
+          if (r < irows) ip[r] += yv * iw[static_cast<std::size_t>(r) * hc * h + static_cast<std::size_t>(st) * h + i];
+      }
+    }
+  }
+  if (iw) {
+#pragma unroll
+    for (std::uint32_t r = 0; r < 8; ++r) {
+      if (r >= irows) break;
+      const float sum = BlockSum(ip[r], scratch);
+      if (threadIdx.x == 0) ipart[v * irows + r] = sum;
     }
   }
 }
 
+// inject[t][r] = sum over streams s (in order) of ipart[(t * hc + s) * irows + r].
+//   grid (ceil(T * irows / 256))
+extern "C" __global__ void halo_inject_reduce(const float* ipart, float* inject, std::uint32_t hc, std::uint32_t irows,
+                                              std::uint32_t tokens) {
+  const std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= tokens * irows) return;
+  const std::uint32_t t = idx / irows, r = idx % irows;
+  float acc = 0.0f;
+  for (std::uint32_t st = 0; st < hc; ++st) acc += ipart[(static_cast<std::size_t>(t) * hc + st) * irows + r];
+  inject[idx] = acc;
+}
+
 // halo_rmsnorm_rows that also writes an fp16 copy (the next GEMM's input on
 // the FP16 route), sparing a conversion pass.
+// iw / ipart / irows: the next projection's partial products, as in
+// halo_hc_combine_norm_rows (w_period = hc streams; iw null to skip).
 extern "C" __global__ void halo_rmsnorm_rows_h(const float* x, const float* w_all, float* y, _Float16* y16,
                                                std::uint32_t d, float eps, std::uint32_t w_stride,
-                                               std::uint32_t w_period) {
+                                               std::uint32_t w_period, const float* iw, float* ipart,
+                                               std::uint32_t irows) {
   __shared__ float scratch[32];
   const std::size_t row = static_cast<std::size_t>(blockIdx.x) * d;
-  const float* w = w_all + (blockIdx.x % w_period) * w_stride;
+  const std::uint32_t st = blockIdx.x % w_period;
+  const float* w = w_all + st * w_stride;
   float ss = 0.0f;
   for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) ss += x[row + i] * x[row + i];
   ss = BlockSum(ss, scratch);
   const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
+  float ip[8] = {};
   for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) {
     const float v = x[row + i] * scale * w[i];
     y[row + i] = v;
     y16[row + i] = static_cast<_Float16>(v);
+    if (iw) {
+#pragma unroll
+      for (std::uint32_t r = 0; r < 8; ++r)
+        if (r < irows) ip[r] += v * iw[static_cast<std::size_t>(r) * w_period * d + static_cast<std::size_t>(st) * d + i];
+    }
+  }
+  if (iw) {
+#pragma unroll
+    for (std::uint32_t r = 0; r < 8; ++r) {
+      if (r >= irows) break;
+      const float sum = BlockSum(ip[r], scratch);
+      if (threadIdx.x == 0) ipart[static_cast<std::size_t>(blockIdx.x) * irows + r] = sum;
+    }
   }
 }
 

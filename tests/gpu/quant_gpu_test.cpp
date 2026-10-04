@@ -1640,7 +1640,9 @@ TEST(GpuKernels, Fp16EmittingNormsMatchOriginals) {
       launch("halo_rmsnorm_rows", rows, {rt::Arg::Buf(xb), rt::Arg::Buf(wb), rt::Arg::Buf(y1), rt::Arg::Val(d),
                                          rt::Arg::Val(1e-6f), rt::Arg::Val(d), rt::Arg::Val(period)});
       launch("halo_rmsnorm_rows_h", rows, {rt::Arg::Buf(xb), rt::Arg::Buf(wb), rt::Arg::Buf(y2), rt::Arg::Buf(h2),
-                                           rt::Arg::Val(d), rt::Arg::Val(1e-6f), rt::Arg::Val(d), rt::Arg::Val(period)});
+                                           rt::Arg::Val(d), rt::Arg::Val(1e-6f), rt::Arg::Val(d), rt::Arg::Val(period),
+                                           rt::Arg::Val<std::uint64_t>(0), rt::Arg::Val<std::uint64_t>(0),
+                                           rt::Arg::Val(0u)});
       // Gated norm: the original in place on g1 (a copy of x), the fp16 variant from x.
       launch("halo_gated_norm_h", rows, {rt::Arg::Buf(xb), rt::Arg::Buf(wb), rt::Arg::Buf(zb), rt::Arg::Buf(h3),
                                          rt::Arg::Val(d), rt::Arg::Val(1e-6f), rt::Arg::Val(mode)});
@@ -1668,6 +1670,7 @@ TEST(GpuKernels, Fp16EmittingNormsMatchOriginals) {
 }
 
 // P4: the combine fused with the next mixer's norm against the two kernels
+// (and both norms' inject partial products, reduced, against double sums)
 // (halo_hc_combine_rows, then halo_rmsnorm_rows_h): residual and normalized
 // rows bit for bit in fp32; the fp16 copy within one ulp (first asserted
 // exact: either kernel may round the final product straight to fp16).
@@ -1697,6 +1700,11 @@ TEST(GpuKernels, CombineNormEqualsSeparateKernels) {
         owned.push_back(b);
         return b;
       };
+      const auto irows = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 8}));
+      const auto iw = vec(std::size_t{irows} * hc * h, 1.0f);
+      auto iwb = up(iw.data(), iw.size() * 4), p1 = up(nullptr, std::size_t{T} * hc * irows * 4),
+           p2 = up(nullptr, std::size_t{T} * hc * irows * 4), j1 = up(nullptr, std::size_t{T} * irows * 4),
+           j2 = up(nullptr, std::size_t{T} * irows * 4);
       auto r1 = up(res.data(), n * 4), r2 = up(res.data(), n * 4), ob = up(out.data(), out.size() * 4),
            ib = up(inj.data(), inj.size() * 4), wb = up(w.data(), w.size() * 4), y1 = up(nullptr, n * 4),
            y2 = up(nullptr, n * 4), h1 = up(nullptr, n * 2), h2 = up(nullptr, n * 2);
@@ -1706,16 +1714,40 @@ TEST(GpuKernels, CombineNormEqualsSeparateKernels) {
       launch("halo_hc_combine_rows", static_cast<std::uint32_t>((n + 255) / 256),
              {rt::Arg::Buf(r1), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Val(hc), rt::Arg::Val(h), rt::Arg::Val(T)});
       launch("halo_rmsnorm_rows_h", T * hc, {rt::Arg::Buf(r1), rt::Arg::Buf(wb), rt::Arg::Buf(y1), rt::Arg::Buf(h1),
-                                             rt::Arg::Val(h), rt::Arg::Val(1e-6f), rt::Arg::Val(h), rt::Arg::Val(hc)});
+                                             rt::Arg::Val(h), rt::Arg::Val(1e-6f), rt::Arg::Val(h), rt::Arg::Val(hc),
+                                             rt::Arg::Buf(iwb), rt::Arg::Buf(p1), rt::Arg::Val(irows)});
       launch("halo_hc_combine_norm_rows", T * hc, {rt::Arg::Buf(r2), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Buf(wb),
                                                    rt::Arg::Buf(y2), rt::Arg::Buf(h2), rt::Arg::Val(hc), rt::Arg::Val(h),
-                                                   rt::Arg::Val(1e-6f)});
+                                                   rt::Arg::Val(1e-6f), rt::Arg::Buf(iwb), rt::Arg::Buf(p2),
+                                                   rt::Arg::Val(irows)});
+      launch("halo_inject_reduce", (T * irows + 255) / 256,
+             {rt::Arg::Buf(p1), rt::Arg::Buf(j1), rt::Arg::Val(hc), rt::Arg::Val(irows), rt::Arg::Val(T)});
+      launch("halo_inject_reduce", (T * irows + 255) / 256,
+             {rt::Arg::Buf(p2), rt::Arg::Buf(j2), rt::Arg::Val(hc), rt::Arg::Val(irows), rt::Arg::Val(T)});
       std::vector<float> a1(n), a2(n), b1(n), b2(n);
       std::vector<std::uint16_t> c1(n), c2(n);
       ASSERT_TRUE(dev->Download(r1, 0, a1.data(), n * 4, &error) && dev->Download(r2, 0, a2.data(), n * 4, &error) &&
                   dev->Download(y1, 0, b1.data(), n * 4, &error) && dev->Download(y2, 0, b2.data(), n * 4, &error) &&
                   dev->Download(h1, 0, c1.data(), n * 2, &error) && dev->Download(h2, 0, c2.data(), n * 2, &error))
           << error;
+      // The inject partial products: both kernels' (reduced) against double sums
+      // over the normalized rows, with the fp32 summation bound.
+      std::vector<float> in1(std::size_t{T} * irows), in2(in1.size());
+      ASSERT_TRUE(dev->Download(j1, 0, in1.data(), in1.size() * 4, &error) &&
+                  dev->Download(j2, 0, in2.data(), in2.size() * 4, &error))
+          << error;
+      for (std::uint32_t t = 0; t < T; ++t)
+        for (std::uint32_t r = 0; r < irows; ++r) {
+          double want = 0, mag = 0;
+          for (std::size_t c = 0; c < std::size_t{hc} * h; ++c) {
+            const double p = double(iw[r * hc * h + c]) * b1[std::size_t{t} * hc * h + c];
+            want += p;
+            mag += std::fabs(p);
+          }
+          const double bound = double(hc) * h * 0x1p-23 * mag + 1e-30;
+          ASSERT_NEAR(in1[t * irows + r], want, bound) << "inject (norm kernel) t " << t << " r " << r;
+          ASSERT_NEAR(in2[t * irows + r], want, bound) << "inject (combine+norm) t " << t << " r " << r;
+        }
       for (auto& o : owned) dev->Free(o);
       for (std::size_t i = 0; i < n; ++i) {
         ASSERT_EQ(std::bit_cast<std::uint32_t>(a1[i]), std::bit_cast<std::uint32_t>(a2[i])) << "residual " << i;

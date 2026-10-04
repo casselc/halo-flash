@@ -148,6 +148,7 @@ int main(int argc, char** argv) {
     else if (a == "--parallel-bucket") engine::FlashNextGpu::prefill_parallel_bucket_ = std::string(argv[i + 1]) == "1";
     else if (a == "--skinny-f32") engine::FlashNextGpu::prefill_skinny_f32_ = std::string(argv[i + 1]) == "1";
     else if (a == "--fused-combine") engine::FlashNextGpu::prefill_fused_combine_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--fused-inject") engine::FlashNextGpu::prefill_fused_inject_ = std::string(argv[i + 1]) == "1";
     else if (a == "--kernel-timing") kernel_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill-warm") prefill_warm = argv[i + 1];
