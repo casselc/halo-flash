@@ -138,9 +138,12 @@ stayed in the cache).
 | 32-value K stages (`halo_gemm_bf16_f16`) | 937 us (27 GB/s) | 902 us | 1459 us (4.4 TFLOPS) |
 | 128-value K stages, loads in flight (`_k128`) | 500 us (50 GB/s) | 617 us | 641 us (10.1 TFLOPS) |
 
-Split-K over 4 was slower in every case. Short chunks remain latency-bound;
-a skinny (VALU, weights streamed like the decode GEMVs) kernel for T <= 16
-is the next candidate.
+Split-K over 4 was slower in every case. Short chunks remain latency-bound.
+A first skinny kernel (VALU, 4 rows per wave, 16 tokens' activations staged
+in LDS 256 columns at a time) read only 44 GB/s at T = 16: the staging and
+two barriers per 256 columns leave too few weight loads in flight. Not
+adopted; holding activations in registers for T <= 8 with more rows per
+wave (as llama.cpp's small-batch kernels do) is the next design.
 
 ### HRX vs HIP decode gap: what it is not (2026-10-04, idle machine)
 
