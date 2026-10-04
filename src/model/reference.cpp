@@ -51,6 +51,22 @@ std::vector<float> QuantizedInput(std::span<const float> input) {
 void ReferenceModel::MatVec(const TensorRef& weight, std::uint64_t expert,
                             std::span<const float> x, std::span<float> out,
                             bool narrow_weights) {
+  MatVecBase(weight, expert, x, out, narrow_weights);
+  // LoRA: out += (alpha / r) * B (A x), on dense (non-expert) projections.
+  if (lora_ != nullptr && weight.experts == 1) {
+    if (const LoraPair* p = lora_->Find(weight.name)) {
+      std::vector<float> ax(p->rank), bax(out.size());
+      cpu::MatVec(p->a, 0, x, ax);
+      cpu::MatVec(p->b, 0, ax, bax);
+      const float scale = lora_->Scale(*p);
+      for (std::size_t i = 0; i < out.size(); ++i) out[i] += scale * bax[i];
+    }
+  }
+}
+
+void ReferenceModel::MatVecBase(const TensorRef& weight, std::uint64_t expert,
+                                std::span<const float> x, std::span<float> out,
+                                bool narrow_weights) {
   if (storage_ == Storage::kFloat32) {
     cpu::MatVec(weight, expert, x, out);
     return;

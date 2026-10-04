@@ -6,13 +6,14 @@ otherwise writes all-zero QSA compression ratios (silently disabling sparse
 attention). This maps the names back before metadata is written.
 
 Usage: LLAMA_CPP=<llama.cpp checkout> convert_qwen4exp.py <convert args...>
+       LLAMA_CONVERT=convert_lora_to_gguf.py ... for adapters (same fix).
 """
 import os
 import sys
 
 llama = os.environ["LLAMA_CPP"]
 sys.path[:0] = [llama, os.path.join(llama, "gguf-py")]
-sys.argv[0] = os.path.join(llama, "convert_hf_to_gguf.py")
+sys.argv[0] = os.path.join(llama, os.environ.get("LLAMA_CONVERT", "convert_hf_to_gguf.py"))
 
 from conversion import qwen4exp  # noqa: E402
 

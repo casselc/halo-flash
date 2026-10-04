@@ -50,6 +50,7 @@ add_library(halo_model STATIC
   src/model/ngram.cpp
   src/model/cpu_ops.cpp
   src/model/reference.cpp
+  src/model/lora.cpp
 )
 target_link_libraries(halo_model PUBLIC halo_core Threads::Threads)
 
@@ -94,7 +95,8 @@ if(HALO_BUILD_TESTS)
     tests/text/tokenizer_test.cpp)
   halo_test(model_tests
     tests/model/reference_hf_test.cpp
-    tests/model/ngram_table_test.cpp)
+    tests/model/ngram_table_test.cpp
+    tests/model/lora_hf_test.cpp)
   target_compile_definitions(text_tests PRIVATE
     HALO_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/text/data")
 endif()

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "model/lora.hpp"
 #include "model/ngram.hpp"
 #include "model/weights.hpp"
 
@@ -47,12 +48,18 @@ public:
                              const MtpTrace* stage_inputs = nullptr);
 
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
+  /// Applies `adapter` (or none) to every subsequent projection. The adapter
+  /// must outlive its use.
+  void SetAdapter(const LoraAdapter* adapter) noexcept { lora_ = adapter; }
   void Reset();
 
 private:
   void MatVec(const TensorRef& weight, std::uint64_t expert,
               std::span<const float> x, std::span<float> out,
               bool narrow_weights = false);
+  void MatVecBase(const TensorRef& weight, std::uint64_t expert,
+                  std::span<const float> x, std::span<float> out,
+                  bool narrow_weights);
   struct LinearState {
     std::vector<float> conv;   ///< [kernel-1][channels], oldest first
     std::vector<float> state;  ///< [v_heads][head_dim(v)][head_dim(k)]
@@ -80,6 +87,7 @@ private:
            std::span<float> out);
 
   const ModelWeights& w_;
+  const LoraAdapter* lora_{nullptr};
   const Config& c_;
   Storage storage_;
   NgramTable* ngram_;
