@@ -58,6 +58,7 @@ bool FlashNextGpu::Upload(const model::TensorRef& t, std::string* error) {
   if (const char* k = MatVecKernel(t.type)) {
     d.matvec = dev_.Kernel(k, error);
     d.embed = dev_.Kernel(std::string(k) + "_embed", error);
+    d.expert = dev_.Kernel(std::string(k) + "_expert", error);
   }
   tensors_.emplace(t.data, d);
   return true;
@@ -99,6 +100,10 @@ bool FlashNextGpu::MatVec(const model::TensorRef& t, std::uint64_t expert, const
 bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_context, std::string* error) {
   const auto& c = w_.config;
   max_context_ = max_context;
+  if (c.num_experts > 1024 || c.num_experts_used == 0 || c.num_experts_used > c.num_experts) {
+    if (error) *error = "halo_router_topk supports 1..1024 experts with 0 < used <= experts";
+    return false;
+  }
   if (!dev_.LoadModule(kernels::CoreHsaco(), error)) return false;
   std::uint32_t max_rank = 1;
   // Every tensor the step reads goes up once; LoRA pairs attach to dense
@@ -162,6 +167,8 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   block_scores_ = Scratch(max_context / c.compress_ratio + 1, error);
   visible_ = Scratch(max_context, error);
   router_ = Scratch(c.num_experts, error);
+  expert_ids_ = Scratch(c.num_experts_used, error);
+  expert_weights_ = Scratch(c.num_experts_used, error);
   eg_ = Scratch(std::max(c.expert_ff, c.shared_expert_ff), error);
   eu_ = Scratch(std::max(c.expert_ff, c.shared_expert_ff), error);
   ed_ = Scratch(H, error);
@@ -308,81 +315,67 @@ bool FlashNextGpu::Attention(const model::LayerWeights& l, AttnState& s, std::st
       return false;
     ++s.blocks;
   }
-  std::vector<std::uint32_t> visible;
+  // Selection on device with the reference's rule; the visible count
+  // depends only on the position.
   const std::uint32_t budget = c.indexer_top_k / ratio;
-  if (complete <= budget) {
-    visible.resize(n_kv);
-    std::iota(visible.begin(), visible.end(), 0U);
-  } else {
-    std::vector<float> score(complete);
-    if (!Launch("halo_qsa_scores", {Blocks(complete)}, {kBlock},
-                {rt::Arg::Buf(iq_), rt::Arg::Buf(s.block_k), rt::Arg::Buf(block_scores_), rt::Arg::Val(c.indexer_heads),
-                 rt::Arg::Val(idim), rt::Arg::Val(complete)},
-                error) ||
-        !dev_.Download(block_scores_, 0, score.data(), complete * 4, error))
-      return false;
-    // The reference's selection: stable sort by score, keep `budget` blocks
-    // in position order, then the incomplete tail.
-    std::vector<std::uint32_t> order(complete);
-    std::iota(order.begin(), order.end(), 0U);
-    std::stable_sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) { return score[a] > score[b]; });
-    order.resize(budget);
-    std::sort(order.begin(), order.end());
-    for (std::uint32_t b : order)
-      for (std::uint32_t t = 0; t < ratio; ++t) visible.push_back(b * ratio + t);
-    for (std::uint32_t p = complete * ratio; p < n_kv; ++p) visible.push_back(p);
-  }
-  return dev_.Upload(visible_, 0, visible.data(), visible.size() * 4, error) &&
-         Launch("halo_attention_select", {nh}, {kBlock},
+  const std::uint32_t n_visible = complete <= budget ? n_kv : budget * ratio + (n_kv - complete * ratio);
+  if (complete > budget &&
+      !Launch("halo_qsa_scores", {Blocks(complete)}, {kBlock},
+              {rt::Arg::Buf(iq_), rt::Arg::Buf(s.block_k), rt::Arg::Buf(block_scores_), rt::Arg::Val(c.indexer_heads),
+               rt::Arg::Val(idim), rt::Arg::Val(complete)},
+              error))
+    return false;
+  if (!Launch("halo_qsa_select", {1}, {1024},
+              {rt::Arg::Buf(block_scores_), rt::Arg::Buf(visible_), rt::Arg::Val(complete), rt::Arg::Val(budget),
+               rt::Arg::Val(ratio), rt::Arg::Val(n_kv)},
+              error))
+    return false;
+  return Launch("halo_attention_select", {nh}, {kBlock},
                 {rt::Arg::Buf(q_), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v), rt::Arg::Buf(gate_), rt::Arg::Buf(visible_),
                  rt::Arg::Buf(ctx_), rt::Arg::Buf(scores_), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(hd),
-                 rt::Arg::Val(static_cast<std::uint32_t>(visible.size())), rt::Arg::Val(max_context_)},
+                 rt::Arg::Val(n_visible), rt::Arg::Val(max_context_)},
                 error) &&
          MatVec(l.attn_out, 0, ctx_, block_out_, error);
+}
+
+bool FlashNextGpu::ExpertMatVec(const model::TensorRef& t, std::uint32_t slot, const rt::Buffer& x,
+                                const rt::Buffer& y, std::string* error) {
+  const auto& d = tensors_.at(t.data);
+  const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
+  const rt::Arg args[] = {rt::Arg::Buf(d.buf), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(x), rt::Arg::Buf(y),
+                          rt::Arg::Val(slot), rt::Arg::Val<std::uint64_t>(t.RowBytes() * t.rows),
+                          rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val<std::uint64_t>(t.RowBytes())};
+  return dev_.Launch(d.expert, {Blocks(rows, kBlock / 32)}, {kBlock}, args, error);
 }
 
 bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
   const auto& c = w_.config;
   const std::uint32_t H = c.hidden_size;
-  std::vector<float> logits(c.num_experts);
-  if (!MatVec(l.router, 0, mixed_, router_, error) || !dev_.Download(router_, 0, logits.data(), logits.size() * 4, error))
+  // Routing on device: softmax, top-k (ties keep the lower expert), renormalize.
+  if (!MatVec(l.router, 0, mixed_, router_, error) ||
+      !Launch("halo_router_topk", {1}, {kBlock},
+              {rt::Arg::Buf(router_), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(expert_weights_),
+               rt::Arg::Val(c.num_experts), rt::Arg::Val(c.num_experts_used)},
+              error) ||
+      !dev_.Fill(block_out_, 0, error))
     return false;
-  // The reference's routing: softmax over all experts, top-k, renormalize.
-  const float mx = *std::max_element(logits.begin(), logits.end());
-  double den = 0;
-  for (float& v : logits) {
-    v = std::exp(v - mx);
-    den += v;
-  }
-  for (float& v : logits) v = static_cast<float>(v / den);
-  std::vector<std::uint32_t> order(c.num_experts);
-  std::iota(order.begin(), order.end(), 0U);
-  std::partial_sort(order.begin(), order.begin() + c.num_experts_used, order.end(),
-                    [&](std::uint32_t a, std::uint32_t b) { return logits[a] > logits[b]; });
-  float sum = 0;
-  for (std::uint32_t i = 0; i < c.num_experts_used; ++i) sum += logits[order[i]];
-  sum = std::max(sum, 6.103515625e-5F);
-  if (!dev_.Fill(block_out_, 0, error)) return false;
   for (std::uint32_t i = 0; i < c.num_experts_used; ++i) {
-    const std::uint32_t e = order[i];
-    if (!MatVec(l.ffn_gate_exps, e, mixed_, eg_, error) || !MatVec(l.ffn_up_exps, e, mixed_, eu_, error) ||
+    if (!ExpertMatVec(l.ffn_gate_exps, i, mixed_, eg_, error) || !ExpertMatVec(l.ffn_up_exps, i, mixed_, eu_, error) ||
         !Launch("halo_silu_mul", {Blocks(c.expert_ff)}, {kBlock},
                 {rt::Arg::Buf(eg_), rt::Arg::Buf(eu_), rt::Arg::Val(c.expert_ff)}, error) ||
-        !MatVec(l.ffn_down_exps, e, eg_, ed_, error) ||
-        !Launch("halo_axpy", {Blocks(H)}, {kBlock},
-                {rt::Arg::Buf(block_out_), rt::Arg::Buf(ed_), rt::Arg::Val(logits[e] / sum), rt::Arg::Val(H)}, error))
+        !ExpertMatVec(l.ffn_down_exps, i, eg_, ed_, error) ||
+        !Launch("halo_axpy_slot", {Blocks(H)}, {kBlock},
+                {rt::Arg::Buf(block_out_), rt::Arg::Buf(ed_), rt::Arg::Buf(expert_weights_), rt::Arg::Val(i),
+                 rt::Arg::Val(H)},
+                error))
       return false;
   }
-  float sg = 0;
-  if (!MatVec(l.shexp_gate, 0, mixed_, eg_, error) || !MatVec(l.shexp_up, 0, mixed_, eu_, error) ||
-      !Launch("halo_silu_mul", {Blocks(c.shared_expert_ff)}, {kBlock},
-              {rt::Arg::Buf(eg_), rt::Arg::Buf(eu_), rt::Arg::Val(c.shared_expert_ff)}, error) ||
-      !MatVec(l.shexp_down, 0, eg_, ed_, error) || !MatVec(l.shexp_gate_inp, 0, mixed_, sgate_, error) ||
-      !dev_.Download(sgate_, 0, &sg, 4, error))
-    return false;
-  return Launch("halo_axpy", {Blocks(H)}, {kBlock},
-                {rt::Arg::Buf(block_out_), rt::Arg::Buf(ed_), rt::Arg::Val(1.0F / (1.0F + std::exp(-sg))), rt::Arg::Val(H)},
-                error);
+  return MatVec(l.shexp_gate, 0, mixed_, eg_, error) && MatVec(l.shexp_up, 0, mixed_, eu_, error) &&
+         Launch("halo_silu_mul", {Blocks(c.shared_expert_ff)}, {kBlock},
+                {rt::Arg::Buf(eg_), rt::Arg::Buf(eu_), rt::Arg::Val(c.shared_expert_ff)}, error) &&
+         MatVec(l.shexp_down, 0, eg_, ed_, error) && MatVec(l.shexp_gate_inp, 0, mixed_, sgate_, error) &&
+         Launch("halo_axpy_sigmoid", {Blocks(H)}, {kBlock},
+                {rt::Arg::Buf(block_out_), rt::Arg::Buf(ed_), rt::Arg::Buf(sgate_), rt::Arg::Val(H)}, error);
 }
 
 bool FlashNextGpu::Step(std::int32_t token, std::span<float> logits, std::string* error) {

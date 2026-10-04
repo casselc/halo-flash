@@ -175,6 +175,11 @@ __device__ void Embed(const std::uint8_t* w, float* out, std::uint32_t token, st
                                   std::uint32_t cols, std::uint64_t row_bytes) {                               \
     MatVec<L>(w, x, y, rows, cols, row_bytes);                                                                 \
   }                                                                                                            \
+  extern "C" __global__ void NAME##_expert(const std::uint8_t* w, const std::uint32_t* ids, const float* x, float* y,  \
+                                           std::uint32_t slot, std::uint64_t expert_bytes, std::uint32_t rows,      \
+                                           std::uint32_t cols, std::uint64_t row_bytes) {                           \
+    MatVec<L>(w + ids[slot] * expert_bytes, x, y, rows, cols, row_bytes);                                         \
+  }                                                                                                            \
   extern "C" __global__ void NAME##_embed(const std::uint8_t* w, float* out, std::uint32_t token,              \
                                           std::uint32_t cols, std::uint64_t row_bytes) {                       \
     Embed<L>(w, out, token, cols, row_bytes);                                                                  \
@@ -478,4 +483,162 @@ extern "C" __global__ void halo_attention_select(const float* q, const float* kc
       acc += sc[j] * vc[(static_cast<std::size_t>(visible[j]) * num_kv_heads + kvh) * hd + i];
     out[h * hd + i] = acc / den * Sigmoid(gate[h * hd + i]);
   }
+}
+
+// ---- Device-side routing and selection (no host round trip) ----------------
+
+// MoE router: softmax over all experts, top-k of the probabilities (ties
+// keep the lower expert index), renormalized with the reference's floor.
+// One block; ids/weights receive k entries in descending probability.
+extern "C" __global__ void halo_router_topk(const float* logits, std::uint32_t* ids, float* weights, std::uint32_t n,
+                                            std::uint32_t k) {
+  __shared__ float scratch[32];
+  __shared__ float prob[1024];
+  __shared__ float best_v[32];
+  __shared__ std::uint32_t best_i[32];
+  float mx = -INFINITY;
+  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) mx = fmaxf(mx, logits[i]);
+  mx = BlockMax(mx, scratch);
+  float den = 0.0f;
+  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    prob[i] = expf(logits[i] - mx);
+    den += prob[i];
+  }
+  den = BlockSum(den, scratch);
+  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) prob[i] /= den;
+  __syncthreads();
+  float sum = 0.0f;
+  for (std::uint32_t slot = 0; slot < k; ++slot) {
+    float v = -1.0f;
+    std::uint32_t at = 0xFFFFFFFFu;
+    for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x)
+      if (prob[i] > v) {  // strided ascending scan: first max per thread has the lowest index
+        v = prob[i];
+        at = i;
+      }
+    for (int o = kWarp / 2; o > 0; o >>= 1) {
+      const float ov = __shfl_xor(v, o, kWarp);
+      const std::uint32_t oi = __shfl_xor(at, o, kWarp);
+      if (ov > v || (ov == v && oi < at)) {
+        v = ov;
+        at = oi;
+      }
+    }
+    if (threadIdx.x % kWarp == 0) {
+      best_v[threadIdx.x / kWarp] = v;
+      best_i[threadIdx.x / kWarp] = at;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      for (std::uint32_t w = 1; w < (blockDim.x + kWarp - 1) / kWarp; ++w)
+        if (best_v[w] > best_v[0] || (best_v[w] == best_v[0] && best_i[w] < best_i[0])) {
+          best_v[0] = best_v[w];
+          best_i[0] = best_i[w];
+        }
+      ids[slot] = best_i[0];
+      weights[slot] = best_v[0];
+      sum += best_v[0];
+      prob[best_i[0]] = -1.0f;
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    sum = fmaxf(sum, 6.103515625e-5f);
+    for (std::uint32_t slot = 0; slot < k; ++slot) weights[slot] /= sum;
+  }
+}
+
+// y += weights[slot] * x
+extern "C" __global__ void halo_axpy_slot(float* y, const float* x, const float* weights, std::uint32_t slot,
+                                          std::uint32_t n) {
+  const float a = weights[slot];
+  for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) y[i] += a * x[i];
+}
+
+// y += sigmoid(g[0]) * x (shared-expert gate)
+extern "C" __global__ void halo_axpy_sigmoid(float* y, const float* x, const float* g, std::uint32_t n) {
+  const float a = Sigmoid(g[0]);
+  for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) y[i] += a * x[i];
+}
+
+namespace {
+// Order-preserving key of a non-negative score (QSA scores are sums of ReLU).
+__device__ inline std::uint32_t ScoreKey(float v) { return v > 0.0f ? __float_as_uint(v) : 0u; }
+
+// Exclusive prefix sum of one flag per thread across the block; returns the
+// thread's offset and writes the block total to *total.
+__device__ inline std::uint32_t BlockScan(std::uint32_t flag, std::uint32_t* buf, std::uint32_t* total) {
+  buf[threadIdx.x] = flag;
+  __syncthreads();
+  for (std::uint32_t o = 1; o < blockDim.x; o <<= 1) {
+    const std::uint32_t add = threadIdx.x >= o ? buf[threadIdx.x - o] : 0u;
+    __syncthreads();
+    buf[threadIdx.x] += add;
+    __syncthreads();
+  }
+  const std::uint32_t inclusive = buf[threadIdx.x];
+  *total = buf[blockDim.x - 1];
+  __syncthreads();
+  return inclusive - flag;
+}
+}  // namespace
+
+// QSA block selection: keep the k highest-scoring of n complete blocks
+// (equal scores: lower block first, i.e. the reference's stable sort), in
+// position order, expanded to their `ratio` token positions, then the
+// incomplete tail [n*ratio, n_kv). One block; blockDim a power of two.
+extern "C" __global__ void halo_qsa_select(const float* score, std::uint32_t* visible, std::uint32_t n, std::uint32_t k,
+                                           std::uint32_t ratio, std::uint32_t n_kv) {
+  __shared__ std::uint32_t hist[256];
+  __shared__ std::uint32_t buf[1024];
+  __shared__ std::uint32_t prefix, prefix_mask, remaining;
+  if (k >= n) {  // under budget: every position is visible
+    for (std::uint32_t p = threadIdx.x; p < n_kv; p += blockDim.x) visible[p] = p;
+    return;
+  }
+  if (threadIdx.x == 0) {
+    prefix = 0;
+    prefix_mask = 0;
+    remaining = k;  // rank (1-based) of the threshold among keys matching the prefix
+  }
+  // MSB-first radix select of the k-th largest key, 8 bits per pass.
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    for (std::uint32_t i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
+    __syncthreads();
+    for (std::uint32_t b = threadIdx.x; b < n; b += blockDim.x) {
+      const std::uint32_t key = ScoreKey(score[b]);
+      if ((key & prefix_mask) == prefix) atomicAdd(&hist[(key >> shift) & 0xFF], 1u);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      std::uint32_t digit = 255, acc = 0;
+      for (;; --digit) {
+        if (acc + hist[digit] >= remaining || digit == 0) break;
+        acc += hist[digit];
+      }
+      remaining -= acc;
+      prefix |= digit << shift;
+      prefix_mask |= 0xFFu << shift;
+    }
+    __syncthreads();
+  }
+  const std::uint32_t threshold = prefix, take_equal = remaining;
+  // One pass in block order: every key above the threshold, and the first
+  // `take_equal` keys equal to it.
+  std::uint32_t written = 0, equal_seen = 0;
+  for (std::uint32_t base = 0; base < n; base += blockDim.x) {
+    const std::uint32_t b = base + threadIdx.x;
+    const std::uint32_t key = b < n ? ScoreKey(score[b]) : 0u;
+    const std::uint32_t eq = b < n && key == threshold;
+    std::uint32_t eq_total;
+    const std::uint32_t eq_rank = equal_seen + BlockScan(eq, buf, &eq_total);
+    const std::uint32_t keep = b < n && (key > threshold || (eq && eq_rank < take_equal));
+    std::uint32_t kept;
+    const std::uint32_t at = written + BlockScan(keep, buf, &kept);
+    if (keep)
+      for (std::uint32_t t = 0; t < ratio; ++t) visible[at * ratio + t] = b * ratio + t;
+    written += kept;
+    equal_seen += eq_total;
+  }
+  for (std::uint32_t p = n * ratio + threadIdx.x; p < n_kv; p += blockDim.x) visible[k * ratio + p - n * ratio] = p;
 }

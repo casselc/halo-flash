@@ -5,8 +5,9 @@
 // halo::model::ReferenceModel step by step: hyper-connection mixing, PLE
 // n-gram injection (rows gathered on the CPU from the on-disk table), Gated
 // DeltaNet, gated GQA with QSA block selection, and softmax top-k MoE with the
-// shared expert. Routing and block selection run on the host with the
-// reference's exact tie rules; P3 moves them on device.
+// shared expert. Routing and QSA block selection run on device with the
+// reference's tie rules (equal scores keep the lower index), so a step
+// needs no host round trip except the n-gram rows and the final logits.
 
 #include <cstdint>
 #include <initializer_list>
@@ -48,7 +49,7 @@ class FlashNextGpu {
  private:
   struct DevTensor {
     rt::Buffer buf;
-    rt::KernelId matvec = -1, embed = -1;
+    rt::KernelId matvec = -1, embed = -1, expert = -1;
   };
   struct DevLora {
     const model::LoraPair* pair = nullptr;
@@ -77,6 +78,9 @@ class FlashNextGpu {
   bool Linear(const model::LayerWeights& l, LinearState& s, std::string* error);
   bool Attention(const model::LayerWeights& l, AttnState& s, std::string* error);
   bool Moe(const model::LayerWeights& l, std::string* error);
+  /// Matvec on the expert that routing slot `slot` selected (ids on device).
+  bool ExpertMatVec(const model::TensorRef& t, std::uint32_t slot, const rt::Buffer& x, const rt::Buffer& y,
+                    std::string* error);
   /// Visits every state buffer with the float count currently meaningful.
   template <typename F>
   bool ForEachState(F&& f);
@@ -97,7 +101,7 @@ class FlashNextGpu {
   rt::Buffer ple_emb_, ple_key_, ple_value_, ple_query_, ple_gated_, ple_norm_, ple_history_;
   rt::Buffer qkv_, conv_out_, z_, alpha_, beta_, gdn_out_;
   rt::Buffer qg_, q_, gate_, k_, v_, ctx_, scores_, iq_, ik_, pooled_, block_scores_, visible_;
-  rt::Buffer router_, eg_, eu_, ed_, sgate_, logits_, lora_tmp_, lora_out_;
+  rt::Buffer router_, expert_ids_, expert_weights_, eg_, eu_, ed_, sgate_, logits_, lora_tmp_, lora_out_;
 };
 
 class FlashNextGpu::Snapshot {

@@ -30,8 +30,8 @@ why = "Flash-Next gates DeltaNet output with sigmoid, Qwen3.5 with SiLU"
 [[mutant]]
 name = "fn-qsa-extra-block"
 file = "src/engine/flash_next_gpu.cpp"
-find = 'order.resize(budget);'
-replace = 'order.resize(budget + 1);'
+find = 'rt::Arg::Val(complete), rt::Arg::Val(budget),'
+replace = 'rt::Arg::Val(complete), rt::Arg::Val(budget + 1),'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
@@ -59,9 +59,9 @@ why = "the PLE conv is dilated by the n-gram size"
 
 [[mutant]]
 name = "fn-moe-no-renorm"
-file = "src/engine/flash_next_gpu.cpp"
-find = 'rt::Arg::Val(logits[e] / sum)'
-replace = 'rt::Arg::Val(logits[e])'
+file = "src/kernels/core.hip"
+find = 'for (std::uint32_t slot = 0; slot < k; ++slot) weights[slot] /= sum;'
+replace = ''
 suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
@@ -69,9 +69,9 @@ why = "top-k expert weights are renormalized to sum to 1"
 
 [[mutant]]
 name = "fn-shared-expert-ungated"
-file = "src/engine/flash_next_gpu.cpp"
-find = 'rt::Arg::Val(1.0F / (1.0F + std::exp(-sg)))'
-replace = 'rt::Arg::Val(1.0F)'
+file = "src/kernels/core.hip"
+find = 'const float a = Sigmoid(g[0]);'
+replace = 'const float a = 1.0f;'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
@@ -325,3 +325,55 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuQuant.*"
 why = "one IQ4_NL codebook entry off by one"
+
+# ---- Device-side routing and QSA selection ----------------------------------
+
+[[mutant]]
+name = "k-qsa-select-takes-extra-tie"
+file = "src/kernels/core.hip"
+find = '(eq && eq_rank < take_equal)'
+replace = '(eq && eq_rank <= take_equal)'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuSelect.*"
+why = "exactly k blocks: one more score equal to the threshold is one too many"
+
+[[mutant]]
+name = "k-qsa-radix-rank-not-carried"
+file = "src/kernels/core.hip"
+find = '      remaining -= acc;'
+replace = ''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuSelect.*"
+why = "the k-th key's rank is relative to keys under the chosen prefix (>= vs > on the digit bound is equivalent)"
+
+[[mutant]]
+name = "k-router-tie-higher-index"
+file = "src/kernels/core.hip"
+find = 'if (ov > v || (ov == v && oi < at)) {'
+replace = 'if (ov > v || (ov == v && oi > at)) {'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuSelect.*"
+why = "equal router probabilities keep the lower expert"
+
+[[mutant]]
+name = "k-router-no-renorm"
+file = "src/kernels/core.hip"
+find = 'for (std::uint32_t slot = 0; slot < k; ++slot) weights[slot] /= sum;'
+replace = ''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuSelect.*"
+why = "selected expert weights are renormalized"
+
+[[mutant]]
+name = "fn-visible-count-drops-tail"
+file = "src/engine/flash_next_gpu.cpp"
+find = 'budget * ratio + (n_kv - complete * ratio)'
+replace = 'budget * ratio'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
+why = "the incomplete tail block is always visible"
