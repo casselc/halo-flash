@@ -18,7 +18,8 @@ Outputs in <out-dir>:
   tokens.i32            the reference sequence (int32)
   logits_prefill.f32    [T, vocab] logits from one full forward
   logits_decode.f32     [T, vocab] logits from token-by-token cached decode
-  hidden.f32            [layers+1, T, hc_dim] per-layer residual streams
+  hidden.f32            [n, T, hc_dim] residual streams recorded by HF
+  head_input.f32        [T, hidden] head-mixer output (LM head input)
   meta.json             shapes, versions, and the prefill/decode agreement
 """
 import json
@@ -120,6 +121,12 @@ def main():
     cfg = config.to_dict()
     cfg["architectures"] = ["Qwen4ExpForCausalLM"]
     cfg["torch_dtype"] = "float32"
+    # transformers main serializes attention layers as "indexed_attention";
+    # the real Flash-Next config.json says "full_attention", which is the only
+    # value llama.cpp's converter recognizes (anything else silently writes
+    # zero QSA compression ratios). Match the real checkpoint.
+    cfg["layer_types"] = ["full_attention" if t == "indexed_attention" else t
+                          for t in cfg["layer_types"]]
     json.dump(cfg, open(os.path.join(hf_dir, "config.json"), "w"), indent=2)
     save_file(checkpoint_state(model, config), os.path.join(hf_dir, "model.safetensors"),
               metadata={"format": "pt"})
@@ -138,7 +145,9 @@ def main():
     with torch.no_grad():
         full = model(input_ids=ids, output_hidden_states=True, use_cache=False)
         prefill = full.logits[0].float()
-        hidden = torch.stack([h[0] for h in full.hidden_states]).float()
+        hc_dim = config.hc_count * config.hidden_size
+        hidden = torch.stack([h[0] for h in full.hidden_states if h.shape[-1] == hc_dim]).float()
+        head_in = [h[0] for h in full.hidden_states if h.shape[-1] != hc_dim][-1].float()
         cache = None
         decode = []
         for t in range(T):
@@ -151,6 +160,7 @@ def main():
     prefill.numpy().tofile(os.path.join(out_dir, "logits_prefill.f32"))
     decode.numpy().tofile(os.path.join(out_dir, "logits_decode.f32"))
     hidden.numpy().tofile(os.path.join(out_dir, "hidden.f32"))
+    head_in.numpy().tofile(os.path.join(out_dir, "head_input.f32"))
     rel = ((prefill - decode).norm() / prefill.norm()).item()
     meta = {
         "seed": SEED, "T": T, "vocab": config.vocab_size,

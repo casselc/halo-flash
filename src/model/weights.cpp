@@ -77,7 +77,9 @@ struct Binder {
            std::to_string(rows) + ", " + std::to_string(experts) + "]");
       return t;
     }
-    bool type_ok = false;
+    // F32 is lossless and always decodable; converter test artifacts
+    // (tests/model) store every tensor that way.
+    bool type_ok = info->type == GgmlType::kF32;
     for (auto type : types) {
       type_ok = type_ok || info->type == type;
     }
