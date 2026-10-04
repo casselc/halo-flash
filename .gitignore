@@ -10,3 +10,6 @@ timeout-*
 models/
 tools/__pycache__/
 .claude/
+
+# nix develop environment export (tools may source it)
+.nix-env.sh

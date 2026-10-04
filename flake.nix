@@ -21,14 +21,20 @@
           pkgs.ninja
           pkgs.python3
           pkgs.sqlite
+          # Host code: nixpkgs' wrapped clang, so headers, libc and libstdc++
+          # all come from this nixpkgs. ROCm's own clang stays off PATH (it is
+          # not wrapped: it reads the host's /usr/include) and is used only
+          # through hipcc, for device code.
+          pkgs.clang
+          pkgs.llvm # llvm-readelf for tools/kernel_report.py
           rocm.clr # HIP runtime (libamdhip64) and hipcc
-          rocm.llvm.clang # the HIP device compiler hipcc drives
-          rocm.llvm.llvm # llvm-readelf for tools/kernel_report.py
           rocm.rocminfo
           rocm.rocprofiler-sdk # rocprofv3, matching the runtime above
         ];
         env = {
           HALO_TOOLCHAIN = "nix-rocm-${rocm.clr.version}";
+          HALO_CC = "${pkgs.clang}/bin/clang";
+          HALO_CXX = "${pkgs.clang}/bin/clang++";
           ROCM_PATH = "${rocm.clr}";
           HIP_PATH = "${rocm.clr}";
         };

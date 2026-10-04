@@ -85,6 +85,16 @@
       "environment": {
         "MULL_CONFIG": "${sourceDir}/mull.yml"
       }
+    },
+    {
+      "name": "nix-gpu",
+      "inherits": "gpu",
+      "displayName": "GPU, inside `nix develop` (pinned ROCm toolchain)",
+      "binaryDir": "${sourceDir}/build/nix-gpu",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "$env{HALO_CC}",
+        "CMAKE_CXX_COMPILER": "$env{HALO_CXX}"
+      }
     }
   ],
   "buildPresets": [
@@ -119,6 +129,10 @@
     {
       "name": "mull",
       "configurePreset": "mull"
+    },
+    {
+      "name": "nix-gpu",
+      "configurePreset": "nix-gpu"
     }
   ],
   "testPresets": [
@@ -170,6 +184,13 @@
     {
       "name": "gpu",
       "configurePreset": "gpu",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "nix-gpu",
+      "configurePreset": "nix-gpu",
       "output": {
         "outputOnFailure": true
       }

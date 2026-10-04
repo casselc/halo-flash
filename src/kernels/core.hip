@@ -3947,7 +3947,8 @@ extern "C" __global__ void __launch_bounds__(256)
                            std::uint32_t tokens, std::uint32_t qk_stride, std::uint32_t v_stride,
                            std::uint32_t o_stride) {
   constexpr std::uint32_t d = 128, kStage = 8;
-  __shared__ float ks[kStage][d], qs[kStage][d], vs[kStage][64], decay_s[kStage], beta_s[kStage];
+  __shared__ __attribute__((aligned(16))) float ks[kStage][d], qs[kStage][d];  // float4 reads
+  __shared__ float vs[kStage][64], decay_s[kStage], beta_s[kStage];
   const std::uint32_t h = blockIdx.y, heads = gridDim.y, tid = threadIdx.x;
   const std::uint32_t j = blockIdx.x * 64 + tid / 4, part = tid % 4, i0 = part * 32;
   float* S = state + static_cast<std::size_t>(h) * d * d + j;  // S[i][j] at S[i * d]
@@ -4001,13 +4002,24 @@ extern "C" __global__ void __launch_bounds__(256)
     if (t0 + kStage < tokens) load(t0 + kStage, min(kStage, tokens - t0 - kStage));  // in flight below
     for (std::uint32_t tt = 0; tt < n; ++tt) {
       const std::uint32_t t = t0 + tt;
+      // This lane's 32 k and q values in registers, read as float4s once and
+      // used by both the dot products and the state update. Left to the
+      // compiler, ROCm clang 22 split these into narrow LDS reads and re-read
+      // k for the update (553 vs 308 ms per prefill against clang 21).
+      float kr[32], qr[32];
+#pragma unroll
+      for (std::uint32_t i = 0; i < 32; i += 4) {
+        const float4 k4 = *reinterpret_cast<const float4*>(&ks[tt][i0 + i]);
+        const float4 q4 = *reinterpret_cast<const float4*>(&qs[tt][i0 + i]);
+        kr[i] = k4.x, kr[i + 1] = k4.y, kr[i + 2] = k4.z, kr[i + 3] = k4.w;
+        qr[i] = q4.x, qr[i + 1] = q4.y, qr[i + 2] = q4.z, qr[i + 3] = q4.w;
+      }
       float kq = 0.0f, A = 0.0f, B = 0.0f;
 #pragma unroll
       for (std::uint32_t i = 0; i < 32; ++i) {
-        const float kv = ks[tt][i0 + i], qv = qs[tt][i0 + i];
-        kq += kv * qv;
-        A += s[i] * kv;
-        B += s[i] * qv;
+        kq += kr[i] * qr[i];
+        A += s[i] * kr[i];
+        B += s[i] * qr[i];
       }
 #pragma unroll
       for (int o = 1; o < 4; o <<= 1) {
@@ -4018,7 +4030,7 @@ extern "C" __global__ void __launch_bounds__(256)
       const float decay = decay_s[tt], b = beta_s[tt];
       const float delta = (vs[tt][tid / 4] - decay * A) * b;
 #pragma unroll
-      for (std::uint32_t i = 0; i < 32; ++i) s[i] = decay * s[i] + delta * ks[tt][i0 + i];
+      for (std::uint32_t i = 0; i < 32; ++i) s[i] = decay * s[i] + delta * kr[i];
       if (part == 0)
         out[static_cast<std::size_t>(t) * o_stride + h * d + j] = (decay * B + delta * kq) / sqrtf(static_cast<float>(d));
     }
