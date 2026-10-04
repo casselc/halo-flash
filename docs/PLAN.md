@@ -266,6 +266,17 @@ not one-off checks:
     24 tok/s. Graph replay and fusion are therefore the first P3 levers.
   - HRX graph replay measured slower per node than HIP under load; this
     needs a quiet-machine remeasurement.
+- **Fast-path coverage (2026-10-04).** The tiny model's widths are too small
+  for the quantized kernels, so its tests only covered the float fallbacks.
+  A "small" model (hidden 256, head dims 128/256, mixer rank 32;
+  `make_tiny_hf_reference.py --small-quant`, `tools/make_small_quant.sh`)
+  carries UD-Q4_K_XL's per-tensor types, including the Q5_K and Q8_0 expert
+  layers, BF16 indexer and IQ4_NL n-gram table. On it, every fast kernel
+  runs and must match the CPU reference (relative L2 3.4e-7 with float
+  expert activations). int8 activations are checked against a reference
+  that emulates the same quantization; values within 1e-6 of a rounding
+  boundary make that comparison 1-ulp sensitive (5e-4), so the bound is
+  1e-3 per position plus a tenth of the int8-vs-float distance.
 - **Order of work (2026-10-03):**
   1. Device-side sampling, before fusion. Today each token downloads about
      1 MB of logits and filters them on the host.

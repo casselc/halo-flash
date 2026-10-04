@@ -384,3 +384,82 @@ TEST(FlashNextGpu, FileLoadedWeightsMatchDirectUpload) {
     }
   }
 }
+
+// The small model (tools/make_tiny_hf_reference.py --small-quant, quantized by
+// tools/make_small_quant.sh with UD-Q4_K_XL's per-tensor types) has widths
+// the quantized fast paths accept, so this runs the kernels the real model
+// runs: repacked Q8_0, Q4_K/Q5_1 experts with int8 activations, the Q5_K and
+// Q8_0 expert fallbacks, the fused mixer, shared expert and DeltaNet block,
+// d128 GDN and BF16 indexer.
+//   Float activations, against the float reference: relative L2 < 1e-4 and
+//   identical argmax at every position (fixed in advance, as above).
+//   int8 activations, against the reference emulating the same quantization:
+//   identical argmax, relative L2 < 1e-3 at every position, and over the
+//   sequence at most a tenth of the emulation's own distance from float.
+// Why int8 is not held to 1e-4: values land within 1e-6 of a rounding
+// boundary (x / scale = 10.4999990 occurs here), so a 1-ulp difference in x,
+// which float reordering produces, flips a quant and moves logits by up to
+// 5e-4. An end-to-end bound of 1e-2 against the float reference, set in
+// advance, also failed (2.7%): the random-weight model amplifies the ~0.5%
+// per-projection quantization error; that comparison belongs to the real
+// model's quality gate. A formula error (wrong scale, dropped min term,
+// truncation) moves int8 as far as float is, which the tenth-bound catches.
+//   HALO_SMALL_QUANT_DIR  holds small-q.gguf and tokens.i32
+TEST(FlashNextGpu, SmallQuantizedModelRunsFastPathsAndMatchesReference) {
+  const char* dir = std::getenv("HALO_SMALL_QUANT_DIR");
+  if (!dir) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  std::string error;
+  auto reader = core::GgufReader::OpenFile(std::string(dir) + "/small-q.gguf", &error);
+  ASSERT_TRUE(reader) << error;
+  auto weights = model::ModelWeights::Bind(*reader, &error);
+  ASSERT_TRUE(weights) << error;
+  const auto& p = weights->ple_table;
+  auto ngram = model::NgramTable::Open(reader->GetMappedRegions()[p.shard].file_descriptor, p.file_offset, p.rows,
+                                       weights->config.ple_head_dim, p.type, &error);
+  ASSERT_TRUE(ngram) << error;
+  const auto tokens = ReadTokens(std::string(dir) + "/tokens.i32");
+  const auto n = static_cast<std::uint32_t>(tokens.size());
+  const std::size_t V = weights->config.vocab_size;
+
+  // Reference logits, float and int8 expert activations.
+  std::vector<float> want[2];
+  for (const bool int8 : {false, true}) {
+    want[int8].resize(tokens.size() * V);
+    model::ReferenceModel cpu(*weights, ngram.get(), n);
+    cpu.SetInt8ExpertActivations(int8);
+    for (std::size_t i = 0; i < tokens.size(); ++i)
+      ASSERT_TRUE(cpu.Step(tokens[i], std::span<float>(want[int8].data() + i * V, V), {}, &error)) << error;
+  }
+  std::printf("int8 vs float reference: relative L2 %.3g over the sequence\n",
+              RelL2(want[1], want[0].data()));
+  auto devices = Devices();
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  const bool saved = engine::FlashNextGpu::int8_act_moe_;
+  for (auto& dev : devices)
+    for (const bool int8 : {false, true}) {
+      engine::FlashNextGpu::int8_act_moe_ = int8;
+      auto gpu = engine::FlashNextGpu::Create(*dev, *weights, ngram.get(), nullptr, n, &error);
+      ASSERT_TRUE(gpu) << error;
+      std::vector<float> got(V);
+      double worst = 0;
+      std::vector<float> all(tokens.size() * V);
+      for (std::size_t i = 0; i < tokens.size(); ++i) {
+        ASSERT_TRUE(gpu->Step(tokens[i], got, &error)) << error;
+        std::copy(got.begin(), got.end(), all.begin() + static_cast<std::ptrdiff_t>(i * V));
+        const float* w = want[int8].data() + i * V;
+        const double rel = RelL2(got, w);
+        worst = std::max(worst, rel);
+        ASSERT_LT(rel, int8 ? 1e-3 : 1e-4) << rt::BackendName(dev->backend()) << " int8 " << int8 << " position " << i;
+        ASSERT_EQ(Argmax(got.data(), V), Argmax(w, V)) << "int8 " << int8 << " position " << i;
+      }
+      if (int8) EXPECT_LT(RelL2(all, want[1].data()), 0.1 * RelL2(want[1], want[0].data()));
+      for (const char* k : {"halo_gemv_q8r_r2", "halo_gemv_q8r_r4", "halo_moe_down_q5_1_r4", "halo_moe_down_q8r_r4",
+                             "halo_hc_mix_a", "halo_hc_mix_b", "halo_shexp_gate_up",
+                             "halo_gemv_q8r_dual", "halo_gdn_step_d128_norm", "halo_matvec_f32_rowblock2"})
+        EXPECT_TRUE(gpu->LaunchedKernel(k)) << k;
+      EXPECT_EQ(gpu->LaunchedKernel("halo_moe_gate_up_q4_k_dot"), int8);
+      EXPECT_EQ(gpu->LaunchedKernel("halo_moe_gate_up_q4_k_s2"), !int8);
+      std::printf("%s int8 %d: worst relative L2 %.3g\n", rt::BackendName(dev->backend()), int8, worst);
+    }
+  engine::FlashNextGpu::int8_act_moe_ = saved;
+}

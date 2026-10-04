@@ -145,6 +145,12 @@ inline constexpr std::int8_t kValuesIq4Nl[16] = {
 // Standard 16-bit float helper
 float Fp16ToFloat(std::uint16_t h) noexcept;
 
+/// Q4_K sub-block `group` (0..7, 32 values each) of `block`: its values are
+/// `scale * q - min` with q the 4-bit quant.
+void Q4KScaleMin(const block_q4_K& block, std::size_t group, float& scale, float& min) noexcept;
+/// The 4-bit quant of value `index` (0..255) of a Q4_K block.
+std::uint8_t Q4KQuant(const block_q4_K& block, std::size_t index) noexcept;
+
 // Dequantize row of Q4_K to float
 void DequantizeQ4_K(const void* src, float* dst, std::size_t k);
 

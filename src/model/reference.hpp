@@ -51,6 +51,10 @@ public:
   /// Applies `adapter` (or none) to every subsequent projection. The adapter
   /// must outlive its use.
   void SetAdapter(const LoraAdapter* adapter) noexcept { lora_ = adapter; }
+  /// Routed Q4_K gate/up see int8 activations, one scale (amax / 127) per 32
+  /// values with round to nearest and exact float sums for the min term,
+  /// exactly as the GPU's int8 expert kernel computes them.
+  void SetInt8ExpertActivations(bool on) noexcept { int8_expert_activations_ = on; }
   void Reset();
 
 private:
@@ -90,6 +94,7 @@ private:
   const LoraAdapter* lora_{nullptr};
   const Config& c_;
   Storage storage_;
+  bool int8_expert_activations_ = false;
   NgramTable* ngram_;
   std::uint32_t max_context_;
   std::uint32_t position_{0};

@@ -8,9 +8,14 @@ The checkpoint mimics the real one's tensor names and layout
 `ngram_embedding.shard_N` pieces), so llama.cpp's converter runs the same code
 path it runs on the real model:
 
-  make_tiny_hf_reference.py <tokenizer-dir> <out-dir>
+  make_tiny_hf_reference.py <tokenizer-dir> <out-dir> [--small-quant]
   python <llama.cpp>/convert_hf_to_gguf.py <out-dir>/hf --outtype f32 \
       --outfile <out-dir>/tiny-f32.gguf
+
+--small-quant builds a larger "small" model whose widths the real quant mix
+accepts (hidden 256, DeltaNet and indexer head dim 128, attention head dim
+256, mixer rank 32), so the GPU's quantized fast paths run end to end;
+tools/make_small_quant.sh then quantizes it like UD-Q4_K_XL.
 
 <tokenizer-dir> holds Flash-Next's tokenizer.json and tokenizer_config.json.
 Outputs in <out-dir>:
@@ -40,9 +45,9 @@ EOS = 248044     # <|endoftext|>, the PLE n-gram reset token
 SPLIT = 4        # PLE table shards
 
 
-def tiny_config():
+def tiny_config(**overrides):
     layers = 8
-    return cfgmod.Qwen4ExpTextConfig(
+    kw = dict(
         vocab_size=248320, hidden_size=64, num_hidden_layers=layers,
         layer_types=["linear_attention"] * 3 + ["full_attention"]
                     + ["linear_attention"] * 3 + ["full_attention"],
@@ -66,6 +71,20 @@ def tiny_config():
         eos_token_id=EOS, bos_token_id=EOS, pad_token_id=None,
         tie_word_embeddings=False, attention_bias=False,
     )
+    kw.update(overrides)
+    return cfgmod.Qwen4ExpTextConfig(**kw)
+
+
+def small_quant_config():
+    """Same layer pattern; every width a multiple of the quant block it meets."""
+    return tiny_config(
+        hidden_size=256, head_dim=256,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0,
+                         "partial_rotary_factor": 0.25,
+                         "mrope_section": [11, 11, 10], "mrope_interleaved": True},
+        indexer_head_dim=128, linear_key_head_dim=128, linear_value_head_dim=128,
+        num_experts=16, num_experts_per_tok=4, moe_intermediate_size=128,
+        shared_expert_intermediate_size=128, hc_lowrank=32, ple_embed_dim=512)
 
 
 def randomize(model, gen):
@@ -112,7 +131,7 @@ def main():
     tok_dir, out_dir = sys.argv[1], sys.argv[2]
     torch.manual_seed(SEED)
     gen = torch.Generator().manual_seed(SEED)
-    config = tiny_config()
+    config = small_quant_config() if "--small-quant" in sys.argv[3:] else tiny_config()
     model = mod.Qwen4ExpForCausalLM(config).eval().to(torch.float32)
     randomize(model, gen)
 

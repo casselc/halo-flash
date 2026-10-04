@@ -257,6 +257,20 @@ std::size_t EncodedSizeBytes(core::GgmlType type,
   }
 }
 
+void Q4KScaleMin(const block_q4_K& block, std::size_t group, float& scale, float& min) noexcept {
+  std::uint8_t sc = 0;
+  std::uint8_t m = 0;
+  GetQ4ScaleMin(group, block.scales, sc, m);
+  scale = Fp16ToFloat(block.d) * static_cast<float>(sc);
+  min = Fp16ToFloat(block.dmin) * static_cast<float>(m);
+}
+
+std::uint8_t Q4KQuant(const block_q4_K& block, std::size_t index) noexcept {
+  const std::size_t group = index / 32;
+  const std::uint8_t packed = block.qs[(group / 2 * 32) + index % 32];
+  return (group & 1U) != 0 ? packed >> 4U : packed & 0x0FU;
+}
+
 void DequantizeQ4_K(const void* src, float* dst, std::size_t k) {
   const auto* blocks = static_cast<const block_q4_K*>(src);
   const std::size_t nb = k / 256;

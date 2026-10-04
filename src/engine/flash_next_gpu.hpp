@@ -73,6 +73,9 @@ class FlashNextGpu {
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
   /// Graph replay (default) or eager launches; both run the same sequence.
   void SetUseGraphs(bool on) noexcept { use_graphs_ = on; }
+  /// Kernels launched so far by name (not the per-type embedding lookups), so
+  /// tests can assert which paths a model's shapes and types select.
+  [[nodiscard]] bool LaunchedKernel(const std::string& name) const { return kernels_.contains(name); }
 
   /// A device-resident copy of the whole sequence state: DeltaNet recurrent
   /// and conv state, attention KV, QSA indexer keys and pooled blocks, PLE

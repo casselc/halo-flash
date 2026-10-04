@@ -8,6 +8,7 @@
 #include <cmath>
 #include <numeric>
 
+#include "core/quant.hpp"
 #include "model/cpu_ops.hpp"
 
 namespace halo::model {
@@ -46,6 +47,39 @@ std::vector<float> QuantizedInput(std::span<const float> input) {
   }
   return result;
 }
+// Q4_K expert row times x quantized to int8 per 32 values (scale amax / 127,
+// round to nearest); the min term uses x's exact sums.
+void Q4kInt8MatVec(const TensorRef& w, std::uint64_t expert, std::span<const float> x, std::span<float> out) {
+  const std::size_t nb = x.size() / 32;
+  std::vector<int> q(x.size());
+  std::vector<float> scale(nb);
+  std::vector<double> sum(nb);
+  for (std::size_t b = 0; b < nb; ++b) {
+    float amax = 0;
+    for (std::size_t i = 0; i < 32; ++i) {
+      amax = std::max(amax, std::fabs(x[b * 32 + i]));
+      sum[b] += x[b * 32 + i];
+    }
+    scale[b] = amax / 127.0F;
+    for (std::size_t i = 0; i < 32; ++i)
+      q[b * 32 + i] = scale[b] > 0 ? static_cast<int>(std::nearbyint(x[b * 32 + i] / scale[b])) : 0;
+  }
+  const std::size_t row_bytes = x.size() / 256 * sizeof(quant::block_q4_K);
+  for (std::size_t r = 0; r < out.size(); ++r) {
+    const auto* blocks = reinterpret_cast<const quant::block_q4_K*>(static_cast<const std::uint8_t*>(w.data) +
+                                                                    (expert * w.rows + r) * row_bytes);
+    double acc = 0;
+    for (std::size_t b = 0; b < nb; ++b) {
+      float sc = 0, mn = 0;
+      quant::Q4KScaleMin(blocks[b / 8], b % 8, sc, mn);
+      int dot = 0;
+      for (std::size_t i = 0; i < 32; ++i) dot += q[b * 32 + i] * quant::Q4KQuant(blocks[b / 8], (b % 8) * 32 + i);
+      acc += double(sc) * scale[b] * dot - double(mn) * sum[b];
+    }
+    out[r] = static_cast<float>(acc);
+  }
+}
+
 }  // namespace
 
 void ReferenceModel::MatVec(const TensorRef& weight, std::uint64_t expert,
@@ -525,8 +559,14 @@ void ReferenceModel::Moe(const LayerWeights& l, std::span<const float> x,
   for (std::uint32_t i = 0; i < c_.num_experts_used; ++i) {
     const std::uint32_t e = order[i];
     const float weight = logits[e] / sum;
-    MatVec(l.ffn_gate_exps, e, x, gate);
-    MatVec(l.ffn_up_exps, e, x, up);
+    if (int8_expert_activations_ && l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
+        l.ffn_up_exps.type == core::GgmlType::kQ4_K && x.size() % 256 == 0) {
+      Q4kInt8MatVec(l.ffn_gate_exps, e, x, gate);
+      Q4kInt8MatVec(l.ffn_up_exps, e, x, up);
+    } else {
+      MatVec(l.ffn_gate_exps, e, x, gate);
+      MatVec(l.ffn_up_exps, e, x, up);
+    }
     for (std::uint32_t j = 0; j < c_.expert_ff; ++j) {
       gate[j] = Silu(gate[j]) * up[j];
     }

@@ -12,7 +12,7 @@ env = []
 
 [suite.gpu]
 build_dir = "build/gpu"
-env = ["HALO_TINY_HF_DIR", "HALO_TINY_QWEN35_DIR"]
+env = ["HALO_TINY_HF_DIR", "HALO_TINY_QWEN35_DIR", "HALO_SMALL_QUANT_DIR"]
 
 [suite.cpu]
 build_dir = "build/cpu-debug"
@@ -1109,3 +1109,25 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuKernels.FusedHcMixerMatchesKernelSequence"
 why = "each stream is normalized by its own RMS"
+
+# ---- int8 expert activations, end to end on the small quantized model ------
+
+[[mutant]]
+name = "q8act-truncate"
+file = "src/kernels/core.hip"
+find = 'static_cast<int>(rintf(v / scale))'
+replace = 'static_cast<int>(truncf(v / scale))'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.SmallQuantizedModelRunsFastPathsAndMatchesReference"
+why = "activations round to nearest; truncation biases every quant by half a step"
+
+[[mutant]]
+name = "q4k-dot-drop-min"
+file = "src/kernels/core.hip"
+find = 'dmin * (static_cast<float>(m0) * a.sum[s0] + static_cast<float>(m1) * a.sum[s1]);'
+replace = 'dmin * (static_cast<float>(m0) * a.sum[s0]);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.SmallQuantizedModelRunsFastPathsAndMatchesReference"
+why = "the Q4_K min term covers both sub-blocks of an item"
