@@ -95,7 +95,7 @@ bool FlashNextGpu::Launch(const char* name, rt::Dim3 grid, rt::Dim3 block, std::
 }
 
 bool FlashNextGpu::MatVec(const model::TensorRef& t, std::uint64_t expert, const rt::Buffer& x, const rt::Buffer& y,
-                          std::string* error) {
+                          std::string* error, std::size_t x_off, std::size_t y_off) {
   const auto& d = tensors_.at(t.data);
   if (d.matvec < 0) {
     if (error) *error = "no GPU matvec for " + std::string(t.name);
@@ -112,24 +112,24 @@ bool FlashNextGpu::MatVec(const model::TensorRef& t, std::uint64_t expert, const
     const std::uint32_t per_block = rows < 2048 ? 16 : 32;
     if (!Launch(k, {Blocks(rows, per_block)}, {256},
                 {rt::Arg::Buf(d.qs, e * rows * d.qstride), rt::Arg::Buf(d.d, e * rows * (cols / 32) * 2),
-                 rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride)},
+                 rt::Arg::Buf(x, x_off), rt::Arg::Buf(y, y_off), rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride)},
                 error))
       return false;
   } else if (t.type == core::GgmlType::kF32 && rows <= 1024 && expert == 0 && small_row_kernels_) {
     if (!Launch("halo_matvec_f32_rowblock", {rows}, {256},
-                {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols)}, error))
+                {rt::Arg::Buf(d.buf), rt::Arg::Buf(x, x_off), rt::Arg::Buf(y, y_off), rt::Arg::Val(rows), rt::Arg::Val(cols)}, error))
       return false;
   } else {
-    const rt::Arg args[] = {rt::Arg::Buf(d.buf, expert * t.RowBytes() * t.rows), rt::Arg::Buf(x), rt::Arg::Buf(y),
+    const rt::Arg args[] = {rt::Arg::Buf(d.buf, expert * t.RowBytes() * t.rows), rt::Arg::Buf(x, x_off), rt::Arg::Buf(y, y_off),
                             rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val<std::uint64_t>(t.RowBytes())};
     if (!dev_.Launch(d.matvec, {Blocks(rows, kBlock / 32)}, {kBlock}, args, error)) return false;
   }
   // LoRA: y += (alpha / r) * B (A x), on dense projections, as the reference.
   if (auto it = lora_.find(t.data); it != lora_.end()) {
     const auto& [pair, scale] = it->second;
-    if (!MatVec(pair->a, 0, x, lora_tmp_, error) || !MatVec(pair->b, 0, lora_tmp_, lora_out_, error) ||
+    if (!MatVec(pair->a, 0, x, lora_tmp_, error, x_off) || !MatVec(pair->b, 0, lora_tmp_, lora_out_, error) ||
         !Launch("halo_axpy", {Blocks(rows)}, {kBlock},
-                {rt::Arg::Buf(y), rt::Arg::Buf(lora_out_), rt::Arg::Val(scale), rt::Arg::Val(rows)}, error))
+                {rt::Arg::Buf(y, y_off), rt::Arg::Buf(lora_out_), rt::Arg::Val(scale), rt::Arg::Val(rows)}, error))
       return false;
   }
   return true;
@@ -833,8 +833,15 @@ bool FlashNextGpu::Reset(std::string* error) {
 }
 
 bool FlashNextGpu::Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error) {
-  for (std::size_t i = 0; i < tokens.size(); ++i)
-    if (!Step(tokens[i], i + 1 == tokens.size() ? logits : std::span<float>{}, error)) return false;
+  if (!batched_prefill_ || !ChunkSupported()) {
+    for (std::size_t i = 0; i < tokens.size(); ++i)
+      if (!Step(tokens[i], i + 1 == tokens.size() ? logits : std::span<float>{}, error)) return false;
+    return true;
+  }
+  for (std::size_t i = 0; i < tokens.size(); i += kPrefillChunk) {
+    const std::size_t n = std::min<std::size_t>(kPrefillChunk, tokens.size() - i);
+    if (!PrefillChunk(tokens.subspan(i, n), i + n == tokens.size() ? logits : std::span<float>{}, error)) return false;
+  }
   return true;
 }
 

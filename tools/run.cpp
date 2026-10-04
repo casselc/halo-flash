@@ -4,6 +4,12 @@
 //
 //   halo_run --model <shard-00001.gguf> --prompt "text" [--n 16]
 //            [--device cpu|hip|hrx|both-hip|both-hrx] [--max-context 512]
+//   halo_run --model <shard-00001.gguf> --prefill-bench 2048 --max-context 2048
+//            [--batched-prefill 0|1] [--prefill-int8 0|1] [--reps 3]
+//
+// --prefill-bench N times Prefill over N pseudo-random tokens (fixed seed,
+// as llama-bench's pp test uses random tokens) from a reset engine, --reps
+// times, and reports the median.
 //
 // The prompt is encoded raw (no chat template), as `gufo prompt --raw`.
 // Output: one line per generated token (id, top-2 logit margin, piece),
@@ -110,7 +116,7 @@ struct Profiling final : rt::Device {
 
 int main(int argc, char** argv) {
   std::string model, prompt = "The capital of France is", device = "hip";
-  int n = 16;
+  int n = 16, prefill_bench = 0, reps = 3;
   bool eager = false, profile = false, device_sample = false;
   setvbuf(stdout, nullptr, _IOLBF, 0);
   std::uint32_t max_context = 512;
@@ -125,6 +131,10 @@ int main(int argc, char** argv) {
     else if (a == "--profile") profile = std::string(argv[i + 1]) == "1";
     else if (a == "--device-sample") device_sample = std::string(argv[i + 1]) == "1";
     else if (a == "--int8-moe") engine::FlashNextGpu::int8_act_moe_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--prefill-bench") prefill_bench = std::atoi(argv[i + 1]);
+    else if (a == "--reps") reps = std::max(1, std::atoi(argv[i + 1]));
+    else if (a == "--batched-prefill") engine::FlashNextGpu::batched_prefill_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--prefill-int8") engine::FlashNextGpu::prefill_int8_gemm_ = std::string(argv[i + 1]) == "1";
     else {
       std::fprintf(stderr, "unknown option %s\n", a.c_str());
       return 2;
@@ -172,6 +182,42 @@ int main(int argc, char** argv) {
     std::printf("gpu (%s) ready in %.1f s\n", rt::BackendName(backend),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tu).count());
     gpu->SetUseGraphs(!eager);
+  }
+  if (prefill_bench > 0) {
+    if (!gpu) return std::fprintf(stderr, "--prefill-bench needs a GPU device\n"), 2;
+    std::vector<std::int32_t> toks(static_cast<std::size_t>(prefill_bench));
+    std::uint32_t seed = 1234;
+    for (auto& x : toks) {
+      seed = seed * 1664525u + 1013904223u;
+      x = static_cast<std::int32_t>((seed >> 4) % c.vocab_size);
+    }
+    std::vector<float> logits(c.vocab_size);
+    std::vector<double> secs;
+    if (profile) static_cast<Profiling*>(dev.get())->on = true;
+    for (int r = 0; r < reps; ++r) {
+      if (!gpu->Reset(&error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      const auto st = std::chrono::steady_clock::now();
+      if (!gpu->Prefill(toks, logits, &error)) return std::fprintf(stderr, "prefill: %s\n", error.c_str()), 1;
+      secs.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - st).count());
+      std::printf("prefill %d tokens: %.3f s (%.1f tok/s), argmax %u\n", prefill_bench, secs.back(),
+                  prefill_bench / secs.back(), Argmax(logits).best);
+    }
+    std::sort(secs.begin(), secs.end());
+    std::printf("prefill median: %.1f tok/s over %d reps (batched %d, int8 GEMMs %d)\n",
+                prefill_bench / secs[secs.size() / 2], reps, engine::FlashNextGpu::batched_prefill_ ? 1 : 0,
+                engine::FlashNextGpu::prefill_int8_gemm_ ? 1 : 0);
+    if (profile) {
+      auto* p = static_cast<Profiling*>(dev.get());
+      std::vector<std::pair<std::string, std::pair<double, long>>> rows(p->time.begin(), p->time.end());
+      std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.second.first > b.second.first; });
+      double total = 0;
+      for (auto& r : rows) total += r.second.first;
+      std::printf("profile over %d prefills: %.3f s each (each launch timed with a synchronize)\n", reps, total / reps);
+      for (auto& [name, v] : rows)
+        std::printf("  %-28s %8.1f ms/prefill %6.1f%%  %8ld launches/prefill\n", name.c_str(), 1e3 * v.first / reps,
+                    100 * v.first / total, v.second / reps);
+    }
+    return 0;
   }
   std::unique_ptr<model::ReferenceModel> cpu;
   if (use_cpu) cpu = std::make_unique<model::ReferenceModel>(*weights, ngram.get(), max_context);

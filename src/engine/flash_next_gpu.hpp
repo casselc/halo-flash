@@ -67,8 +67,19 @@ class FlashNextGpu {
   static inline bool fused_shexp_ = true;  ///< P3 shared expert in two launches
   static inline bool fused_linear_ = true;  ///< P3 DeltaNet block in five launches
   static constexpr std::uint32_t kHcParts = 8;  ///< column chunks of the fused mixer's down projection
+  static constexpr std::uint32_t kPrefillChunk = 256;
+  static inline bool batched_prefill_ = true;
+  /// Debug: chunk projections through the decode GEMVs (token by token)
+  /// instead of the int8 GEMMs, so a chunk equals stepping up to float order.
+  static inline bool prefill_exact_projections_ = false;
+  /// Repacked Q8_0 projections as int8 WMMA GEMMs (activations quantized per
+  /// token and 32 values); off, they run through the decode GEMVs per token.
+  static inline bool prefill_int8_gemm_ = true;
   /// Runs `tokens` in order; `logits` (optional) receives the last position's.
-  /// Token at a time for now (P4 batches it); any chunking is equivalent.
+  /// P4: in chunks of kPrefillChunk tokens, the dense projections as T-token
+  /// GEMMs and the rest row-batched or token by token (prefill_chunk.cpp);
+  /// a token at a time when batched_prefill_ is off or the model's shapes
+  /// do not fit the chunk kernels.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error);
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
   /// Graph replay (default) or eager launches; both run the same sequence.
@@ -117,7 +128,7 @@ class FlashNextGpu {
   bool Launch(const char* kernel, rt::Dim3 grid, rt::Dim3 block, std::initializer_list<rt::Arg> args,
               std::string* error);
   bool MatVec(const model::TensorRef& t, std::uint64_t expert, const rt::Buffer& x, const rt::Buffer& y,
-              std::string* error);
+              std::string* error, std::size_t x_off = 0, std::size_t y_off = 0);
   bool GroupedNorm(const rt::Buffer& x, const model::TensorRef& w, const rt::Buffer& y, std::string* error);
   bool HcMix(const model::HcMixer& m, bool inject, std::string* error);
   bool Ple(const model::LayerWeights& l, std::string* error);
@@ -137,6 +148,29 @@ class FlashNextGpu {
   template <typename F>
   bool ForEachState(F&& f);
   bool CopyFloats(const rt::Buffer& dst, const rt::Buffer& src, std::size_t n, std::string* error);
+
+  // ---- P4 chunk prefill (prefill_chunk.cpp) ----
+  struct ChunkBuffers {
+    rt::Buffer res, xn, lo, gate, mixed, inject, block_out, embd, xq, xd, host;
+    rt::Buffer qkv, conv, z, alpha, beta, gdn, qg, q, gate_a, k, v, ctx, iq, ik;
+    rt::Buffer router, ids, wts, eg, eu, ed, sgate;
+    std::size_t params_offset = 0;  // in `host`: per-token step params after the n-gram rows
+  };
+  ChunkBuffers ck_;
+  bool ck_ready_ = false;
+  std::vector<std::uint8_t> ck_host_;
+  bool ChunkSupported() const;
+  bool AllocChunk(std::string* error);
+  bool PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error);
+  /// y[T][rows] = W x[T][cols]: int8 GEMM for repacked Q8 (x quantized here),
+  /// BF16 / F32 GEMMs, else the decode GEMV per token.
+  bool Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::Buffer& y, std::uint32_t tokens,
+            std::string* error);
+  bool HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_t tokens, std::string* error);
+  bool PleChunk(const model::LayerWeights& l, std::uint32_t tokens, std::string* error);
+  bool LinearChunk(const model::LayerWeights& l, LinearState& s, std::uint32_t tokens, std::string* error);
+  bool AttentionChunk(const model::LayerWeights& l, AttnState& s, std::uint32_t tokens, std::string* error);
+  bool MoeChunk(const model::LayerWeights& l, std::uint32_t tokens, std::string* error);
 
   rt::Device& dev_;
   const model::ModelWeights& w_;

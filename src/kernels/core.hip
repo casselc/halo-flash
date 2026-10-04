@@ -2980,3 +2980,68 @@ extern "C" __global__ void __launch_bounds__(128)
       }
     }
 }
+
+// ---- P4: Flash-Next chunk prefill, row-batched elementwise kernels -------------
+// Each is the decode kernel applied to T token rows at once (same arithmetic).
+
+// halo_rmsnorm over T * hc vectors whose gammas repeat every w_period
+// vectors (grouped hyper-connection norms: vector t*hc + s uses gamma s).
+extern "C" __global__ void halo_rmsnorm_rows(const float* x, const float* w_all, float* y, std::uint32_t d, float eps,
+                                             std::uint32_t w_stride, std::uint32_t w_period) {
+  __shared__ float scratch[32];
+  const float* xv = x + static_cast<std::size_t>(blockIdx.x) * d;
+  const float* w = w_all + (blockIdx.x % w_period) * w_stride;
+  float* yv = y + static_cast<std::size_t>(blockIdx.x) * d;
+  float ss = 0.0f;
+  for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) ss += xv[i] * xv[i];
+  ss = BlockSum(ss, scratch);
+  const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
+  for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) yv[i] = xv[i] * scale * w[i];
+}
+
+// halo_hc_mix for T rows: xn, gate [T][hc][h] -> mixed [T][h].
+extern "C" __global__ void halo_hc_mix_rows(const float* xn, const float* gate, float* mixed, std::uint32_t hc,
+                                            std::uint32_t h, std::uint32_t tokens) {
+  const std::size_t n = static_cast<std::size_t>(tokens) * h;
+  for (std::size_t idx = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; idx < n;
+       idx += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    const std::size_t t = idx / h, i = idx % h;
+    const float* xr = xn + t * hc * h;
+    const float* gr = gate + t * hc * h;
+    float acc = 0.0f;
+    for (std::uint32_t s = 0; s < hc; ++s) acc += xr[s * h + i] * Sigmoid(gr[s * h + i]);
+    mixed[idx] = acc / static_cast<float>(hc);
+  }
+}
+
+// halo_hc_combine for T rows: res [T][hc][h] += out [T][h] * 2 sigmoid(inject [T][hc] / hc).
+extern "C" __global__ void halo_hc_combine_rows(float* res, const float* out, const float* inject, std::uint32_t hc,
+                                                std::uint32_t h, std::uint32_t tokens) {
+  const std::size_t n = static_cast<std::size_t>(tokens) * hc * h;
+  for (std::size_t idx = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; idx < n;
+       idx += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    const std::size_t t = idx / (static_cast<std::size_t>(hc) * h), r = idx % (static_cast<std::size_t>(hc) * h);
+    const std::uint32_t s = static_cast<std::uint32_t>(r / h);
+    res[idx] += out[t * h + r % h] * 2.0f * Sigmoid(inject[t * hc + s] / static_cast<float>(hc));
+  }
+}
+
+// halo_broadcast for T rows: res [T][hc][h] = x [T][h].
+extern "C" __global__ void halo_broadcast_rows(float* res, const float* x, std::uint32_t hc, std::uint32_t h,
+                                               std::uint32_t tokens) {
+  const std::size_t n = static_cast<std::size_t>(tokens) * hc * h;
+  for (std::size_t idx = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; idx < n;
+       idx += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    const std::size_t t = idx / (static_cast<std::size_t>(hc) * h);
+    res[idx] = x[t * h + idx % h];
+  }
+}
+
+// halo_axpy_sigmoid for T rows: y [T][n] += x [T][n] * sigmoid(g [T]).
+extern "C" __global__ void halo_axpy_sigmoid_rows(float* y, const float* x, const float* g, std::uint32_t n,
+                                                  std::uint32_t tokens) {
+  const std::size_t total = static_cast<std::size_t>(tokens) * n;
+  for (std::size_t idx = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; idx < total;
+       idx += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+    y[idx] += Sigmoid(g[idx / n]) * x[idx];
+}

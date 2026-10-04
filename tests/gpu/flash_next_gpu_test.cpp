@@ -463,3 +463,132 @@ TEST(FlashNextGpu, SmallQuantizedModelRunsFastPathsAndMatchesReference) {
     }
   engine::FlashNextGpu::int8_act_moe_ = saved;
 }
+
+// P4: chunked prefill (T-token GEMMs, row kernels, the DeltaNet chunk
+// kernels) against stepping, over generated interleavings of prefills
+// (crossing the kPrefillChunk boundary) and steps, in three modes:
+// - exact projections (the decode GEMVs per token inside the chunk) with
+//   float expert activations: equal to stepping up to float order. Bound
+//   fixed in advance: relative L2 < 1e-4 and identical argmax everywhere.
+//   With int8 expert activations (the default) a 1e-7 float-order
+//   difference can flip one value's rounding, a discrete jump: on a
+//   16-token alphabet, where routing and QSA scores sit near ties, that
+//   measured up to 4e-4 against stepping while float activations stayed
+//   below 1e-6 on the same sequence (and stepping matched the CPU
+//   reference to 2e-7 either way). So the strict mode runs float.
+// - float GEMMs (Q8_0 through the decode GEMVs; BF16 indexer projections on
+//   FP16 WMMA, F32 ones on the row GEMM) and int8 GEMMs (activations
+//   quantized per token and 32 values): these change the arithmetic, so
+//   stepping is not their oracle. Two checks instead:
+//   * partition invariance, strict: every token's activations are
+//     quantized on their own, so a second engine that splits the same
+//     prompt at different points must agree to float order (relative L2
+//     < 1e-4, identical argmax). This catches row-offset, tail and stride
+//     errors in the GEMM plumbing, which noise cannot hide.
+//   * drift from stepping, reported, with only a gross-error cap (relative
+//     L2 < 0.5; a wrong row or a dropped scale moves logits by O(1)).
+//     History: bounds of 3e-2, then 0.1, were set before measuring and
+//     failed (0.033 on a one-token prefill, 0.112 after 92 tokens). A
+//     diagnostic then ran every projection both ways inside the engine: the
+//     int8 GEMM equalled the float GEMV on the same quantized activations
+//     to < 2e-7 for every shape, while quantization moved activations by
+//     ~0.55% per projection, and a rounding flip (a discrete jump) from
+//     1e-7 noise is amplified through the random model's layers and state,
+//     which is also why no strict int8-vs-float twin bound holds end to
+//     end. Whether int8 dense prefill is accurate enough is decided on the
+//     real model's NLL (halo_score), not here.
+//   HALO_SMALL_QUANT_DIR  holds small-q.gguf
+TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
+  const char* dir = std::getenv("HALO_SMALL_QUANT_DIR");
+  if (!dir) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  std::string error;
+  auto reader = core::GgufReader::OpenFile(std::string(dir) + "/small-q.gguf", &error);
+  ASSERT_TRUE(reader) << error;
+  auto weights = model::ModelWeights::Bind(*reader, &error);
+  ASSERT_TRUE(weights) << error;
+  const auto& p = weights->ple_table;
+  auto ngram = model::NgramTable::Open(reader->GetMappedRegions()[p.shard].file_descriptor, p.file_offset, p.rows,
+                                       weights->config.ple_head_dim, p.type, &error);
+  ASSERT_TRUE(ngram) << error;
+  auto devices = Devices();
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  const auto& c = weights->config;
+  const std::size_t V = c.vocab_size;
+  constexpr std::uint32_t kMaxContext = 640;
+  using E = engine::FlashNextGpu;
+  const bool saved_exact = E::prefill_exact_projections_, saved_int8 = E::prefill_int8_gemm_,
+             saved_moe = E::int8_act_moe_;
+  enum Mode { kExact, kFloatGemm, kInt8Gemm, kModes };
+  const char* names[kModes] = {"exact", "float GEMMs", "int8 GEMMs"};
+  std::size_t compared[kModes] = {}, agreed[kModes] = {};
+  double worst[kModes] = {}, worst_split[kModes] = {};
+  hegel::test([&](hegel::TestCase& tc) {
+    auto& dev = *devices[tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = devices.size() - 1}))];
+    const auto mode = static_cast<Mode>(tc.draw(gs::integers<int>({.min_value = 0, .max_value = kModes - 1})));
+    E::prefill_exact_projections_ = mode == kExact;
+    E::int8_act_moe_ = mode != kExact;
+    E::prefill_int8_gemm_ = mode == kInt8Gemm;
+    auto chunked = E::Create(dev, *weights, ngram.get(), nullptr, kMaxContext, &error);
+    auto split = E::Create(dev, *weights, ngram.get(), nullptr, kMaxContext, &error);
+    auto stepped = E::Create(dev, *weights, ngram.get(), nullptr, kMaxContext, &error);
+    ASSERT_TRUE(chunked && split && stepped) << error;
+    std::vector<float> a(V), b(V), s(V);
+    const auto token = [&] {
+      return tc.draw(gs::integers<int>({.min_value = 0, .max_value = 15})) == 0
+                 ? static_cast<std::int32_t>(c.ple_eos_token)
+                 : tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = static_cast<std::int32_t>(V - 1)}));
+    };
+    const auto check = [&](const char* what) {
+      const double rel = RelL2(a, b.data()), rel_split = RelL2(a, s.data());
+      worst[mode] = std::max(worst[mode], rel);
+      worst_split[mode] = std::max(worst_split[mode], rel_split);
+      ++compared[mode];
+      const bool same = Argmax(a.data(), V) == Argmax(b.data(), V);
+      agreed[mode] += same;
+      const auto at = [&] { return std::string(what) + " at position " + std::to_string(chunked->Position()) + ", " + names[mode]; };
+      ASSERT_LT(rel_split, 1e-4) << "split " << at();
+      ASSERT_EQ(Argmax(a.data(), V), Argmax(s.data(), V)) << "split " << at();
+      ASSERT_LT(rel, mode == kExact ? 1e-4 : 0.5) << at();
+      if (mode == kExact) ASSERT_TRUE(same) << at();
+    };
+    const int ops = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 6}));
+    bool prefilled = false;
+    for (int i = 0; i < ops; ++i) {
+      if (tc.draw(gs::integers<int>({.min_value = 0, .max_value = 2})) > 0) {
+        const auto n = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 300}));
+        if (chunked->Position() + n > kMaxContext) break;
+        std::vector<std::int32_t> chunk(n);
+        for (auto& tok : chunk) tok = token();
+        ASSERT_TRUE(chunked->Prefill(chunk, a, &error)) << error;
+        prefilled = true;
+        // The same tokens as two prefills, cut at a drawn point.
+        const auto cut = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = n - 1}));
+        const std::span<const std::int32_t> all(chunk);
+        if (cut > 0) ASSERT_TRUE(split->Prefill(all.first(cut), {}, &error)) << error;
+        ASSERT_TRUE(split->Prefill(all.subspan(cut), s, &error)) << error;
+        for (std::uint32_t j = 0; j < n; ++j)
+          ASSERT_TRUE(stepped->Step(chunk[j], j + 1 == n ? std::span<float>(b) : std::span<float>{}, &error)) << error;
+        check("prefill");
+      } else {
+        if (chunked->Position() >= kMaxContext) break;
+        const auto tok = token();
+        ASSERT_TRUE(chunked->Step(tok, a, &error)) << error;
+        ASSERT_TRUE(split->Step(tok, s, &error)) << error;
+        ASSERT_TRUE(stepped->Step(tok, b, &error)) << error;
+        check("step after prefill");
+      }
+      ASSERT_EQ(chunked->Position(), stepped->Position());
+    }
+    if (prefilled) {
+      EXPECT_TRUE(chunked->LaunchedKernel("halo_gdn_prefill_d128_norm"));
+      EXPECT_EQ(chunked->LaunchedKernel("halo_gemm_q8r_wmma_t"), mode == kInt8Gemm);
+      EXPECT_EQ(chunked->LaunchedKernel("halo_gemm_bf16_f16_k128"), mode != kExact);
+    }
+  }, {.test_cases = 30});
+  E::prefill_exact_projections_ = saved_exact;
+  E::prefill_int8_gemm_ = saved_int8;
+  E::int8_act_moe_ = saved_moe;
+  for (int m = 0; m < kModes; ++m)
+    std::printf("%s: %zu compared, argmax agreed %zu, worst relative L2 vs stepping %.3g, vs a split prefill %.3g\n",
+                names[m], compared[m], agreed[m], worst[m], worst_split[m]);
+}
