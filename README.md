@@ -59,6 +59,42 @@ skipped. A mutant that doesn't compile is reported INVALID, never killed. When
 a mutant survives, add the missing test; if it is equivalent, replace it and
 say why in its `why`.
 
+## Mutation testing with Mull
+
+[Mull](https://github.com/mull-project/mull) 0.34 (the build for LLVM 21)
+mutates the host libraries named in `mull.yml` and checks that some test fails
+for each mutant. Unpack its `.deb` anywhere (`dpkg-deb -x Mull-21-*.deb
+$MULL_ROOT`) and point `MULL_ROOT` at it:
+
+```sh
+export MULL_ROOT=...            # contains usr/bin/mull-runner-21
+cmake --preset mull && cmake --build --preset mull
+export CI=1                     # Hegel derandomizes under CI: same inputs for every mutant
+for t in core text decide model; do
+  $MULL_ROOT/usr/bin/mull-runner-21 --reporters SQLite --reporters IDE --report-dir build/mull/report \
+    --report-name $t --allow-surviving --no-output --minimum-timeout 60000 build/mull/${t}_tests
+done
+python3 tools/mull_survivors.py summary build/mull/report/*.sqlite
+python3 tools/mull_survivors.py keys build/mull/report/*.sqlite > build/mull/survivors.txt
+python3 tools/mull_survivors.py check tests/mull-baseline.txt build/mull/survivors.txt
+```
+
+Delete the `.sqlite` reports before a rerun: Mull appends to them. A mutant's
+timeout is ten times the unmutated run or `--minimum-timeout`, whichever is
+larger (`--timeout` bounds only the unmutated run); a timeout counts as
+killed, so keep the minimum generous when the machine is busy. Set the
+fixture variables first (`HALO_TINY_HF_DIR`, `HALO_TINY_QWEN35_DIR`,
+`HALO_DECIDER_TOKENIZER_GGUF`), or the tests that need them skip and their
+mutants survive. The end-to-end decider test (`HALO_DECIDER_MODELS_DIR`) is
+too slow to run per mutant; leave it unset.
+
+`check` fails on a survivor that is not in `tests/mull-baseline.txt`. A
+survivor's key is its file, enclosing function and mutator, so it does not move
+when lines do. For a new survivor, write the test that kills it, or, if no test
+can observe it, add its key to the baseline with a one-line reason
+(`key | reason`). `check` also lists baseline entries that no longer survive;
+delete them. `python3 tools/mull_survivors_test.py` tests the script.
+
 ## System One decisions (strands-decider)
 
 `/v1/systemone` decisions run strands-decider-2B-hobson-v19 on the CPU
