@@ -718,7 +718,10 @@ typed `llm_scores` facts (assert, supersede, retract), and trace context
 tags accumulate). Output content follows the capture policy (off, digest,
 full). Tested with directed cases, a Hegel property (every OK return is
 exactly the rows written), concurrent threads under TSan, and a chDB round
-trip. HTTP endpoints for out-of-process harnesses come with the P7 server.
+trip. The same API is served over HTTP for harnesses in other processes
+(`POST /v1/scope/steps`, `.../steps/{id}/end`, `/v1/scope/tool_results`,
+`/v1/scope/scores`, `.../scores/{id}/retract`, `/v1/scope/traces/{id}/meta`;
+429 when a ring is full), by `halo_serve --scope-dir`.
 The server's own generations are recorded too (`halo_serve --scope-dir`,
 in builds with HALO_SCOPE=ON): one GENERATION observation per request with
 usage and cache reads, time to first text, per-piece latency percentiles,

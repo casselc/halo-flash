@@ -4,7 +4,8 @@
 //              [--model-id NAME] [--decider-dir DIR [--decider-device hip|hrx|cpu]]
 // With halo-scope built in (HALO_SCOPE=ON): --scope-dir DIR records every
 // generation as a GENERATION observation in DIR/chdb and keeps stored
-// /v1/responses in DIR/metadata.sqlite, so they survive restarts
+// /v1/responses in DIR/metadata.sqlite, so they survive restarts; harnesses
+// annotate traces through POST /v1/scope/... (scope/http_annotations.hpp)
 // [--scope-project NAME] [--scope-capture off|digest|full] [--scope-wal PATH].
 // --decider-dir serves POST /v1/systemone with strands-decider-2B (the
 // directory holds Qwen3.5-2B-Base-BF16.gguf and the strands-decider-*.gguf
@@ -36,6 +37,7 @@
 #include "halo_scope.h"
 #include "scope/c_api.hpp"
 #include "scope/generation_observer.hpp"
+#include "scope/http_annotations.hpp"
 #include "scope/metadata.hpp"
 #include "scope/response_store.hpp"
 #endif
@@ -136,6 +138,9 @@ int main(int argc, char** argv) {
   server::HttpServer http({.host = host, .port = port, .api_key = api_key});
   service.Register(http);
   metrics.Register(http);
+#if HALO_WITH_SCOPE
+  if (scope) scope::RegisterAnnotationRoutes(http, scope::AnnotatorOf(scope));  // harnesses in other processes
+#endif
   std::unique_ptr<StrandsEngine> decider;
   if (!decider_dir.empty()) {
     const std::string& d = decider_dir;
