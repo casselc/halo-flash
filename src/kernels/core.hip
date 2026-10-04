@@ -277,6 +277,13 @@ extern "C" __global__ void halo_rope_neox_p(float* x, const std::uint32_t* param
   RopeNeox(x, head_dim, rotary_dim, params[slot] * scale, theta);
 }
 
+// P4: x holds pooled blocks b0, b0 + 1, ...; block b at position b * ratio.
+// grid (nblocks)
+extern "C" __global__ void halo_rope_neox_blocks(float* x, std::uint32_t head_dim, std::uint32_t rotary_dim,
+                                                 std::uint32_t b0, std::uint32_t ratio, float theta) {
+  RopeNeox(x, head_dim, rotary_dim, (b0 + blockIdx.x) * ratio, theta);
+}
+
 extern "C" __global__ void halo_add(float* y, const float* x, std::uint32_t n) {
   for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) y[i] += x[i];
 }
@@ -537,8 +544,21 @@ extern "C" __global__ void halo_pool_block(const float* raw, float* pooled, cons
   }
 }
 
+// P4: pools blocks b0 .. b0 + gridDim.x - 1 straight into their cache rows
+// (raw rows past the chunk's last position are whatever the cache holds,
+// as when stepping pools an incomplete block). grid (nblocks)
+extern "C" __global__ void halo_pool_blocks(const float* raw, float* block_k, std::uint32_t b0, std::uint32_t ratio,
+                                            std::uint32_t dim) {
+  const std::uint32_t block = b0 + blockIdx.x;
+  for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    float acc = 0.0f;
+    for (std::uint32_t t = 0; t < ratio; ++t) acc += raw[(block * ratio + t) * dim + i] / static_cast<float>(ratio);
+    block_k[static_cast<std::size_t>(block) * dim + i] = acc;
+  }
+}
+
 // QSA block scores: score[b] = sum_heads relu(<q_h, k_b>). One thread per block.
-extern "C" __global__ void halo_qsa_scores(const float* q, const float* blocks, float* score,
+__device__ void QsaScores(const float* q, const float* blocks, float* score,
                                            const std::uint32_t* params, std::uint32_t heads, std::uint32_t dim) {
   const std::uint32_t n_blocks = params[kHaloComplete];
   for (std::uint32_t b = blockIdx.x * blockDim.x + threadIdx.x; b < n_blocks; b += gridDim.x * blockDim.x) {
@@ -551,9 +571,20 @@ extern "C" __global__ void halo_qsa_scores(const float* q, const float* blocks, 
     score[b] = acc;
   }
 }
+extern "C" __global__ void halo_qsa_scores(const float* q, const float* blocks, float* score,
+                                           const std::uint32_t* params, std::uint32_t heads, std::uint32_t dim) {
+  QsaScores(q, blocks, score, params, heads, dim);
+}
+// P4: token t = blockIdx.y of a chunk, its step parameters 16 words apart.
+extern "C" __global__ void halo_qsa_scores_rows(const float* q, const float* blocks, float* score,
+                                                const std::uint32_t* params, std::uint32_t heads, std::uint32_t dim,
+                                                std::uint32_t score_stride) {
+  const std::size_t t = blockIdx.y;
+  QsaScores(q + t * heads * dim, blocks, score + t * score_stride, params + t * 16, heads, dim);
+}
 
 // Attention over a list of visible positions (QSA selection), GQA, gated.
-extern "C" __global__ void halo_attention_select(const float* q, const float* kc, const float* vc, const float* gate,
+__device__ void AttentionSelect(const float* q, const float* kc, const float* vc, const float* gate,
                                                  const std::uint32_t* visible, float* out, float* scores,
                                                  const std::uint32_t* params, std::uint32_t num_heads,
                                                  std::uint32_t num_kv_heads, std::uint32_t hd, std::uint32_t max_n) {
@@ -586,14 +617,30 @@ extern "C" __global__ void halo_attention_select(const float* q, const float* kc
     out[h * hd + i] = acc / den * Sigmoid(gate[h * hd + i]);
   }
 }
+extern "C" __global__ void halo_attention_select(const float* q, const float* kc, const float* vc, const float* gate,
+                                                 const std::uint32_t* visible, float* out, float* scores,
+                                                 const std::uint32_t* params, std::uint32_t num_heads,
+                                                 std::uint32_t num_kv_heads, std::uint32_t hd, std::uint32_t max_n) {
+  AttentionSelect(q, kc, vc, gate, visible, out, scores, params, num_heads, num_kv_heads, hd, max_n);
+}
+// P4: token t = blockIdx.y; visible lists `max_n` apart, scores
+// num_heads * max_n apart. grid (num_heads, T)
+extern "C" __global__ void halo_attention_select_rows(const float* q, const float* kc, const float* vc,
+                                                      const float* gate, const std::uint32_t* visible, float* out,
+                                                      float* scores, const std::uint32_t* params,
+                                                      std::uint32_t num_heads, std::uint32_t num_kv_heads,
+                                                      std::uint32_t hd, std::uint32_t max_n) {
+  const std::size_t t = blockIdx.y, row = static_cast<std::size_t>(num_heads) * hd;
+  AttentionSelect(q + t * row, kc, vc, gate + t * row, visible + t * max_n, out + t * row,
+                  scores + t * num_heads * max_n, params + t * 16, num_heads, num_kv_heads, hd, max_n);
+}
 
 // ---- Device-side routing and selection (no host round trip) ----------------
 
 // MoE router: softmax over all experts, top-k of the probabilities (ties
 // keep the lower expert index), renormalized with the reference's floor.
 // One block; ids/weights receive k entries in descending probability.
-extern "C" __global__ void halo_router_topk(const float* logits, std::uint32_t* ids, float* weights, std::uint32_t n,
-                                            std::uint32_t k) {
+__device__ void RouterTopk(const float* logits, std::uint32_t* ids, float* weights, std::uint32_t n, std::uint32_t k) {
   __shared__ float scratch[32];
   __shared__ float prob[1024];
   __shared__ float best_v[32];
@@ -650,6 +697,18 @@ extern "C" __global__ void halo_router_topk(const float* logits, std::uint32_t* 
   }
 }
 
+extern "C" __global__ void halo_router_topk(const float* logits, std::uint32_t* ids, float* weights, std::uint32_t n,
+                                            std::uint32_t k) {
+  RouterTopk(logits, ids, weights, n, k);
+}
+
+// P4: one block per token row: logits [T][n] -> ids, weights [T][k].
+extern "C" __global__ void halo_router_topk_rows(const float* logits, std::uint32_t* ids, float* weights,
+                                                 std::uint32_t n, std::uint32_t k) {
+  const std::size_t t = blockIdx.x;
+  RouterTopk(logits + t * n, ids + t * k, weights + t * k, n, k);
+}
+
 // y += weights[slot] * x
 extern "C" __global__ void halo_axpy_slot(float* y, const float* x, const float* weights, std::uint32_t slot,
                                           std::uint32_t n) {
@@ -689,7 +748,7 @@ __device__ inline std::uint32_t BlockScan(std::uint32_t flag, std::uint32_t* buf
 // (equal scores: lower block first, i.e. the reference's stable sort), in
 // position order, expanded to their `ratio` token positions, then the
 // incomplete tail [n*ratio, n_kv). One block; blockDim a power of two.
-extern "C" __global__ void halo_qsa_select(const float* score, std::uint32_t* visible, const std::uint32_t* params,
+__device__ void QsaSelect(const float* score, std::uint32_t* visible, const std::uint32_t* params,
                                            std::uint32_t k, std::uint32_t ratio) {
   const std::uint32_t n = params[kHaloComplete], n_kv = params[kHaloNkv];
   __shared__ std::uint32_t hist[256];
@@ -744,6 +803,17 @@ extern "C" __global__ void halo_qsa_select(const float* score, std::uint32_t* vi
     equal_seen += eq_total;
   }
   for (std::uint32_t p = n * ratio + threadIdx.x; p < n_kv; p += blockDim.x) visible[k * ratio + p - n * ratio] = p;
+}
+extern "C" __global__ void halo_qsa_select(const float* score, std::uint32_t* visible, const std::uint32_t* params,
+                                           std::uint32_t k, std::uint32_t ratio) {
+  QsaSelect(score, visible, params, k, ratio);
+}
+// P4: one block per token t = blockIdx.x of a chunk. grid (T)
+extern "C" __global__ void halo_qsa_select_rows(const float* score, std::uint32_t* visible, const std::uint32_t* params,
+                                                std::uint32_t k, std::uint32_t ratio, std::uint32_t score_stride,
+                                                std::uint32_t visible_stride) {
+  const std::size_t t = blockIdx.x;
+  QsaSelect(score + t * score_stride, visible + t * visible_stride, params + t * 16, k, ratio);
 }
 
 // ---- Device-side sampling (core/sampling semantics) --------------------------
@@ -3044,4 +3114,507 @@ extern "C" __global__ void halo_axpy_sigmoid_rows(float* y, const float* x, cons
   for (std::size_t idx = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; idx < total;
        idx += static_cast<std::size_t>(gridDim.x) * blockDim.x)
     y[idx] += Sigmoid(g[idx / n]) * x[idx];
+}
+
+// ---- P4 stage B: routed experts over a prompt chunk, grouped by expert -------
+//
+// The chunk's T * k (token, slot) pairs, pair p = t * k + slot, are bucketed
+// by expert in pair order (deterministic), then each expert's tokens run as
+// one GEMM against its weights: gate and up with SwiGLU fused into the
+// epilogue, then down, each into a per-pair row; the combine sums a token's
+// k rows in slot order with its routing weights. Weights are dequantized
+// into fp16 WMMA fragments as they are read (each weight row belongs to one
+// wave, so they bypass LDS); activations are staged in LDS as fp16.
+
+// Bucketing in one block: per-expert counts and offsets, pairs sorted by
+// expert, each pair's sorted position, and work tiles of up to kMoeTile
+// pairs of one expert: tiles[3 i .. 3 i + 2] = (expert, first, count).
+constexpr std::uint32_t kMoeTile = 64;
+extern "C" __global__ void __launch_bounds__(1024)
+    halo_moe_bucket(const std::uint32_t* ids, std::uint32_t pairs, std::uint32_t experts, std::uint32_t* sorted,
+                    std::uint32_t* pos, std::uint32_t* tiles, std::uint32_t* ntiles) {
+  __shared__ std::uint32_t cnt[1024], poff[1024], toff[1024];
+  __shared__ std::uint32_t chunk[4096];
+  const std::uint32_t tid = threadIdx.x;
+  for (std::uint32_t e = tid; e < experts; e += blockDim.x) cnt[e] = 0;
+  // Pass 1: counts. Each thread owns experts tid, tid + blockDim, ...
+  for (std::uint32_t base = 0; base < pairs; base += 4096) {
+    const std::uint32_t n = min(4096u, pairs - base);
+    __syncthreads();
+    for (std::uint32_t i = tid; i < n; i += blockDim.x) chunk[i] = ids[base + i];
+    __syncthreads();
+    for (std::uint32_t e = tid; e < experts; e += blockDim.x) {
+      std::uint32_t c = 0;
+      for (std::uint32_t i = 0; i < n; ++i) c += chunk[i] == e;
+      cnt[e] += c;
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+    std::uint32_t p = 0, t = 0;
+    for (std::uint32_t e = 0; e < experts; ++e) {
+      poff[e] = p;
+      toff[e] = t;
+      p += cnt[e];
+      t += (cnt[e] + kMoeTile - 1) / kMoeTile;
+    }
+    *ntiles = t;
+  }
+  __syncthreads();
+  for (std::uint32_t e = tid; e < experts; e += blockDim.x)
+    for (std::uint32_t i = 0; i * kMoeTile < cnt[e]; ++i) {
+      tiles[3 * (toff[e] + i)] = e;
+      tiles[3 * (toff[e] + i) + 1] = poff[e] + i * kMoeTile;
+      tiles[3 * (toff[e] + i) + 2] = min(kMoeTile, cnt[e] - i * kMoeTile);
+    }
+  // Pass 2: scatter in pair order.
+  for (std::uint32_t e = tid; e < experts; e += blockDim.x) cnt[e] = poff[e];
+  for (std::uint32_t base = 0; base < pairs; base += 4096) {
+    const std::uint32_t n = min(4096u, pairs - base);
+    __syncthreads();
+    for (std::uint32_t i = tid; i < n; i += blockDim.x) chunk[i] = ids[base + i];
+    __syncthreads();
+    for (std::uint32_t e = tid; e < experts; e += blockDim.x) {
+      std::uint32_t c = cnt[e];
+      for (std::uint32_t i = 0; i < n; ++i)
+        if (chunk[i] == e) {
+          sorted[c] = base + i;
+          pos[base + i] = c;
+          ++c;
+        }
+      cnt[e] = c;
+    }
+  }
+}
+
+namespace {
+
+// 16 consecutive weights (k0 % 16 == 0) of one row as a WMMA A fragment:
+// one vector load and one scale decode for the specialized formats, the
+// element loader otherwise.
+template <typename L>
+struct Frag16 {
+  __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
+    halo_v16h a;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) a[i] = static_cast<_Float16>(L::At(row, k0 + i));
+    return a;
+  }
+};
+template <>
+struct Frag16<LoadQ4_K> {
+  __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
+    const std::uint8_t* b = row + (k0 / 256) * 144;
+    const std::uint32_t e = k0 % 256, chunk = e / 64, hi = (e % 64) / 32, l0 = e % 32;
+    std::uint32_t sc, m;
+    ScaleMinK4(2 * chunk + hi, b + 4, sc, m);
+    const float a = F16(U16(b)) * static_cast<float>(sc), c = F16(U16(b + 2)) * static_cast<float>(m);
+    const uint4 q = *reinterpret_cast<const uint4*>(b + 16 + chunk * 32 + l0);
+    const std::uint32_t w[4] = {q.x, q.y, q.z, q.w};
+    halo_v16h v;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const std::uint32_t byte = (w[i / 4] >> (8 * (i % 4))) & 0xFF;
+      v[i] = static_cast<_Float16>(a * static_cast<float>(hi ? byte >> 4 : byte & 0xF) - c);
+    }
+    return v;
+  }
+};
+template <>
+struct Frag16<LoadQ5_K> {
+  __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
+    const std::uint8_t* b = row + (k0 / 256) * 176;
+    const std::uint32_t e = k0 % 256, chunk = e / 64, hi = (e % 64) / 32, l0 = e % 32, bit = 2 * chunk + hi;
+    std::uint32_t sc, m;
+    ScaleMinK4(bit, b + 4, sc, m);
+    const float a = F16(U16(b)) * static_cast<float>(sc), c = F16(U16(b + 2)) * static_cast<float>(m);
+    const uint4 q = *reinterpret_cast<const uint4*>(b + 48 + chunk * 32 + l0);
+    const uint4 h = *reinterpret_cast<const uint4*>(b + 16 + l0);
+    const std::uint32_t w[4] = {q.x, q.y, q.z, q.w}, hw[4] = {h.x, h.y, h.z, h.w};
+    halo_v16h v;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const std::uint32_t byte = (w[i / 4] >> (8 * (i % 4))) & 0xFF, hb = (hw[i / 4] >> (8 * (i % 4))) & 0xFF;
+      const std::uint32_t qv = (hi ? byte >> 4 : byte & 0xF) | (((hb >> bit) & 1) << 4);
+      v[i] = static_cast<_Float16>(a * static_cast<float>(qv) - c);
+    }
+    return v;
+  }
+};
+template <>
+struct Frag16<LoadQ5_1> {
+  __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
+    const std::uint8_t* b = row + (k0 / 32) * 24;  // 8-byte aligned
+    const std::uint32_t j0 = k0 % 32;
+    const uint2 hd = *reinterpret_cast<const uint2*>(b);
+    const float d = F16(static_cast<std::uint16_t>(hd.x & 0xFFFF)), m = F16(static_cast<std::uint16_t>(hd.x >> 16));
+    const std::uint32_t qh = hd.y;
+    const uint2 q0 = *reinterpret_cast<const uint2*>(b + 8), q1 = *reinterpret_cast<const uint2*>(b + 16);
+    const std::uint32_t w[4] = {q0.x, q0.y, q1.x, q1.y};
+    halo_v16h v;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const std::uint32_t byte = (w[i / 4] >> (8 * (i % 4))) & 0xFF;
+      const std::uint32_t qv = (j0 ? byte >> 4 : byte & 0xF) | (((qh >> (j0 + i)) & 1) << 4);
+      v[i] = static_cast<_Float16>(static_cast<float>(qv) * d + m);
+    }
+    return v;
+  }
+};
+template <>
+struct Frag16<LoadQ8_0> {
+  __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
+    const std::uint8_t* b = row + (k0 / 32) * 34;  // 2-byte aligned
+    const float d = F16(U16(b));
+    const std::uint16_t* q = reinterpret_cast<const std::uint16_t*>(b + 2 + k0 % 32);
+    halo_v16h v;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const std::uint16_t p = q[i];
+      v[2 * i] = static_cast<_Float16>(d * static_cast<float>(static_cast<std::int8_t>(p & 0xFF)));
+      v[2 * i + 1] = static_cast<_Float16>(d * static_cast<float>(static_cast<std::int8_t>(p >> 8)));
+    }
+    return v;
+  }
+};
+
+__device__ inline halo_v16h LdsFrag(const _Float16* p) {
+  typedef _Float16 v8h __attribute__((ext_vector_type(8)));
+  const v8h lo = *reinterpret_cast<const v8h*>(p), hi = *reinterpret_cast<const v8h*>(p + 8);
+  halo_v16h b;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    b[e] = lo[e];
+    b[e + 8] = hi[e];
+  }
+  return b;
+}
+
+// K staged 128 at a time for up to kMoeTile token rows.
+constexpr std::uint32_t kMoeKs = 128, kMoeRs = kMoeKs + 8, kMoeSub = kMoeTile / 16;
+
+// gate/up: hp[pair][r] = silu(gate_e[r] . x_t) * (up_e[r] . x_t). Each wave
+// owns 16 rows; every weight fragment feeds the tile's 16-token sub-tiles.
+//   grid (ceil(ff / 64), max tiles), block 128; H % 256 == 0.
+template <typename L>
+__device__ void MoeGateUp(const std::uint8_t* gate, const std::uint8_t* up, std::uint64_t expert_bytes,
+                          std::uint64_t row_bytes, const float* x, const std::uint32_t* sorted,
+                          const std::uint32_t* tiles, const std::uint32_t* ntiles, float* hp, std::uint32_t ff,
+                          std::uint32_t H, std::uint32_t k) {
+  __shared__ __attribute__((aligned(16))) _Float16 Bs[kMoeTile * kMoeRs];
+  __shared__ std::uint32_t tok[kMoeTile];
+  const std::uint32_t tile = blockIdx.y;
+  if (tile >= *ntiles) return;
+  const std::uint32_t e = tiles[3 * tile], first = tiles[3 * tile + 1], n = tiles[3 * tile + 2];
+  const std::uint32_t subs = (n + 15) / 16;  // block-uniform
+  const std::uint32_t lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+  const std::uint32_t r0 = blockIdx.x * 64 + wave * 16, row = min(r0 + lane % 16, ff - 1);
+  const std::uint8_t* g = gate + e * expert_bytes + row * row_bytes;
+  const std::uint8_t* u = up + e * expert_bytes + row * row_bytes;
+  for (std::uint32_t i = threadIdx.x; i < kMoeTile; i += blockDim.x) tok[i] = sorted[first + (i < n ? i : 0)] / k;
+  halo_v8f ag[kMoeSub] = {}, au[kMoeSub] = {};
+  for (std::uint32_t k0 = 0; k0 < H; k0 += kMoeKs) {
+    __syncthreads();
+    for (std::uint32_t i = threadIdx.x; i < subs * 16 * kMoeKs / 4; i += blockDim.x) {
+      const std::uint32_t r = i / (kMoeKs / 4), c = (i % (kMoeKs / 4)) * 4;
+      const float4 v = *reinterpret_cast<const float4*>(x + static_cast<std::size_t>(tok[r]) * H + k0 + c);
+      _Float16* d = Bs + r * kMoeRs + c;
+      d[0] = static_cast<_Float16>(v.x);
+      d[1] = static_cast<_Float16>(v.y);
+      d[2] = static_cast<_Float16>(v.z);
+      d[3] = static_cast<_Float16>(v.w);
+    }
+    __syncthreads();
+    for (std::uint32_t kk = 0; kk < kMoeKs; kk += 16) {
+      const halo_v16h fg = Frag16<L>::Get(g, k0 + kk), fu = Frag16<L>::Get(u, k0 + kk);
+#pragma unroll
+      for (std::uint32_t h = 0; h < kMoeSub; ++h) {
+        if (h >= subs) break;
+        const halo_v16h b = LdsFrag(&Bs[(h * 16 + lane % 16) * kMoeRs + kk]);
+        ag[h] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fg, b, ag[h]);
+        au[h] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fu, b, au[h]);
+      }
+    }
+  }
+#pragma unroll
+  for (std::uint32_t h = 0; h < kMoeSub; ++h) {
+    const std::uint32_t t = h * 16 + lane % 16;
+    if (t >= n) continue;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const std::uint32_t r = r0 + 2 * j + lane / 16;
+      if (r < ff) hp[static_cast<std::size_t>(first + t) * ff + r] = Silu(ag[h][j]) * au[h][j];
+    }
+  }
+}
+
+// down: yp[pair][r] = down_e[r] . hp[pair]; the tile's pairs are contiguous.
+// frag(row, k0) gives 16 weights of an output row of the tile's expert.
+//   grid (ceil(H / 64), max tiles), block 128; ff % 16 == 0.
+template <typename F>
+__device__ void MoeDown(F frag, const float* hp, const std::uint32_t* tiles, const std::uint32_t* ntiles, float* yp,
+                        std::uint32_t H, std::uint32_t ff) {
+  __shared__ __attribute__((aligned(16))) _Float16 Bs[kMoeTile * kMoeRs];
+  const std::uint32_t tile = blockIdx.y;
+  if (tile >= *ntiles) return;
+  const std::uint32_t e = tiles[3 * tile], first = tiles[3 * tile + 1], n = tiles[3 * tile + 2];
+  const std::uint32_t subs = (n + 15) / 16;
+  const std::uint32_t lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+  const std::uint32_t r0 = blockIdx.x * 64 + wave * 16, row = min(r0 + lane % 16, H - 1);
+  halo_v8f acc[kMoeSub] = {};
+  for (std::uint32_t k0 = 0; k0 < ff; k0 += kMoeKs) {
+    const std::uint32_t ks = min(kMoeKs, ff - k0);
+    __syncthreads();
+    for (std::uint32_t i = threadIdx.x; i < subs * 16 * ks; i += blockDim.x) {
+      const std::uint32_t r = i / ks, c = i % ks;
+      Bs[r * kMoeRs + c] = static_cast<_Float16>(hp[static_cast<std::size_t>(first + (r < n ? r : 0)) * ff + k0 + c]);
+    }
+    __syncthreads();
+    for (std::uint32_t kk = 0; kk < ks; kk += 16) {
+      const halo_v16h fw = frag(e, row, k0 + kk);
+#pragma unroll
+      for (std::uint32_t h = 0; h < kMoeSub; ++h) {
+        if (h >= subs) break;
+        acc[h] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fw, LdsFrag(&Bs[(h * 16 + lane % 16) * kMoeRs + kk]), acc[h]);
+      }
+    }
+  }
+#pragma unroll
+  for (std::uint32_t h = 0; h < kMoeSub; ++h) {
+    const std::uint32_t t = h * 16 + lane % 16;
+    if (t >= n) continue;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const std::uint32_t r = r0 + 2 * j + lane / 16;
+      if (r < H) yp[static_cast<std::size_t>(first + t) * H + r] = acc[h][j];
+    }
+  }
+}
+
+}  // namespace
+#define HALO_MOE_GROUPED(SUFFIX, L)                                                                                   \
+  extern "C" __global__ void __launch_bounds__(128) halo_moe_gate_up_grouped_##SUFFIX(                               \
+      const std::uint8_t* gate, const std::uint8_t* up, std::uint64_t expert_bytes, std::uint64_t row_bytes,          \
+      const float* x, const std::uint32_t* sorted, const std::uint32_t* tiles, const std::uint32_t* ntiles,           \
+      float* hp, std::uint32_t ff, std::uint32_t H, std::uint32_t k) {                                                \
+    MoeGateUp<L>(gate, up, expert_bytes, row_bytes, x, sorted, tiles, ntiles, hp, ff, H, k);                          \
+  }                                                                                                                   \
+  extern "C" __global__ void __launch_bounds__(128) halo_moe_down_grouped_##SUFFIX(                                  \
+      const std::uint8_t* down, std::uint64_t expert_bytes, std::uint64_t row_bytes, const float* hp,                 \
+      const std::uint32_t* tiles, const std::uint32_t* ntiles, float* yp, std::uint32_t H, std::uint32_t ff) {        \
+    MoeDown([=](std::uint32_t e, std::uint32_t row, std::uint32_t k0) {                                               \
+      return Frag16<L>::Get(down + e * expert_bytes + row * row_bytes, k0);                                           \
+    }, hp, tiles, ntiles, yp, H, ff);                                                                                 \
+  }
+HALO_MOE_GROUPED(q4_k, LoadQ4_K)
+HALO_MOE_GROUPED(q5_k, LoadQ5_K)
+HALO_MOE_GROUPED(q6_k, LoadQ6_K)
+HALO_MOE_GROUPED(q5_1, LoadQ5_1)
+HALO_MOE_GROUPED(q8_0, LoadQ8_0)
+HALO_MOE_GROUPED(f32, LoadF32)
+#undef HALO_MOE_GROUPED
+
+// Down projection over repacked Q8_0 (int8 rows qstride apart, fp16 scales
+// per 32 values; experts rows * qstride and rows * cols / 32 apart).
+extern "C" __global__ void __launch_bounds__(128)
+    halo_moe_down_grouped_q8r(const std::int8_t* qs, const std::uint16_t* d, std::uint32_t qstride, const float* hp,
+                              const std::uint32_t* tiles, const std::uint32_t* ntiles, float* yp, std::uint32_t H,
+                              std::uint32_t ff) {
+  MoeDown([=](std::uint32_t e, std::uint32_t row, std::uint32_t k0) {
+    const std::size_t r = static_cast<std::size_t>(e) * H + row;
+    const float sc = F16(d[r * (ff / 32) + k0 / 32]);
+    const int4 q = *reinterpret_cast<const int4*>(qs + r * qstride + k0);
+    const std::uint32_t w[4] = {static_cast<std::uint32_t>(q.x), static_cast<std::uint32_t>(q.y),
+                                static_cast<std::uint32_t>(q.z), static_cast<std::uint32_t>(q.w)};
+    halo_v16h v;
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+      v[i] = static_cast<_Float16>(sc * static_cast<float>(static_cast<std::int8_t>((w[i / 4] >> (8 * (i % 4))) & 0xFF)));
+    return v;
+  }, hp, tiles, ntiles, yp, H, ff);
+}
+
+// out[t][i] = sum_s w[t][s] * yp[pos[t * k + s]][i], slots in order.
+//   grid (ceil(n / 256), T), block 256
+extern "C" __global__ void halo_moe_combine_grouped(const float* yp, const std::uint32_t* pos, const float* w,
+                                                    float* out, std::uint32_t k, std::uint32_t n) {
+  const std::uint32_t t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float acc = 0.0f;
+  for (std::uint32_t s = 0; s < k; ++s)
+    acc += w[t * k + s] * yp[static_cast<std::size_t>(pos[t * k + s]) * n + i];
+  out[static_cast<std::size_t>(t) * n + i] = acc;
+}
+
+// ---- P4: chunk attention on FP16 WMMA ---------------------------------------
+//
+// halo_attention_select_rows' result for head_dim 256 by tiles: one block
+// per (KV head g, token t); the G <= 16 query heads sharing g are the rows
+// of a 16-row tile (padding rows zero). The token's visible keys run 64 at
+// a time with an online softmax: each wave scores 16 keys (Q . K^T, K read
+// from the cache as fp16 fragments), the block rescales and exponentiates
+// in LDS, then each wave adds P . V for its 64 of the 256 output dims (V
+// staged in LDS). Inputs are rounded to fp16, scores and sums stay fp32.
+//   grid (num_kv_heads, T), block 128; visible lists max_n apart.
+extern "C" __global__ void __launch_bounds__(128)
+    halo_attention_wmma_rows(const float* q, const float* kc, const float* vc, const float* gate,
+                             const std::uint32_t* visible, float* out, const std::uint32_t* params,
+                             std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t max_n) {
+  constexpr std::uint32_t HD = 256, QR = HD + 8, KC = 64, VR = HD + 8, PR = KC + 8;
+  __shared__ __attribute__((aligned(16))) _Float16 Qs[16 * QR];
+  __shared__ __attribute__((aligned(16))) _Float16 Vs[KC * VR];
+  __shared__ __attribute__((aligned(16))) _Float16 Ps[16 * PR];
+  __shared__ float Ss[16 * KC];
+  __shared__ float mrow[16], lrow[16], alpha[16];
+  const std::uint32_t g = blockIdx.x, t = blockIdx.y, G = num_heads / num_kv_heads;
+  const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const std::uint32_t n = params[static_cast<std::size_t>(t) * 16 + kHaloNVisible];
+  const std::uint32_t* vis = visible + static_cast<std::size_t>(t) * max_n;
+  const float* qrow = q + static_cast<std::size_t>(t) * num_heads * HD;
+  const float scale = 1.0f / sqrtf(static_cast<float>(HD));
+  for (std::uint32_t i = tid; i < 16 * HD; i += blockDim.x) {
+    const std::uint32_t h = i / HD, d = i % HD;
+    Qs[h * QR + d] = static_cast<_Float16>(h < G ? qrow[(g * G + h) * HD + d] : 0.0f);
+  }
+  if (tid < 16) {
+    mrow[tid] = -INFINITY;
+    lrow[tid] = 0.0f;
+  }
+  halo_v8f acc[4] = {};
+  for (std::uint32_t c0 = 0; c0 < n; c0 += KC) {
+    __syncthreads();  // previous chunk's Vs / Ps reads done (and Qs written)
+    for (std::uint32_t i = tid; i < KC * HD / 4; i += blockDim.x) {
+      const std::uint32_t j = i / (HD / 4), d = (i % (HD / 4)) * 4;
+      float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      if (c0 + j < n)
+        v = *reinterpret_cast<const float4*>(vc + (static_cast<std::size_t>(vis[c0 + j]) * num_kv_heads + g) * HD + d);
+      _Float16* dst = Vs + j * VR + d;
+      dst[0] = static_cast<_Float16>(v.x);
+      dst[1] = static_cast<_Float16>(v.y);
+      dst[2] = static_cast<_Float16>(v.z);
+      dst[3] = static_cast<_Float16>(v.w);
+    }
+    // Scores of this wave's 16 keys.
+    const std::uint32_t kj = c0 + wave * 16 + lane % 16;
+    const float* krow = kc + (static_cast<std::size_t>(vis[min(kj, n - 1)]) * num_kv_heads + g) * HD;
+    halo_v8f s = {};
+    for (std::uint32_t k0 = 0; k0 < HD; k0 += 16) {
+      const halo_v16h a = LdsFrag(&Qs[(lane % 16) * QR + k0]);
+      halo_v16h b;
+#pragma unroll
+      for (int i = 0; i < 16; i += 4) {
+        const float4 v = *reinterpret_cast<const float4*>(krow + k0 + i);
+        b[i] = static_cast<_Float16>(v.x);
+        b[i + 1] = static_cast<_Float16>(v.y);
+        b[i + 2] = static_cast<_Float16>(v.z);
+        b[i + 3] = static_cast<_Float16>(v.w);
+      }
+      s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, s);
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+      Ss[(2 * j + lane / 16) * KC + wave * 16 + lane % 16] = kj < n ? s[j] * scale : -INFINITY;
+    __syncthreads();
+    // Online softmax: 8 threads per head row, 8 keys each.
+    {
+      const std::uint32_t row = tid / 8, part = tid % 8;
+      float mx = -INFINITY;
+      for (std::uint32_t c = part * 8; c < part * 8 + 8; ++c) mx = fmaxf(mx, Ss[row * KC + c]);
+      for (int o = 4; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 32));
+      const float m_old = mrow[row], m_new = fmaxf(m_old, mx);
+      float sum = 0.0f;
+      for (std::uint32_t c = part * 8; c < part * 8 + 8; ++c) {
+        const float p = expf(Ss[row * KC + c] - m_new);
+        Ps[row * PR + c] = static_cast<_Float16>(p);
+        sum += p;
+      }
+      for (int o = 4; o > 0; o >>= 1) sum += __shfl_xor(sum, o, 32);
+      __syncthreads();  // every lane of the row has read mrow
+      if (part == 0) {
+        const float a = m_old == -INFINITY ? 0.0f : expf(m_old - m_new);
+        alpha[row] = a;
+        lrow[row] = lrow[row] * a + sum;
+        mrow[row] = m_new;
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int tile = 0; tile < 4; ++tile)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[tile][j] *= alpha[2 * j + lane / 16];
+    for (std::uint32_t kk = 0; kk < KC; kk += 16) {
+      const halo_v16h a = LdsFrag(&Ps[(lane % 16) * PR + kk]);
+#pragma unroll
+      for (int tile = 0; tile < 4; ++tile) {
+        const std::uint32_t d = wave * 64 + tile * 16 + lane % 16;
+        halo_v16h b;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) b[i] = Vs[(kk + i) * VR + d];
+        acc[tile] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[tile]);
+      }
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int tile = 0; tile < 4; ++tile)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const std::uint32_t h = 2 * j + lane / 16, d = wave * 64 + tile * 16 + lane % 16;
+      if (h >= G) continue;
+      const std::size_t idx = static_cast<std::size_t>(t) * num_heads * HD + (g * G + h) * HD + d;
+      out[idx] = acc[tile][j] / lrow[h] * Sigmoid(gate[idx]);
+    }
+}
+
+// ---- P4: tiled FP32 GEMM for the F32 projections (router, DeltaNet
+// alpha/beta, mixer inject, shared-expert gate) -------------------------------
+// y[t][r] = sum_c W[r][c] x[t][c], fp32 throughout: 64 rows x 64 tokens per
+// block, K staged 16 at a time in LDS, 4 x 4 outputs per thread.
+//   grid (ceil(T / 64), ceil(rows / 64)), block 256; cols % 16 == 0.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_f32_tiled(const float* w, const float* x, float* y, std::uint32_t rows, std::uint32_t cols,
+                        std::uint32_t tokens) {
+  constexpr std::uint32_t BM = 64, BN = 64, BK = 16;
+  __shared__ float As[BK][BM + 4], Bs[BK][BN + 4];
+  const std::uint32_t tid = threadIdx.x, r0 = blockIdx.y * BM, t0 = blockIdx.x * BN;
+  const std::uint32_t tr = (tid % 16) * 4, tt = (tid / 16) * 4;
+  // Loads: 64 x 16 floats per operand, one float4 per thread.
+  const std::uint32_t lrow = tid / 4, lk = (tid % 4) * 4;
+  const float* wp = w + static_cast<std::size_t>(min(r0 + lrow, rows - 1)) * cols + lk;
+  const float* xp = x + static_cast<std::size_t>(min(t0 + lrow, tokens - 1)) * cols + lk;
+  float acc[4][4] = {};
+  for (std::uint32_t k0 = 0; k0 < cols; k0 += BK) {
+    const float4 a = *reinterpret_cast<const float4*>(wp + k0), b = *reinterpret_cast<const float4*>(xp + k0);
+    __syncthreads();
+    As[lk][lrow] = a.x;
+    As[lk + 1][lrow] = a.y;
+    As[lk + 2][lrow] = a.z;
+    As[lk + 3][lrow] = a.w;
+    Bs[lk][lrow] = b.x;
+    Bs[lk + 1][lrow] = b.y;
+    Bs[lk + 2][lrow] = b.z;
+    Bs[lk + 3][lrow] = b.w;
+    __syncthreads();
+#pragma unroll
+    for (std::uint32_t k = 0; k < BK; ++k) {
+      float av[4], bv[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        av[i] = As[k][tr + i];
+        bv[i] = Bs[k][tt + i];
+      }
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const std::uint32_t t = t0 + tt + j;
+    if (t >= tokens) continue;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      if (r0 + tr + i < rows) y[static_cast<std::size_t>(t) * rows + r0 + tr + i] = acc[i][j];
+  }
 }

@@ -466,7 +466,8 @@ TEST(FlashNextGpu, SmallQuantizedModelRunsFastPathsAndMatchesReference) {
 
 // P4: chunked prefill (T-token GEMMs, row kernels, the DeltaNet chunk
 // kernels) against stepping, over generated interleavings of prefills
-// (crossing the kPrefillChunk boundary) and steps, in three modes:
+// (crossing chunk boundaries: prefill_chunk_ is drawn small) and steps, in
+// three modes:
 // - exact projections (the decode GEMVs per token inside the chunk) with
 //   float expert activations: equal to stepping up to float order. Bound
 //   fixed in advance: relative L2 < 1e-4 and identical argmax everywhere.
@@ -477,7 +478,9 @@ TEST(FlashNextGpu, SmallQuantizedModelRunsFastPathsAndMatchesReference) {
 //   below 1e-6 on the same sequence (and stepping matched the CPU
 //   reference to 2e-7 either way). So the strict mode runs float.
 // - float GEMMs (Q8_0 through the decode GEMVs; BF16 indexer projections on
-//   FP16 WMMA, F32 ones on the row GEMM) and int8 GEMMs (activations
+//   FP16 WMMA, F32 ones on the row GEMM; routed experts grouped by expert on
+//   FP16 WMMA, GpuQuant.GroupedExpertsMatchCpuReference; attention on FP16
+//   WMMA with an online softmax) and int8 GEMMs (activations
 //   quantized per token and 32 values): these change the arithmetic, so
 //   stepping is not their oracle. Two checks instead:
 //   * partition invariance, strict: every token's activations are
@@ -517,7 +520,9 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
   constexpr std::uint32_t kMaxContext = 640;
   using E = engine::FlashNextGpu;
   const bool saved_exact = E::prefill_exact_projections_, saved_int8 = E::prefill_int8_gemm_,
-             saved_moe = E::int8_act_moe_;
+             saved_moe = E::int8_act_moe_, saved_grouped = E::prefill_grouped_moe_,
+             saved_wmma_attn = E::prefill_wmma_attention_;
+  const std::uint32_t saved_chunk = E::prefill_chunk_;
   enum Mode { kExact, kFloatGemm, kInt8Gemm, kModes };
   const char* names[kModes] = {"exact", "float GEMMs", "int8 GEMMs"};
   std::size_t compared[kModes] = {}, agreed[kModes] = {};
@@ -527,7 +532,10 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
     const auto mode = static_cast<Mode>(tc.draw(gs::integers<int>({.min_value = 0, .max_value = kModes - 1})));
     E::prefill_exact_projections_ = mode == kExact;
     E::int8_act_moe_ = mode != kExact;
+    E::prefill_grouped_moe_ = mode != kExact;  // fp16 expert GEMMs change the arithmetic
+    E::prefill_wmma_attention_ = mode != kExact;  // and so does fp16 attention
     E::prefill_int8_gemm_ = mode == kInt8Gemm;
+    E::prefill_chunk_ = tc.draw(gs::sampled_from(std::vector<std::uint32_t>{1, 17, 64, 256}));
     auto chunked = E::Create(dev, *weights, ngram.get(), nullptr, kMaxContext, &error);
     auto split = E::Create(dev, *weights, ngram.get(), nullptr, kMaxContext, &error);
     auto stepped = E::Create(dev, *weights, ngram.get(), nullptr, kMaxContext, &error);
@@ -583,11 +591,16 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
       EXPECT_TRUE(chunked->LaunchedKernel("halo_gdn_prefill_d128_norm"));
       EXPECT_EQ(chunked->LaunchedKernel("halo_gemm_q8r_wmma_t"), mode == kInt8Gemm);
       EXPECT_EQ(chunked->LaunchedKernel("halo_gemm_bf16_f16_k128"), mode != kExact);
+      EXPECT_EQ(chunked->LaunchedKernel("halo_moe_bucket"), mode != kExact);
+      EXPECT_EQ(chunked->LaunchedKernel("halo_attention_wmma_rows"), mode != kExact);
     }
   }, {.test_cases = 30});
   E::prefill_exact_projections_ = saved_exact;
   E::prefill_int8_gemm_ = saved_int8;
   E::int8_act_moe_ = saved_moe;
+  E::prefill_grouped_moe_ = saved_grouped;
+  E::prefill_chunk_ = saved_chunk;
+  E::prefill_wmma_attention_ = saved_wmma_attn;
   for (int m = 0; m < kModes; ++m)
     std::printf("%s: %zu compared, argmax agreed %zu, worst relative L2 vs stepping %.3g, vs a split prefill %.3g\n",
                 names[m], compared[m], agreed[m], worst[m], worst_split[m]);

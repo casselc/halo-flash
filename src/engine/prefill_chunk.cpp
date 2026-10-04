@@ -36,7 +36,8 @@ bool FlashNextGpu::ChunkSupported() const {
 bool FlashNextGpu::AllocChunk(std::string* error) {
   if (ck_ready_) return true;
   const auto& c = w_.config;
-  const std::size_t T = kPrefillChunk, H = c.hidden_size, D = c.HcDim();
+  const std::size_t T = std::max<std::uint32_t>(1, std::min(prefill_chunk_, max_context_)), H = c.hidden_size,
+                    D = c.HcDim();
   const std::size_t qdim = c.AttentionQDim(), kvdim = c.AttentionKvDim(), vd = c.SsmValueDim();
   const std::size_t max_cols = std::max({D, H, qdim, vd, std::size_t{c.shared_expert_ff}, std::size_t{c.hc_low_rank}});
   auto& k = ck_;
@@ -72,14 +73,28 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   k.eu = f(T * c.shared_expert_ff);
   k.ed = f(T * H);
   k.sgate = f(T);
+  const std::size_t pairs = T * c.num_experts_used;
+  k.sorted = f(pairs);
+  k.pos = f(pairs);
+  k.tiles = f(3 * (pairs / 64 + c.num_experts + 1));
+  k.ntiles = f(1);
+  k.hp = f(pairs * c.expert_ff);
+  k.yp = f(pairs * H);
+  const std::size_t sub = std::min<std::size_t>(T, kAttnSub);
+  k.bscores = f(sub * (max_context_ / c.compress_ratio + 1));
+  k.vis = f(sub * AttnVisibleStride());
+  k.ascores = f(sub * c.num_heads * AttnVisibleStride());
   k.params_offset = (T * c.PleEmbeddingDim() * 4 + 63) / 64 * 64;
   ck_host_.assign(k.params_offset + T * 64, 0);
   k.host = dev_.Alloc(ck_host_.size(), error);
   if (k.host) owned_.push_back(k.host);
   for (const auto* b : {&k.res, &k.xn, &k.lo, &k.gate, &k.mixed, &k.inject, &k.block_out, &k.embd, &k.xq, &k.xd,
                         &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg, &k.q, &k.gate_a, &k.k, &k.v, &k.ctx,
-                        &k.iq, &k.ik, &k.router, &k.ids, &k.wts, &k.eg, &k.eu, &k.ed, &k.sgate, &k.host})
+                        &k.iq, &k.ik, &k.router, &k.ids, &k.wts, &k.eg, &k.eu, &k.ed, &k.sgate, &k.host,
+                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp,
+                        &k.bscores, &k.vis, &k.ascores})
     if (!*b) return false;
+  k.cap = static_cast<std::uint32_t>(T);
   ck_ready_ = true;
   return true;
 }
@@ -99,6 +114,11 @@ bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt
   }
   if (!per_token && t.type == core::GgmlType::kBF16 && cols % 128 == 0)
     return Launch("halo_gemm_bf16_f16_k128", {(T + 63) / 64, (rows + 63) / 64}, {128},
+                  {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                   rt::Arg::Val(T)},
+                  error);
+  if (!per_token && t.type == core::GgmlType::kF32 && cols % 16 == 0)
+    return Launch("halo_gemm_f32_tiled", {(T + 63) / 64, (rows + 63) / 64}, {256},
                   {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols),
                    rt::Arg::Val(T)},
                   error);
@@ -202,6 +222,7 @@ bool FlashNextGpu::AttentionChunk(const model::LayerWeights& l, AttnState& s, st
       !norm(ck_.q, l.attn_q_norm, T * nh, hd) || !norm(ck_.k, l.attn_k_norm, T * nkv, hd) ||
       !norm(ck_.iq, l.indexer_q_norm, T * ih, idim))
     return false;
+  if (prefill_batched_attention_) return AttentionBatched(l, s, T, error);
   for (std::uint32_t t = 0; t < T; ++t) {
     const rt::Arg params = rt::Arg::Buf(ck_.host, ck_.params_offset + std::size_t{t} * 64);
     const std::size_t qo = std::size_t{t} * qdim * 4, ko = std::size_t{t} * kvdim * 4;
@@ -245,6 +266,83 @@ bool FlashNextGpu::AttentionChunk(const model::LayerWeights& l, AttnState& s, st
   return Gemm(l.attn_out, ck_.ctx, ck_.block_out, T, error);
 }
 
+// A token's visible list holds at most every position (under budget) or
+// budget blocks of `ratio` plus the incomplete tail.
+std::uint32_t FlashNextGpu::AttnVisibleStride() const {
+  const auto& c = w_.config;
+  return std::min(max_context_, (c.indexer_top_k / c.compress_ratio + 1) * c.compress_ratio);
+}
+
+// The chunk's attention in batched launches, each the decode kernel's body
+// per token with that token's step parameters, so the arithmetic equals
+// stepping: rope on all rows; K, V and indexer keys appended as contiguous
+// rows; every QSA block the chunk touches pooled, normalized and rotated
+// (only complete blocks are ever scored, and a block's final value is the
+// one stepping leaves); then scores, selection and attention, kAttnSub
+// tokens at a time (bounded scratch).
+bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, std::uint32_t T, std::string* error) {
+  const auto& c = w_.config;
+  const std::uint32_t nh = c.num_heads, nkv = c.num_kv_heads, hd = c.head_dim, idim = c.indexer_head_dim;
+  const std::uint32_t qdim = c.AttentionQDim(), kvdim = c.AttentionKvDim(), ih = c.indexer_heads;
+  const std::uint32_t ratio = c.compress_ratio, budget = c.indexer_top_k / ratio;
+  const std::uint32_t max_blocks = max_context_ / ratio + 1, vstride = AttnVisibleStride();
+  const std::uint32_t pos0 = position_;
+  const bool wmma = prefill_wmma_attention_ && hd == 256 && nh % nkv == 0 && nh / nkv <= 16;
+  const auto rope = [&](const rt::Buffer& x, std::uint32_t heads, std::uint32_t dim) {
+    return Launch("halo_rope_neox_rows", {T * heads}, {64},
+                  {rt::Arg::Buf(x), rt::Arg::Val(dim), rt::Arg::Val(c.rotary_dim), rt::Arg::Val(pos0),
+                   rt::Arg::Val(heads), rt::Arg::Val(c.rope_theta)},
+                  error);
+  };
+  const auto append = [&](const rt::Buffer& cache, const rt::Buffer& rows, std::uint32_t n) {
+    return Launch("halo_copy", {Blocks(std::size_t{T} * n)}, {kBlock},
+                  {rt::Arg::Buf(cache, std::size_t{pos0} * n * 4), rt::Arg::Buf(rows), rt::Arg::Val(T * n)}, error);
+  };
+  const std::uint32_t b0 = pos0 / ratio, nb = (pos0 + T - 1) / ratio - b0 + 1;
+  if (!rope(ck_.q, nh, hd) || !rope(ck_.k, nkv, hd) || !rope(ck_.iq, ih, idim) || !append(s.k, ck_.k, kvdim) ||
+      !append(s.v, ck_.v, kvdim) || !append(s.index_k, ck_.ik, idim) ||
+      !Launch("halo_pool_blocks", {nb}, {128},
+              {rt::Arg::Buf(s.index_k), rt::Arg::Buf(s.block_k), rt::Arg::Val(b0), rt::Arg::Val(ratio),
+               rt::Arg::Val(idim)},
+              error) ||
+      !Launch("halo_rmsnorm", {nb}, {kBlock},
+              {rt::Arg::Buf(s.block_k, std::size_t{b0} * idim * 4), rt::Arg::Buf(tensors_.at(l.indexer_k_norm.data).buf),
+               rt::Arg::Buf(s.block_k, std::size_t{b0} * idim * 4), rt::Arg::Val(idim), rt::Arg::Val(c.rms_eps),
+               rt::Arg::Val<std::uint32_t>(0)},
+              error) ||
+      !Launch("halo_rope_neox_blocks", {nb}, {64},
+              {rt::Arg::Buf(s.block_k, std::size_t{b0} * idim * 4), rt::Arg::Val(idim), rt::Arg::Val(c.rotary_dim),
+               rt::Arg::Val(b0), rt::Arg::Val(ratio), rt::Arg::Val(c.rope_theta)},
+              error))
+    return false;
+  for (std::uint32_t t0 = 0; t0 < T; t0 += kAttnSub) {
+    const std::uint32_t n = std::min(kAttnSub, T - t0);
+    const rt::Arg params = rt::Arg::Buf(ck_.host, ck_.params_offset + std::size_t{t0} * 64);
+    if (!Launch("halo_qsa_scores_rows", {std::min(Blocks(max_blocks), 64u), n}, {kBlock},
+                {rt::Arg::Buf(ck_.iq, std::size_t{t0} * ih * idim * 4), rt::Arg::Buf(s.block_k),
+                 rt::Arg::Buf(ck_.bscores), params, rt::Arg::Val(ih), rt::Arg::Val(idim), rt::Arg::Val(max_blocks)},
+                error) ||
+        !Launch("halo_qsa_select_rows", {n}, {1024},
+                {rt::Arg::Buf(ck_.bscores), rt::Arg::Buf(ck_.vis), params, rt::Arg::Val(budget), rt::Arg::Val(ratio),
+                 rt::Arg::Val(max_blocks), rt::Arg::Val(vstride)},
+                error) ||
+        !(wmma ? Launch("halo_attention_wmma_rows", {nkv, n}, {128},
+                        {rt::Arg::Buf(ck_.q, std::size_t{t0} * qdim * 4), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v),
+                         rt::Arg::Buf(ck_.gate_a, std::size_t{t0} * qdim * 4), rt::Arg::Buf(ck_.vis),
+                         rt::Arg::Buf(ck_.ctx, std::size_t{t0} * qdim * 4), params, rt::Arg::Val(nh),
+                         rt::Arg::Val(nkv), rt::Arg::Val(vstride)},
+                        error)
+               : Launch("halo_attention_select_rows", {nh, n}, {kBlock},
+                {rt::Arg::Buf(ck_.q, std::size_t{t0} * qdim * 4), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v),
+                 rt::Arg::Buf(ck_.gate_a, std::size_t{t0} * qdim * 4), rt::Arg::Buf(ck_.vis),
+                 rt::Arg::Buf(ck_.ctx, std::size_t{t0} * qdim * 4), rt::Arg::Buf(ck_.ascores), params,
+                 rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(hd), rt::Arg::Val(vstride)},
+                error)))
+      return false;
+  }
+  return Gemm(l.attn_out, ck_.ctx, ck_.block_out, T, error);
+}
+
 bool FlashNextGpu::MoeChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error) {
   const auto& c = w_.config;
   const std::uint32_t H = c.hidden_size, used = c.num_experts_used, E = c.num_experts;
@@ -258,6 +356,7 @@ bool FlashNextGpu::MoeChunk(const model::LayerWeights& l, std::uint32_t T, std::
                             up.rows == gate.rows && up.cols == gate.cols && gate.cols % 256 == 0 && H <= 4096;
   const bool down_q5_1 = down.type == core::GgmlType::kQ5_1 && down.cols % 32 == 0 && ff <= 2048;
   const bool fast = gate_up_fast && (down_q5_1 || static_cast<bool>(dd.qs));
+  if (prefill_grouped_moe_ && GroupedMoeFits(l)) return GroupedMoe(l, T, error) && SharedExpertChunk(l, T, error);
   const char* gu = int8_act_moe_ ? "halo_moe_gate_up_q4_k_dot" : "halo_moe_gate_up_q4_k_s2";
   for (std::uint32_t t = 0; t < T; ++t) {
     const std::size_t ido = std::size_t{t} * used * 4, xo = std::size_t{t} * H * 4;
@@ -313,6 +412,83 @@ bool FlashNextGpu::MoeChunk(const model::LayerWeights& l, std::uint32_t T, std::
                             error))
       return false;
   }
+  return SharedExpertChunk(l, T, error);
+}
+
+namespace {
+// Kernel-name suffix of a grouped expert GEMM for a weight type, or null.
+const char* GroupedSuffix(core::GgmlType t) {
+  switch (t) {
+    case core::GgmlType::kQ4_K: return "q4_k";
+    case core::GgmlType::kQ5_K: return "q5_k";
+    case core::GgmlType::kQ6_K: return "q6_k";
+    case core::GgmlType::kQ5_1: return "q5_1";
+    case core::GgmlType::kQ8_0: return "q8_0";
+    case core::GgmlType::kF32: return "f32";
+    default: return nullptr;
+  }
+}
+}  // namespace
+
+bool FlashNextGpu::GroupedMoeFits(const model::LayerWeights& l) const {
+  const auto& c = w_.config;
+  const auto& gate = l.ffn_gate_exps;
+  const auto& up = l.ffn_up_exps;
+  const auto& down = l.ffn_down_exps;
+  return GroupedSuffix(gate.type) && GroupedSuffix(down.type) && up.type == gate.type && up.rows == gate.rows &&
+         up.cols == gate.cols && !tensors_.at(gate.data).qs && !tensors_.at(up.data).qs &&
+         (!tensors_.at(down.data).qs || (down.type == core::GgmlType::kQ8_0 && down.cols % 32 == 0)) &&
+         c.hidden_size % 256 == 0 && gate.cols == c.hidden_size && gate.rows % 16 == 0 &&
+         c.num_experts <= 1024 && down.cols == gate.rows && down.rows == c.hidden_size;
+}
+
+// Routed experts grouped by expert (stage B): top-k for every token,
+// bucketing, gate/up with SwiGLU, down, weighted combine; five launches.
+bool FlashNextGpu::GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std::string* error) {
+  const auto& c = w_.config;
+  const std::uint32_t H = c.hidden_size, used = c.num_experts_used, E = c.num_experts;
+  const auto& gate = l.ffn_gate_exps;
+  const auto& down = l.ffn_down_exps;
+  const auto ff = static_cast<std::uint32_t>(gate.rows);
+  const auto& tg = tensors_.at(gate.data);
+  const auto& tu = tensors_.at(l.ffn_up_exps.data);
+  const auto& td = tensors_.at(down.data);
+  const std::string gu = std::string("halo_moe_gate_up_grouped_") + GroupedSuffix(gate.type);
+  const std::string dn = std::string("halo_moe_down_grouped_") + GroupedSuffix(down.type);
+  const std::uint32_t pairs = T * used, max_tiles = pairs / 64 + E + 1;
+  return Launch("halo_router_topk_rows", {T}, {kBlock},
+                {rt::Arg::Buf(ck_.router), rt::Arg::Buf(ck_.ids), rt::Arg::Buf(ck_.wts), rt::Arg::Val(E),
+                 rt::Arg::Val(used)},
+                error) &&
+         Launch("halo_moe_bucket", {1}, {1024},
+                {rt::Arg::Buf(ck_.ids), rt::Arg::Val(pairs), rt::Arg::Val(E), rt::Arg::Buf(ck_.sorted),
+                 rt::Arg::Buf(ck_.pos), rt::Arg::Buf(ck_.tiles), rt::Arg::Buf(ck_.ntiles)},
+                error) &&
+         Launch(gu.c_str(), {(ff + 63) / 64, max_tiles}, {128},
+                {rt::Arg::Buf(tg.buf), rt::Arg::Buf(tu.buf), rt::Arg::Val<std::uint64_t>(gate.RowBytes() * gate.rows),
+                 rt::Arg::Val<std::uint64_t>(gate.RowBytes()), rt::Arg::Buf(ck_.mixed), rt::Arg::Buf(ck_.sorted),
+                 rt::Arg::Buf(ck_.tiles), rt::Arg::Buf(ck_.ntiles), rt::Arg::Buf(ck_.hp), rt::Arg::Val(ff),
+                 rt::Arg::Val(H), rt::Arg::Val(used)},
+                error) &&
+         (td.qs ? Launch("halo_moe_down_grouped_q8r", {(H + 63) / 64, max_tiles}, {128},
+                         {rt::Arg::Buf(td.qs), rt::Arg::Buf(td.d), rt::Arg::Val(td.qstride), rt::Arg::Buf(ck_.hp),
+                          rt::Arg::Buf(ck_.tiles), rt::Arg::Buf(ck_.ntiles), rt::Arg::Buf(ck_.yp), rt::Arg::Val(H),
+                          rt::Arg::Val(ff)},
+                         error)
+                : Launch(dn.c_str(), {(H + 63) / 64, max_tiles}, {128},
+                         {rt::Arg::Buf(td.buf), rt::Arg::Val<std::uint64_t>(down.RowBytes() * down.rows),
+                          rt::Arg::Val<std::uint64_t>(down.RowBytes()), rt::Arg::Buf(ck_.hp), rt::Arg::Buf(ck_.tiles),
+                          rt::Arg::Buf(ck_.ntiles), rt::Arg::Buf(ck_.yp), rt::Arg::Val(H), rt::Arg::Val(ff)},
+                         error)) &&
+         Launch("halo_moe_combine_grouped", {Blocks(H), T}, {kBlock},
+                {rt::Arg::Buf(ck_.yp), rt::Arg::Buf(ck_.pos), rt::Arg::Buf(ck_.wts), rt::Arg::Buf(ck_.block_out),
+                 rt::Arg::Val(used), rt::Arg::Val(H)},
+                error);
+}
+
+bool FlashNextGpu::SharedExpertChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error) {
+  const auto& c = w_.config;
+  const std::uint32_t H = c.hidden_size;
   const std::uint32_t sff = c.shared_expert_ff;
   return Gemm(l.shexp_gate, ck_.mixed, ck_.eg, T, error) && Gemm(l.shexp_up, ck_.mixed, ck_.eu, T, error) &&
          Launch("halo_silu_mul", {Blocks(std::size_t{T} * sff)}, {kBlock},

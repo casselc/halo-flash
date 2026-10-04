@@ -838,8 +838,10 @@ bool FlashNextGpu::Prefill(std::span<const std::int32_t> tokens, std::span<float
       if (!Step(tokens[i], i + 1 == tokens.size() ? logits : std::span<float>{}, error)) return false;
     return true;
   }
-  for (std::size_t i = 0; i < tokens.size(); i += kPrefillChunk) {
-    const std::size_t n = std::min<std::size_t>(kPrefillChunk, tokens.size() - i);
+  if (!AllocChunk(error)) return false;
+  const std::size_t chunk = std::max<std::uint32_t>(1, std::min(prefill_chunk_, ck_.cap));
+  for (std::size_t i = 0; i < tokens.size(); i += chunk) {
+    const std::size_t n = std::min(chunk, tokens.size() - i);
     if (!PrefillChunk(tokens.subspan(i, n), i + n == tokens.size() ? logits : std::span<float>{}, error)) return false;
   }
   return true;

@@ -8,6 +8,7 @@
 // agreement where local tokens align byte for byte with the API's.
 //
 //   halo_score --model <shard-00001.gguf> --fixtures <dir> [--device hip|hrx|cpu] [--limit N]
+//              [--prefill 1] [--prefill-int8 0|1]   (prompts through the batched prefill)
 
 #include <chrono>
 #include <cmath>
@@ -61,6 +62,7 @@ int main(int argc, char** argv) {
   std::string model, fixtures, device = "hip";
   int limit = 1 << 30;
   bool eager = true;  // graph replay is the default once instantiation is fast on the real model
+  bool prefill = false;
   setvbuf(stdout, nullptr, _IOLBF, 0);
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
@@ -70,6 +72,8 @@ int main(int argc, char** argv) {
     else if (a == "--limit") limit = std::atoi(argv[i + 1]);
     else if (a == "--eager") eager = std::string(argv[i + 1]) == "1";
     else if (a == "--int8-moe") engine::FlashNextGpu::int8_act_moe_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--prefill") prefill = std::string(argv[i + 1]) == "1";
+    else if (a == "--prefill-int8") engine::FlashNextGpu::prefill_int8_gemm_ = std::string(argv[i + 1]) == "1";
     else return std::fprintf(stderr, "unknown option %s\n", a.c_str()), 2;
   }
   if (model.empty() || fixtures.empty())
@@ -162,8 +166,13 @@ int main(int argc, char** argv) {
 
     if (cpu) cpu->Reset();
     else if (!gpu->Reset(&error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
-    for (std::size_t i = 0; i + 1 < ids.size(); ++i)
-      if (!step(static_cast<std::int32_t>(ids[i]), {})) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    if (prefill && gpu) {  // P4: the prompt through Prefill (batched chunks), the targets stepped
+      const std::vector<std::int32_t> head(ids.begin(), ids.end() - 1);
+      if (!head.empty() && !gpu->Prefill(head, {}, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    } else {
+      for (std::size_t i = 0; i + 1 < ids.size(); ++i)
+        if (!step(static_cast<std::int32_t>(ids[i]), {})) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    }
     std::int32_t prev = static_cast<std::int32_t>(ids.back());
     double case_nll = 0;
     for (std::size_t j = 0; j < target.size(); ++j) {

@@ -67,7 +67,10 @@ class FlashNextGpu {
   static inline bool fused_shexp_ = true;  ///< P3 shared expert in two launches
   static inline bool fused_linear_ = true;  ///< P3 DeltaNet block in five launches
   static constexpr std::uint32_t kHcParts = 8;  ///< column chunks of the fused mixer's down projection
-  static constexpr std::uint32_t kPrefillChunk = 256;
+  /// Prompt tokens per prefill chunk (buffers are sized for the smaller of
+  /// this and the context when first needed). Large chunks let each routed
+  /// expert see enough tokens to reuse its weights.
+  static inline std::uint32_t prefill_chunk_ = 2048;
   static inline bool batched_prefill_ = true;
   /// Debug: chunk projections through the decode GEMVs (token by token)
   /// instead of the int8 GEMMs, so a chunk equals stepping up to float order.
@@ -75,8 +78,17 @@ class FlashNextGpu {
   /// Repacked Q8_0 projections as int8 WMMA GEMMs (activations quantized per
   /// token and 32 values); off, they run through the decode GEMVs per token.
   static inline bool prefill_int8_gemm_ = true;
+  /// Routed experts of a chunk grouped by expert (one GEMM per expert's
+  /// tokens) instead of token by token.
+  static inline bool prefill_grouped_moe_ = true;
+  /// Attention of a chunk's tokens in batched launches (same arithmetic as
+  /// stepping) instead of token by token.
+  static inline bool prefill_batched_attention_ = true;
+  /// The batched attention on FP16 WMMA tiles with an online softmax (head
+  /// dim 256); off, the decode kernel's arithmetic per token.
+  static inline bool prefill_wmma_attention_ = true;
   /// Runs `tokens` in order; `logits` (optional) receives the last position's.
-  /// P4: in chunks of kPrefillChunk tokens, the dense projections as T-token
+  /// P4: in chunks of prefill_chunk_ tokens, the dense projections as T-token
   /// GEMMs and the rest row-batched or token by token (prefill_chunk.cpp);
   /// a token at a time when batched_prefill_ is off or the model's shapes
   /// do not fit the chunk kernels.
@@ -154,8 +166,13 @@ class FlashNextGpu {
     rt::Buffer res, xn, lo, gate, mixed, inject, block_out, embd, xq, xd, host;
     rt::Buffer qkv, conv, z, alpha, beta, gdn, qg, q, gate_a, k, v, ctx, iq, ik;
     rt::Buffer router, ids, wts, eg, eu, ed, sgate;
+    rt::Buffer sorted, pos, tiles, ntiles, hp, yp;  // grouped experts
+    rt::Buffer bscores, vis, ascores;                // batched attention, kAttnSub tokens at a time
     std::size_t params_offset = 0;  // in `host`: per-token step params after the n-gram rows
+    std::uint32_t cap = 0;  // tokens the buffers hold
   };
+  static constexpr std::uint32_t kAttnSub = 512;
+  std::uint32_t AttnVisibleStride() const;
   ChunkBuffers ck_;
   bool ck_ready_ = false;
   std::vector<std::uint8_t> ck_host_;
@@ -169,7 +186,11 @@ class FlashNextGpu {
   bool HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_t tokens, std::string* error);
   bool PleChunk(const model::LayerWeights& l, std::uint32_t tokens, std::string* error);
   bool LinearChunk(const model::LayerWeights& l, LinearState& s, std::uint32_t tokens, std::string* error);
+  bool AttentionBatched(const model::LayerWeights& l, AttnState& s, std::uint32_t T, std::string* error);
   bool AttentionChunk(const model::LayerWeights& l, AttnState& s, std::uint32_t tokens, std::string* error);
+  bool GroupedMoeFits(const model::LayerWeights& l) const;
+  bool GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std::string* error);
+  bool SharedExpertChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error);
   bool MoeChunk(const model::LayerWeights& l, std::uint32_t tokens, std::string* error);
 
   rt::Device& dev_;

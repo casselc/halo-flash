@@ -1120,3 +1120,220 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
     }, {.test_cases = 40});
   }
 }
+
+// P4 stage B: routed experts of a chunk grouped by expert (bucket, gate/up
+// with SwiGLU, down, weighted combine) against a CPU reference that applies
+// the kernels' fp16 roundings (activations, dequantized weights, the SwiGLU
+// output), so only float summation order differs. Bound fixed in advance:
+// |got - want| <= 1e-3 * sum |terms| per output. Also: bucketing is a
+// permutation grouped by expert in pair order, tiles cover each expert's
+// pairs exactly, and the row-wise router top-k equals the single-row kernel.
+TEST(GpuQuant, GroupedExpertsMatchCpuReference) {
+  std::string error;
+  const auto f16 = [](float v) { return static_cast<float>(static_cast<_Float16>(v)); };
+  const auto silu = [](float v) { return v / (1.0f + std::exp(-v)); };
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      const std::size_t H = 256 * tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 3}));
+      const std::size_t ff = 32 * tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 12}));
+      const std::size_t E = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 40}));
+      const std::size_t used = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = std::min<std::size_t>(E, 10)}));
+      const std::size_t T = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 200}));
+      const bool q5k = tc.draw(gs::booleans()), q8_down = tc.draw(gs::booleans());
+      const bool repacked = q8_down && tc.draw(gs::booleans());  // the engine's repacked Q8_0 layout
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto fill = [&](std::vector<std::uint8_t>& w, std::size_t rows, std::size_t row_bytes, std::size_t block_bytes,
+                            std::initializer_list<std::size_t> halves) {
+        for (auto& b : w) { seed = seed * 1664525u + 1013904223u; b = static_cast<std::uint8_t>(seed >> 24); }
+        for (std::size_t r = 0; r < rows; ++r)
+          for (std::size_t b = 0; b < row_bytes / block_bytes; ++b)
+            for (std::size_t off : halves) {
+              // Small finite scales so values stay well inside fp16.
+              const auto h = static_cast<std::uint16_t>(FiniteHalf(tc) & 0xA3FF);
+              std::memcpy(w.data() + r * row_bytes + b * block_bytes + off, &h, 2);
+            }
+      };
+      const std::size_t gblk = q5k ? 176 : 144, gu_row = H / 256 * gblk, dn_row = q8_down ? ff / 32 * 34 : ff / 32 * 24;
+      std::vector<std::uint8_t> gate(E * ff * gu_row), up(E * ff * gu_row), down(E * H * dn_row);
+      fill(gate, E * ff, gu_row, gblk, {0, 2});
+      fill(up, E * ff, gu_row, gblk, {0, 2});
+      if (q8_down) fill(down, E * H, dn_row, 34, {0});
+      else fill(down, E * H, dn_row, 24, {0, 2});
+      // Routing: router logits per token; the CPU takes the GPU's top-k
+      // (checked against the single-row kernel below).
+      std::vector<float> logits(T * E), x(T * H);
+      for (auto& v : logits) { seed = seed * 1664525u + 1013904223u; v = static_cast<float>(seed >> 8) / 16777216.0f * 4.0f; }
+      for (auto& v : x) { seed = seed * 1664525u + 1013904223u; v = (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f) * 0.2f; }
+      const std::size_t P = T * used, max_tiles = P / 64 + E + 1;
+      auto gb = dev->Alloc(gate.size(), &error), ub = dev->Alloc(up.size(), &error), db = dev->Alloc(down.size(), &error),
+           lb = dev->Alloc(logits.size() * 4, &error), xb = dev->Alloc(x.size() * 4, &error),
+           ib = dev->Alloc(P * 4, &error), wb = dev->Alloc(P * 4, &error), i1 = dev->Alloc(P * 4, &error),
+           w1 = dev->Alloc(P * 4, &error), sb = dev->Alloc(P * 4, &error), pb = dev->Alloc(P * 4, &error),
+           tb = dev->Alloc(max_tiles * 12, &error), nb = dev->Alloc(4, &error), hb = dev->Alloc(P * ff * 4, &error),
+           yb = dev->Alloc(P * H * 4, &error), ob = dev->Alloc(T * H * 4, &error);
+      ASSERT_TRUE(gb && ub && db && lb && xb && ib && wb && i1 && w1 && sb && pb && tb && nb && hb && yb && ob) << error;
+      ASSERT_TRUE(dev->Upload(gb, 0, gate.data(), gate.size(), &error) && dev->Upload(ub, 0, up.data(), up.size(), &error) &&
+                  dev->Upload(db, 0, down.data(), down.size(), &error) &&
+                  dev->Upload(lb, 0, logits.data(), logits.size() * 4, &error) &&
+                  dev->Upload(xb, 0, x.data(), x.size() * 4, &error))
+          << error;
+      const auto u32 = [](std::size_t v) { return static_cast<std::uint32_t>(v); };
+      const auto launch = [&](const char* k, rt::Dim3 g, rt::Dim3 b, std::initializer_list<rt::Arg> a) {
+        const std::vector<rt::Arg> args(a);
+        ASSERT_TRUE(dev->Launch(dev->Kernel(k, &error), g, b, args, &error)) << k << ": " << error;
+      };
+      launch("halo_router_topk_rows", {u32(T)}, {256},
+             {rt::Arg::Buf(lb), rt::Arg::Buf(ib), rt::Arg::Buf(wb), rt::Arg::Val(u32(E)), rt::Arg::Val(u32(used))});
+      for (std::size_t t = 0; t < T; ++t)
+        launch("halo_router_topk", {1}, {256},
+               {rt::Arg::Buf(lb, t * E * 4), rt::Arg::Buf(i1, t * used * 4), rt::Arg::Buf(w1, t * used * 4),
+                rt::Arg::Val(u32(E)), rt::Arg::Val(u32(used))});
+      launch("halo_moe_bucket", {1}, {1024},
+             {rt::Arg::Buf(ib), rt::Arg::Val(u32(P)), rt::Arg::Val(u32(E)), rt::Arg::Buf(sb), rt::Arg::Buf(pb),
+              rt::Arg::Buf(tb), rt::Arg::Buf(nb)});
+      const std::string gk = std::string("halo_moe_gate_up_grouped_") + (q5k ? "q5_k" : "q4_k");
+      const std::string dk = std::string("halo_moe_down_grouped_") + (q8_down ? "q8_0" : "q5_1");
+      launch(gk.c_str(), {u32((ff + 63) / 64), u32(max_tiles)}, {128},
+             {rt::Arg::Buf(gb), rt::Arg::Buf(ub), rt::Arg::Val<std::uint64_t>(ff * gu_row),
+              rt::Arg::Val<std::uint64_t>(gu_row), rt::Arg::Buf(xb), rt::Arg::Buf(sb), rt::Arg::Buf(tb), rt::Arg::Buf(nb),
+              rt::Arg::Buf(hb), rt::Arg::Val(u32(ff)), rt::Arg::Val(u32(H)), rt::Arg::Val(u32(used))});
+      if (repacked) {
+        const std::uint32_t qstride = u32((ff + 15) / 16 * 16);
+        auto qs = dev->Alloc(E * H * qstride, &error), dsc = dev->Alloc(E * H * (ff / 32) * 2, &error);
+        ASSERT_TRUE(qs && dsc) << error;
+        launch("halo_repack_q8_0", {4096}, {256},
+               {rt::Arg::Buf(db), rt::Arg::Buf(qs), rt::Arg::Buf(dsc), rt::Arg::Val(u32(E * H)), rt::Arg::Val(u32(ff)),
+                rt::Arg::Val(qstride)});
+        launch("halo_moe_down_grouped_q8r", {u32((H + 63) / 64), u32(max_tiles)}, {128},
+               {rt::Arg::Buf(qs), rt::Arg::Buf(dsc), rt::Arg::Val(qstride), rt::Arg::Buf(hb), rt::Arg::Buf(tb),
+                rt::Arg::Buf(nb), rt::Arg::Buf(yb), rt::Arg::Val(u32(H)), rt::Arg::Val(u32(ff))});
+        ASSERT_TRUE(dev->Synchronize(&error)) << error;
+        dev->Free(qs);
+        dev->Free(dsc);
+      } else {
+        launch(dk.c_str(), {u32((H + 63) / 64), u32(max_tiles)}, {128},
+               {rt::Arg::Buf(db), rt::Arg::Val<std::uint64_t>(H * dn_row), rt::Arg::Val<std::uint64_t>(dn_row),
+                rt::Arg::Buf(hb), rt::Arg::Buf(tb), rt::Arg::Buf(nb), rt::Arg::Buf(yb), rt::Arg::Val(u32(H)),
+                rt::Arg::Val(u32(ff))});
+      }
+      launch("halo_moe_combine_grouped", {u32((H + 255) / 256), u32(T)}, {256},
+             {rt::Arg::Buf(yb), rt::Arg::Buf(pb), rt::Arg::Buf(wb), rt::Arg::Buf(ob), rt::Arg::Val(u32(used)),
+              rt::Arg::Val(u32(H))});
+      std::vector<std::uint32_t> ids(P), ids1(P), sorted(P), pos(P), tiles(max_tiles * 3), ntiles(1);
+      std::vector<float> wts(P), wts1(P), out(T * H);
+      ASSERT_TRUE(dev->Download(ib, 0, ids.data(), P * 4, &error) && dev->Download(i1, 0, ids1.data(), P * 4, &error) &&
+                  dev->Download(wb, 0, wts.data(), P * 4, &error) && dev->Download(w1, 0, wts1.data(), P * 4, &error) &&
+                  dev->Download(sb, 0, sorted.data(), P * 4, &error) && dev->Download(pb, 0, pos.data(), P * 4, &error) &&
+                  dev->Download(tb, 0, tiles.data(), tiles.size() * 4, &error) &&
+                  dev->Download(nb, 0, ntiles.data(), 4, &error) && dev->Download(ob, 0, out.data(), out.size() * 4, &error))
+          << error;
+      for (auto* b : {&gb, &ub, &db, &lb, &xb, &ib, &wb, &i1, &w1, &sb, &pb, &tb, &nb, &hb, &yb, &ob}) dev->Free(*b);
+      ASSERT_EQ(ids, ids1);
+      ASSERT_EQ(wts, wts1);
+      // Bucketing: sorted is a permutation, grouped by expert, pair order
+      // within an expert, pos its inverse; tiles cover each group.
+      for (std::size_t i = 0; i < P; ++i) {
+        ASSERT_LT(sorted[i], P);
+        ASSERT_EQ(pos[sorted[i]], i);
+        if (i > 0) {
+          ASSERT_LE(ids[sorted[i - 1]], ids[sorted[i]]);
+          if (ids[sorted[i - 1]] == ids[sorted[i]]) ASSERT_LT(sorted[i - 1], sorted[i]);
+        }
+      }
+      std::vector<std::size_t> covered(P, 0);
+      ASSERT_LE(ntiles[0], max_tiles);
+      for (std::size_t i = 0; i < ntiles[0]; ++i) {
+        ASSERT_GE(tiles[3 * i + 2], 1u);
+        ASSERT_LE(tiles[3 * i + 2], 64u);
+        for (std::uint32_t j = 0; j < tiles[3 * i + 2]; ++j) {
+          ASSERT_EQ(ids[sorted[tiles[3 * i + 1] + j]], tiles[3 * i]);
+          ++covered[tiles[3 * i + 1] + j];
+        }
+      }
+      for (auto n : covered) ASSERT_EQ(n, 1u);
+      // Reference with the kernels' fp16 roundings.
+      model::TensorRef tg, tu, td;
+      tg.data = gate.data(); tg.type = q5k ? GgmlType::kQ5_K : GgmlType::kQ4_K; tg.cols = H; tg.rows = ff; tg.experts = E;
+      tu = tg; tu.data = up.data();
+      td.data = down.data(); td.type = q8_down ? GgmlType::kQ8_0 : GgmlType::kQ5_1; td.cols = ff; td.rows = H; td.experts = E;
+      std::vector<float> wg(H), wu(H), wd(ff), h(ff);
+      for (std::size_t t = 0; t < T; ++t) {
+        std::vector<double> want(H, 0.0), mag(H, 0.0);
+        for (std::size_t s = 0; s < used; ++s) {
+          const std::uint32_t e = ids[t * used + s];
+          for (std::size_t j = 0; j < ff; ++j) {
+            model::cpu::DequantizeRow(tg, e, j, wg.data());
+            model::cpu::DequantizeRow(tu, e, j, wu.data());
+            double g = 0, u = 0;
+            for (std::size_t c = 0; c < H; ++c) {
+              const double xc = f16(x[t * H + c]);
+              g += double(f16(wg[c])) * xc;
+              u += double(f16(wu[c])) * xc;
+            }
+            h[j] = f16(silu(static_cast<float>(g)) * static_cast<float>(u));
+          }
+          for (std::size_t r = 0; r < H; ++r) {
+            model::cpu::DequantizeRow(td, e, r, wd.data());
+            double y = 0, m = 0;
+            for (std::size_t j = 0; j < ff; ++j) {
+              y += double(f16(wd[j])) * h[j];
+              m += std::fabs(double(f16(wd[j])) * h[j]);
+            }
+            want[r] += wts[t * used + s] * y;
+            mag[r] += std::fabs(wts[t * used + s]) * m;
+          }
+        }
+        for (std::size_t r = 0; r < H; ++r)
+          ASSERT_NEAR(out[t * H + r], want[r], 1e-3 * mag[r] + 1e-30)
+              << rt::BackendName(backend) << " t " << t << " r " << r << " H " << H << " ff " << ff << " E " << E
+              << " used " << used << " T " << T << " q5k " << q5k << " q8_down " << q8_down << " repacked " << repacked;
+      }
+    }, {.test_cases = 40});
+  }
+}
+
+// P4: the tiled FP32 GEMM for F32 projections against double sums, with
+// the worst-case fp32 summation bound |err| <= cols * 2^-23 * sum |w x|,
+// over ragged rows and tokens.
+TEST(GpuQuant, TiledF32GemmMatchesDoubleSums) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      const auto rows = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 600}));
+      const auto cols = 16 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 80}));
+      const auto T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 200}));
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return static_cast<float>(seed >> 8) / 16777216.0f - 0.5f; };
+      std::vector<float> w(std::size_t{rows} * cols), x(std::size_t{T} * cols), y(std::size_t{T} * rows);
+      for (auto& v : w) v = rnd();
+      for (auto& v : x) v = 3 * rnd();
+      auto wb = dev->Alloc(w.size() * 4, &error), xb = dev->Alloc(x.size() * 4, &error), yb = dev->Alloc(y.size() * 4, &error);
+      ASSERT_TRUE(wb && xb && yb && dev->Upload(wb, 0, w.data(), w.size() * 4, &error) &&
+                  dev->Upload(xb, 0, x.data(), x.size() * 4, &error))
+          << error;
+      const rt::Arg a[] = {rt::Arg::Buf(wb), rt::Arg::Buf(xb), rt::Arg::Buf(yb), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                           rt::Arg::Val(T)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemm_f32_tiled", &error), {(T + 63) / 64, (rows + 63) / 64}, {256}, a,
+                              &error))
+          << error;
+      ASSERT_TRUE(dev->Download(yb, 0, y.data(), y.size() * 4, &error)) << error;
+      for (auto* b : {&wb, &xb, &yb}) dev->Free(*b);
+      for (std::uint32_t t = 0; t < T; ++t)
+        for (std::uint32_t r = 0; r < rows; ++r) {
+          double want = 0, mag = 0;
+          for (std::uint32_t c = 0; c < cols; ++c) {
+            want += double(w[std::size_t{r} * cols + c]) * x[std::size_t{t} * cols + c];
+            mag += std::fabs(double(w[std::size_t{r} * cols + c]) * x[std::size_t{t} * cols + c]);
+          }
+          ASSERT_NEAR(y[std::size_t{t} * rows + r], want, cols * 0x1p-23 * mag + 1e-30)
+              << rt::BackendName(backend) << " t " << t << " r " << r << " rows " << rows << " cols " << cols << " T " << T;
+        }
+    }, {.test_cases = 40});
+  }
+}
