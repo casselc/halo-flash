@@ -171,3 +171,44 @@ TEST(Json, DepthLimitIsEnforced) {
   EXPECT_NE(error.find("deep"), std::string::npos);
   EXPECT_TRUE(halo::json::Parse(std::string(100, '[') + std::string(100, ']'), &error));
 }
+
+// The limits are exact: max_depth nested containers below the top value, and
+// max_bytes of input.
+TEST(Json, LimitsAreExact) {
+  std::string error;
+  const halo::json::ParseLimits depth2{.max_depth = 2};
+  EXPECT_TRUE(halo::json::Parse("[[[]]]", &error, depth2)) << error;
+  EXPECT_TRUE(halo::json::Parse("{\"a\":{\"b\":[]}}", &error, depth2)) << error;
+  EXPECT_FALSE(halo::json::Parse("[[[[]]]]", &error, depth2));
+  EXPECT_NE(error.find("deep"), std::string::npos) << error;
+  EXPECT_FALSE(halo::json::Parse("{\"a\":{\"b\":[[]]}}", &error, depth2));
+  const halo::json::ParseLimits bytes3{.max_bytes = 3};
+  EXPECT_TRUE(halo::json::Parse("[1]", &error, bytes3)) << error;
+  EXPECT_FALSE(halo::json::Parse("[1] ", &error, bytes3));
+  EXPECT_NE(error.find("too large"), std::string::npos) << error;
+}
+
+// CPython's json.dumps(indent=0): newlines, no indentation.
+TEST(Json, IndentZeroMatchesCPython) {
+  std::string error;
+  auto v = halo::json::Parse(R"([1,{"a":2,"b":[]},[],"x"])", &error);
+  ASSERT_TRUE(v) << error;
+  EXPECT_EQ(halo::json::DumpPython(*v, 0), "[\n1,\n{\n\"a\": 2,\n\"b\": []\n},\n[],\n\"x\"\n]");
+  v = halo::json::Parse(R"({"k":[1.5,null,true]})", &error);
+  ASSERT_TRUE(v) << error;
+  EXPECT_EQ(halo::json::DumpPython(*v, 0), "{\n\"k\": [\n1.5,\nnull,\ntrue\n]\n}");
+}
+
+TEST(Json, ValueAccessors) {
+  EXPECT_EQ(Value::Int("123").number(), 123.0);
+  EXPECT_EQ(Value::Int(-7).number(), -7.0);
+  EXPECT_EQ(Value::Float(2.5).number(), 2.5);
+  EXPECT_TRUE(std::isnan(Value::String("1").number()));
+  EXPECT_TRUE(std::isnan(Value::Null().number()));
+  const Value o = Value::MakeObject({{"a", Value::Int(1)}, {"b", Value::Bool(true)}, {"a", Value::Int(2)}});
+  ASSERT_NE(o.find("a"), nullptr);
+  EXPECT_TRUE(*o.find("a") == Value::Int(2));  // a later key replaces an earlier one, as in CPython
+  ASSERT_NE(o.find("b"), nullptr);
+  EXPECT_EQ(o.find("c"), nullptr);
+  EXPECT_EQ(halo::json::DumpPython(o), R"({"a": 2, "b": true})");
+}
