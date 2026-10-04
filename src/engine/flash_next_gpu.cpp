@@ -104,7 +104,11 @@ bool FlashNextGpu::MatVec(const model::TensorRef& t, std::uint64_t expert, const
   const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
   if (d.qs) {
     const std::size_t e = expert;
-    if (!Launch(cols > 8192 ? "halo_gemv_q8r_wide" : "halo_gemv_q8r", {Blocks(rows, 8)}, {256},
+    // Multi-row variants (4 rows per wave; 2 for wide inputs with few rows,
+    // where 32-row blocks would leave the GPU idle); see halo_gemv_bench.
+    const char* k = cols <= 6144 ? "halo_gemv_q8r_r4n" : rows < 2048 ? "halo_gemv_q8r_r2" : "halo_gemv_q8r_r4";
+    const std::uint32_t per_block = cols > 6144 && rows < 2048 ? 16 : 32;
+    if (!Launch(k, {Blocks(rows, per_block)}, {256},
                 {rt::Arg::Buf(d.qs, e * rows * d.qstride), rt::Arg::Buf(d.d, e * rows * (cols / 32) * 2),
                  rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride)},
                 error))
@@ -434,7 +438,7 @@ bool FlashNextGpu::ExpertMatVec(const model::TensorRef& t, std::uint32_t slot, c
   const auto& d = tensors_.at(t.data);
   const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
   if (d.qs)
-    return Launch("halo_gemv_q8r_expert", {Blocks(rows, 8)}, {256},
+    return Launch("halo_gemv_q8r_expert_r4", {Blocks(rows, 32)}, {256},
                   {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(x), rt::Arg::Buf(y),
                    rt::Arg::Val(slot), rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride)},
                   error);
@@ -465,7 +469,9 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
   const bool down_q8r = static_cast<bool>(dd.qs);
   if (gate_up_fast && (down_q5_1 || down_q8r)) {
     const auto ff = static_cast<std::uint32_t>(gate.rows), used = c.num_experts_used;
-    if (!Launch("halo_moe_gate_up_q4_k", {Blocks(ff, 8), used}, {256},
+    // 4 rows per wave with precomputed x sub-block sums (inputs <= 4096).
+    const bool s4 = H <= 4096;
+    if (!Launch(s4 ? "halo_moe_gate_up_q4_k_s4" : "halo_moe_gate_up_q4_k", {Blocks(ff, s4 ? 32 : 8), used}, {256},
                 {rt::Arg::Buf(tensors_.at(gate.data).buf), rt::Arg::Buf(tensors_.at(up.data).buf),
                  rt::Arg::Buf(expert_ids_), rt::Arg::Buf(mixed_), rt::Arg::Buf(moe_h_),
                  rt::Arg::Val<std::uint64_t>(gate.RowBytes() * gate.rows), rt::Arg::Val(ff), rt::Arg::Val(H),
@@ -473,12 +479,13 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
                 error))
       return false;
     const bool down_ok =
-        down_q5_1 ? Launch("halo_moe_down_q5_1", {Blocks(H, 8), used}, {256},
+        down_q5_1 ? Launch(ff <= 2048 ? "halo_moe_down_q5_1_r4" : "halo_moe_down_q5_1",
+                           {Blocks(H, ff <= 2048 ? 32 : 8), used}, {256},
                            {rt::Arg::Buf(dd.buf), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(moe_h_), rt::Arg::Buf(moe_part_),
                             rt::Arg::Val<std::uint64_t>(down.RowBytes() * down.rows), rt::Arg::Val(H), rt::Arg::Val(ff),
                             rt::Arg::Val<std::uint64_t>(down.RowBytes())},
                            error)
-                  : Launch("halo_moe_down_q8r", {Blocks(H, 8), used}, {256},
+                  : Launch("halo_moe_down_q8r_r4", {Blocks(H, 32), used}, {256},
                            {rt::Arg::Buf(dd.qs), rt::Arg::Buf(dd.d), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(moe_h_),
                             rt::Arg::Buf(moe_part_), rt::Arg::Val(H), rt::Arg::Val(ff), rt::Arg::Val(dd.qstride)},
                            error);

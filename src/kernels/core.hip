@@ -1505,9 +1505,12 @@ struct DotQ4K {
   __device__ static float Item(const std::uint8_t* row, const float* xs, std::uint32_t item) {
     const std::uint32_t sb = item / 4, c = item % 4;
     const std::uint8_t* b = row + sb * 144;
+    // d, dmin and the 12 scale bytes in one 16-byte load.
+    const int4 hdr = *reinterpret_cast<const int4*>(b);
+    const std::uint8_t* h = reinterpret_cast<const std::uint8_t*>(&hdr);
     std::uint32_t sc0, m0, sc1, m1;
-    ScaleMinK4(2 * c, b + 4, sc0, m0);
-    ScaleMinK4(2 * c + 1, b + 4, sc1, m1);
+    ScaleMinK4(2 * c, h + 4, sc0, m0);
+    ScaleMinK4(2 * c + 1, h + 4, sc1, m1);
     const int4 qa = *reinterpret_cast<const int4*>(b + 16 + c * 32);
     const int4 qb = *reinterpret_cast<const int4*>(b + 16 + c * 32 + 16);
     const std::uint8_t* q0 = reinterpret_cast<const std::uint8_t*>(&qa);
@@ -1528,7 +1531,7 @@ struct DotQ4K {
       xlo += x[16 + j];
       xhi += x[48 + j];
     }
-    const float d = F16(U16(b)), dmin = F16(U16(b + 2));
+    const float d = F16(U16(h)), dmin = F16(U16(h + 2));
     return d * (static_cast<float>(sc0) * lo + static_cast<float>(sc1) * hi) -
            dmin * (static_cast<float>(m0) * xlo + static_cast<float>(m1) * xhi);
   }
@@ -1539,11 +1542,11 @@ struct DotQ5_1 {
   static constexpr std::uint32_t kItemValues = 32;
   __device__ static float Item(const std::uint8_t* row, const float* xs, std::uint32_t item) {
     const std::uint8_t* b = row + item * 24;
-    const std::uint32_t qh = static_cast<std::uint32_t>(b[4]) | (static_cast<std::uint32_t>(b[5]) << 8) |
-                             (static_cast<std::uint32_t>(b[6]) << 16) | (static_cast<std::uint32_t>(b[7]) << 24);
-    // 16 nibble bytes at an 8-byte aligned offset: two 8-byte loads.
+    // The 24-byte block in three 8-byte loads: d, m, qh, then 16 nibble bytes.
+    const uint2 hd = *reinterpret_cast<const uint2*>(b);
     const uint2 qa = *reinterpret_cast<const uint2*>(b + 8);
     const uint2 qb = *reinterpret_cast<const uint2*>(b + 16);
+    const std::uint32_t qh = hd.y;
     std::uint8_t q[16];
     *reinterpret_cast<uint2*>(q) = qa;
     *reinterpret_cast<uint2*>(q + 8) = qb;
@@ -1556,7 +1559,7 @@ struct DotQ5_1 {
       s += lo * x[j] + hi * x[16 + j];
       sx += x[j] + x[16 + j];
     }
-    return F16(U16(b)) * s + F16(U16(b + 2)) * sx;
+    return F16(static_cast<std::uint16_t>(hd.x & 0xFFFF)) * s + F16(static_cast<std::uint16_t>(hd.x >> 16)) * sx;
   }
 };
 
@@ -1652,4 +1655,236 @@ extern "C" __global__ void halo_moe_combine(const float* part, const float* weig
     for (std::uint32_t s = 0; s < slots; ++s) acc += weights[s] * part[static_cast<std::size_t>(s) * n + i];
     out[i] = acc;
   }
+}
+
+// ---- P3: multi-row Q8 GEMV variants (tuning) ---------------------------------
+// Each wave computes kWaveRows rows: every x chunk read from LDS feeds all of
+// them and each lane keeps kWaveRows 16-byte loads in flight; a block of 8
+// waves stages x once for 8 * kWaveRows rows.
+
+namespace {
+
+template <int kWaveRows, std::uint32_t kMaxCols>
+__device__ void GemvQ8rMulti(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y,
+                             std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride) {
+  __shared__ float xs[kMaxCols];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kWaveRows;
+  if (r0 >= rows) return;
+  const std::uint32_t lane = threadIdx.x % kWarp, nblk = cols / 32;
+  float acc[kWaveRows] = {};
+  for (std::uint32_t c = lane * 16; c < cols; c += kWarp * 16) {
+    int4 q[kWaveRows];
+    float s[kWaveRows];
+#pragma unroll
+    for (int k = 0; k < kWaveRows; ++k) {
+      const std::uint32_t r = min(r0 + k, rows - 1);
+      q[k] = *reinterpret_cast<const int4*>(qs + static_cast<std::size_t>(r) * qstride + c);
+      s[k] = F16(d[static_cast<std::size_t>(r) * nblk + c / 32]);
+    }
+    const float* xv = xs + c;
+    float xr[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) xr[i] = xv[i];
+#pragma unroll
+    for (int k = 0; k < kWaveRows; ++k) {
+      const std::int8_t* v = reinterpret_cast<const std::int8_t*>(&q[k]);
+      float part = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) part += static_cast<float>(v[i]) * xr[i];
+      acc[k] += s[k] * part;
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < kWaveRows; ++k) {
+    const float a = WarpSum(acc[k]);
+    if (lane == 0 && r0 + k < rows) y[r0 + k] = a;
+  }
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_r2(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y, std::uint32_t rows,
+                     std::uint32_t cols, std::uint32_t qstride) {
+  GemvQ8rMulti<2, 12288>(qs, d, x, y, rows, cols, qstride);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_r4(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y, std::uint32_t rows,
+                     std::uint32_t cols, std::uint32_t qstride) {
+  GemvQ8rMulti<4, 12288>(qs, d, x, y, rows, cols, qstride);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_r4n(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y, std::uint32_t rows,
+                      std::uint32_t cols, std::uint32_t qstride) {
+  GemvQ8rMulti<4, 6144>(qs, d, x, y, rows, cols, qstride);
+}
+
+// Multi-row expert and fused-MoE down variants (cols <= 6144).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_expert_r4(const std::int8_t* qs, const std::uint16_t* d, const std::uint32_t* ids, const float* x,
+                            float* y, std::uint32_t slot, std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride) {
+  const std::size_t e = ids[slot];
+  GemvQ8rMulti<4, 6144>(qs + e * rows * qstride, d + e * rows * (cols / 32), x, y, rows, cols, qstride);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_down_q8r_r4(const std::int8_t* qs, const std::uint16_t* d, const std::uint32_t* ids, const float* h,
+                         float* part, std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride) {
+  const std::uint32_t slot = blockIdx.y;
+  const std::size_t e = ids[slot];
+  GemvQ8rMulti<4, 6144>(qs + e * rows * qstride, d + e * rows * (cols / 32), h + static_cast<std::size_t>(slot) * cols,
+                        part + static_cast<std::size_t>(slot) * rows, rows, cols, qstride);
+}
+
+// ---- P3: multi-row block-format GEMVs (tuning) --------------------------------
+// Lanes take (row, block) pairs over kRows rows, so short rows (Q5_1 down:
+// 20 blocks of 32) still keep every lane busy and several loads in flight.
+
+namespace {
+
+template <typename Fmt, int kRows, std::uint32_t kMaxCols>
+__device__ void GemvBlocksMulti(const std::uint8_t* w, std::uint64_t row_bytes, const float* x, float* y,
+                                std::uint32_t rows, std::uint32_t cols) {
+  __shared__ float xs[kMaxCols];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  const std::uint32_t lane = threadIdx.x % kWarp, per_row = cols / Fmt::kItemValues;
+  float acc[kRows] = {};
+  for (std::uint32_t t = lane; t < kRows * per_row; t += kWarp) {
+    const std::uint32_t k = t / per_row, i = t % per_row;
+    const std::uint32_t r = min(r0 + k, rows - 1);
+    const float v = Fmt::Item(w + r * row_bytes, xs, i);
+#pragma unroll
+    for (int kk = 0; kk < kRows; ++kk)
+      if (kk == static_cast<int>(k)) acc[kk] += v;
+  }
+#pragma unroll
+  for (int kk = 0; kk < kRows; ++kk) {
+    const float a = WarpSum(acc[kk]);
+    if (lane == 0 && r0 + kk < rows) y[r0 + kk] = a;
+  }
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_down_q5_1_r4(const std::uint8_t* down, const std::uint32_t* ids, const float* h, float* part,
+                          std::uint64_t expert_bytes, std::uint32_t rows, std::uint32_t cols, std::uint64_t row_bytes) {
+  const std::uint32_t slot = blockIdx.y;
+  GemvBlocksMulti<DotQ5_1, 4, 2048>(down + ids[slot] * expert_bytes, row_bytes, h + static_cast<std::size_t>(slot) * cols,
+                                    part + static_cast<std::size_t>(slot) * rows, rows, cols);
+}
+
+// gate and up rows r0..r0+1 per wave: lanes take (matrix, row, chunk) items.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_gate_up_q4_k_r2(const std::uint8_t* gate, const std::uint8_t* up, const std::uint32_t* ids,
+                             const float* x, float* h, std::uint64_t expert_bytes, std::uint32_t rows,
+                             std::uint32_t cols, std::uint64_t row_bytes) {
+  constexpr int kRows = 2;
+  __shared__ float xs[4096];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  const std::uint32_t slot = blockIdx.y;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  const std::uint32_t lane = threadIdx.x % kWarp, per_row = cols / 64;
+  const std::size_t e = ids[slot];
+  float g[kRows] = {}, u[kRows] = {};
+  for (std::uint32_t t = lane; t < 2 * kRows * per_row; t += kWarp) {
+    const std::uint32_t m = t / (kRows * per_row), rem = t % (kRows * per_row), k = rem / per_row, i = rem % per_row;
+    const std::uint32_t r = min(r0 + k, rows - 1);
+    const float v = DotQ4K::Item((m == 0 ? gate : up) + e * expert_bytes + r * row_bytes, xs, i);
+#pragma unroll
+    for (int kk = 0; kk < kRows; ++kk) {
+      if (kk == static_cast<int>(k) && m == 0) g[kk] += v;
+      if (kk == static_cast<int>(k) && m == 1) u[kk] += v;
+    }
+  }
+#pragma unroll
+  for (int kk = 0; kk < kRows; ++kk) {
+    const float gs = WarpSum(g[kk]), us = WarpSum(u[kk]);
+    if (lane == 0 && r0 + kk < rows) h[static_cast<std::size_t>(slot) * rows + r0 + kk] = Silu(gs) * us;
+  }
+}
+
+// Q4_K with x sub-block sums precomputed: the min term needs sum(x) over each
+// 32-value sub-block, which does not depend on the row.
+namespace {
+
+__device__ inline float Q4KItemSums(const std::uint8_t* row, const float* xs, const float* xsum, std::uint32_t item) {
+  const std::uint32_t sb = item / 4, c = item % 4;
+  const std::uint8_t* b = row + sb * 144;
+  const int4 hdr = *reinterpret_cast<const int4*>(b);
+  const int4 qa = *reinterpret_cast<const int4*>(b + 16 + c * 32);
+  const int4 qb = *reinterpret_cast<const int4*>(b + 16 + c * 32 + 16);
+  const std::uint8_t* h = reinterpret_cast<const std::uint8_t*>(&hdr);
+  std::uint32_t sc0, m0, sc1, m1;
+  ScaleMinK4(2 * c, h + 4, sc0, m0);
+  ScaleMinK4(2 * c + 1, h + 4, sc1, m1);
+  const std::uint8_t* q0 = reinterpret_cast<const std::uint8_t*>(&qa);
+  const std::uint8_t* q1 = reinterpret_cast<const std::uint8_t*>(&qb);
+  const float* x = xs + sb * 256 + c * 64;
+  float lo = 0, hi = 0;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    lo += static_cast<float>(q0[j] & 0xF) * x[j] + static_cast<float>(q1[j] & 0xF) * x[16 + j];
+    hi += static_cast<float>(q0[j] >> 4) * x[32 + j] + static_cast<float>(q1[j] >> 4) * x[48 + j];
+  }
+  const std::uint32_t s0 = (sb * 256 + c * 64) / 32;
+  return F16(U16(h)) * (static_cast<float>(sc0) * lo + static_cast<float>(sc1) * hi) -
+         F16(U16(h + 2)) * (static_cast<float>(m0) * xsum[s0] + static_cast<float>(m1) * xsum[s0 + 1]);
+}
+
+template <int kRows>
+__device__ void MoeGateUpQ4K(const std::uint8_t* gate, const std::uint8_t* up, const std::uint32_t* ids,
+                             const float* x, float* h, std::uint64_t expert_bytes, std::uint32_t rows,
+                             std::uint32_t cols, std::uint64_t row_bytes) {
+  __shared__ float xs[4096], xsum[128];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  for (std::uint32_t j = threadIdx.x; j < cols / 32; j += blockDim.x) {
+    float a = 0;
+    for (int i = 0; i < 32; ++i) a += xs[j * 32 + i];
+    xsum[j] = a;
+  }
+  __syncthreads();
+  const std::uint32_t slot = blockIdx.y;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  const std::uint32_t lane = threadIdx.x % kWarp, per_row = cols / 64;
+  const std::size_t e = ids[slot];
+  float g[kRows] = {}, u[kRows] = {};
+  for (std::uint32_t t = lane; t < 2 * kRows * per_row; t += kWarp) {
+    const std::uint32_t m = t / (kRows * per_row), rem = t % (kRows * per_row), k = rem / per_row, i = rem % per_row;
+    const std::uint32_t r = min(r0 + k, rows - 1);
+    const float v = Q4KItemSums((m == 0 ? gate : up) + e * expert_bytes + r * row_bytes, xs, xsum, i);
+#pragma unroll
+    for (int kk = 0; kk < kRows; ++kk) {
+      if (kk == static_cast<int>(k) && m == 0) g[kk] += v;
+      if (kk == static_cast<int>(k) && m == 1) u[kk] += v;
+    }
+  }
+#pragma unroll
+  for (int kk = 0; kk < kRows; ++kk) {
+    const float gs = WarpSum(g[kk]), us = WarpSum(u[kk]);
+    if (lane == 0 && r0 + kk < rows) h[static_cast<std::size_t>(slot) * rows + r0 + kk] = Silu(gs) * us;
+  }
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_gate_up_q4_k_s2(const std::uint8_t* gate, const std::uint8_t* up, const std::uint32_t* ids,
+                             const float* x, float* h, std::uint64_t expert_bytes, std::uint32_t rows,
+                             std::uint32_t cols, std::uint64_t row_bytes) {
+  MoeGateUpQ4K<2>(gate, up, ids, x, h, expert_bytes, rows, cols, row_bytes);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_gate_up_q4_k_s4(const std::uint8_t* gate, const std::uint8_t* up, const std::uint32_t* ids,
+                             const float* x, float* h, std::uint64_t expert_bytes, std::uint32_t rows,
+                             std::uint32_t cols, std::uint64_t row_bytes) {
+  MoeGateUpQ4K<4>(gate, up, ids, x, h, expert_bytes, rows, cols, row_bytes);
 }

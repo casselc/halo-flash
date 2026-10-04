@@ -837,3 +837,35 @@ binary = "gpu_tests"
 filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
 why = "the key-major state layout is indexed S[i * d + j]"
 timeout = 1200
+
+[[mutant]]
+name = "p3-q8r-multirow-same-row"
+file = "src/kernels/core.hip"
+find = '      const std::uint32_t r = min(r0 + k, rows - 1);'
+replace = '      const std::uint32_t r = r0;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.RepackedQ8GemvMatchesCpuDequant"
+why = "each of a wave's rows reads its own weights"
+timeout = 1200
+
+[[mutant]]
+name = "p3-q4k-xsum-wrong-subblock"
+file = "src/kernels/core.hip"
+find = '         F16(U16(h + 2)) * (static_cast<float>(m0) * xsum[s0] + static_cast<float>(m1) * xsum[s0 + 1]);'
+replace = '         F16(U16(h + 2)) * (static_cast<float>(m0) * xsum[s0] + static_cast<float>(m1) * xsum[s0]);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.FusedMoeMatchesCpuComposition"
+why = "the odd sub-block's minimum uses its own x sum"
+timeout = 1500
+
+[[mutant]]
+name = "p3-q5-1-qh-from-wrong-word"
+file = "src/kernels/core.hip"
+find = '    const std::uint32_t qh = hd.y;'
+replace = '    const std::uint32_t qh = hd.x;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.BlockGemvMatchesCpuDequant"
+why = "qh is the block's second 32-bit word"

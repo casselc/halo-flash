@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "core/gguf.hpp"
+#include "core/sampling.hpp"
 #include "engine/flash_next_gpu.hpp"
 #include "model/ngram.hpp"
 #include "model/reference.hpp"
@@ -110,7 +111,7 @@ struct Profiling final : rt::Device {
 int main(int argc, char** argv) {
   std::string model, prompt = "The capital of France is", device = "hip";
   int n = 16;
-  bool eager = false, profile = false;
+  bool eager = false, profile = false, device_sample = false;
   setvbuf(stdout, nullptr, _IOLBF, 0);
   std::uint32_t max_context = 512;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -122,6 +123,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-context") max_context = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--eager") eager = std::string(argv[i + 1]) == "1";
     else if (a == "--profile") profile = std::string(argv[i + 1]) == "1";
+    else if (a == "--device-sample") device_sample = std::string(argv[i + 1]) == "1";
     else {
       std::fprintf(stderr, "unknown option %s\n", a.c_str());
       return 2;
@@ -177,6 +179,7 @@ int main(int argc, char** argv) {
   std::printf("prompt: %zu tokens\n", ids.size());
   std::vector<float> lc(c.vocab_size), lg(c.vocab_size);
   std::vector<text::TokenId> generated;
+  std::vector<double> step_ms;  // decode steps after warm-up (graph capture etc.)
   const auto ts = std::chrono::steady_clock::now();
   double worst = 0;
   for (std::size_t step = 0; step < ids.size() + static_cast<std::size_t>(n) - 1; ++step) {
@@ -185,8 +188,17 @@ int main(int argc, char** argv) {
     if (cpu && !cpu->Step(token, want ? std::span<float>(lc) : std::span<float>{}, {}, &error))
       return std::fprintf(stderr, "cpu: %s\n", error.c_str()), 1;
     const auto st = std::chrono::steady_clock::now();
-    if (gpu && !gpu->Step(token, want ? std::span<float>(lg) : std::span<float>{}, &error))
+    if (gpu && want && device_sample && !cpu) {  // greedy on the device: only the token comes back
+      static sampling::SamplingConfig greedy;
+      engine::FlashNextGpu::SampleResult r;
+      if (!gpu->StepSample(token, {&greedy, {}, 0}, &r, &error)) return std::fprintf(stderr, "gpu: %s\n", error.c_str()), 1;
+      std::fill(lg.begin(), lg.end(), 0.0f);
+      lg[static_cast<std::size_t>(r.token)] = 1.0f;
+    } else if (gpu && !gpu->Step(token, want ? std::span<float>(lg) : std::span<float>{}, &error)) {
       return std::fprintf(stderr, "gpu: %s\n", error.c_str()), 1;
+    }
+    if (want && generated.size() >= 4) step_ms.push_back(
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - st).count());
     if (step < 2 || step + 1 == ids.size())
       std::printf("step %zu: %.3f s\n", step, std::chrono::duration<double>(std::chrono::steady_clock::now() - st).count());
     if (profile && step == ids.size()) static_cast<Profiling*>(dev.get())->on = true;  // after warm-up
@@ -207,6 +219,11 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
   }
   const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
+  if (!step_ms.empty()) {
+    std::sort(step_ms.begin(), step_ms.end());
+    std::printf("steady decode: median %.2f ms/step (%.2f tok/s), min %.2f ms, over %zu steps\n",
+                step_ms[step_ms.size() / 2], 1000.0 / step_ms[step_ms.size() / 2], step_ms.front(), step_ms.size());
+  }
   std::printf("text: %s%s\n", prompt.c_str(), tok->Decode(generated).c_str());
   std::printf("%zu steps in %.2f s (%.2f steps/s)%s\n", ids.size() + generated.size() - 1, secs,
               (ids.size() + generated.size() - 1) / secs,

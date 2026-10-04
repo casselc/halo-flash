@@ -174,13 +174,23 @@ TEST(GpuQuant, RepackedQ8GemvMatchesCpuDequant) {
       if (as_expert) {
         const rt::Arg a[] = {rt::Arg::Buf(qs), rt::Arg::Buf(d), rt::Arg::Buf(ib), rt::Arg::Buf(xb), rt::Arg::Buf(yb),
                              rt::Arg::Val(0u), rt::Arg::Val(R), rt::Arg::Val(C), rt::Arg::Val(qstride)};
-        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemv_q8r_expert", &error), {(R + 7) / 8}, {256}, a, &error)) << error;
+        const bool r4 = cols <= 6144 && tc.draw(gs::booleans());
+        ASSERT_TRUE(dev->Launch(dev->Kernel(r4 ? "halo_gemv_q8r_expert_r4" : "halo_gemv_q8r_expert", &error),
+                                {r4 ? (R + 31) / 32 : (R + 7) / 8}, {256}, a, &error))
+            << error;
       } else {
         const rt::Arg a[] = {rt::Arg::Buf(qs, std::size_t{pick} * rows * qstride),
                              rt::Arg::Buf(d, std::size_t{pick} * rows * (cols / 32) * 2), rt::Arg::Buf(xb),
                              rt::Arg::Buf(yb), rt::Arg::Val(R), rt::Arg::Val(C), rt::Arg::Val(qstride)};
-        ASSERT_TRUE(dev->Launch(dev->Kernel(cols > 8192 ? "halo_gemv_q8r_wide" : "halo_gemv_q8r", &error), {(R + 7) / 8},
-                                {256}, a, &error))
+        struct V { const char* name; std::uint32_t rows_per_block, max_cols; };
+        const V variants[] = {{"halo_gemv_q8r", 8, 8192}, {"halo_gemv_q8r_wide", 8, 12288}, {"halo_gemv_q8r_r2", 16, 12288},
+                              {"halo_gemv_q8r_r4", 32, 12288}, {"halo_gemv_q8r_r4n", 32, 6144}};
+        std::vector<V> ok;
+        for (const auto& v : variants)
+          if (cols <= v.max_cols) ok.push_back(v);
+        const V v = ok[tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = ok.size() - 1}))];
+        ASSERT_TRUE(dev->Launch(dev->Kernel(v.name, &error), {(R + v.rows_per_block - 1) / v.rows_per_block}, {256}, a,
+                                &error))
             << error;
       }
       std::vector<float> got(rows);
@@ -337,19 +347,31 @@ TEST(GpuQuant, FusedMoeMatchesCpuComposition) {
       const rt::Arg a1[] = {rt::Arg::Buf(gb), rt::Arg::Buf(ub), rt::Arg::Buf(ib), rt::Arg::Buf(xb), rt::Arg::Buf(hb),
                             rt::Arg::Val<std::uint64_t>(ff * gu_row), rt::Arg::Val(uF), rt::Arg::Val(uH),
                             rt::Arg::Val<std::uint64_t>(gu_row)};
-      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_moe_gate_up_q4_k", &error), {(uF + 7) / 8, uU}, {256}, a1, &error)) << error;
+      struct V { const char* name; std::uint32_t rows_per_block; };
+      const V gate_up[] = {{"halo_moe_gate_up_q4_k", 8}, {"halo_moe_gate_up_q4_k_r2", 16},
+                           {"halo_moe_gate_up_q4_k_s2", 16}, {"halo_moe_gate_up_q4_k_s4", 32}};
+      const V gv = gate_up[tc.draw(gs::integers<int>({.min_value = 0, .max_value = 3}))];
+      ASSERT_TRUE(dev->Launch(dev->Kernel(gv.name, &error), {(uF + gv.rows_per_block - 1) / gv.rows_per_block, uU}, {256}, a1,
+                              &error))
+          << error;
       if (q8_down) {
         const rt::Arg r[] = {rt::Arg::Buf(db), rt::Arg::Buf(qs), rt::Arg::Buf(dsc),
                              rt::Arg::Val(static_cast<std::uint32_t>(E * H)), rt::Arg::Val(uF), rt::Arg::Val(uF)};
         ASSERT_TRUE(dev->Launch(dev->Kernel("halo_repack_q8_0", &error), {64}, {256}, r, &error)) << error;
         const rt::Arg a2[] = {rt::Arg::Buf(qs), rt::Arg::Buf(dsc), rt::Arg::Buf(ib), rt::Arg::Buf(hb), rt::Arg::Buf(pb),
                               rt::Arg::Val(uH), rt::Arg::Val(uF), rt::Arg::Val(uF)};
-        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_moe_down_q8r", &error), {(uH + 7) / 8, uU}, {256}, a2, &error)) << error;
+        const bool r4 = tc.draw(gs::booleans());
+        ASSERT_TRUE(dev->Launch(dev->Kernel(r4 ? "halo_moe_down_q8r_r4" : "halo_moe_down_q8r", &error),
+                                {r4 ? (uH + 31) / 32 : (uH + 7) / 8, uU}, {256}, a2, &error))
+            << error;
       } else {
         const rt::Arg a2[] = {rt::Arg::Buf(db), rt::Arg::Buf(ib), rt::Arg::Buf(hb), rt::Arg::Buf(pb),
                               rt::Arg::Val<std::uint64_t>(H * dn_row), rt::Arg::Val(uH), rt::Arg::Val(uF),
                               rt::Arg::Val<std::uint64_t>(dn_row)};
-        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_moe_down_q5_1", &error), {(uH + 7) / 8, uU}, {256}, a2, &error)) << error;
+        const bool r4 = ff <= 2048 && tc.draw(gs::booleans());
+        ASSERT_TRUE(dev->Launch(dev->Kernel(r4 ? "halo_moe_down_q5_1_r4" : "halo_moe_down_q5_1", &error),
+                                {r4 ? (uH + 31) / 32 : (uH + 7) / 8, uU}, {256}, a2, &error))
+            << error;
       }
       const rt::Arg a3[] = {rt::Arg::Buf(pb), rt::Arg::Buf(wb), rt::Arg::Buf(ob), rt::Arg::Val(uU), rt::Arg::Val(uH)};
       ASSERT_TRUE(dev->Launch(dev->Kernel("halo_moe_combine", &error), {(uH + 255) / 256}, {256}, a3, &error)) << error;
