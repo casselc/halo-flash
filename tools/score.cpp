@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
     else if (a == "--device") device = argv[i + 1];
     else if (a == "--limit") limit = std::atoi(argv[i + 1]);
     else if (a == "--eager") eager = std::string(argv[i + 1]) == "1";
+    else if (a == "--int8-moe") engine::FlashNextGpu::int8_act_moe_ = std::string(argv[i + 1]) == "1";
     else return std::fprintf(stderr, "unknown option %s\n", a.c_str()), 2;
   }
   if (model.empty() || fixtures.empty())

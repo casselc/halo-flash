@@ -290,8 +290,8 @@ why = "decay includes the dt bias"
 [[mutant]]
 name = "k-l2norm-as-rms"
 file = "src/kernels/core.hip"
-find = '1.0f / sqrtf(ss + eps)'
-replace = '1.0f / sqrtf(ss / static_cast<float>(d) + eps)'
+find = '  const float scale = 1.0f / sqrtf(ss + eps);'
+replace = '  const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
@@ -824,8 +824,14 @@ timeout = 1200
 [[mutant]]
 name = "p3-rowblock-ignores-x"
 file = "src/kernels/core.hip"
-find = '  for (std::uint32_t c = threadIdx.x; c < cols; c += blockDim.x) acc += row[c] * x[c];'
-replace = '  for (std::uint32_t c = threadIdx.x; c < cols; c += blockDim.x) acc += row[c];'
+find = """
+  const float* row = w + static_cast<std::size_t>(r) * cols;
+  float acc = 0.0f;
+  for (std::uint32_t c = threadIdx.x; c < cols; c += blockDim.x) acc += row[c] * x[c];"""
+replace = """
+  const float* row = w + static_cast<std::size_t>(r) * cols;
+  float acc = 0.0f;
+  for (std::uint32_t c = threadIdx.x; c < cols; c += blockDim.x) acc += row[c];"""
 suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
@@ -849,8 +855,12 @@ timeout = 1200
 [[mutant]]
 name = "p3-q8r-multirow-same-row"
 file = "src/kernels/core.hip"
-find = '      const std::uint32_t r = min(r0 + k, rows - 1);'
-replace = '      const std::uint32_t r = r0;'
+find = """
+    for (int k = 0; k < kWaveRows; ++k) {
+      const std::uint32_t r = min(r0 + k, rows - 1);"""
+replace = """
+    for (int k = 0; k < kWaveRows; ++k) {
+      const std::uint32_t r = r0;"""
 suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuQuant.RepackedQ8GemvMatchesCpuDequant"
@@ -860,8 +870,8 @@ timeout = 1200
 [[mutant]]
 name = "p3-q4k-xsum-wrong-subblock"
 file = "src/kernels/core.hip"
-find = '         F16(U16(h + 2)) * (static_cast<float>(m0) * xsum[s0] + static_cast<float>(m1) * xsum[s0 + 1]);'
-replace = '         F16(U16(h + 2)) * (static_cast<float>(m0) * xsum[s0] + static_cast<float>(m1) * xsum[s0]);'
+find = '             (static_cast<float>(m0) * xsum[s0] + static_cast<float>(m1) * xsum[s0 + 1]);'
+replace = '             (static_cast<float>(m0) * xsum[s0] + static_cast<float>(m1) * xsum[s0]);'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuQuant.FusedMoeMatchesCpuComposition"
@@ -891,8 +901,12 @@ why = "the output reads the updated state: decay (S q) + delta (k . q)"
 [[mutant]]
 name = "p3-gdn1-state-not-decayed"
 file = "src/kernels/core.hip"
-find = '  for (std::uint32_t i = 0; i < d; ++i) S[i * d] = decay * s[i] + delta * ks[i];'
-replace = '  for (std::uint32_t i = 0; i < d; ++i) S[i * d] = s[i] + delta * ks[i];'
+find = """
+  for (std::uint32_t i = 0; i < d; ++i) S[i * d] = decay * s[i] + delta * ks[i];
+  out[h * d + j] = (decay * B + delta * kq) / sqrtf(static_cast<float>(d));"""
+replace = """
+  for (std::uint32_t i = 0; i < d; ++i) S[i * d] = s[i] + delta * ks[i];
+  out[h * d + j] = (decay * B + delta * kq) / sqrtf(static_cast<float>(d));"""
 suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuKernels.SinglePassGdnMatchesTwoLoopKernel"
@@ -911,3 +925,157 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuKernels.SinglePassGdnMatchesTwoLoopKernel"
 why = "decay includes the dt bias (single-pass kernel)"
+
+[[mutant]]
+name = "p3-q4kdot-hi-reads-low-subblock"
+file = "src/kernels/core.hip"
+find = '    hi = __builtin_amdgcn_sudot4(false, static_cast<int>((qw[k] >> 4) & 0x0F0F0F0Fu), true, static_cast<int>(x1[k]), hi,'
+replace = '    hi = __builtin_amdgcn_sudot4(false, static_cast<int>((qw[k] >> 4) & 0x0F0F0F0Fu), true, static_cast<int>(x0[k]), hi,'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.Q4kDotGateUpWithinActivationQuantizationBound"
+why = "high nibbles are the odd sub-block's values"
+
+[[mutant]]
+name = "p3-q4kdot-unsigned-activations"
+file = "src/kernels/core.hip"
+find = '    lo = __builtin_amdgcn_sudot4(false, static_cast<int>(qw[k] & 0x0F0F0F0Fu), true, static_cast<int>(x0[k]), lo, false);'
+replace = '    lo = __builtin_amdgcn_sudot4(false, static_cast<int>(qw[k] & 0x0F0F0F0Fu), false, static_cast<int>(x0[k]), lo, false);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.Q4kDotGateUpWithinActivationQuantizationBound"
+why = "quantized activations are signed"
+
+[[mutant]]
+name = "p3-q4kdot-one-activation-scale"
+file = "src/kernels/core.hip"
+find = '              static_cast<float>(sc1) * a.scale[s1] * static_cast<float>(hi)) -'
+replace = '              static_cast<float>(sc1) * a.scale[s0] * static_cast<float>(hi)) -'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.Q4kDotGateUpWithinActivationQuantizationBound"
+why = "each sub-block has its own activation scale"
+
+[[mutant]]
+name = "p3-q8act-scale"
+file = "src/kernels/core.hip"
+find = '    const int qv = scale > 0.0f ? static_cast<int>(rintf(v / scale)) : 0;'
+replace = '    const int qv = scale > 0.0f ? static_cast<int>(rintf(v * scale)) : 0;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuQuant.Q4kDotGateUpWithinActivationQuantizationBound"
+why = "activations are quantized as round(x / scale) (a coarser +-100 range would be equivalent within the bound)"
+
+[[mutant]]
+name = "p3-hcmix-b-no-mean"
+file = "src/kernels/core.hip"
+find = '  if (lane == 0) mixed[i] = m / static_cast<float>(hc);'
+replace = '  if (lane == 0) mixed[i] = m;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedHcMixerMatchesKernelSequence"
+why = "the mixer averages the streams"
+
+[[mutant]]
+name = "p3-hcmix-a-norm-shared-gamma"
+file = "src/kernels/core.hip"
+find = '    for (std::uint32_t i = threadIdx.x; i < h; i += blockDim.x) xs[s * h + i] = xs[s * h + i] * scale * norm_w[s * h + i];'
+replace = '    for (std::uint32_t i = threadIdx.x; i < h; i += blockDim.x) xs[s * h + i] = xs[s * h + i] * scale * norm_w[i];'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedHcMixerMatchesKernelSequence"
+why = "each stream has its own norm gamma"
+
+[[mutant]]
+name = "p3-hcmix-a-silu-unscaled"
+file = "src/kernels/core.hip"
+find = '    if (lane == 0 && r0 + k < low_rank) lo[r0 + k] = Silu(a / static_cast<float>(hc));'
+replace = '    if (lane == 0 && r0 + k < low_rank) lo[r0 + k] = Silu(a);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedHcMixerMatchesKernelSequence"
+why = "the low-rank activation is silu(down / hc)"
+
+[[mutant]]
+name = "p3-shexp-gate-not-applied"
+file = "src/kernels/core.hip"
+find = '  const float s = Sigmoid(sgate[0]);'
+replace = '  const float s = 1.0f;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedSharedExpertMatchesKernelSequence"
+why = "the shared expert output is scaled by sigmoid(<gate_inp, x>)"
+
+[[mutant]]
+name = "p3-shexp-overwrites-routed-sum"
+file = "src/kernels/core.hip"
+find = '      if (r0 + k < rows) out[r0 + k] += s * y[k];'
+replace = '      if (r0 + k < rows) out[r0 + k] = s * y[k];'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedSharedExpertMatchesKernelSequence"
+why = "the shared expert adds to the routed experts' sum"
+
+[[mutant]]
+name = "p3-dual-second-matrix-offset"
+file = "src/kernels/core.hip"
+find = '  const std::uint32_t b = first ? blockIdx.x : blockIdx.x - blocks1;'
+replace = '  const std::uint32_t b = first ? blockIdx.x : blockIdx.x - blocks1 + 1;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedDeltaNetPiecesMatchKernelSequences"
+why = "the second matrix's blocks start at its own row 0"
+
+[[mutant]]
+name = "p3-conv-l2-on-v-channels"
+file = "src/kernels/core.hip"
+find = '  if (blockIdx.x * blockDim.x < l2_channels) {  // block-uniform'
+replace = '  if (true) {  // block-uniform'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedDeltaNetPiecesMatchKernelSequences"
+why = "only q and k are L2-normalized; v is not"
+
+[[mutant]]
+name = "p3-gdn-norm-mode-ignored"
+file = "src/kernels/core.hip"
+find = '  out[h * d + j] = o * scale * norm_w[j] * (mode == 0 ? Silu(zv) : Sigmoid(zv));'
+replace = '  out[h * d + j] = o * scale * norm_w[j] * Sigmoid(zv);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedDeltaNetPiecesMatchKernelSequences"
+why = "mode 0 gates with silu (Qwen3.5), mode 1 with sigmoid (Flash-Next)"
+
+[[mutant]]
+name = "p3-rowblock2-b-reads-a"
+file = "src/kernels/core.hip"
+find = '  const float* row = (a ? wa : wb) + static_cast<std::size_t>(r) * cols;'
+replace = '  const float* row = wa + static_cast<std::size_t>(r) * cols;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedDeltaNetPiecesMatchKernelSequences"
+why = "beta rows come from the beta matrix"
+
+[[mutant]]
+name = "p3-conv-l2-as-rms"
+file = "src/kernels/core.hip"
+find = '    v *= 1.0f / sqrtf(ss + eps);'
+replace = '    v *= 1.0f / sqrtf(ss / 128.0f + eps);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedDeltaNetPiecesMatchKernelSequences"
+why = "DeltaNet q/k use the L2 norm, not RMS (fused conv kernel)"
+
+[[mutant]]
+name = "p3-gdn1norm-state-not-decayed"
+file = "src/kernels/core.hip"
+find = """
+  for (std::uint32_t i = 0; i < d; ++i) S[i * d] = decay * s[i] + delta * ks[i];
+  const float o = (decay * B + delta * kq) / sqrtf(static_cast<float>(d));"""
+replace = """
+  for (std::uint32_t i = 0; i < d; ++i) S[i * d] = s[i] + delta * ks[i];
+  const float o = (decay * B + delta * kq) / sqrtf(static_cast<float>(d));"""
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedDeltaNetPiecesMatchKernelSequences"
+why = "the stored state is decayed (fused DeltaNet + norm kernel)"

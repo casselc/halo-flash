@@ -93,6 +93,24 @@ __device__ inline void ScaleMinK4(std::uint32_t j, const std::uint8_t* q, std::u
   }
 }
 
+// The same unpacking from the header's three scale words (bytes 4..15 of a
+// K-quant block) with shifts and selects: indexing a local byte array by a
+// runtime j forces it into scratch memory.
+__device__ inline std::uint32_t ScaleByte(std::uint32_t i, std::uint32_t w0, std::uint32_t w1, std::uint32_t w2) {
+  const std::uint32_t w = i < 4 ? w0 : (i < 8 ? w1 : w2);
+  return (w >> (8 * (i & 3))) & 0xFF;
+}
+__device__ inline void ScaleMinK4Words(std::uint32_t j, std::uint32_t w0, std::uint32_t w1, std::uint32_t w2,
+                                       std::uint32_t& sc, std::uint32_t& m) {
+  if (j < 4) {
+    sc = ScaleByte(j, w0, w1, w2) & 63;
+    m = ScaleByte(j + 4, w0, w1, w2) & 63;
+  } else {
+    sc = (ScaleByte(j + 4, w0, w1, w2) & 0xF) | ((ScaleByte(j - 4, w0, w1, w2) >> 6) << 4);
+    m = (ScaleByte(j + 4, w0, w1, w2) >> 4) | ((ScaleByte(j, w0, w1, w2) >> 6) << 4);
+  }
+}
+
 struct LoadQ4_K {  // 144-byte blocks of 256: d, dmin, scales[12], qs[128]
   __device__ static float At(const std::uint8_t* row, std::uint32_t c) {
     const std::uint8_t* b = row + (c / 256) * 144;
@@ -1507,10 +1525,11 @@ struct DotQ4K {
     const std::uint8_t* b = row + sb * 144;
     // d, dmin and the 12 scale bytes in one 16-byte load.
     const int4 hdr = *reinterpret_cast<const int4*>(b);
-    const std::uint8_t* h = reinterpret_cast<const std::uint8_t*>(&hdr);
+    const auto w0 = static_cast<std::uint32_t>(hdr.y), w1 = static_cast<std::uint32_t>(hdr.z),
+               w2 = static_cast<std::uint32_t>(hdr.w);
     std::uint32_t sc0, m0, sc1, m1;
-    ScaleMinK4(2 * c, h + 4, sc0, m0);
-    ScaleMinK4(2 * c + 1, h + 4, sc1, m1);
+    ScaleMinK4Words(2 * c, w0, w1, w2, sc0, m0);
+    ScaleMinK4Words(2 * c + 1, w0, w1, w2, sc1, m1);
     const int4 qa = *reinterpret_cast<const int4*>(b + 16 + c * 32);
     const int4 qb = *reinterpret_cast<const int4*>(b + 16 + c * 32 + 16);
     const std::uint8_t* q0 = reinterpret_cast<const std::uint8_t*>(&qa);
@@ -1531,7 +1550,8 @@ struct DotQ4K {
       xlo += x[16 + j];
       xhi += x[48 + j];
     }
-    const float d = F16(U16(h)), dmin = F16(U16(h + 2));
+    const float d = F16(static_cast<std::uint16_t>(hdr.x & 0xFFFF)),
+                dmin = F16(static_cast<std::uint16_t>(static_cast<std::uint32_t>(hdr.x) >> 16));
     return d * (static_cast<float>(sc0) * lo + static_cast<float>(sc1) * hi) -
            dmin * (static_cast<float>(m0) * xlo + static_cast<float>(m1) * xhi);
   }
@@ -1820,10 +1840,11 @@ __device__ inline float Q4KItemSums(const std::uint8_t* row, const float* xs, co
   const int4 hdr = *reinterpret_cast<const int4*>(b);
   const int4 qa = *reinterpret_cast<const int4*>(b + 16 + c * 32);
   const int4 qb = *reinterpret_cast<const int4*>(b + 16 + c * 32 + 16);
-  const std::uint8_t* h = reinterpret_cast<const std::uint8_t*>(&hdr);
+  const auto w0 = static_cast<std::uint32_t>(hdr.y), w1 = static_cast<std::uint32_t>(hdr.z),
+             w2 = static_cast<std::uint32_t>(hdr.w);
   std::uint32_t sc0, m0, sc1, m1;
-  ScaleMinK4(2 * c, h + 4, sc0, m0);
-  ScaleMinK4(2 * c + 1, h + 4, sc1, m1);
+  ScaleMinK4Words(2 * c, w0, w1, w2, sc0, m0);
+  ScaleMinK4Words(2 * c + 1, w0, w1, w2, sc1, m1);
   const std::uint8_t* q0 = reinterpret_cast<const std::uint8_t*>(&qa);
   const std::uint8_t* q1 = reinterpret_cast<const std::uint8_t*>(&qb);
   const float* x = xs + sb * 256 + c * 64;
@@ -1834,8 +1855,9 @@ __device__ inline float Q4KItemSums(const std::uint8_t* row, const float* xs, co
     hi += static_cast<float>(q0[j] >> 4) * x[32 + j] + static_cast<float>(q1[j] >> 4) * x[48 + j];
   }
   const std::uint32_t s0 = (sb * 256 + c * 64) / 32;
-  return F16(U16(h)) * (static_cast<float>(sc0) * lo + static_cast<float>(sc1) * hi) -
-         F16(U16(h + 2)) * (static_cast<float>(m0) * xsum[s0] + static_cast<float>(m1) * xsum[s0 + 1]);
+  return F16(static_cast<std::uint16_t>(hdr.x & 0xFFFF)) * (static_cast<float>(sc0) * lo + static_cast<float>(sc1) * hi) -
+         F16(static_cast<std::uint16_t>(static_cast<std::uint32_t>(hdr.x) >> 16)) *
+             (static_cast<float>(m0) * xsum[s0] + static_cast<float>(m1) * xsum[s0 + 1]);
 }
 
 template <int kRows>
@@ -1920,4 +1942,397 @@ extern "C" __global__ void __launch_bounds__(128)
 #pragma unroll
   for (std::uint32_t i = 0; i < d; ++i) S[i * d] = decay * s[i] + delta * ks[i];
   out[h * d + j] = (decay * B + delta * kq) / sqrtf(static_cast<float>(d));
+}
+
+// ---- P3: Q4_K gate+up with int8 activations and integer dot products --------
+// x is quantized once per block to int8 with one scale per 32 values (as
+// llama.cpp's Q8_1 activations); nibbles multiply them with v_dot4 (4
+// multiply-adds per instruction) instead of 64 float conversions and FMAs
+// per chunk. The minimum term keeps exact float sums of x.
+//   value = d * (sc0 * sx0 * <q_lo, xq0> + sc1 * sx1 * <q_hi, xq1>) - dmin * (m0 * sum0 + m1 * sum1)
+
+namespace {
+
+struct Q8Act {
+  std::uint32_t q[1024];  // int8 x, 4 per word, 4096 values
+  float scale[128];       // per 32 values
+  float sum[128];         // exact float sums per 32 values
+};
+
+// Fills `a` from x (cols <= 4096, cols % 32 == 0). One warp per 32 values.
+__device__ inline void QuantizeActivations(const float* x, std::uint32_t cols, Q8Act& a) {
+  const std::uint32_t lane = threadIdx.x % kWarp;
+  for (std::uint32_t blk = threadIdx.x / kWarp; blk < cols / 32; blk += blockDim.x / kWarp) {
+    const float v = x[blk * 32 + lane];
+    float amax = fabsf(v), sum = v;
+    for (int o = kWarp / 2; o > 0; o >>= 1) {
+      amax = fmaxf(amax, __shfl_xor(amax, o, kWarp));
+      sum += __shfl_xor(sum, o, kWarp);
+    }
+    const float scale = amax / 127.0f;
+    const int qv = scale > 0.0f ? static_cast<int>(rintf(v / scale)) : 0;
+    // Pack 4 lanes' bytes into one word.
+    const std::uint32_t byte = static_cast<std::uint32_t>(qv & 0xFF) << (8 * (lane & 3));
+    std::uint32_t word = byte;
+    word |= __shfl_xor(word, 1, kWarp);
+    word |= __shfl_xor(word, 2, kWarp);
+    if ((lane & 3) == 0) a.q[blk * 8 + lane / 4] = word;
+    if (lane == 0) {
+      a.scale[blk] = scale;
+      a.sum[blk] = sum;
+    }
+  }
+}
+
+__device__ inline float Q4KItemDot(const std::uint8_t* row, const Q8Act& a, std::uint32_t item) {
+  const std::uint32_t sb = item / 4, c = item % 4;
+  const std::uint8_t* b = row + sb * 144;
+  const int4 hdr = *reinterpret_cast<const int4*>(b);
+  const int4 qa = *reinterpret_cast<const int4*>(b + 16 + c * 32);
+  const int4 qb = *reinterpret_cast<const int4*>(b + 16 + c * 32 + 16);
+  const auto w0 = static_cast<std::uint32_t>(hdr.y), w1 = static_cast<std::uint32_t>(hdr.z),
+             w2 = static_cast<std::uint32_t>(hdr.w);
+  std::uint32_t sc0, m0, sc1, m1;
+  ScaleMinK4Words(2 * c, w0, w1, w2, sc0, m0);
+  ScaleMinK4Words(2 * c + 1, w0, w1, w2, sc1, m1);
+  const std::uint32_t s0 = sb * 8 + 2 * c, s1 = s0 + 1;
+  const std::uint32_t* x0 = a.q + s0 * 8;  // values 0..31 of sub-block s0 (low nibbles)
+  const std::uint32_t* x1 = a.q + s1 * 8;  // values 0..31 of sub-block s1 (high nibbles)
+  const std::uint32_t qw[8] = {static_cast<std::uint32_t>(qa.x), static_cast<std::uint32_t>(qa.y),
+                               static_cast<std::uint32_t>(qa.z), static_cast<std::uint32_t>(qa.w),
+                               static_cast<std::uint32_t>(qb.x), static_cast<std::uint32_t>(qb.y),
+                               static_cast<std::uint32_t>(qb.z), static_cast<std::uint32_t>(qb.w)};
+  int lo = 0, hi = 0;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    lo = __builtin_amdgcn_sudot4(false, static_cast<int>(qw[k] & 0x0F0F0F0Fu), true, static_cast<int>(x0[k]), lo, false);
+    hi = __builtin_amdgcn_sudot4(false, static_cast<int>((qw[k] >> 4) & 0x0F0F0F0Fu), true, static_cast<int>(x1[k]), hi,
+                                 false);
+  }
+  const float d = F16(static_cast<std::uint16_t>(hdr.x & 0xFFFF));
+  const float dmin = F16(static_cast<std::uint16_t>(static_cast<std::uint32_t>(hdr.x) >> 16));
+  return d * (static_cast<float>(sc0) * a.scale[s0] * static_cast<float>(lo) +
+              static_cast<float>(sc1) * a.scale[s1] * static_cast<float>(hi)) -
+         dmin * (static_cast<float>(m0) * a.sum[s0] + static_cast<float>(m1) * a.sum[s1]);
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_gate_up_q4_k_dot(const std::uint8_t* gate, const std::uint8_t* up, const std::uint32_t* ids,
+                              const float* x, float* h, std::uint64_t expert_bytes, std::uint32_t rows,
+                              std::uint32_t cols, std::uint64_t row_bytes) {
+  constexpr int kRows = 2;
+  __shared__ Q8Act act;
+  QuantizeActivations(x, cols, act);
+  __syncthreads();
+  const std::uint32_t slot = blockIdx.y;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  const std::uint32_t lane = threadIdx.x % kWarp, per_row = cols / 64;
+  const std::size_t e = ids[slot];
+  float g[kRows] = {}, u[kRows] = {};
+  for (std::uint32_t t = lane; t < 2 * kRows * per_row; t += kWarp) {
+    const std::uint32_t m = t / (kRows * per_row), rem = t % (kRows * per_row), k = rem / per_row, i = rem % per_row;
+    const std::uint32_t r = min(r0 + k, rows - 1);
+    const float v = Q4KItemDot((m == 0 ? gate : up) + e * expert_bytes + r * row_bytes, act, i);
+#pragma unroll
+    for (int kk = 0; kk < kRows; ++kk) {
+      if (kk == static_cast<int>(k) && m == 0) g[kk] += v;
+      if (kk == static_cast<int>(k) && m == 1) u[kk] += v;
+    }
+  }
+#pragma unroll
+  for (int kk = 0; kk < kRows; ++kk) {
+    const float gs = WarpSum(g[kk]), us = WarpSum(u[kk]);
+    if (lane == 0 && r0 + kk < rows) h[static_cast<std::size_t>(slot) * rows + r0 + kk] = Silu(gs) * us;
+  }
+}
+
+// ---- P3: fused hyper-connection mixer (6 launches -> 2) ------------------------
+//
+// A: grouped RMSNorm of the residual (staged in LDS) -> Q8 down projection
+//    with the silu(y / hc) epilogue -> lo; extra blocks compute the F32
+//    inject rows from the same normalized input; block 0 writes xn.
+// B: Q8 up projection, one wave per hidden index i over rows s*H + i
+//    (s < hc), with the hc_mix epilogue: mixed[i] = mean_s xn[s*H+i] * sigmoid(g_s).
+
+namespace {
+constexpr std::uint32_t kHcMaxDim = 12288;  // hc * hidden
+constexpr std::uint32_t kHcMaxLow = 1024;   // low rank
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_mix_a(const float* res, const float* norm_w, const std::int8_t* dqs, const std::uint16_t* dd,
+                  const float* inject_w, float* xn, float* lo, float* inject, std::uint32_t hc, std::uint32_t h,
+                  std::uint32_t low_rank, float eps, std::uint32_t down_blocks, std::uint32_t qstride) {
+  __shared__ float xs[kHcMaxDim];
+  __shared__ float scratch[32];
+  const std::uint32_t D = hc * h;
+  for (std::uint32_t i = threadIdx.x; i < D; i += blockDim.x) xs[i] = res[i];
+  __syncthreads();
+  for (std::uint32_t s = 0; s < hc; ++s) {
+    float ss = 0.0f;
+    for (std::uint32_t i = threadIdx.x; i < h; i += blockDim.x) ss += xs[s * h + i] * xs[s * h + i];
+    ss = BlockSum(ss, scratch);
+    const float scale = 1.0f / sqrtf(ss / static_cast<float>(h) + eps);
+    for (std::uint32_t i = threadIdx.x; i < h; i += blockDim.x) xs[s * h + i] = xs[s * h + i] * scale * norm_w[s * h + i];
+  }
+  __syncthreads();
+  if (blockIdx.x == 0)
+    for (std::uint32_t i = threadIdx.x; i < D; i += blockDim.x) xn[i] = xs[i];
+  const std::uint32_t lane = threadIdx.x % kWarp;
+  if (blockIdx.x >= down_blocks) {  // inject row: the whole block on one row
+    const std::uint32_t r = blockIdx.x - down_blocks;
+    const float* w = inject_w + static_cast<std::size_t>(r) * D;
+    float acc = 0.0f;
+    for (std::uint32_t c = threadIdx.x; c < D; c += blockDim.x) acc += w[c] * xs[c];
+    acc = BlockSum(acc, scratch);
+    if (threadIdx.x == 0) inject[r] = acc;
+    return;
+  }
+  constexpr int kRows = 2;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= low_rank) return;
+  const std::uint32_t nblk = D / 32;
+  float acc[kRows] = {};
+  for (std::uint32_t c = lane * 16; c < D; c += kWarp * 16) {
+    float xr[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) xr[i] = xs[c + i];
+#pragma unroll
+    for (int k = 0; k < kRows; ++k) {
+      const std::uint32_t r = min(r0 + k, low_rank - 1);
+      const int4 q = *reinterpret_cast<const int4*>(dqs + static_cast<std::size_t>(r) * qstride + c);
+      const float sc = F16(dd[static_cast<std::size_t>(r) * nblk + c / 32]);
+      const std::int8_t* v = reinterpret_cast<const std::int8_t*>(&q);
+      float part = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) part += static_cast<float>(v[i]) * xr[i];
+      acc[k] += sc * part;
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < kRows; ++k) {
+    const float a = WarpSum(acc[k]);
+    if (lane == 0 && r0 + k < low_rank) lo[r0 + k] = Silu(a / static_cast<float>(hc));
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_mix_b(const float* lo, const std::int8_t* uqs, const std::uint16_t* ud, const float* xn, float* mixed,
+                  std::uint32_t hc, std::uint32_t h, std::uint32_t low_rank, std::uint32_t qstride) {
+  __shared__ float ls[kHcMaxLow];
+  for (std::uint32_t i = threadIdx.x; i < low_rank; i += blockDim.x) ls[i] = lo[i];
+  __syncthreads();
+  const std::uint32_t i = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp;
+  if (i >= h) return;
+  const std::uint32_t lane = threadIdx.x % kWarp, nblk = low_rank / 32;
+  float acc[4] = {};
+  for (std::uint32_t c = lane * 16; c < low_rank; c += kWarp * 16) {
+    float xr[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) xr[j] = ls[c + j];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      if (static_cast<std::uint32_t>(s) >= hc) break;
+      const std::size_t r = static_cast<std::size_t>(s) * h + i;
+      const int4 q = *reinterpret_cast<const int4*>(uqs + r * qstride + c);
+      const float sc = F16(ud[r * nblk + c / 32]);
+      const std::int8_t* v = reinterpret_cast<const std::int8_t*>(&q);
+      float part = 0.0f;
+#pragma unroll
+      for (int j = 0; j < 16; ++j) part += static_cast<float>(v[j]) * xr[j];
+      acc[s] += sc * part;
+    }
+  }
+  float m = 0.0f;
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    const float g = WarpSum(acc[s]);
+    if (static_cast<std::uint32_t>(s) < hc) m += xn[s * h + i] * Sigmoid(g);
+  }
+  if (lane == 0) mixed[i] = m / static_cast<float>(hc);
+}
+
+// ---- P3: fused shared expert (6 launches -> 2) --------------------------------
+//   gate_up:  h = silu(<gate_r, x>) * <up_r, x>; block 0 also writes
+//             sgate = <gate_inp, x> (the shared expert's scalar gate logit)
+//   down_add: out[r] += sigmoid(sgate) * <down_r, h>   (out holds the routed sum)
+
+namespace {
+
+// Dot products of kRows consecutive repacked-Q8 rows with xs (LDS), reduced
+// over the wave; every lane gets the sums.
+template <int kRows>
+__device__ inline void Q8RowsDot(const std::int8_t* qs, const std::uint16_t* d, const float* xs, std::uint32_t r0,
+                                 std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, float (&out)[kRows]) {
+  const std::uint32_t lane = threadIdx.x % kWarp, nblk = cols / 32;
+  float acc[kRows] = {};
+  for (std::uint32_t c = lane * 16; c < cols; c += kWarp * 16) {
+    float xr[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) xr[i] = xs[c + i];
+#pragma unroll
+    for (int k = 0; k < kRows; ++k) {
+      const std::uint32_t r = min(r0 + k, rows - 1);
+      const int4 q = *reinterpret_cast<const int4*>(qs + static_cast<std::size_t>(r) * qstride + c);
+      const float sc = F16(d[static_cast<std::size_t>(r) * nblk + c / 32]);
+      const std::int8_t* v = reinterpret_cast<const std::int8_t*>(&q);
+      float part = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) part += static_cast<float>(v[i]) * xr[i];
+      acc[k] += sc * part;
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < kRows; ++k) out[k] = WarpSum(acc[k]);
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_shexp_gate_up(const std::int8_t* gq, const std::uint16_t* gd, const std::int8_t* uq, const std::uint16_t* ud,
+                       const float* gate_inp, const float* x, float* h, float* sgate, std::uint32_t rows,
+                       std::uint32_t cols, std::uint32_t qstride) {
+  __shared__ float xs[kGemvMaxCols];
+  __shared__ float scratch[32];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  if (blockIdx.x == 0) {
+    float a = 0.0f;
+    for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) a += gate_inp[i] * xs[i];
+    a = BlockSum(a, scratch);
+    if (threadIdx.x == 0) sgate[0] = a;
+  }
+  constexpr int kRows = 2;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  float g[kRows], u[kRows];
+  Q8RowsDot<kRows>(gq, gd, xs, r0, rows, cols, qstride, g);
+  Q8RowsDot<kRows>(uq, ud, xs, r0, rows, cols, qstride, u);
+  if (threadIdx.x % kWarp == 0)
+#pragma unroll
+    for (int k = 0; k < kRows; ++k)
+      if (r0 + k < rows) h[r0 + k] = Silu(g[k]) * u[k];
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_shexp_down_add(const std::int8_t* dq, const std::uint16_t* dd, const float* hin, const float* sgate, float* out,
+                        std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride) {
+  __shared__ float hs[kGemvMaxCols];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) hs[i] = hin[i];
+  __syncthreads();
+  constexpr int kRows = 4;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  float y[kRows];
+  Q8RowsDot<kRows>(dq, dd, hs, r0, rows, cols, qstride, y);
+  const float s = Sigmoid(sgate[0]);
+  if (threadIdx.x % kWarp == 0)
+#pragma unroll
+    for (int k = 0; k < kRows; ++k)
+      if (r0 + k < rows) out[r0 + k] += s * y[k];
+}
+
+// ---- P3: fused DeltaNet block pieces -------------------------------------------
+
+// Two repacked-Q8 matrices with the same input in one launch (4 rows per
+// wave): blocks [0, blocks1) take matrix 1, the rest matrix 2.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_dual(const std::int8_t* q1, const std::uint16_t* d1, float* y1, std::uint32_t rows1,
+                       std::uint32_t qstride1, const std::int8_t* q2, const std::uint16_t* d2, float* y2,
+                       std::uint32_t rows2, std::uint32_t qstride2, const float* x, std::uint32_t cols,
+                       std::uint32_t blocks1) {
+  __shared__ float xs[12288];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  const bool first = blockIdx.x < blocks1;
+  const std::uint32_t b = first ? blockIdx.x : blockIdx.x - blocks1;
+  const std::int8_t* qs = first ? q1 : q2;
+  const std::uint16_t* d = first ? d1 : d2;
+  float* y = first ? y1 : y2;
+  const std::uint32_t rows = first ? rows1 : rows2, qstride = first ? qstride1 : qstride2;
+  constexpr int kRows = 4;
+  const std::uint32_t r0 = (b * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  float acc[kRows];
+  Q8RowsDot<kRows>(qs, d, xs, r0, rows, cols, qstride, acc);
+  if (threadIdx.x % kWarp == 0)
+#pragma unroll
+    for (int k = 0; k < kRows; ++k)
+      if (r0 + k < rows) y[r0 + k] = acc[k];
+}
+
+// Two few-row F32 matvecs with the same input (DeltaNet alpha and beta): a
+// block per row, blocks [0, rows) for wa, [rows, 2 rows) for wb.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_matvec_f32_rowblock2(const float* wa, const float* wb, const float* x, float* ya, float* yb,
+                              std::uint32_t rows, std::uint32_t cols) {
+  __shared__ float scratch[32];
+  const bool a = blockIdx.x < rows;
+  const std::uint32_t r = a ? blockIdx.x : blockIdx.x - rows;
+  const float* row = (a ? wa : wb) + static_cast<std::size_t>(r) * cols;
+  float acc = 0.0f;
+  for (std::uint32_t c = threadIdx.x; c < cols; c += blockDim.x) acc += row[c] * x[c];
+  acc = BlockSum(acc, scratch);
+  if (threadIdx.x == 0) (a ? ya : yb)[r] = acc;
+}
+
+// Causal conv step (as halo_conv_step) and, for the first l2_channels
+// channels (DeltaNet q and k), the per-head L2 norm. One block per head of d
+// channels (blockDim == d).
+extern "C" __global__ void halo_conv_l2norm(const float* in, float* state, const float* w, float* out,
+                                            std::uint32_t channels, std::uint32_t kern, std::uint32_t l2_channels,
+                                            float eps) {
+  __shared__ float scratch[32];
+  const std::uint32_t ch = blockIdx.x * blockDim.x + threadIdx.x;
+  float v = 0.0f;
+  if (ch < channels) {
+    float acc = w[ch * kern + kern - 1] * in[ch];
+    for (std::uint32_t k = 0; k + 1 < kern; ++k) acc += w[ch * kern + k] * state[k * channels + ch];
+    for (std::uint32_t k = 0; k + 2 < kern; ++k) state[k * channels + ch] = state[(k + 1) * channels + ch];
+    if (kern > 1) state[(kern - 2) * channels + ch] = in[ch];
+    v = Silu(acc);
+  }
+  if (blockIdx.x * blockDim.x < l2_channels) {  // block-uniform
+    const float ss = BlockSum(v * v, scratch);
+    v *= 1.0f / sqrtf(ss + eps);
+  }
+  if (ch < channels) out[ch] = v;
+}
+
+// halo_gdn_step_d128 with the per-head gated RMSNorm in the epilogue
+// (mode 0: silu(z), mode 1: sigmoid(z)), replacing halo_gated_norm.
+extern "C" __global__ void __launch_bounds__(128)
+    halo_gdn_step_d128_norm(const float* q, const float* k, const float* v, const float* alpha, const float* beta,
+                            const float* a, const float* dt, float* state, const float* norm_w, const float* z,
+                            float* out, std::uint32_t num_k_heads, float eps, std::uint32_t mode) {
+  constexpr std::uint32_t d = 128;
+  __shared__ float ks[d], qs[d], red[32];
+  const std::uint32_t h = blockIdx.x, j = threadIdx.x;
+  const float* qh = q + (h % num_k_heads) * d;
+  const float* kh = k + (h % num_k_heads) * d;
+  ks[j] = kh[j];
+  qs[j] = qh[j];
+  const float kq = BlockSum(kh[j] * qh[j], red);
+  const float decay = expf(a[h] * Softplus(alpha[h] + dt[h]));
+  const float b = Sigmoid(beta[h]);
+  float* S = state + static_cast<std::size_t>(h) * d * d + j;
+  float s[d];
+  float A = 0.0f, B = 0.0f;
+#pragma unroll
+  for (std::uint32_t i = 0; i < d; ++i) {
+    s[i] = S[i * d];
+    A += s[i] * ks[i];
+    B += s[i] * qs[i];
+  }
+  const float delta = (v[h * d + j] - decay * A) * b;
+#pragma unroll
+  for (std::uint32_t i = 0; i < d; ++i) S[i * d] = decay * s[i] + delta * ks[i];
+  const float o = (decay * B + delta * kq) / sqrtf(static_cast<float>(d));
+  const float ss = BlockSum(o * o, red);
+  const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
+  const float zv = z[h * d + j];
+  out[h * d + j] = o * scale * norm_w[j] * (mode == 0 ? Silu(zv) : Sigmoid(zv));
 }

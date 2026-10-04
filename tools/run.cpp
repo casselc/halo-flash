@@ -124,6 +124,7 @@ int main(int argc, char** argv) {
     else if (a == "--eager") eager = std::string(argv[i + 1]) == "1";
     else if (a == "--profile") profile = std::string(argv[i + 1]) == "1";
     else if (a == "--device-sample") device_sample = std::string(argv[i + 1]) == "1";
+    else if (a == "--int8-moe") engine::FlashNextGpu::int8_act_moe_ = std::string(argv[i + 1]) == "1";
     else {
       std::fprintf(stderr, "unknown option %s\n", a.c_str());
       return 2;

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <random>
 #include <string>
@@ -55,21 +56,31 @@ int main(int argc, char** argv) {
                           Shape{"lm head 248320x2560", 248320, 2560}, Shape{"hc down    320x10240", 320, 10240}}) {
       std::vector<std::uint8_t> raw(std::size_t{s.rows} * (s.cols / 32) * 34);
       FillQuant(raw, 34, {0});
-      auto rb = d->Alloc(raw.size(), &e), qs = d->Alloc(std::size_t{s.rows} * s.cols, &e),
-           dd = d->Alloc(std::size_t{s.rows} * (s.cols / 32) * 2, &e);
+      // Enough copies that the working set (>= 768 MB) defeats the caches:
+      // decode streams every matrix from DRAM once per token.
+      const std::size_t mat = std::size_t{s.rows} * s.cols;
+      const std::uint32_t copies = static_cast<std::uint32_t>(std::max<std::size_t>(1, (768u << 20) / mat));
+      auto rb = d->Alloc(raw.size(), &e), qs = d->Alloc(mat * copies, &e),
+           dd = d->Alloc(std::size_t{s.rows} * (s.cols / 32) * 2 * copies, &e);
       (void)d->Upload(rb, 0, raw.data(), raw.size(), &e);
-      const rt::Arg ra[] = {rt::Arg::Buf(rb), rt::Arg::Buf(qs), rt::Arg::Buf(dd), rt::Arg::Val(s.rows), rt::Arg::Val(s.cols),
-                            rt::Arg::Val(s.cols)};
-      (void)d->Launch(d->Kernel("halo_repack_q8_0", &e), {4096}, {256}, ra, &e);
-      const rt::Arg a[] = {rt::Arg::Buf(qs), rt::Arg::Buf(dd), rt::Arg::Buf(xb), rt::Arg::Buf(yb), rt::Arg::Val(s.rows),
-                           rt::Arg::Val(s.cols), rt::Arg::Val(s.cols)};
+      for (std::uint32_t k = 0; k < copies; ++k) {
+        const rt::Arg ra[] = {rt::Arg::Buf(rb), rt::Arg::Buf(qs, k * mat), rt::Arg::Buf(dd, k * (mat / 32) * 2),
+                              rt::Arg::Val(s.rows), rt::Arg::Val(s.cols), rt::Arg::Val(s.cols)};
+        (void)d->Launch(d->Kernel("halo_repack_q8_0", &e), {4096}, {256}, ra, &e);
+      }
+      std::uint32_t next_copy = 0;
       const double bytes = static_cast<double>(s.rows) * s.cols * (1 + 2.0 / 32);
       struct V { const char* kernel; std::uint32_t rows_per_block; };
       for (const V v : {V{s.cols > 8192 ? "halo_gemv_q8r_wide" : "halo_gemv_q8r", 8}, V{"halo_gemv_q8r_r2", 16},
                         V{"halo_gemv_q8r_r4", 32}, V{"halo_gemv_q8r_r4n", 32}}) {
         if (std::string(v.kernel) == "halo_gemv_q8r_r4n" && s.cols > 6144) continue;
         const auto k = d->Kernel(v.kernel, &e);
-        const double sec = time([&] { (void)d->Launch(k, {(s.rows + v.rows_per_block - 1) / v.rows_per_block}, {256}, a, &e); });
+        const double sec = time([&] {
+          const std::uint32_t c = next_copy++ % copies;
+          const rt::Arg a[] = {rt::Arg::Buf(qs, c * mat), rt::Arg::Buf(dd, c * (mat / 32) * 2), rt::Arg::Buf(xb),
+                               rt::Arg::Buf(yb), rt::Arg::Val(s.rows), rt::Arg::Val(s.cols), rt::Arg::Val(s.cols)};
+          (void)d->Launch(k, {(s.rows + v.rows_per_block - 1) / v.rows_per_block}, {256}, a, &e);
+        });
         std::printf("%s %-20s %-22s %8.1f us  %6.1f GB/s\n", rt::BackendName(be), v.kernel, s.name, sec * 1e6,
                     bytes / sec / 1e9);
       }
@@ -88,26 +99,43 @@ int main(int argc, char** argv) {
       (void)d->Upload(gb, 0, gate.data(), gate.size(), &e);
       (void)d->Upload(ub, 0, gate.data(), gate.size(), &e);
       (void)d->Upload(db, 0, down.data(), down.size(), &e);
-      std::vector<std::uint32_t> ids(used);
-      for (std::uint32_t i = 0; i < used; ++i) ids[i] = (i * 53 + 7) % E;
-      (void)d->Upload(ib, 0, ids.data(), used * 4, &e);
-      const rt::Arg a1[] = {rt::Arg::Buf(gb), rt::Arg::Buf(ub), rt::Arg::Buf(ib), rt::Arg::Buf(xb), rt::Arg::Buf(hb),
-                            rt::Arg::Val<std::uint64_t>(ff * gu_row), rt::Arg::Val(ff), rt::Arg::Val(H),
-                            rt::Arg::Val<std::uint64_t>(gu_row)};
+      // 51 disjoint id sets cycled per launch: 510 distinct experts, ~900 MB
+      // of gate/up, so every launch reads its experts from DRAM.
+      constexpr std::uint32_t kSets = 51;
+      d->Free(ib);
+      ib = d->Alloc(kSets * used * 4, &e);
+      std::vector<std::uint32_t> ids(kSets * used);
+      for (std::uint32_t i = 0; i < kSets * used; ++i) ids[i] = (i * 53 + 7) % E;
+      (void)d->Upload(ib, 0, ids.data(), ids.size() * 4, &e);
+      std::uint32_t next_set = 0;
+      const auto a1_for = [&](std::uint32_t set) {
+        return std::vector<rt::Arg>{rt::Arg::Buf(gb), rt::Arg::Buf(ub), rt::Arg::Buf(ib, set * used * 4), rt::Arg::Buf(xb),
+                                    rt::Arg::Buf(hb), rt::Arg::Val<std::uint64_t>(ff * gu_row), rt::Arg::Val(ff),
+                                    rt::Arg::Val(H), rt::Arg::Val<std::uint64_t>(gu_row)};
+      };
       const double b1 = 2.0 * used * ff * gu_row;
       for (auto [name, per_block] : {std::pair{"halo_moe_gate_up_q4_k", 8u}, std::pair{"halo_moe_gate_up_q4_k_r2", 16u},
-                                     std::pair{"halo_moe_gate_up_q4_k_s2", 16u}, std::pair{"halo_moe_gate_up_q4_k_s4", 32u}}) {
+                                     std::pair{"halo_moe_gate_up_q4_k_s2", 16u}, std::pair{"halo_moe_gate_up_q4_k_s4", 32u},
+                                     std::pair{"halo_moe_gate_up_q4_k_dot", 16u}}) {
         const auto k1 = d->Kernel(name, &e);
-        const double s1 = time([&] { (void)d->Launch(k1, {(ff + per_block - 1) / per_block, used}, {256}, a1, &e); });
+        const double s1 = time([&] {
+          const auto a1 = a1_for(next_set++ % kSets);
+          (void)d->Launch(k1, {(ff + per_block - 1) / per_block, used}, {256}, a1, &e);
+        });
         std::printf("%s %-26s (10 experts, Q4_K) %8.1f us  %6.1f GB/s\n", rt::BackendName(be), name, s1 * 1e6, b1 / s1 / 1e9);
       }
-      const rt::Arg a2[] = {rt::Arg::Buf(db), rt::Arg::Buf(ib), rt::Arg::Buf(hb), rt::Arg::Buf(pb),
-                            rt::Arg::Val<std::uint64_t>(H * dn_row), rt::Arg::Val(H), rt::Arg::Val(ff),
-                            rt::Arg::Val<std::uint64_t>(dn_row)};
+      const auto a2_for = [&](std::uint32_t set) {
+        return std::vector<rt::Arg>{rt::Arg::Buf(db), rt::Arg::Buf(ib, set * used * 4), rt::Arg::Buf(hb), rt::Arg::Buf(pb),
+                                    rt::Arg::Val<std::uint64_t>(H * dn_row), rt::Arg::Val(H), rt::Arg::Val(ff),
+                                    rt::Arg::Val<std::uint64_t>(dn_row)};
+      };
       const double b2 = 1.0 * used * H * dn_row;
       for (auto [name, per_block] : {std::pair{"halo_moe_down_q5_1", 8u}, std::pair{"halo_moe_down_q5_1_r4", 32u}}) {
         const auto k2 = d->Kernel(name, &e);
-        const double s2 = time([&] { (void)d->Launch(k2, {(H + per_block - 1) / per_block, used}, {256}, a2, &e); });
+        const double s2 = time([&] {
+          const auto a2 = a2_for(next_set++ % kSets);
+          (void)d->Launch(k2, {(H + per_block - 1) / per_block, used}, {256}, a2, &e);
+        });
         std::printf("%s %-26s (10 experts, Q5_1) %8.1f us  %6.1f GB/s\n", rt::BackendName(be), name, s2 * 1e6, b2 / s2 / 1e9);
       }
       for (auto* b : {&gb, &ub, &db, &ib, &hb, &pb}) d->Free(*b);

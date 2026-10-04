@@ -60,6 +60,12 @@ class FlashNextGpu {
   static inline bool block_gemv_ = true;  ///< P3 Q4_K / Q5_1 GEMVs
   static inline bool fused_moe_ = true;   ///< P3 routed experts in three launches
   static inline bool small_row_kernels_ = true;  ///< P3 block-per-row F32 matvec for few rows
+  /// P3 expert gate+up with int8 activations (llama.cpp-style Q8_1); false
+  /// keeps the float kernel. A quality-gated choice (docs/BENCHMARKS.md).
+  static inline bool int8_act_moe_ = true;
+  static inline bool fused_hc_ = true;  ///< P3 hyper-connection mixer in two launches
+  static inline bool fused_shexp_ = true;  ///< P3 shared expert in two launches
+  static inline bool fused_linear_ = true;  ///< P3 DeltaNet block in five launches
   /// Runs `tokens` in order; `logits` (optional) receives the last position's.
   /// Token at a time for now (P4 batches it); any chunking is equivalent.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error);

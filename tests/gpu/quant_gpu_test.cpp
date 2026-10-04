@@ -447,3 +447,424 @@ TEST(GpuKernels, SinglePassGdnMatchesTwoLoopKernel) {
     }, {.test_cases = 60});
   }
 }
+
+// P3 Q4_K gate+up with int8 activations: within the bound that quantizing x
+// (one scale per 32 values, round to nearest) allows, propagated through
+// silu(g) * u; exact float CPU matvecs as the reference.
+TEST(GpuQuant, Q4kDotGateUpWithinActivationQuantizationBound) {
+  std::string error;
+  const auto silu = [](double v) { return v / (1.0 + std::exp(-v)); };
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      const std::size_t H = 256 * tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 16}));
+      const std::size_t ff = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 70}));
+      const std::size_t E = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 4}));
+      const std::size_t used = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = E}));
+      const std::size_t row = H / 256 * 144;
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      std::vector<std::uint8_t> gate(E * ff * row), up(E * ff * row);
+      // Mostly dmin = 0: then every weight is d * sc * q, the quantization
+      // bound below is exact, and errors in the activation scales cannot
+      // hide behind the conservative 63 * |dmin| allowance.
+      const bool zero_min = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 3})) != 0;
+      for (auto* w : {&gate, &up}) {
+        for (auto& b : *w) { seed = seed * 1664525u + 1013904223u; b = static_cast<std::uint8_t>(seed >> 24); }
+        for (std::size_t r = 0; r < E * ff; ++r)
+          for (std::size_t b = 0; b < H / 256; ++b)
+            for (std::size_t off : {0, 2}) {
+              const std::uint16_t h = off == 2 && zero_min ? std::uint16_t{0} : FiniteHalf(tc);
+              std::memcpy(w->data() + r * row + b * 144 + off, &h, 2);
+            }
+      }
+      std::vector<float> x(H);
+      const float xs = tc.draw(gs::sampled_from(std::vector<float>{1e-3f, 0.05f, 1.0f, 30.0f}));
+      // Amplitude varies block to block, so per-32 scales differ.
+      for (std::size_t i = 0; i < H; ++i)
+        x[i] = xs * static_cast<float>(1 + (i / 32 * 7 + seed) % 9) * std::sin(static_cast<float>(i) * 0.71f + static_cast<float>(seed % 7));
+      std::vector<std::uint32_t> ids(used);
+      for (std::size_t s = 0; s < used; ++s) ids[s] = static_cast<std::uint32_t>((s + seed) % E);
+      // Per-32 quantization error bound of x: scale / 2 per value.
+      std::vector<double> qerr(H / 32);
+      for (std::size_t b = 0; b < H / 32; ++b) {
+        float amax = 0;
+        for (std::size_t i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[b * 32 + i]));
+        qerr[b] = amax / 127.0 / 2.0 * 1.0001 + 1e-30;
+      }
+      auto gb = dev->Alloc(gate.size(), &error), ub = dev->Alloc(up.size(), &error), ib = dev->Alloc(used * 4, &error),
+           xb = dev->Alloc(H * 4, &error), hb = dev->Alloc(used * ff * 4, &error);
+      ASSERT_TRUE(gb && ub && ib && xb && hb) << error;
+      ASSERT_TRUE(dev->Upload(gb, 0, gate.data(), gate.size(), &error) && dev->Upload(ub, 0, up.data(), up.size(), &error) &&
+                  dev->Upload(ib, 0, ids.data(), used * 4, &error) && dev->Upload(xb, 0, x.data(), H * 4, &error))
+          << error;
+      const auto uF = static_cast<std::uint32_t>(ff), uH = static_cast<std::uint32_t>(H);
+      const rt::Arg a[] = {rt::Arg::Buf(gb), rt::Arg::Buf(ub), rt::Arg::Buf(ib), rt::Arg::Buf(xb), rt::Arg::Buf(hb),
+                           rt::Arg::Val<std::uint64_t>(ff * row), rt::Arg::Val(uF), rt::Arg::Val(uH),
+                           rt::Arg::Val<std::uint64_t>(row)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_moe_gate_up_q4_k_dot", &error),
+                              {(uF + 15) / 16, static_cast<std::uint32_t>(used)}, {256}, a, &error))
+          << error;
+      std::vector<float> got(used * ff);
+      ASSERT_TRUE(dev->Download(hb, 0, got.data(), got.size() * 4, &error)) << error;
+      for (auto* b : {&gb, &ub, &ib, &xb, &hb}) dev->Free(*b);
+      model::TensorRef tg;
+      tg.data = gate.data(); tg.type = GgmlType::kQ4_K; tg.cols = H; tg.rows = ff; tg.experts = E;
+      model::TensorRef tu = tg;
+      tu.data = up.data();
+      std::vector<float> wrow(H);
+      for (std::size_t s = 0; s < used; ++s)
+        for (std::size_t r = 0; r < ff; ++r) {
+          double gv = 0, uv = 0, eg = 0, eu = 0;
+          for (auto [t, val, err] : {std::tuple{&tg, &gv, &eg}, std::tuple{&tu, &uv, &eu}}) {
+            model::cpu::DequantizeRow(*t, ids[s], r, wrow.data());
+            const auto* blk = static_cast<const std::uint8_t*>(t->data) + (ids[s] * ff + r) * row;
+            for (std::size_t i = 0; i < H; ++i) {
+              *val += static_cast<double>(wrow[i]) * x[i];
+              // |d*sc*q| <= |w| + |dmin| * 63 (the per-value scale part only).
+              std::uint16_t dm;
+              std::memcpy(&dm, blk + (i / 256) * 144 + 2, 2);
+              const double dmin = std::fabs(static_cast<double>(static_cast<_Float16>(*reinterpret_cast<_Float16*>(&dm))));
+              *err += (std::fabs(wrow[i]) + 63.0 * dmin) * qerr[i / 32];
+            }
+          }
+          const double want = silu(gv) * uv;
+          const double bound = 1.2 * (std::fabs(uv) * eg + (std::fabs(silu(gv)) + 1.2 * eg) * eu) +
+                               1e-5 * (std::fabs(want) + 1e-6);
+          ASSERT_LE(std::fabs(got[s * ff + r] - want), bound)
+              << "slot " << s << " row " << r << " H " << H << " got " << got[s * ff + r] << " want " << want;
+        }
+    }, {.test_cases = 60});
+  }
+}
+
+// P3 fused hyper-connection mixer (halo_hc_mix_a + _b) against the six-kernel
+// sequence it replaces (grouped RMSNorm, Q8 down, scale_silu, Q8 up, hc_mix,
+// F32 inject): mixed, xn and inject agree.
+TEST(GpuKernels, FusedHcMixerMatchesKernelSequence) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      const std::uint32_t hc = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 4}));
+      const std::uint32_t H = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 80}));
+      const std::uint32_t L = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 12}));
+      const bool with_inject = tc.draw(gs::booleans());
+      const std::uint32_t D = hc * H;
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto rnd = [&](float scale) {
+        seed = seed * 1664525u + 1013904223u;
+        return scale * (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f);
+      };
+      const auto q8 = [&](std::uint32_t rows, std::uint32_t cols) {
+        std::vector<std::uint8_t> w(std::size_t{rows} * (cols / 32) * 34);
+        for (auto& b : w) b = static_cast<std::uint8_t>(rnd(256.0f) + 128);
+        for (std::size_t b = 0; b < w.size(); b += 34) {
+          const std::uint16_t h = 0x1C00 | (static_cast<std::uint16_t>(seed >> 9) & 0x3FF);  // ~0.004-0.008
+          std::memcpy(w.data() + b, &h, 2);
+        }
+        return w;
+      };
+      std::vector<float> res(D), norm(D), inj(std::size_t{hc} * D);
+      for (auto& v : res) v = rnd(4.0f);
+      for (auto& v : norm) v = 1.0f + rnd(0.5f);
+      for (auto& v : inj) v = rnd(0.1f);
+      const auto down = q8(L, D), up = q8(D, L);
+      const auto upload = [&](const void* p, std::size_t bytes) {
+        auto b = dev->Alloc(bytes, &error);
+        EXPECT_TRUE(b && dev->Upload(b, 0, p, bytes, &error)) << error;
+        return b;
+      };
+      auto rb = upload(res.data(), D * 4ull), nb = upload(norm.data(), D * 4ull),
+           ib = upload(inj.data(), inj.size() * 4), draw = upload(down.data(), down.size()),
+           uraw = upload(up.data(), up.size());
+      auto dqs = dev->Alloc(std::size_t{L} * D, &error), dd = dev->Alloc(std::size_t{L} * (D / 32) * 2, &error),
+           uqs = dev->Alloc(std::size_t{D} * L, &error), ud = dev->Alloc(std::size_t{D} * (L / 32) * 2, &error);
+      const auto repack = [&](const rt::Buffer& raw, const rt::Buffer& qs, const rt::Buffer& d, std::uint32_t rows,
+                              std::uint32_t cols) {
+        const rt::Arg a[] = {rt::Arg::Buf(raw), rt::Arg::Buf(qs), rt::Arg::Buf(d), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                             rt::Arg::Val(cols)};
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_repack_q8_0", &error), {256}, {256}, a, &error)) << error;
+      };
+      repack(draw, dqs, dd, L, D);
+      repack(uraw, uqs, ud, D, L);
+      // Reference sequence.
+      auto xn1 = dev->Alloc(D * 4ull, &error), lo1 = dev->Alloc(L * 4ull, &error), g1 = dev->Alloc(D * 4ull, &error),
+           m1 = dev->Alloc(H * 4ull, &error), i1 = dev->Alloc(16 * 4, &error);
+      const float eps = 1e-6f;
+      const auto launch = [&](const char* k, rt::Dim3 grid, rt::Dim3 block, std::initializer_list<rt::Arg> args) {
+        ASSERT_TRUE(dev->Launch(dev->Kernel(k, &error), grid, block, std::span<const rt::Arg>(args.begin(), args.size()),
+                                &error))
+            << k << ": " << error;
+      };
+      launch("halo_rmsnorm", {hc}, {256}, {rt::Arg::Buf(rb), rt::Arg::Buf(nb), rt::Arg::Buf(xn1), rt::Arg::Val(H),
+                                            rt::Arg::Val(eps), rt::Arg::Val(H)});
+      launch("halo_gemv_q8r_r2", {(L + 15) / 16}, {256}, {rt::Arg::Buf(dqs), rt::Arg::Buf(dd), rt::Arg::Buf(xn1),
+                                                          rt::Arg::Buf(lo1), rt::Arg::Val(L), rt::Arg::Val(D), rt::Arg::Val(D)});
+      launch("halo_scale_silu", {(L + 255) / 256}, {256},
+             {rt::Arg::Buf(lo1), rt::Arg::Val(1.0f / static_cast<float>(hc)), rt::Arg::Val(L)});
+      launch("halo_gemv_q8r_r2", {(D + 15) / 16}, {256}, {rt::Arg::Buf(uqs), rt::Arg::Buf(ud), rt::Arg::Buf(lo1),
+                                                          rt::Arg::Buf(g1), rt::Arg::Val(D), rt::Arg::Val(L), rt::Arg::Val(L)});
+      launch("halo_hc_mix", {(H + 255) / 256}, {256}, {rt::Arg::Buf(xn1), rt::Arg::Buf(g1), rt::Arg::Buf(m1),
+                                                       rt::Arg::Val(hc), rt::Arg::Val(H)});
+      if (with_inject)
+        launch("halo_matvec_f32_rowblock", {hc}, {256}, {rt::Arg::Buf(ib), rt::Arg::Buf(xn1), rt::Arg::Buf(i1),
+                                                         rt::Arg::Val(hc), rt::Arg::Val(D)});
+      // Fused.
+      auto xn2 = dev->Alloc(D * 4ull, &error), lo2 = dev->Alloc(L * 4ull, &error), m2 = dev->Alloc(H * 4ull, &error),
+           i2 = dev->Alloc(16 * 4, &error);
+      const std::uint32_t down_blocks = (L + 15) / 16;
+      launch("halo_hc_mix_a", {down_blocks + (with_inject ? hc : 0)}, {256},
+             {rt::Arg::Buf(rb), rt::Arg::Buf(nb), rt::Arg::Buf(dqs), rt::Arg::Buf(dd), rt::Arg::Buf(ib), rt::Arg::Buf(xn2),
+              rt::Arg::Buf(lo2), rt::Arg::Buf(i2), rt::Arg::Val(hc), rt::Arg::Val(H), rt::Arg::Val(L), rt::Arg::Val(eps),
+              rt::Arg::Val(down_blocks), rt::Arg::Val(D)});
+      launch("halo_hc_mix_b", {(H + 7) / 8}, {256}, {rt::Arg::Buf(lo2), rt::Arg::Buf(uqs), rt::Arg::Buf(ud),
+                                                     rt::Arg::Buf(xn2), rt::Arg::Buf(m2), rt::Arg::Val(hc), rt::Arg::Val(H),
+                                                     rt::Arg::Val(L), rt::Arg::Val(L)});
+      const auto get = [&](const rt::Buffer& b, std::size_t n) {
+        std::vector<float> v(n);
+        EXPECT_TRUE(dev->Download(b, 0, v.data(), n * 4, &error)) << error;
+        return v;
+      };
+      const auto expect_close = [&](const std::vector<float>& a, const std::vector<float>& b, const char* what) {
+        double num = 0, den = 0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+          num += double(a[i] - b[i]) * (a[i] - b[i]);
+          den += double(b[i]) * b[i];
+        }
+        ASSERT_LE(std::sqrt(num / std::max(den, 1e-30)), 1e-5) << what << " (hc " << hc << ", H " << H << ", L " << L << ")";
+      };
+      expect_close(get(xn2, D), get(xn1, D), "xn");
+      expect_close(get(m2, H), get(m1, H), "mixed");
+      if (with_inject) expect_close(get(i2, hc), get(i1, hc), "inject");
+      for (auto* b : {&rb, &nb, &ib, &draw, &uraw, &dqs, &dd, &uqs, &ud, &xn1, &lo1, &g1, &m1, &i1, &xn2, &lo2, &m2, &i2})
+        dev->Free(*b);
+    }, {.test_cases = 80});
+  }
+}
+
+// P3 fused shared expert (halo_shexp_gate_up + halo_shexp_down_add) against
+// the six-kernel sequence it replaces, accumulating onto an existing output.
+TEST(GpuKernels, FusedSharedExpertMatchesKernelSequence) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      const std::uint32_t H = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 100}));
+      const std::uint32_t F = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 30}));
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto rnd = [&](float scale) {
+        seed = seed * 1664525u + 1013904223u;
+        return scale * (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f);
+      };
+      const auto q8 = [&](std::uint32_t rows, std::uint32_t cols) {
+        std::vector<std::uint8_t> w(std::size_t{rows} * (cols / 32) * 34);
+        for (auto& b : w) b = static_cast<std::uint8_t>(rnd(256.0f) + 128);
+        for (std::size_t b = 0; b < w.size(); b += 34) {
+          const std::uint16_t h = 0x1C00 | (static_cast<std::uint16_t>(seed >> 9) & 0x3FF);
+          std::memcpy(w.data() + b, &h, 2);
+        }
+        return w;
+      };
+      std::vector<float> x(H), gi(H), out0(H);
+      for (auto& v : x) v = rnd(4.0f);
+      for (auto& v : gi) v = rnd(0.2f);
+      for (auto& v : out0) v = rnd(1.0f);
+      const auto gw = q8(F, H), uw = q8(F, H), dw = q8(H, F);
+      const auto upload = [&](const void* p, std::size_t bytes) {
+        auto b = dev->Alloc(bytes, &error);
+        EXPECT_TRUE(b && dev->Upload(b, 0, p, bytes, &error)) << error;
+        return b;
+      };
+      auto xb = upload(x.data(), H * 4ull), gib = upload(gi.data(), H * 4ull), o1 = upload(out0.data(), H * 4ull),
+           o2 = upload(out0.data(), H * 4ull);
+      rt::Buffer raw[3], qs[3], dd[3];
+      const std::uint32_t rows[3] = {F, F, H}, cols[3] = {H, H, F};
+      const std::vector<std::uint8_t>* src[3] = {&gw, &uw, &dw};
+      for (int i = 0; i < 3; ++i) {
+        raw[i] = upload(src[i]->data(), src[i]->size());
+        qs[i] = dev->Alloc(std::size_t{rows[i]} * cols[i], &error);
+        dd[i] = dev->Alloc(std::size_t{rows[i]} * (cols[i] / 32) * 2, &error);
+        const rt::Arg a[] = {rt::Arg::Buf(raw[i]), rt::Arg::Buf(qs[i]), rt::Arg::Buf(dd[i]), rt::Arg::Val(rows[i]),
+                             rt::Arg::Val(cols[i]), rt::Arg::Val(cols[i])};
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_repack_q8_0", &error), {256}, {256}, a, &error)) << error;
+      }
+      const auto launch = [&](const char* k, rt::Dim3 grid, std::initializer_list<rt::Arg> args) {
+        ASSERT_TRUE(dev->Launch(dev->Kernel(k, &error), grid, {256}, std::span<const rt::Arg>(args.begin(), args.size()),
+                                &error))
+            << k << ": " << error;
+      };
+      auto g = dev->Alloc(F * 4ull, &error), u = dev->Alloc(F * 4ull, &error), y = dev->Alloc(H * 4ull, &error),
+           s1 = dev->Alloc(4, &error), h2 = dev->Alloc(F * 4ull, &error), s2 = dev->Alloc(4, &error);
+      launch("halo_gemv_q8r_r2", {(F + 15) / 16}, {rt::Arg::Buf(qs[0]), rt::Arg::Buf(dd[0]), rt::Arg::Buf(xb), rt::Arg::Buf(g),
+                                                   rt::Arg::Val(F), rt::Arg::Val(H), rt::Arg::Val(H)});
+      launch("halo_gemv_q8r_r2", {(F + 15) / 16}, {rt::Arg::Buf(qs[1]), rt::Arg::Buf(dd[1]), rt::Arg::Buf(xb), rt::Arg::Buf(u),
+                                                   rt::Arg::Val(F), rt::Arg::Val(H), rt::Arg::Val(H)});
+      launch("halo_silu_mul", {(F + 255) / 256}, {rt::Arg::Buf(g), rt::Arg::Buf(u), rt::Arg::Val(F)});
+      launch("halo_gemv_q8r_r2", {(H + 15) / 16}, {rt::Arg::Buf(qs[2]), rt::Arg::Buf(dd[2]), rt::Arg::Buf(g), rt::Arg::Buf(y),
+                                                   rt::Arg::Val(H), rt::Arg::Val(F), rt::Arg::Val(F)});
+      launch("halo_matvec_f32_rowblock", {1}, {rt::Arg::Buf(gib), rt::Arg::Buf(xb), rt::Arg::Buf(s1), rt::Arg::Val(1u),
+                                               rt::Arg::Val(H)});
+      launch("halo_axpy_sigmoid", {(H + 255) / 256}, {rt::Arg::Buf(o1), rt::Arg::Buf(y), rt::Arg::Buf(s1), rt::Arg::Val(H)});
+      launch("halo_shexp_gate_up", {(F + 15) / 16}, {rt::Arg::Buf(qs[0]), rt::Arg::Buf(dd[0]), rt::Arg::Buf(qs[1]),
+                                                     rt::Arg::Buf(dd[1]), rt::Arg::Buf(gib), rt::Arg::Buf(xb), rt::Arg::Buf(h2),
+                                                     rt::Arg::Buf(s2), rt::Arg::Val(F), rt::Arg::Val(H), rt::Arg::Val(H)});
+      launch("halo_shexp_down_add", {(H + 31) / 32}, {rt::Arg::Buf(qs[2]), rt::Arg::Buf(dd[2]), rt::Arg::Buf(h2),
+                                                      rt::Arg::Buf(s2), rt::Arg::Buf(o2), rt::Arg::Val(H), rt::Arg::Val(F),
+                                                      rt::Arg::Val(F)});
+      std::vector<float> a(H), b(H);
+      ASSERT_TRUE(dev->Download(o1, 0, a.data(), H * 4ull, &error) && dev->Download(o2, 0, b.data(), H * 4ull, &error)) << error;
+      double num = 0, den = 0;
+      for (std::uint32_t i = 0; i < H; ++i) {
+        num += double(a[i] - b[i]) * (a[i] - b[i]);
+        den += double(a[i]) * a[i];
+      }
+      ASSERT_LE(std::sqrt(num / den), 1e-5) << "H " << H << " F " << F;
+      for (auto* p : {&xb, &gib, &o1, &o2, &g, &u, &y, &s1, &h2, &s2}) dev->Free(*p);
+      for (int i = 0; i < 3; ++i) {
+        dev->Free(raw[i]);
+        dev->Free(qs[i]);
+        dev->Free(dd[i]);
+      }
+    }, {.test_cases = 80});
+  }
+}
+
+// P3 fused DeltaNet block pieces against the kernels they replace: dual Q8
+// GEMV vs two GEMVs, alpha+beta vs two row-block matvecs, conv+L2 vs
+// conv_step then l2norm, DeltaNet+gated norm vs gdn_step_d128 then gated_norm.
+TEST(GpuKernels, FusedDeltaNetPiecesMatchKernelSequences) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      constexpr std::uint32_t d = 128;
+      const std::uint32_t nk = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 4}));
+      const std::uint32_t nv = nk * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 3}));
+      const std::uint32_t H = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 80}));
+      const std::uint32_t kd = nk * d, ch = 2 * kd + nv * d, kern = 4;
+      const std::uint32_t mode = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = 1}));
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto rnd = [&](float scale) {
+        seed = seed * 1664525u + 1013904223u;
+        return scale * (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f);
+      };
+      const auto vec = [&](std::size_t n, float scale) {
+        std::vector<float> v(n);
+        for (auto& x : v) x = rnd(scale);
+        return v;
+      };
+      const auto upload = [&](const void* p, std::size_t bytes) {
+        auto b = dev->Alloc(std::max<std::size_t>(bytes, 4), &error);
+        EXPECT_TRUE(b && dev->Upload(b, 0, p, bytes, &error)) << error;
+        return b;
+      };
+      const auto get = [&](const rt::Buffer& b, std::size_t n) {
+        std::vector<float> v(n);
+        EXPECT_TRUE(dev->Download(b, 0, v.data(), n * 4, &error)) << error;
+        return v;
+      };
+      const auto close = [&](const std::vector<float>& a, const std::vector<float>& b, const char* what) {
+        double num = 0, den = 0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+          num += double(a[i] - b[i]) * (a[i] - b[i]);
+          den += double(a[i]) * a[i];
+        }
+        ASSERT_LE(std::sqrt(num / std::max(den, 1e-30)), 1e-5) << what << " (nk " << nk << ", nv " << nv << ", H " << H << ")";
+      };
+      const auto launch = [&](const char* k, rt::Dim3 grid, rt::Dim3 block, std::initializer_list<rt::Arg> args) {
+        ASSERT_TRUE(dev->Launch(dev->Kernel(k, &error), grid, block, std::span<const rt::Arg>(args.begin(), args.size()),
+                                &error))
+            << k << ": " << error;
+      };
+      std::vector<rt::Buffer> owned;
+      const auto own = [&](rt::Buffer b) { owned.push_back(b); return b; };
+      // Dual GEMV.
+      const auto x = vec(H, 4.0f);
+      auto xb = own(upload(x.data(), H * 4ull));
+      const std::uint32_t r1 = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 20})) + 3,
+                          r2 = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 20})) + 7;
+      rt::Buffer mq[2], md[2], yref[2], yfused[2];
+      for (int m = 0; m < 2; ++m) {
+        const std::uint32_t rows = m == 0 ? r1 : r2;
+        std::vector<std::uint8_t> raw(std::size_t{rows} * (H / 32) * 34);
+        for (auto& b : raw) b = static_cast<std::uint8_t>(rnd(256.0f) + 128);
+        for (std::size_t b = 0; b < raw.size(); b += 34) {
+          const std::uint16_t h = 0x1C00 | (static_cast<std::uint16_t>(seed >> 9) & 0x3FF);
+          std::memcpy(raw.data() + b, &h, 2);
+        }
+        auto rb = own(upload(raw.data(), raw.size()));
+        mq[m] = own(dev->Alloc(std::size_t{rows} * H, &error));
+        md[m] = own(dev->Alloc(std::size_t{rows} * (H / 32) * 2, &error));
+        yref[m] = own(dev->Alloc(rows * 4ull, &error));
+        yfused[m] = own(dev->Alloc(rows * 4ull, &error));
+        launch("halo_repack_q8_0", {256}, {256}, {rt::Arg::Buf(rb), rt::Arg::Buf(mq[m]), rt::Arg::Buf(md[m]),
+                                                  rt::Arg::Val(rows), rt::Arg::Val(H), rt::Arg::Val(H)});
+        launch("halo_gemv_q8r_r4", {(rows + 31) / 32}, {256}, {rt::Arg::Buf(mq[m]), rt::Arg::Buf(md[m]), rt::Arg::Buf(xb),
+                                                               rt::Arg::Buf(yref[m]), rt::Arg::Val(rows), rt::Arg::Val(H),
+                                                               rt::Arg::Val(H)});
+      }
+      const std::uint32_t b1 = (r1 + 31) / 32;
+      launch("halo_gemv_q8r_dual", {b1 + (r2 + 31) / 32}, {256},
+             {rt::Arg::Buf(mq[0]), rt::Arg::Buf(md[0]), rt::Arg::Buf(yfused[0]), rt::Arg::Val(r1), rt::Arg::Val(H),
+              rt::Arg::Buf(mq[1]), rt::Arg::Buf(md[1]), rt::Arg::Buf(yfused[1]), rt::Arg::Val(r2), rt::Arg::Val(H),
+              rt::Arg::Buf(xb), rt::Arg::Val(H), rt::Arg::Val(b1)});
+      close(get(yfused[0], r1), get(yref[0], r1), "dual gemv (first)");
+      close(get(yfused[1], r2), get(yref[1], r2), "dual gemv (second)");
+      // alpha + beta.
+      const auto wa = vec(std::size_t{nv} * H, 0.2f), wb = vec(std::size_t{nv} * H, 0.2f);
+      auto wab = own(upload(wa.data(), wa.size() * 4)), wbb = own(upload(wb.data(), wb.size() * 4));
+      auto ya1 = own(dev->Alloc(nv * 4, &error)), yb1 = own(dev->Alloc(nv * 4, &error)),
+           ya2 = own(dev->Alloc(nv * 4, &error)), yb2 = own(dev->Alloc(nv * 4, &error));
+      launch("halo_matvec_f32_rowblock", {nv}, {256}, {rt::Arg::Buf(wab), rt::Arg::Buf(xb), rt::Arg::Buf(ya1), rt::Arg::Val(nv), rt::Arg::Val(H)});
+      launch("halo_matvec_f32_rowblock", {nv}, {256}, {rt::Arg::Buf(wbb), rt::Arg::Buf(xb), rt::Arg::Buf(yb1), rt::Arg::Val(nv), rt::Arg::Val(H)});
+      launch("halo_matvec_f32_rowblock2", {2 * nv}, {256}, {rt::Arg::Buf(wab), rt::Arg::Buf(wbb), rt::Arg::Buf(xb),
+                                                            rt::Arg::Buf(ya2), rt::Arg::Buf(yb2), rt::Arg::Val(nv), rt::Arg::Val(H)});
+      close(get(ya2, nv), get(ya1, nv), "alpha");
+      close(get(yb2, nv), get(yb1, nv), "beta");
+      // conv + L2.
+      const auto in = vec(ch, 3.0f), st = vec(std::size_t{kern - 1} * ch, 1.0f), cw = vec(std::size_t{ch} * kern, 0.5f);
+      auto inb = own(upload(in.data(), ch * 4ull)), s1 = own(upload(st.data(), st.size() * 4)),
+           s2 = own(upload(st.data(), st.size() * 4)), cwb = own(upload(cw.data(), cw.size() * 4));
+      auto c1 = own(dev->Alloc(ch * 4ull, &error)), c2 = own(dev->Alloc(ch * 4ull, &error));
+      launch("halo_conv_step", {(ch + 255) / 256}, {256}, {rt::Arg::Buf(inb), rt::Arg::Buf(s1), rt::Arg::Buf(cwb),
+                                                           rt::Arg::Buf(c1), rt::Arg::Val(ch), rt::Arg::Val(kern)});
+      launch("halo_l2norm", {2 * nk}, {128}, {rt::Arg::Buf(c1), rt::Arg::Val(d), rt::Arg::Val(1e-6f)});
+      launch("halo_conv_l2norm", {ch / 128}, {128}, {rt::Arg::Buf(inb), rt::Arg::Buf(s2), rt::Arg::Buf(cwb), rt::Arg::Buf(c2),
+                                                     rt::Arg::Val(ch), rt::Arg::Val(kern), rt::Arg::Val(2 * kd),
+                                                     rt::Arg::Val(1e-6f)});
+      close(get(c2, ch), get(c1, ch), "conv+l2 output");
+      close(get(s2, st.size()), get(s1, st.size()), "conv state");
+      // DeltaNet + gated norm.
+      auto a = vec(nv, 2.0f), dt = vec(nv, 2.0f);
+      for (auto& v : a) v = -std::exp(v);
+      const auto al = vec(nv, 4.0f), be = vec(nv, 4.0f), state = vec(std::size_t{nv} * d * d, 0.2f), nw = vec(d, 1.0f),
+                 zv = vec(std::size_t{nv} * d, 4.0f);
+      auto ab = own(upload(a.data(), nv * 4ull)), dtb = own(upload(dt.data(), nv * 4ull)),
+           alb = own(upload(al.data(), nv * 4ull)), beb = own(upload(be.data(), nv * 4ull)),
+           g1 = own(upload(state.data(), state.size() * 4)), g2 = own(upload(state.data(), state.size() * 4)),
+           nwb = own(upload(nw.data(), d * 4ull)), zb = own(upload(zv.data(), zv.size() * 4));
+      auto o1 = own(dev->Alloc(nv * d * 4ull, &error)), o2 = own(dev->Alloc(nv * d * 4ull, &error));
+      const auto qkv = [&](std::size_t off) { return rt::Arg::Buf(c1, off * 4); };
+      launch("halo_gdn_step_d128", {nv}, {d}, {qkv(0), qkv(kd), qkv(2 * kd), rt::Arg::Buf(alb), rt::Arg::Buf(beb),
+                                               rt::Arg::Buf(ab), rt::Arg::Buf(dtb), rt::Arg::Buf(g1), rt::Arg::Buf(o1),
+                                               rt::Arg::Val(nk)});
+      launch("halo_gated_norm", {nv}, {128}, {rt::Arg::Buf(o1), rt::Arg::Buf(nwb), rt::Arg::Buf(zb), rt::Arg::Val(d),
+                                              rt::Arg::Val(1e-6f), rt::Arg::Val(mode)});
+      launch("halo_gdn_step_d128_norm", {nv}, {d}, {qkv(0), qkv(kd), qkv(2 * kd), rt::Arg::Buf(alb), rt::Arg::Buf(beb),
+                                                    rt::Arg::Buf(ab), rt::Arg::Buf(dtb), rt::Arg::Buf(g2), rt::Arg::Buf(nwb),
+                                                    rt::Arg::Buf(zb), rt::Arg::Buf(o2), rt::Arg::Val(nk),
+                                                    rt::Arg::Val(1e-6f), rt::Arg::Val(mode)});
+      close(get(o2, nv * d), get(o1, nv * d), "gdn + gated norm output");
+      close(get(g2, state.size()), get(g1, state.size()), "gdn state");
+      for (auto& b : owned) dev->Free(b);
+    }, {.test_cases = 60});
+  }
+}
