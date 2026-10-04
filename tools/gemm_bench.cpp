@@ -6,6 +6,10 @@
 //   halo_gemm_bench peak      register-only WMMA throughput (the ceiling)
 //   halo_gemm_bench deltanet  one DeltaNet layer's chunk: decode steps vs chunked kernels
 //   halo_gemm_bench bf16      the Qwen3.5 BF16 GEMMs (fp16 WMMA), weights from DRAM
+//   halo_gemm_bench moe       one layer's routed experts at the real shapes (512
+//                             experts, top 10, Q4_K gate/up 640 x 2560, Q5_1 down
+//                             2560 x 640), random routing, T = 2048: bucket,
+//                             gate/up, down, combine (for profilers: small memory)
 //   halo_gemm_bench model     every Flash-Next dense int8 GEMM shape at T = 2048,
 //                             weighted by its count per 2048-token prefill
 
@@ -44,6 +48,76 @@ int main(int argc, char** argv) {
         std::printf("%s blocks %4u: %.1f TOPS\n", f16 ? "fp16" : "int8", blocks,
                     double(blocks) * 8 * iters * 4 * 16 * 16 * 16 * 2 / s / 1e12);
       }
+    return 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "moe") {
+    auto d = rt::Device::Create(rt::Backend::kHip, &e);
+    if (!d || !d->LoadModule(kernels::CoreHsaco(), &e)) return std::printf("%s\n", e.c_str()), 1;
+    const std::uint32_t E = 512, k = 10, ff = 640, H = 2560, T = 2048, P = T * k;
+    const std::size_t gu_row = H / 256 * 144, dn_row = ff / 32 * 24;
+    std::mt19937 g(7);
+    const auto fill = [&](std::vector<std::uint8_t>& w, std::size_t rows, std::size_t row_bytes, std::size_t block,
+                          std::initializer_list<std::size_t> halves) {
+      for (auto& b : w) b = static_cast<std::uint8_t>(g());
+      for (std::size_t r = 0; r < rows; ++r)
+        for (std::size_t b = 0; b < row_bytes / block; ++b)
+          for (std::size_t off : halves) {
+            const std::uint16_t h = 0x2000 | (g() & 0x3FF);
+            std::memcpy(w.data() + r * row_bytes + b * block + off, &h, 2);
+          }
+    };
+    std::vector<std::uint8_t> gate(std::size_t{E} * ff * gu_row), up(gate.size()), down(std::size_t{E} * H * dn_row);
+    fill(gate, std::size_t{E} * ff, gu_row, 144, {0, 2});
+    fill(up, std::size_t{E} * ff, gu_row, 144, {0, 2});
+    fill(down, std::size_t{E} * H, dn_row, 24, {0, 2});
+    std::vector<float> logits(std::size_t{T} * E), x(std::size_t{T} * H);
+    std::normal_distribution<float> nd;
+    for (auto& v : logits) v = nd(g);
+    for (auto& v : x) v = 0.1f * nd(g);
+    const auto up_buf = [&](const void* p, std::size_t n) {
+      auto b = d->Alloc(n, &e);
+      if (p) (void)d->Upload(b, 0, p, n, &e);
+      return b;
+    };
+    auto gb = up_buf(gate.data(), gate.size()), ub = up_buf(up.data(), up.size()), db = up_buf(down.data(), down.size()),
+         lb = up_buf(logits.data(), logits.size() * 4), xb = up_buf(x.data(), x.size() * 4),
+         x16 = up_buf(nullptr, x.size() * 2), ib = up_buf(nullptr, P * 4), wb = up_buf(nullptr, P * 4),
+         cb = up_buf(nullptr, std::size_t{(P + 1023) / 1024} * E * 4), bb = up_buf(nullptr, E * 4),
+         sb = up_buf(nullptr, P * 4), pb = up_buf(nullptr, P * 4), tb = up_buf(nullptr, std::size_t{P / 64 + E + 1} * 12),
+         nb = up_buf(nullptr, 4), hb = up_buf(nullptr, std::size_t{P} * ff * 2), yb = up_buf(nullptr, std::size_t{P} * H * 2),
+         ob = up_buf(nullptr, std::size_t{T} * H * 4);
+    const std::uint32_t chunks = (P + 1023) / 1024, max_tiles = P / 64 + E + 1;
+    const auto L = [&](const char* name, rt::Dim3 grid, rt::Dim3 block, std::initializer_list<rt::Arg> a) {
+      const std::vector<rt::Arg> args(a);
+      (void)d->Launch(d->Kernel(name, &e), grid, block, args, &e);
+    };
+    const auto layer = [&] {
+      L("halo_router_topk_rows", {T}, {256}, {rt::Arg::Buf(lb), rt::Arg::Buf(ib), rt::Arg::Buf(wb), rt::Arg::Val(E), rt::Arg::Val(k)});
+      L("halo_moe_bucket_count", {chunks}, {1024}, {rt::Arg::Buf(ib), rt::Arg::Val(P), rt::Arg::Val(E), rt::Arg::Buf(cb)});
+      L("halo_moe_bucket_scan", {1}, {1024},
+        {rt::Arg::Buf(cb), rt::Arg::Val(chunks), rt::Arg::Val(E), rt::Arg::Buf(tb), rt::Arg::Buf(nb), rt::Arg::Buf(bb)});
+      L("halo_moe_bucket_scatter", {chunks}, {1024},
+        {rt::Arg::Buf(ib), rt::Arg::Val(P), rt::Arg::Val(E), rt::Arg::Buf(cb), rt::Arg::Buf(bb), rt::Arg::Buf(sb), rt::Arg::Buf(pb)});
+      L("halo_f16_perm_rows", {(T * H + 255) / 256}, {256}, {rt::Arg::Buf(xb), rt::Arg::Buf(x16), rt::Arg::Val(T * H)});
+      L("halo_moe_gate_up_grouped_q4_k", {(ff + 127) / 128, max_tiles}, {256},
+        {rt::Arg::Buf(gb), rt::Arg::Buf(ub), rt::Arg::Val<std::uint64_t>(ff * gu_row), rt::Arg::Val<std::uint64_t>(gu_row),
+         rt::Arg::Buf(x16), rt::Arg::Buf(sb), rt::Arg::Buf(tb), rt::Arg::Buf(nb), rt::Arg::Buf(hb), rt::Arg::Val(ff),
+         rt::Arg::Val(H), rt::Arg::Val(k)});
+      L("halo_moe_down_grouped_q5_1", {(H + 127) / 128, max_tiles}, {256},
+        {rt::Arg::Buf(db), rt::Arg::Val<std::uint64_t>(H * dn_row), rt::Arg::Val<std::uint64_t>(dn_row), rt::Arg::Buf(hb),
+         rt::Arg::Buf(tb), rt::Arg::Buf(nb), rt::Arg::Buf(yb), rt::Arg::Val(H), rt::Arg::Val(ff)});
+      L("halo_moe_combine_grouped", {(H + 255) / 256, T}, {256},
+        {rt::Arg::Buf(yb), rt::Arg::Buf(pb), rt::Arg::Buf(wb), rt::Arg::Buf(ob), rt::Arg::Val(k), rt::Arg::Val(H)});
+    };
+    layer();
+    (void)d->Synchronize(&e);
+    const int reps = argc > 2 ? std::atoi(argv[2]) : 10;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < reps; ++i) layer();
+    (void)d->Synchronize(&e);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+    std::printf("moe layer (T %u, %u experts, top %u): %.2f ms; x48 layers = %.0f ms%s\n", T, E, k, ms, 48 * ms,
+                e.empty() ? "" : (" error: " + e).c_str());
     return 0;
   }
   if (argc > 1 && std::string(argv[1]) == "deltanet") {

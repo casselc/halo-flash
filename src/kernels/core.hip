@@ -3416,6 +3416,14 @@ struct Frag16 {
   struct Hdr {};
   __device__ static Hdr LoadHdr(const std::uint8_t*, std::uint32_t) { return {}; }
   __device__ static halo_v16h GetH(const std::uint8_t* row, std::uint32_t k, const Hdr&) { return Get(row, k); }
+  // Stage prefetch (kMoeKs values from k0): Q4_K loads its quant bytes up
+  // front; other formats load per fragment as before.
+  struct Stage {};
+  __device__ static Stage LoadStage(const std::uint8_t*, std::uint32_t) { return {}; }
+  __device__ static halo_v16h GetS(const std::uint8_t* row, std::uint32_t k0, std::uint32_t kk, const Hdr& h,
+                                   const Stage&) {
+    return GetH(row, k0 + kk, h);
+  }
   __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
     halo_v16h a;
 #pragma unroll
@@ -3460,6 +3468,32 @@ struct Frag16<LoadQ4_K> {
               halo_h2{hd.c[i], hd.c[i]});
     return v;
   }
+  // A 128-value stage reads 64 quant bytes per row (two 32-byte chunks; the
+  // high-nibble half of each chunk reuses its bytes): 4 loads, issued before
+  // they are needed.
+  struct Stage {
+    uint4 q[4];
+  };
+  __device__ static Stage LoadStage(const std::uint8_t* row, std::uint32_t k0) {
+    const std::uint8_t* qb = row + (k0 / 256) * 144 + 16 + ((k0 % 256) / 64) * 32;
+    Stage st;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) st.q[i] = *reinterpret_cast<const uint4*>(qb + 16 * i);
+    return st;
+  }
+  // kk in 0 .. 127 (constant once unrolled): chunk kk / 64, nibble (kk % 64) / 32.
+  __device__ static halo_v16h GetS(const std::uint8_t*, std::uint32_t, std::uint32_t kk, const Hdr& hd,
+                                   const Stage& st) {
+    const std::uint32_t hi = (kk % 64) / 32, i = kk / 32;
+    const uint4 q = st.q[(kk / 64) * 2 + (kk % 32) / 16];
+    const std::uint32_t w[4] = {q.x, q.y, q.z, q.w};
+    halo_v16h v;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+      Unpack4(v, j, (w[j] >> (4 * hi)) & 0x0F0F0F0Fu, halo_h2{1024, 1024}, halo_h2{hd.a[i], hd.a[i]},
+              halo_h2{hd.c[i], hd.c[i]});
+    return v;
+  }
   __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
     const std::uint8_t* b = row + (k0 / 256) * 144;
     const std::uint32_t e = k0 % 256, chunk = e / 64, hi = (e % 64) / 32, l0 = e % 32;
@@ -3478,6 +3512,13 @@ struct Frag16<LoadQ4_K> {
 };
 template <>
 struct Frag16<LoadQ5_K> {
+  struct Stage {};
+  __device__ static Stage LoadStage(const std::uint8_t*, std::uint32_t) { return {}; }
+  template <typename H>
+  __device__ static halo_v16h GetS(const std::uint8_t* row, std::uint32_t k0, std::uint32_t kk, const H& h,
+                                   const Stage&) {
+    return GetH(row, k0 + kk, h);
+  }
   using Hdr = KQuantHdr;
   __device__ static Hdr LoadHdr(const std::uint8_t* row, std::uint32_t k0) {
     return LoadKQuantHdr(row + (k0 / 256) * 176, (k0 % 256) / 32);
@@ -3516,6 +3557,13 @@ struct Frag16<LoadQ5_K> {
 };
 template <>
 struct Frag16<LoadQ5_1> {
+  struct Stage {};
+  __device__ static Stage LoadStage(const std::uint8_t*, std::uint32_t) { return {}; }
+  template <typename H>
+  __device__ static halo_v16h GetS(const std::uint8_t* row, std::uint32_t k0, std::uint32_t kk, const H& h,
+                                   const Stage&) {
+    return GetH(row, k0 + kk, h);
+  }
   struct Hdr {};
   __device__ static Hdr LoadHdr(const std::uint8_t*, std::uint32_t) { return {}; }
   __device__ static halo_v16h GetH(const std::uint8_t* row, std::uint32_t k, const Hdr&) { return Get(row, k); }
@@ -3547,6 +3595,13 @@ __device__ inline halo_v16h Int8Frag(const std::uint32_t w[4], _Float16 d) {
 }
 template <>
 struct Frag16<LoadQ8_0> {
+  struct Stage {};
+  __device__ static Stage LoadStage(const std::uint8_t*, std::uint32_t) { return {}; }
+  template <typename H>
+  __device__ static halo_v16h GetS(const std::uint8_t* row, std::uint32_t k0, std::uint32_t kk, const H& h,
+                                   const Stage&) {
+    return GetH(row, k0 + kk, h);
+  }
   struct Hdr {};
   __device__ static Hdr LoadHdr(const std::uint8_t*, std::uint32_t) { return {}; }
   __device__ static halo_v16h GetH(const std::uint8_t* row, std::uint32_t k, const Hdr&) { return Get(row, k); }
@@ -3609,7 +3664,13 @@ __device__ void MoeGateUp(const std::uint8_t* gate, const std::uint8_t* up, std:
   }
   for (std::uint32_t i = threadIdx.x; i < kMoeTile; i += blockDim.x) tok[i] = sorted[first + (i < n ? i : 0)] / k;
   halo_v8f ag[kMoeRowTiles][kMoeSub] = {}, au[kMoeRowTiles][kMoeSub] = {};
+  static_assert(kMoeRowTiles == 1, "stage prefetch holds one row tile's weights");
   for (std::uint32_t k0 = 0; k0 < H; k0 += kMoeKs) {
+    // This stage's weights first: their loads are in flight during the
+    // activation staging and its barriers (thread trace: 74% of the
+    // kernel's time was waiting on per-fragment weight loads).
+    const auto hg = Frag16<L>::LoadHdr(g[0], k0), hu = Frag16<L>::LoadHdr(u[0], k0);
+    const auto sg = Frag16<L>::LoadStage(g[0], k0), su = Frag16<L>::LoadStage(u[0], k0);
     __syncthreads();
     for (std::uint32_t i = threadIdx.x; i < subs * 16 * kMoeKs / 8; i += blockDim.x) {
       const std::uint32_t r = i / (kMoeKs / 8), c = (i % (kMoeKs / 8)) * 8;
@@ -3619,10 +3680,9 @@ __device__ void MoeGateUp(const std::uint8_t* gate, const std::uint8_t* up, std:
     __syncthreads();
 #pragma unroll
     for (std::uint32_t rt = 0; rt < kMoeRowTiles; ++rt) {
-      const auto hg = Frag16<L>::LoadHdr(g[rt], k0), hu = Frag16<L>::LoadHdr(u[rt], k0);
 #pragma unroll
       for (std::uint32_t kk = 0; kk < kMoeKs; kk += 16) {
-        const halo_v16h fg = Frag16<L>::GetH(g[rt], k0 + kk, hg), fu = Frag16<L>::GetH(u[rt], k0 + kk, hu);
+        const halo_v16h fg = Frag16<L>::GetS(g[rt], k0, kk, hg, sg), fu = Frag16<L>::GetS(u[rt], k0, kk, hu, su);
 #pragma unroll
         for (std::uint32_t h = 0; h < kMoeSub; ++h) {
           if (h >= subs) break;
