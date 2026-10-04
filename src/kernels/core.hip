@@ -3189,92 +3189,178 @@ extern "C" __global__ void __launch_bounds__(1024)
 
 namespace {
 
-// 16 consecutive weights (k0 % 16 == 0) of one row as a WMMA A fragment:
-// one vector load and one scale decode for the specialized formats, the
-// element loader otherwise.
+// 16 weights (k0 % 16 == 0) of one row as a WMMA A fragment, in the
+// K order kMoePerm: within every group of 4, positions (0, 1, 2, 3) hold
+// k (0, 2, 1, 3). Activation fragments are staged in the same order, so
+// the dot products are unchanged, and the specialized loaders can build
+// pairs (byte 0, byte 2) and (byte 1, byte 3) of a word with masks alone:
+// a value v < 1024 ORed into fp16 1024 (0x6400) is exactly 1024 + v, so
+// one subtraction gives v exactly and one packed multiply-add scales it.
+__device__ inline std::uint32_t MoePerm(std::uint32_t c) { return (c & ~3u) | ((c & 1u) << 1) | ((c >> 1) & 1u); }
+
+typedef _Float16 halo_h2 __attribute__((ext_vector_type(2)));
+__device__ inline halo_h2 AsH2(std::uint32_t u) { return __builtin_bit_cast(halo_h2, u); }
+
+// Bytes of `w` (each < 1024 after `bias` is removed) times scale plus
+// offset, written to v[4 j .. 4 j + 3] in kMoePerm order.
+__device__ inline void Unpack4(halo_v16h& v, int j, std::uint32_t bytes, halo_h2 bias, halo_h2 scale, halo_h2 offset) {
+  const halo_h2 p0 = (AsH2((bytes & 0x00FF00FFu) | 0x64006400u) - bias) * scale + offset;
+  const halo_h2 p1 = (AsH2(((bytes >> 8) & 0x00FF00FFu) | 0x64006400u) - bias) * scale + offset;
+  v[4 * j] = p0.x;
+  v[4 * j + 1] = p0.y;
+  v[4 * j + 2] = p1.x;
+  v[4 * j + 3] = p1.y;
+}
+
+// Per-stage interface used by the grouped gate/up: LoadHdr(row, k0) once
+// per kMoeKs-value stage (k0 % kMoeKs == 0), then GetH(row, k0 + kk, hdr)
+// per 16 values. Formats whose scales sit beside their quants keep Get.
 template <typename L>
 struct Frag16 {
+  struct Hdr {};
+  __device__ static Hdr LoadHdr(const std::uint8_t*, std::uint32_t) { return {}; }
+  __device__ static halo_v16h GetH(const std::uint8_t* row, std::uint32_t k, const Hdr&) { return Get(row, k); }
   __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
     halo_v16h a;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) a[i] = static_cast<_Float16>(L::At(row, k0 + i));
+    for (std::uint32_t i = 0; i < 16; ++i) a[i] = static_cast<_Float16>(L::At(row, k0 + MoePerm(i)));
     return a;
   }
 };
+// K-quants: a 128-value stage is half a super-block, sub-blocks j0 .. j0 + 3;
+// the header (d, dmin, 12 scale bytes) is one 16-byte load.
+struct KQuantHdr {
+  _Float16 a[4], c[4];
+};
+__device__ inline KQuantHdr LoadKQuantHdr(const std::uint8_t* b, std::uint32_t j0) {
+  const uint4 h = *reinterpret_cast<const uint4*>(b);
+  const float d = F16(static_cast<std::uint16_t>(h.x & 0xFFFF)), dmin = F16(static_cast<std::uint16_t>(h.x >> 16));
+  KQuantHdr r;
+#pragma unroll
+  for (std::uint32_t i = 0; i < 4; ++i) {
+    std::uint32_t sc, m;
+    ScaleMinK4Words(j0 + i, h.y, h.z, h.w, sc, m);
+    r.a[i] = static_cast<_Float16>(d * static_cast<float>(sc));
+    r.c[i] = static_cast<_Float16>(-dmin * static_cast<float>(m));
+  }
+  return r;
+}
 template <>
 struct Frag16<LoadQ4_K> {
+  using Hdr = KQuantHdr;
+  __device__ static Hdr LoadHdr(const std::uint8_t* row, std::uint32_t k0) {
+    return LoadKQuantHdr(row + (k0 / 256) * 144, (k0 % 256) / 32);
+  }
+  // k % kMoeKs selects the sub-block; constant once the stage loop unrolls.
+  __device__ static halo_v16h GetH(const std::uint8_t* row, std::uint32_t k, const Hdr& hd) {
+    const std::uint8_t* b = row + (k / 256) * 144;
+    const std::uint32_t e = k % 256, chunk = e / 64, hi = (e % 64) / 32, l0 = e % 32, i = (k % 128) / 32;
+    const uint4 q = *reinterpret_cast<const uint4*>(b + 16 + chunk * 32 + l0);
+    const std::uint32_t w[4] = {q.x, q.y, q.z, q.w};
+    halo_v16h v;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+      Unpack4(v, j, (w[j] >> (4 * hi)) & 0x0F0F0F0Fu, halo_h2{1024, 1024}, halo_h2{hd.a[i], hd.a[i]},
+              halo_h2{hd.c[i], hd.c[i]});
+    return v;
+  }
   __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
     const std::uint8_t* b = row + (k0 / 256) * 144;
     const std::uint32_t e = k0 % 256, chunk = e / 64, hi = (e % 64) / 32, l0 = e % 32;
     std::uint32_t sc, m;
     ScaleMinK4(2 * chunk + hi, b + 4, sc, m);
-    const float a = F16(U16(b)) * static_cast<float>(sc), c = F16(U16(b + 2)) * static_cast<float>(m);
+    const _Float16 a = static_cast<_Float16>(F16(U16(b)) * static_cast<float>(sc));
+    const _Float16 c = static_cast<_Float16>(-F16(U16(b + 2)) * static_cast<float>(m));
     const uint4 q = *reinterpret_cast<const uint4*>(b + 16 + chunk * 32 + l0);
     const std::uint32_t w[4] = {q.x, q.y, q.z, q.w};
     halo_v16h v;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-      const std::uint32_t byte = (w[i / 4] >> (8 * (i % 4))) & 0xFF;
-      v[i] = static_cast<_Float16>(a * static_cast<float>(hi ? byte >> 4 : byte & 0xF) - c);
-    }
+    for (int j = 0; j < 4; ++j)
+      Unpack4(v, j, (w[j] >> (4 * hi)) & 0x0F0F0F0Fu, halo_h2{1024, 1024}, halo_h2{a, a}, halo_h2{c, c});
     return v;
   }
 };
 template <>
 struct Frag16<LoadQ5_K> {
-  __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
-    const std::uint8_t* b = row + (k0 / 256) * 176;
-    const std::uint32_t e = k0 % 256, chunk = e / 64, hi = (e % 64) / 32, l0 = e % 32, bit = 2 * chunk + hi;
-    std::uint32_t sc, m;
-    ScaleMinK4(bit, b + 4, sc, m);
-    const float a = F16(U16(b)) * static_cast<float>(sc), c = F16(U16(b + 2)) * static_cast<float>(m);
+  using Hdr = KQuantHdr;
+  __device__ static Hdr LoadHdr(const std::uint8_t* row, std::uint32_t k0) {
+    return LoadKQuantHdr(row + (k0 / 256) * 176, (k0 % 256) / 32);
+  }
+  __device__ static halo_v16h GetH(const std::uint8_t* row, std::uint32_t k, const Hdr& hd) {
+    const std::uint8_t* b = row + (k / 256) * 176;
+    const std::uint32_t e = k % 256, chunk = e / 64, hi = (e % 64) / 32, l0 = e % 32, bit = 2 * chunk + hi,
+                        i = (k % 128) / 32;
     const uint4 q = *reinterpret_cast<const uint4*>(b + 48 + chunk * 32 + l0);
     const uint4 h = *reinterpret_cast<const uint4*>(b + 16 + l0);
     const std::uint32_t w[4] = {q.x, q.y, q.z, q.w}, hw[4] = {h.x, h.y, h.z, h.w};
     halo_v16h v;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-      const std::uint32_t byte = (w[i / 4] >> (8 * (i % 4))) & 0xFF, hb = (hw[i / 4] >> (8 * (i % 4))) & 0xFF;
-      const std::uint32_t qv = (hi ? byte >> 4 : byte & 0xF) | (((hb >> bit) & 1) << 4);
-      v[i] = static_cast<_Float16>(a * static_cast<float>(qv) - c);
-    }
+    for (int j = 0; j < 4; ++j)
+      Unpack4(v, j, ((w[j] >> (4 * hi)) & 0x0F0F0F0Fu) | (((hw[j] >> bit) & 0x01010101u) << 4), halo_h2{1024, 1024},
+              halo_h2{hd.a[i], hd.a[i]}, halo_h2{hd.c[i], hd.c[i]});
+    return v;
+  }
+  __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
+    const std::uint8_t* b = row + (k0 / 256) * 176;
+    const std::uint32_t e = k0 % 256, chunk = e / 64, hi = (e % 64) / 32, l0 = e % 32, bit = 2 * chunk + hi;
+    std::uint32_t sc, m;
+    ScaleMinK4(bit, b + 4, sc, m);
+    const _Float16 a = static_cast<_Float16>(F16(U16(b)) * static_cast<float>(sc));
+    const _Float16 c = static_cast<_Float16>(-F16(U16(b + 2)) * static_cast<float>(m));
+    const uint4 q = *reinterpret_cast<const uint4*>(b + 48 + chunk * 32 + l0);
+    const uint4 h = *reinterpret_cast<const uint4*>(b + 16 + l0);
+    const std::uint32_t w[4] = {q.x, q.y, q.z, q.w}, hw[4] = {h.x, h.y, h.z, h.w};
+    halo_v16h v;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+      Unpack4(v, j, ((w[j] >> (4 * hi)) & 0x0F0F0F0Fu) | (((hw[j] >> bit) & 0x01010101u) << 4), halo_h2{1024, 1024},
+              halo_h2{a, a}, halo_h2{c, c});
     return v;
   }
 };
 template <>
 struct Frag16<LoadQ5_1> {
+  struct Hdr {};
+  __device__ static Hdr LoadHdr(const std::uint8_t*, std::uint32_t) { return {}; }
+  __device__ static halo_v16h GetH(const std::uint8_t* row, std::uint32_t k, const Hdr&) { return Get(row, k); }
   __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
     const std::uint8_t* b = row + (k0 / 32) * 24;  // 8-byte aligned
     const std::uint32_t j0 = k0 % 32;
     const uint2 hd = *reinterpret_cast<const uint2*>(b);
-    const float d = F16(static_cast<std::uint16_t>(hd.x & 0xFFFF)), m = F16(static_cast<std::uint16_t>(hd.x >> 16));
-    const std::uint32_t qh = hd.y;
+    const _Float16 d = AsH2(hd.x).x, m = AsH2(hd.x).y;
+    const std::uint32_t qh = hd.y >> j0;
     const uint2 q0 = *reinterpret_cast<const uint2*>(b + 8), q1 = *reinterpret_cast<const uint2*>(b + 16);
     const std::uint32_t w[4] = {q0.x, q0.y, q1.x, q1.y};
     halo_v16h v;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-      const std::uint32_t byte = (w[i / 4] >> (8 * (i % 4))) & 0xFF;
-      const std::uint32_t qv = (j0 ? byte >> 4 : byte & 0xF) | (((qh >> (j0 + i)) & 1) << 4);
-      v[i] = static_cast<_Float16>(static_cast<float>(qv) * d + m);
+    for (int j = 0; j < 4; ++j) {
+      const std::uint32_t x = (qh >> (4 * j)) & 0xFu;
+      const std::uint32_t bits = (x & 1u) | ((x & 2u) << 7) | ((x & 4u) << 14) | ((x & 8u) << 21);
+      Unpack4(v, j, ((w[j] >> (j0 ? 4 : 0)) & 0x0F0F0F0Fu) | (bits << 4), halo_h2{1024, 1024}, halo_h2{d, d},
+              halo_h2{m, m});
     }
     return v;
   }
 };
+// Signed bytes: x ^ 0x80 = x + 128 < 256.
+__device__ inline halo_v16h Int8Frag(const std::uint32_t w[4], _Float16 d) {
+  halo_v16h v;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) Unpack4(v, j, w[j] ^ 0x80808080u, halo_h2{1152, 1152}, halo_h2{d, d}, halo_h2{0, 0});
+  return v;
+}
 template <>
 struct Frag16<LoadQ8_0> {
+  struct Hdr {};
+  __device__ static Hdr LoadHdr(const std::uint8_t*, std::uint32_t) { return {}; }
+  __device__ static halo_v16h GetH(const std::uint8_t* row, std::uint32_t k, const Hdr&) { return Get(row, k); }
   __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
     const std::uint8_t* b = row + (k0 / 32) * 34;  // 2-byte aligned
-    const float d = F16(U16(b));
     const std::uint16_t* q = reinterpret_cast<const std::uint16_t*>(b + 2 + k0 % 32);
-    halo_v16h v;
+    std::uint32_t w[4];
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const std::uint16_t p = q[i];
-      v[2 * i] = static_cast<_Float16>(d * static_cast<float>(static_cast<std::int8_t>(p & 0xFF)));
-      v[2 * i + 1] = static_cast<_Float16>(d * static_cast<float>(static_cast<std::int8_t>(p >> 8)));
-    }
-    return v;
+    for (int j = 0; j < 4; ++j) w[j] = static_cast<std::uint32_t>(q[2 * j]) | (static_cast<std::uint32_t>(q[2 * j + 1]) << 16);
+    return Int8Frag(w, AsH2(U16(b)).x);
   }
 };
 
@@ -3292,14 +3378,17 @@ __device__ inline halo_v16h LdsFrag(const _Float16* p) {
 
 // K staged 128 at a time for up to kMoeTile token rows.
 constexpr std::uint32_t kMoeKs = 128, kMoeRs = kMoeKs + 8, kMoeSub = kMoeTile / 16;
+static_assert(kMoeKs == 128, "the K-quant stage headers (KQuantHdr) cover 128 values");
 
 // gate/up: hp[pair][r] = silu(gate_e[r] . x_t) * (up_e[r] . x_t). Each wave
 // owns 16 rows; every weight fragment feeds the tile's 16-token sub-tiles.
-//   grid (ceil(ff / 64), max tiles), block 128; H % 256 == 0.
+// x and hp are fp16 rows in kMoePerm order (halo_f16_perm_rows), so
+// staging is a plain copy.
+//   grid (ceil(ff / 128), max tiles), block 256; H % 256 == 0.
 template <typename L>
 __device__ void MoeGateUp(const std::uint8_t* gate, const std::uint8_t* up, std::uint64_t expert_bytes,
-                          std::uint64_t row_bytes, const float* x, const std::uint32_t* sorted,
-                          const std::uint32_t* tiles, const std::uint32_t* ntiles, float* hp, std::uint32_t ff,
+                          std::uint64_t row_bytes, const _Float16* x, const std::uint32_t* sorted,
+                          const std::uint32_t* tiles, const std::uint32_t* ntiles, _Float16* hp, std::uint32_t ff,
                           std::uint32_t H, std::uint32_t k) {
   __shared__ __attribute__((aligned(16))) _Float16 Bs[kMoeTile * kMoeRs];
   __shared__ std::uint32_t tok[kMoeTile];
@@ -3308,25 +3397,23 @@ __device__ void MoeGateUp(const std::uint8_t* gate, const std::uint8_t* up, std:
   const std::uint32_t e = tiles[3 * tile], first = tiles[3 * tile + 1], n = tiles[3 * tile + 2];
   const std::uint32_t subs = (n + 15) / 16;  // block-uniform
   const std::uint32_t lane = threadIdx.x % 32, wave = threadIdx.x / 32;
-  const std::uint32_t r0 = blockIdx.x * 64 + wave * 16, row = min(r0 + lane % 16, ff - 1);
+  const std::uint32_t r0 = blockIdx.x * 128 + wave * 16, row = min(r0 + lane % 16, ff - 1);
   const std::uint8_t* g = gate + e * expert_bytes + row * row_bytes;
   const std::uint8_t* u = up + e * expert_bytes + row * row_bytes;
   for (std::uint32_t i = threadIdx.x; i < kMoeTile; i += blockDim.x) tok[i] = sorted[first + (i < n ? i : 0)] / k;
   halo_v8f ag[kMoeSub] = {}, au[kMoeSub] = {};
   for (std::uint32_t k0 = 0; k0 < H; k0 += kMoeKs) {
     __syncthreads();
-    for (std::uint32_t i = threadIdx.x; i < subs * 16 * kMoeKs / 4; i += blockDim.x) {
-      const std::uint32_t r = i / (kMoeKs / 4), c = (i % (kMoeKs / 4)) * 4;
-      const float4 v = *reinterpret_cast<const float4*>(x + static_cast<std::size_t>(tok[r]) * H + k0 + c);
-      _Float16* d = Bs + r * kMoeRs + c;
-      d[0] = static_cast<_Float16>(v.x);
-      d[1] = static_cast<_Float16>(v.y);
-      d[2] = static_cast<_Float16>(v.z);
-      d[3] = static_cast<_Float16>(v.w);
+    for (std::uint32_t i = threadIdx.x; i < subs * 16 * kMoeKs / 8; i += blockDim.x) {
+      const std::uint32_t r = i / (kMoeKs / 8), c = (i % (kMoeKs / 8)) * 8;
+      *reinterpret_cast<uint4*>(Bs + r * kMoeRs + c) =
+          *reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(tok[r]) * H + k0 + c);
     }
     __syncthreads();
+    const auto hg = Frag16<L>::LoadHdr(g, k0), hu = Frag16<L>::LoadHdr(u, k0);
+#pragma unroll
     for (std::uint32_t kk = 0; kk < kMoeKs; kk += 16) {
-      const halo_v16h fg = Frag16<L>::Get(g, k0 + kk), fu = Frag16<L>::Get(u, k0 + kk);
+      const halo_v16h fg = Frag16<L>::GetH(g, k0 + kk, hg), fu = Frag16<L>::GetH(u, k0 + kk, hu);
 #pragma unroll
       for (std::uint32_t h = 0; h < kMoeSub; ++h) {
         if (h >= subs) break;
@@ -3343,16 +3430,16 @@ __device__ void MoeGateUp(const std::uint8_t* gate, const std::uint8_t* up, std:
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
       const std::uint32_t r = r0 + 2 * j + lane / 16;
-      if (r < ff) hp[static_cast<std::size_t>(first + t) * ff + r] = Silu(ag[h][j]) * au[h][j];
+      if (r < ff) hp[static_cast<std::size_t>(first + t) * ff + MoePerm(r)] = static_cast<_Float16>(Silu(ag[h][j]) * au[h][j]);
     }
   }
 }
 
 // down: yp[pair][r] = down_e[r] . hp[pair]; the tile's pairs are contiguous.
-// frag(row, k0) gives 16 weights of an output row of the tile's expert.
-//   grid (ceil(H / 64), max tiles), block 128; ff % 16 == 0.
+// frag(e, row, k0) gives 16 weights of an output row of expert e.
+//   grid (ceil(H / 128), max tiles), block 256; ff % 16 == 0.
 template <typename F>
-__device__ void MoeDown(F frag, const float* hp, const std::uint32_t* tiles, const std::uint32_t* ntiles, float* yp,
+__device__ void MoeDown(F frag, const _Float16* hp, const std::uint32_t* tiles, const std::uint32_t* ntiles, float* yp,
                         std::uint32_t H, std::uint32_t ff) {
   __shared__ __attribute__((aligned(16))) _Float16 Bs[kMoeTile * kMoeRs];
   const std::uint32_t tile = blockIdx.y;
@@ -3360,16 +3447,18 @@ __device__ void MoeDown(F frag, const float* hp, const std::uint32_t* tiles, con
   const std::uint32_t e = tiles[3 * tile], first = tiles[3 * tile + 1], n = tiles[3 * tile + 2];
   const std::uint32_t subs = (n + 15) / 16;
   const std::uint32_t lane = threadIdx.x % 32, wave = threadIdx.x / 32;
-  const std::uint32_t r0 = blockIdx.x * 64 + wave * 16, row = min(r0 + lane % 16, H - 1);
+  const std::uint32_t r0 = blockIdx.x * 128 + wave * 16, row = min(r0 + lane % 16, H - 1);
   halo_v8f acc[kMoeSub] = {};
   for (std::uint32_t k0 = 0; k0 < ff; k0 += kMoeKs) {
     const std::uint32_t ks = min(kMoeKs, ff - k0);
     __syncthreads();
-    for (std::uint32_t i = threadIdx.x; i < subs * 16 * ks; i += blockDim.x) {
-      const std::uint32_t r = i / ks, c = i % ks;
-      Bs[r * kMoeRs + c] = static_cast<_Float16>(hp[static_cast<std::size_t>(first + (r < n ? r : 0)) * ff + k0 + c]);
+    for (std::uint32_t i = threadIdx.x; i < subs * 16 * ks / 8; i += blockDim.x) {
+      const std::uint32_t r = i / (ks / 8), c = (i % (ks / 8)) * 8;
+      *reinterpret_cast<uint4*>(Bs + r * kMoeRs + c) =
+          *reinterpret_cast<const uint4*>(hp + static_cast<std::size_t>(first + (r < n ? r : 0)) * ff + k0 + c);
     }
     __syncthreads();
+#pragma unroll 4
     for (std::uint32_t kk = 0; kk < ks; kk += 16) {
       const halo_v16h fw = frag(e, row, k0 + kk);
 #pragma unroll
@@ -3393,14 +3482,14 @@ __device__ void MoeDown(F frag, const float* hp, const std::uint32_t* tiles, con
 
 }  // namespace
 #define HALO_MOE_GROUPED(SUFFIX, L)                                                                                   \
-  extern "C" __global__ void __launch_bounds__(128) halo_moe_gate_up_grouped_##SUFFIX(                               \
+  extern "C" __global__ void __launch_bounds__(256) halo_moe_gate_up_grouped_##SUFFIX(                               \
       const std::uint8_t* gate, const std::uint8_t* up, std::uint64_t expert_bytes, std::uint64_t row_bytes,          \
-      const float* x, const std::uint32_t* sorted, const std::uint32_t* tiles, const std::uint32_t* ntiles,           \
-      float* hp, std::uint32_t ff, std::uint32_t H, std::uint32_t k) {                                                \
+      const _Float16* x, const std::uint32_t* sorted, const std::uint32_t* tiles, const std::uint32_t* ntiles,        \
+      _Float16* hp, std::uint32_t ff, std::uint32_t H, std::uint32_t k) {                                             \
     MoeGateUp<L>(gate, up, expert_bytes, row_bytes, x, sorted, tiles, ntiles, hp, ff, H, k);                          \
   }                                                                                                                   \
-  extern "C" __global__ void __launch_bounds__(128) halo_moe_down_grouped_##SUFFIX(                                  \
-      const std::uint8_t* down, std::uint64_t expert_bytes, std::uint64_t row_bytes, const float* hp,                 \
+  extern "C" __global__ void __launch_bounds__(256) halo_moe_down_grouped_##SUFFIX(                                  \
+      const std::uint8_t* down, std::uint64_t expert_bytes, std::uint64_t row_bytes, const _Float16* hp,              \
       const std::uint32_t* tiles, const std::uint32_t* ntiles, float* yp, std::uint32_t H, std::uint32_t ff) {        \
     MoeDown([=](std::uint32_t e, std::uint32_t row, std::uint32_t k0) {                                               \
       return Frag16<L>::Get(down + e * expert_bytes + row * row_bytes, k0);                                           \
@@ -3416,22 +3505,24 @@ HALO_MOE_GROUPED(f32, LoadF32)
 
 // Down projection over repacked Q8_0 (int8 rows qstride apart, fp16 scales
 // per 32 values; experts rows * qstride and rows * cols / 32 apart).
-extern "C" __global__ void __launch_bounds__(128)
-    halo_moe_down_grouped_q8r(const std::int8_t* qs, const std::uint16_t* d, std::uint32_t qstride, const float* hp,
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_down_grouped_q8r(const std::int8_t* qs, const std::uint16_t* d, std::uint32_t qstride, const _Float16* hp,
                               const std::uint32_t* tiles, const std::uint32_t* ntiles, float* yp, std::uint32_t H,
                               std::uint32_t ff) {
   MoeDown([=](std::uint32_t e, std::uint32_t row, std::uint32_t k0) {
     const std::size_t r = static_cast<std::size_t>(e) * H + row;
-    const float sc = F16(d[r * (ff / 32) + k0 / 32]);
     const int4 q = *reinterpret_cast<const int4*>(qs + r * qstride + k0);
     const std::uint32_t w[4] = {static_cast<std::uint32_t>(q.x), static_cast<std::uint32_t>(q.y),
                                 static_cast<std::uint32_t>(q.z), static_cast<std::uint32_t>(q.w)};
-    halo_v16h v;
-#pragma unroll
-    for (int i = 0; i < 16; ++i)
-      v[i] = static_cast<_Float16>(sc * static_cast<float>(static_cast<std::int8_t>((w[i / 4] >> (8 * (i % 4))) & 0xFF)));
-    return v;
+    return Int8Frag(w, AsH2(d[r * (ff / 32) + k0 / 32]).x);
   }, hp, tiles, ntiles, yp, H, ff);
+}
+
+// fp16 copy of n values (n % 4 == 0) in kMoePerm order, for the grouped
+// gate/up's activation staging. grid (ceil(n / 256))
+extern "C" __global__ void halo_f16_perm_rows(const float* x, _Float16* y, std::uint32_t n) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[MoePerm(i)] = static_cast<_Float16>(x[i]);
 }
 
 // out[t][i] = sum_s w[t][s] * yp[pos[t * k + s]][i], slots in order.

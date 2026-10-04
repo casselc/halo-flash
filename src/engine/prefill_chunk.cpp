@@ -80,6 +80,7 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   k.ntiles = f(1);
   k.hp = f(pairs * c.expert_ff);
   k.yp = f(pairs * H);
+  k.x16 = f(T * H / 2 + 1);
   const std::size_t sub = std::min<std::size_t>(T, kAttnSub);
   k.bscores = f(sub * (max_context_ / c.compress_ratio + 1));
   k.vis = f(sub * AttnVisibleStride());
@@ -91,7 +92,7 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   for (const auto* b : {&k.res, &k.xn, &k.lo, &k.gate, &k.mixed, &k.inject, &k.block_out, &k.embd, &k.xq, &k.xd,
                         &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg, &k.q, &k.gate_a, &k.k, &k.v, &k.ctx,
                         &k.iq, &k.ik, &k.router, &k.ids, &k.wts, &k.eg, &k.eu, &k.ed, &k.sgate, &k.host,
-                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp,
+                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16,
                         &k.bscores, &k.vis, &k.ascores})
     if (!*b) return false;
   k.cap = static_cast<std::uint32_t>(T);
@@ -464,18 +465,20 @@ bool FlashNextGpu::GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std
                 {rt::Arg::Buf(ck_.ids), rt::Arg::Val(pairs), rt::Arg::Val(E), rt::Arg::Buf(ck_.sorted),
                  rt::Arg::Buf(ck_.pos), rt::Arg::Buf(ck_.tiles), rt::Arg::Buf(ck_.ntiles)},
                 error) &&
-         Launch(gu.c_str(), {(ff + 63) / 64, max_tiles}, {128},
+         Launch("halo_f16_perm_rows", {Blocks(std::size_t{T} * H)}, {kBlock},
+                {rt::Arg::Buf(ck_.mixed), rt::Arg::Buf(ck_.x16), rt::Arg::Val(T * H)}, error) &&
+         Launch(gu.c_str(), {(ff + 127) / 128, max_tiles}, {256},
                 {rt::Arg::Buf(tg.buf), rt::Arg::Buf(tu.buf), rt::Arg::Val<std::uint64_t>(gate.RowBytes() * gate.rows),
-                 rt::Arg::Val<std::uint64_t>(gate.RowBytes()), rt::Arg::Buf(ck_.mixed), rt::Arg::Buf(ck_.sorted),
+                 rt::Arg::Val<std::uint64_t>(gate.RowBytes()), rt::Arg::Buf(ck_.x16), rt::Arg::Buf(ck_.sorted),
                  rt::Arg::Buf(ck_.tiles), rt::Arg::Buf(ck_.ntiles), rt::Arg::Buf(ck_.hp), rt::Arg::Val(ff),
                  rt::Arg::Val(H), rt::Arg::Val(used)},
                 error) &&
-         (td.qs ? Launch("halo_moe_down_grouped_q8r", {(H + 63) / 64, max_tiles}, {128},
+         (td.qs ? Launch("halo_moe_down_grouped_q8r", {(H + 127) / 128, max_tiles}, {256},
                          {rt::Arg::Buf(td.qs), rt::Arg::Buf(td.d), rt::Arg::Val(td.qstride), rt::Arg::Buf(ck_.hp),
                           rt::Arg::Buf(ck_.tiles), rt::Arg::Buf(ck_.ntiles), rt::Arg::Buf(ck_.yp), rt::Arg::Val(H),
                           rt::Arg::Val(ff)},
                          error)
-                : Launch(dn.c_str(), {(H + 63) / 64, max_tiles}, {128},
+                : Launch(dn.c_str(), {(H + 127) / 128, max_tiles}, {256},
                          {rt::Arg::Buf(td.buf), rt::Arg::Val<std::uint64_t>(down.RowBytes() * down.rows),
                           rt::Arg::Val<std::uint64_t>(down.RowBytes()), rt::Arg::Buf(ck_.hp), rt::Arg::Buf(ck_.tiles),
                           rt::Arg::Buf(ck_.ntiles), rt::Arg::Buf(ck_.yp), rt::Arg::Val(H), rt::Arg::Val(ff)},

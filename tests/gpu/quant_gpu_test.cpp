@@ -1124,12 +1124,37 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
 // P4 stage B: routed experts of a chunk grouped by expert (bucket, gate/up
 // with SwiGLU, down, weighted combine) against a CPU reference that applies
 // the kernels' fp16 roundings (activations, dequantized weights, the SwiGLU
-// output), so only float summation order differs. Bound fixed in advance:
+// output), so only float summation order differs. K-quant weights are
+// dequantized as the kernels specify: fp16(q * fp16(d * sc) + fp16(-dmin * m)),
+// within about one fp16 ulp of the sub-block offset of the exact value. Bound fixed in advance:
 // |got - want| <= 1e-3 * sum |terms| per output. Also: bucketing is a
 // permutation grouped by expert in pair order, tiles cover each expert's
 // pairs exactly, and the row-wise router top-k equals the single-row kernel.
 TEST(GpuQuant, GroupedExpertsMatchCpuReference) {
   std::string error;
+  // One row of Q4_K / Q5_K the way the grouped kernels dequantize it.
+  const auto kquant_row = [](const std::uint8_t* row, std::size_t cols, bool q5, float* out) {
+    const auto h = [](const std::uint8_t* p) {
+      std::uint16_t b;
+      std::memcpy(&b, p, 2);
+      _Float16 f;
+      std::memcpy(&f, &b, 2);
+      return static_cast<float>(f);
+    };
+    const auto r16 = [](float v) { return static_cast<float>(static_cast<_Float16>(v)); };
+    const std::size_t bb = q5 ? 176 : 144;
+    for (std::size_t c = 0; c < cols; ++c) {
+      const std::uint8_t* b = row + (c / 256) * bb;
+      const std::uint32_t e = c % 256, chunk = e / 64, hi = (e % 64) / 32, l = e % 32, j = 2 * chunk + hi;
+      const std::uint8_t* q = b + 4;
+      const std::uint32_t sc = j < 4 ? q[j] & 63 : (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+      const std::uint32_t m = j < 4 ? q[j + 4] & 63 : (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+      const std::uint8_t qb = b[(q5 ? 48 : 16) + chunk * 32 + l];
+      std::uint32_t v = hi ? qb >> 4 : qb & 0xF;
+      if (q5 && (b[16 + l] & (1u << j))) v += 16;
+      out[c] = r16(static_cast<float>(v) * r16(h(b) * static_cast<float>(sc)) + r16(-h(b + 2) * static_cast<float>(m)));
+    }
+  };
   const auto f16 = [](float v) { return static_cast<float>(static_cast<_Float16>(v)); };
   const auto silu = [](float v) { return v / (1.0f + std::exp(-v)); };
   for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
@@ -1196,9 +1221,13 @@ TEST(GpuQuant, GroupedExpertsMatchCpuReference) {
               rt::Arg::Buf(tb), rt::Arg::Buf(nb)});
       const std::string gk = std::string("halo_moe_gate_up_grouped_") + (q5k ? "q5_k" : "q4_k");
       const std::string dk = std::string("halo_moe_down_grouped_") + (q8_down ? "q8_0" : "q5_1");
-      launch(gk.c_str(), {u32((ff + 63) / 64), u32(max_tiles)}, {128},
+      auto x16 = dev->Alloc(x.size() * 2, &error);
+      ASSERT_TRUE(x16) << error;
+      launch("halo_f16_perm_rows", {u32((x.size() + 255) / 256)}, {256},
+             {rt::Arg::Buf(xb), rt::Arg::Buf(x16), rt::Arg::Val(u32(x.size()))});
+      launch(gk.c_str(), {u32((ff + 127) / 128), u32(max_tiles)}, {256},
              {rt::Arg::Buf(gb), rt::Arg::Buf(ub), rt::Arg::Val<std::uint64_t>(ff * gu_row),
-              rt::Arg::Val<std::uint64_t>(gu_row), rt::Arg::Buf(xb), rt::Arg::Buf(sb), rt::Arg::Buf(tb), rt::Arg::Buf(nb),
+              rt::Arg::Val<std::uint64_t>(gu_row), rt::Arg::Buf(x16), rt::Arg::Buf(sb), rt::Arg::Buf(tb), rt::Arg::Buf(nb),
               rt::Arg::Buf(hb), rt::Arg::Val(u32(ff)), rt::Arg::Val(u32(H)), rt::Arg::Val(u32(used))});
       if (repacked) {
         const std::uint32_t qstride = u32((ff + 15) / 16 * 16);
@@ -1207,14 +1236,14 @@ TEST(GpuQuant, GroupedExpertsMatchCpuReference) {
         launch("halo_repack_q8_0", {4096}, {256},
                {rt::Arg::Buf(db), rt::Arg::Buf(qs), rt::Arg::Buf(dsc), rt::Arg::Val(u32(E * H)), rt::Arg::Val(u32(ff)),
                 rt::Arg::Val(qstride)});
-        launch("halo_moe_down_grouped_q8r", {u32((H + 63) / 64), u32(max_tiles)}, {128},
+        launch("halo_moe_down_grouped_q8r", {u32((H + 127) / 128), u32(max_tiles)}, {256},
                {rt::Arg::Buf(qs), rt::Arg::Buf(dsc), rt::Arg::Val(qstride), rt::Arg::Buf(hb), rt::Arg::Buf(tb),
                 rt::Arg::Buf(nb), rt::Arg::Buf(yb), rt::Arg::Val(u32(H)), rt::Arg::Val(u32(ff))});
         ASSERT_TRUE(dev->Synchronize(&error)) << error;
         dev->Free(qs);
         dev->Free(dsc);
       } else {
-        launch(dk.c_str(), {u32((H + 63) / 64), u32(max_tiles)}, {128},
+        launch(dk.c_str(), {u32((H + 127) / 128), u32(max_tiles)}, {256},
                {rt::Arg::Buf(db), rt::Arg::Val<std::uint64_t>(H * dn_row), rt::Arg::Val<std::uint64_t>(dn_row),
                 rt::Arg::Buf(hb), rt::Arg::Buf(tb), rt::Arg::Buf(nb), rt::Arg::Buf(yb), rt::Arg::Val(u32(H)),
                 rt::Arg::Val(u32(ff))});
@@ -1230,7 +1259,7 @@ TEST(GpuQuant, GroupedExpertsMatchCpuReference) {
                   dev->Download(tb, 0, tiles.data(), tiles.size() * 4, &error) &&
                   dev->Download(nb, 0, ntiles.data(), 4, &error) && dev->Download(ob, 0, out.data(), out.size() * 4, &error))
           << error;
-      for (auto* b : {&gb, &ub, &db, &lb, &xb, &ib, &wb, &i1, &w1, &sb, &pb, &tb, &nb, &hb, &yb, &ob}) dev->Free(*b);
+      for (auto* b : {&gb, &ub, &db, &lb, &xb, &ib, &wb, &i1, &w1, &sb, &pb, &tb, &nb, &hb, &yb, &ob, &x16}) dev->Free(*b);
       ASSERT_EQ(ids, ids1);
       ASSERT_EQ(wts, wts1);
       // Bucketing: sorted is a permutation, grouped by expert, pair order
@@ -1265,13 +1294,13 @@ TEST(GpuQuant, GroupedExpertsMatchCpuReference) {
         for (std::size_t s = 0; s < used; ++s) {
           const std::uint32_t e = ids[t * used + s];
           for (std::size_t j = 0; j < ff; ++j) {
-            model::cpu::DequantizeRow(tg, e, j, wg.data());
-            model::cpu::DequantizeRow(tu, e, j, wu.data());
+            kquant_row(gate.data() + (e * ff + j) * gu_row, H, q5k, wg.data());
+            kquant_row(up.data() + (e * ff + j) * gu_row, H, q5k, wu.data());
             double g = 0, u = 0;
             for (std::size_t c = 0; c < H; ++c) {
               const double xc = f16(x[t * H + c]);
-              g += double(f16(wg[c])) * xc;
-              u += double(f16(wu[c])) * xc;
+              g += double(wg[c]) * xc;
+              u += double(wu[c]) * xc;
             }
             h[j] = f16(silu(static_cast<float>(g)) * static_cast<float>(u));
           }

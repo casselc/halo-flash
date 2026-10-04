@@ -166,7 +166,7 @@ class FlashNextGpu {
     rt::Buffer res, xn, lo, gate, mixed, inject, block_out, embd, xq, xd, host;
     rt::Buffer qkv, conv, z, alpha, beta, gdn, qg, q, gate_a, k, v, ctx, iq, ik;
     rt::Buffer router, ids, wts, eg, eu, ed, sgate;
-    rt::Buffer sorted, pos, tiles, ntiles, hp, yp;  // grouped experts
+    rt::Buffer sorted, pos, tiles, ntiles, hp, yp, x16;  // grouped experts (hp, x16 fp16)
     rt::Buffer bscores, vis, ascores;                // batched attention, kAttnSub tokens at a time
     std::size_t params_offset = 0;  // in `host`: per-token step params after the n-gram rows
     std::uint32_t cap = 0;  // tokens the buffers hold

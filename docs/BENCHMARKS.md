@@ -75,6 +75,34 @@ numbers are noisy.
 | Graph instantiation | 8,000 nodes: ~14 ms on HIP, ~2 ms on HRX |
 | Graph replay per node (trivial kernels) | ~3 µs on HIP, ~5 µs on HRX (loaded machine) |
 
+### gufo on this machine (2026-10-04, idle, same weights)
+
+gufo 8bdde80, its own `model_bench` protocol (C1 only: the bench supports
+one sequence), UD-Q4_K_XL as above.
+
+| Test | gufo |
+|---|---:|
+| pp2048 | **1599.35 ± 2.24 tok/s** |
+| tg128, AR | 26.53 ± 0.21 tok/s |
+| tg128, MTP (after pp512 at 1009.47 tok/s) | 43.00 tok/s |
+
+### Prefill, real model (P4, 2026-10-04, idle, `halo_run --prefill-bench 2048`)
+
+2048 pseudo-random tokens (fixed seed) from a reset engine, median of 3,
+HIP. Stepping a token at a time runs at about 22 tok/s.
+
+| Build | tok/s | Where the time went (profiled) |
+|---|---:|---|
+| Stage A: dense projections as GEMMs, 256-token chunks (40f22de) | 64 | routed experts per token 62%, attention per token 25% |
+| + routed experts grouped by expert, FP16 WMMA, 2048-token chunks | 124 | per-token attention 7.3 s of 16 |
+| + attention batched on FP16 WMMA, online softmax | 223 | 5 layers with repacked Q8_0 down still per token |
+| + grouped down over repacked Q8_0 | 363 | F32 router/alpha/beta/inject row GEMMs 1.1 s |
+| + tiled FP32 GEMM (1db436f) | **407** | int8 GEMMs 1.0 s, grouped experts 1.4 s, DeltaNet 0.43 s |
+
+gufo is at 1599. The dense int8 GEMMs (about 13.5 TFLOP per 2048 tokens)
+run near 13 TOPS and the grouped experts near 5-7 TFLOPS; both have to
+roughly double for parity.
+
 ### Bytes per decoded token at this quant mix
 
 | Part | Size |
