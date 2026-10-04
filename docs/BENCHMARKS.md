@@ -35,6 +35,35 @@ Its agreement column uses the same 5,568 tokens as ours. ds4's Q4 is a
 different quantization from UD-Q4_K_XL, so the comparison is a sanity check,
 not an identity.
 
+### Prefill vs stepping (P4), 2026-10-04
+
+Chunked prefill must score like token-by-token stepping. The P4 prefill
+replaces the decode kernels with FP16 WMMA GEMMs, grouped experts, split
+DeltaNet and batched attention, so its float order differs. Scored with
+`halo_score --prefill 1 --ngram-resident 1`. The stepping runs were resumed
+across three invocations (`--start`); the per-case results are unaffected.
+
+**Long set** (`qwen38-flash-alibaba-long`, 12 cases, prompts of 2K-24K
+tokens, 766 target tokens):
+
+| Mode | Build | NLL | API top-token agreement |
+|---|---|---:|---:|
+| stepping | fa47edf | 0.1227 | 97.26% |
+| prefill, FP16 GEMMs | fa47edf | 0.12268 | 97.13% |
+| prefill, before the FP16 route | 96d4f5a (inferred from the run time) | 0.12270 | 97.39% |
+| prefill, FP16 GEMMs | 0ab257c | 0.12277 | 97.13% |
+
+Paired by case against stepping:
+- FP16 prefill at fa47edf: +0.0000 ± 0.0010 per case (standard error),
+  4 cases up and 7 down, largest |difference| 0.0065.
+- The earlier prefill: +0.0000 ± 0.0015, 7 up and 5 down.
+
+No shift, at any prompt length up to 24K.
+
+**Short set**, prefill at 0ab257c: NLL 0.285929, agreement 92.67% over 98
+cases. The gate (NLL ≤ 0.305, ≥ 91%) passes, and this matches the stepping
+builds above (0.2859-0.2864).
+
 ### Greedy identity with gufo
 
 `halo_run --device hip` against `gufo prompt --raw -t 0 --speculative off`
