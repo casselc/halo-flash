@@ -312,13 +312,17 @@ HttpResponse HttpServer::Dispatch(const HttpRequest& req) {
   bool other_method = false;
   if (!handler) {
     for (const auto& [key, h] : routes_) other_method |= key.second == req.path;
+    // The longest matching prefix registered for this method; a path that
+    // only other methods' prefixes match is a 405.
+    std::size_t best = 0;
     for (const auto& [key, h] : prefix_routes_) {
-      if (!req.path.starts_with(key.second) || other_method) continue;
-      if (key.first == req.method) {
+      if (!req.path.starts_with(key.second)) continue;
+      if (key.first != req.method) {
+        other_method = true;
+      } else if (!handler || key.second.size() > best) {
         handler = &h;
-        break;
+        best = key.second.size();
       }
-      other_method = true;
     }
   }
   if (!handler)

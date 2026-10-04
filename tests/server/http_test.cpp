@@ -224,6 +224,9 @@ struct TestServer {
     server.Route("GET", "/ping", [](const HttpRequest&) { return HttpResponse::Json(200, R"({"ok": true})"); });
     server.Route("POST", "/echo", [](const HttpRequest& r) { return HttpResponse::Json(200, r.body); });
     server.Route("GET", "/throw", [](const HttpRequest&) -> HttpResponse { throw std::runtime_error("boom"); });
+    server.RoutePrefix("POST", "/p/", [](const HttpRequest&) { return HttpResponse::Json(200, "post"); });
+    server.RoutePrefix("GET", "/p/", [](const HttpRequest&) { return HttpResponse::Json(200, "shallow"); });
+    server.RoutePrefix("GET", "/p/deep/", [](const HttpRequest&) { return HttpResponse::Json(200, "deep"); });
     server.Route("GET", "/sse", [this](const HttpRequest& r) {
       const int n = r.query.empty() ? 5 : std::stoi(r.query);
       return HttpResponse::EventStream([this, n](const BodyWriter& w) {
@@ -268,6 +271,11 @@ TEST(Http, ServesKeepAliveStreamsAndErrors) {
   EXPECT_EQ(r.body, "data: 0\n\ndata: 1\n\ndata: 2\n\ndata: [DONE]\n\n");
   ::close(fd);
   EXPECT_EQ(Call(port, "GET /nope HTTP/1.1\r\n\r\n").status, 404);
+  // Prefix routes: the longest prefix for the method; other methods only: 405.
+  EXPECT_EQ(Call(port, "GET /p/deep/x HTTP/1.1\r\n\r\n").body, "deep");
+  EXPECT_EQ(Call(port, "GET /p/x HTTP/1.1\r\n\r\n").body, "shallow");
+  EXPECT_EQ(Call(port, "POST /p/x HTTP/1.1\r\nContent-Length: 0\r\n\r\n").body, "post");
+  EXPECT_EQ(Call(port, "DELETE /p/x HTTP/1.1\r\n\r\n").status, 405);
   EXPECT_EQ(Call(port, "POST /ping HTTP/1.1\r\nContent-Length: 0\r\n\r\n").status, 405);
   EXPECT_EQ(Call(port, "GET /throw HTTP/1.1\r\n\r\n").status, 500);
   EXPECT_EQ(Call(port, "GET / HTTP/3.0\r\n\r\n").status, 505);

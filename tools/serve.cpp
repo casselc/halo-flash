@@ -6,6 +6,7 @@
 // generation as a GENERATION observation in DIR/chdb and keeps stored
 // /v1/responses in DIR/metadata.sqlite, so they survive restarts; harnesses
 // annotate traces through POST /v1/scope/... (scope/http_annotations.hpp)
+// and read them back with GET /v1/scope/traces[/{id}] (scope/trace_reader.hpp)
 // [--scope-project NAME] [--scope-capture off|digest|full] [--scope-wal PATH].
 // --decider-dir serves POST /v1/systemone with strands-decider-2B (the
 // directory holds Qwen3.5-2B-Base-BF16.gguf and the strands-decider-*.gguf
@@ -37,7 +38,9 @@
 #include "halo_scope.h"
 #include "scope/c_api.hpp"
 #include "scope/generation_observer.hpp"
+#include "scope/chdb.hpp"
 #include "scope/http_annotations.hpp"
+#include "scope/trace_reader.hpp"
 #include "scope/metadata.hpp"
 #include "scope/response_store.hpp"
 #endif
@@ -115,6 +118,7 @@ int main(int argc, char** argv) {
   std::unique_ptr<scope::GenerationObserver> observed;
   std::unique_ptr<scope::MetadataStore> metadata;
   std::unique_ptr<scope::SqliteResponseStore> responses;
+  std::unique_ptr<scope::TraceReader> traces;
   if (!scope_dir.empty()) {
     const auto capture = scope_capture == "off"    ? HALO_SCOPE_CAPTURE_OFF
                          : scope_capture == "full" ? HALO_SCOPE_CAPTURE_FULL
@@ -130,6 +134,10 @@ int main(int argc, char** argv) {
     if (!scope) return std::fprintf(stderr, "halo-scope: %s\n", err), 1;
     observed = std::make_unique<scope::GenerationObserver>(scope::AnnotatorOf(scope));
     observers.Add(observed.get());
+    const scope::ChdbLib* lib = scope::ChdbLib::Load("", &error);
+    auto reader_conn = lib ? scope::Conn::Open(*lib, scope_dir + "/chdb", &error) : nullptr;
+    if (!reader_conn) return std::fprintf(stderr, "halo-scope reader: %s\n", error.c_str()), 1;
+    traces = std::make_unique<scope::TraceReader>(std::move(reader_conn), scope_project);
   }
 #else
   if (!scope_dir.empty()) return std::fprintf(stderr, "--scope-dir needs a build with HALO_SCOPE=ON\n"), 2;
@@ -139,7 +147,10 @@ int main(int argc, char** argv) {
   service.Register(http);
   metrics.Register(http);
 #if HALO_WITH_SCOPE
-  if (scope) scope::RegisterAnnotationRoutes(http, scope::AnnotatorOf(scope));  // harnesses in other processes
+  if (scope) {
+    scope::RegisterAnnotationRoutes(http, scope::AnnotatorOf(scope));  // harnesses in other processes
+    traces->Register(http);                                            // GET /v1/scope/traces[/{id}]
+  }
 #endif
   std::unique_ptr<StrandsEngine> decider;
   if (!decider_dir.empty()) {

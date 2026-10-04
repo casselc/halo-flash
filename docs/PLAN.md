@@ -721,7 +721,11 @@ exactly the rows written), concurrent threads under TSan, and a chDB round
 trip. The same API is served over HTTP for harnesses in other processes
 (`POST /v1/scope/steps`, `.../steps/{id}/end`, `/v1/scope/tool_results`,
 `/v1/scope/scores`, `.../scores/{id}/retract`, `/v1/scope/traces/{id}/meta`;
-429 when a ring is full), by `halo_serve --scope-dir`.
+429 when a ring is full), by `halo_serve --scope-dir`. The read side is
+`GET /v1/scope/traces[?session_id=&limit=]` and `GET /v1/scope/traces/{id}`
+(observations, live scores, merged context); on the real model a tool-calling
+chat in a harness trace, the harness's tool result and score came back as
+one trace. Search (the query language) and the UI are next.
 The server's own generations are recorded too (`halo_serve --scope-dir`,
 in builds with HALO_SCOPE=ON): one GENERATION observation per request with
 usage and cache reads, time to first text, per-piece latency percentiles,

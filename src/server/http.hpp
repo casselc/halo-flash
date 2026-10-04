@@ -107,7 +107,8 @@ class HttpServer {
 
   /// Exact-path routes; register before Start().
   void Route(std::string method, std::string path, HttpHandler handler);
-  /// Paths starting with `prefix` that match no exact route.
+  /// Paths starting with `prefix` that match no exact route (the longest
+  /// matching prefix for the request's method wins).
   void RoutePrefix(std::string method, std::string prefix, HttpHandler handler);
   /// Binds, listens and starts the accept thread.
   [[nodiscard]] bool Start(std::string* error);
