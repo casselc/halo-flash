@@ -2355,3 +2355,250 @@ extern "C" __global__ void __launch_bounds__(128)
   const float zv = z[h * d + j];
   out[h * d + j] = o * scale * norm_w[j] * (mode == 0 ? Silu(zv) : Sigmoid(zv));
 }
+
+// ---- P4: prefill GEMMs on RDNA3 WMMA ------------------------------------------
+//
+// gfx11 wave32 WMMA, 16x16x16 int8 -> int32. Operand layout (checked by
+// GpuKernels.WmmaInt8LayoutProbe): lane l holds row (l % 16) of A and row
+// (l % 16) of B (B given N-major, i.e. one token's K values per lane), 16
+// int8 each, with lanes 16..31 repeating lanes 0..15; result element j of
+// lane l is C[2j + l / 16][l % 16].
+
+typedef int halo_v4i __attribute__((ext_vector_type(4)));
+typedef int halo_v8i __attribute__((ext_vector_type(8)));
+
+extern "C" __global__ void halo_wmma_probe_i8(const std::int8_t* a, const std::int8_t* b, int* c) {
+  const std::uint32_t lane = threadIdx.x % 32;
+  const halo_v4i av = *reinterpret_cast<const halo_v4i*>(a + (lane % 16) * 16);
+  const halo_v4i bv = *reinterpret_cast<const halo_v4i*>(b + (lane % 16) * 16);
+  halo_v8i acc = {};
+  acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, av, true, bv, acc, false);
+  for (int j = 0; j < 8; ++j) c[(2 * j + lane / 16) * 16 + lane % 16] = acc[j];
+}
+
+// Activations for the int8 GEMMs: per token row, one scale per 32 values
+// (amax / 127, round to nearest), as the decode int8 path quantizes them.
+//   grid (T), block 256; x [T][cols] -> xq [T][cols], xd [T][cols / 32]
+extern "C" __global__ void __launch_bounds__(256)
+    halo_quantize_q8_rows(const float* x, std::int8_t* xq, float* xd, std::uint32_t cols) {
+  const std::size_t t = blockIdx.x;
+  const std::uint32_t lane = threadIdx.x % kWarp;
+  for (std::uint32_t blk = threadIdx.x / kWarp; blk < cols / 32; blk += blockDim.x / kWarp) {
+    const float v = x[t * cols + blk * 32 + lane];
+    float amax = fabsf(v);
+    for (int o = kWarp / 2; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o, kWarp));
+    const float scale = amax / 127.0f;
+    xq[t * cols + blk * 32 + lane] = static_cast<std::int8_t>(scale > 0.0f ? static_cast<int>(rintf(v / scale)) : 0);
+    if (lane == 0) xd[t * (cols / 32) + blk] = scale;
+  }
+}
+
+// y[t][r] = sum_c W[r][c] x[t][c] for repacked Q8_0 W (int8 rows, fp16 scale
+// per 32) and quantized x (halo_quantize_q8_rows). A wave computes 16 rows x
+// 64 tokens; a block of 4 waves 64 rows. Grid (ceil(T / 64), ceil(rows / 64)):
+// token tiles vary fastest, so neighbouring blocks share weight rows in L2.
+// Requires cols % 32 == 0 and 16-byte aligned rows (qstride % 16 == 0).
+extern "C" __global__ void __launch_bounds__(128)
+    halo_gemm_q8r_wmma(const std::int8_t* qs, const std::uint16_t* d, const std::int8_t* xq, const float* xd, float* y,
+                       std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
+  constexpr int kSub = 4;  // 16-token subtiles per wave
+  const std::uint32_t lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+  const std::uint32_t r0 = (blockIdx.y * 4 + wave) * 16, t0 = blockIdx.x * 64;
+  if (r0 >= rows) return;
+  const std::uint32_t nblk = cols / 32;
+  const std::uint32_t my_row = min(r0 + lane % 16, rows - 1);
+  const std::int8_t* wrow = qs + static_cast<std::size_t>(my_row) * qstride;
+  std::uint32_t tok[kSub];
+#pragma unroll
+  for (int s = 0; s < kSub; ++s) tok[s] = min(t0 + 16 * s + lane % 16, tokens - 1);
+  float acc[kSub][8] = {};
+  for (std::uint32_t b = 0; b < nblk; ++b) {
+    const halo_v4i a0 = *reinterpret_cast<const halo_v4i*>(wrow + b * 32);
+    const halo_v4i a1 = *reinterpret_cast<const halo_v4i*>(wrow + b * 32 + 16);
+    // Row scales of this block for the 8 result rows this lane holds.
+    const float dw_mine = F16(d[static_cast<std::size_t>(my_row) * nblk + b]);
+    float dw[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) dw[j] = __shfl(dw_mine, 2 * j + lane / 16, 32);
+#pragma unroll
+    for (int s = 0; s < kSub; ++s) {
+      const std::int8_t* xrow = xq + static_cast<std::size_t>(tok[s]) * cols + b * 32;
+      const halo_v4i b0 = *reinterpret_cast<const halo_v4i*>(xrow);
+      const halo_v4i b1 = *reinterpret_cast<const halo_v4i*>(xrow + 16);
+      halo_v8i c = {};
+      c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, c, false);
+      c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, c, false);
+      const float dx = xd[static_cast<std::size_t>(tok[s]) * nblk + b];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[s][j] += static_cast<float>(c[j]) * (dw[j] * dx);
+    }
+  }
+#pragma unroll
+  for (int s = 0; s < kSub; ++s) {
+    const std::uint32_t t = t0 + 16 * s + lane % 16;
+    if (t >= tokens) continue;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const std::uint32_t r = r0 + 2 * j + lane / 16;
+      if (r < rows) y[static_cast<std::size_t>(t) * rows + r] = acc[s][j];
+    }
+  }
+}
+
+// FP16 WMMA, 16x16x16 -> fp32 (layout checked by GpuKernels.WmmaF16LayoutProbe):
+// lane l holds 16 halves of row (l % 16) of A and of B (N-major), lanes
+// 16..31 repeating 0..15; result element j of lane l is C[2j + l / 16][l % 16].
+typedef _Float16 halo_v16h __attribute__((ext_vector_type(16)));
+typedef float halo_v8f __attribute__((ext_vector_type(8)));
+
+extern "C" __global__ void halo_wmma_probe_f16(const _Float16* a, const _Float16* b, float* c) {
+  const std::uint32_t lane = threadIdx.x % 32;
+  const halo_v16h av = *reinterpret_cast<const halo_v16h*>(a + (lane % 16) * 16);
+  const halo_v16h bv = *reinterpret_cast<const halo_v16h*>(b + (lane % 16) * 16);
+  halo_v8f acc = {};
+  acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(av, bv, acc);
+  for (int j = 0; j < 8; ++j) c[(2 * j + lane / 16) * 16 + lane % 16] = acc[j];
+}
+
+// Peak probe: `iters` rounds of 4 independent int8 (or fp16) WMMAs on
+// registers per wave; no memory traffic except one store.
+extern "C" __global__ void __launch_bounds__(256) halo_wmma_peak(int* out, std::uint32_t iters, std::uint32_t fp16) {
+  const std::uint32_t lane = threadIdx.x % 32;
+  if (fp16) {
+    halo_v16h a = {}, b = {};
+    for (int i = 0; i < 16; ++i) {
+      a[i] = static_cast<_Float16>(static_cast<float>((lane + i) % 7) * 0.01f);
+      b[i] = static_cast<_Float16>(static_cast<float>((lane * 3 + i) % 5) * 0.01f);
+    }
+    halo_v8f c0 = {}, c1 = {}, c2 = {}, c3 = {};
+    for (std::uint32_t it = 0; it < iters; ++it) {
+      c0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c0);
+      c1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b, a, c1);
+      c2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, a, c2);
+      c3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b, b, c3);
+    }
+    if (c0[0] + c1[1] + c2[2] + c3[3] == 12345.0f) out[0] = 1;
+  } else {
+    halo_v4i a = {static_cast<int>(lane), 3, 5, 7}, b = {1, static_cast<int>(lane), 2, 9};
+    halo_v8i c0 = {}, c1 = {}, c2 = {}, c3 = {};
+    for (std::uint32_t it = 0; it < iters; ++it) {
+      c0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c0, false);
+      c1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, b, true, a, c1, false);
+      c2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, a, c2, false);
+      c3 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, b, true, b, c3, false);
+    }
+    if (c0[0] + c1[1] + c2[2] + c3[3] == 12345) out[0] = 1;
+  }
+}
+
+// The production prefill GEMM: the block tile staged in LDS (rows padded
+// against bank conflicts, double-buffered over 32-value K blocks), WI x WK
+// WMMA tiles per wave (each fragment feeds WI or WK WMMAs, independent ones
+// issued back to back), GR x GT waves per block. Scales are staged as floats,
+// row scales de-interleaved so a lane's 8 rows (2j + lane / 16) are 8
+// consecutive floats. Measured (docs/BENCHMARKS.md): ~20 TOPS of the 56
+// TOPS int8 WMMA peak at 4 x 2 tiles and 2 x 4 waves; skipping the scale
+// epilogue entirely reaches only ~23, so staging, not math, is the limit.
+template <int WI, int WK, int GR, int GT>
+__device__ void GemmQ8rWmma(const std::int8_t* qs, const std::uint16_t* d, const std::int8_t* xq, const float* xd,
+                            float* y, std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride,
+                            std::uint32_t tokens) {
+  // Block tile BR x BT; wave (wr, wt) owns WI x WK 16 x 16 tiles.
+  constexpr std::uint32_t BR = 16 * WI * GR, BT = 16 * WK * GT, NT = 32 * GR * GT;
+  // Rows padded to 48 bytes: 16-byte reads by lanes at a 32-byte stride hit
+  // the same banks 4 ways; at 48 they spread over all 32.
+  constexpr std::uint32_t RS = 48;
+  __shared__ __attribute__((aligned(16))) std::int8_t As[2][BR * RS];
+  __shared__ __attribute__((aligned(16))) std::int8_t Bs[2][BT * RS];
+  __shared__ __attribute__((aligned(16))) float Ds[2][BR];
+  __shared__ float Xs[2][BT];
+  const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const std::uint32_t r0 = blockIdx.y * BR, t0 = blockIdx.x * BT;
+  const std::uint32_t nblk = cols / 32;
+  const std::uint32_t wr = wave % GR, wt = wave / GR;
+  // Staging: 16-byte halves of A rows, B rows, row scales and token scales,
+  // spread over the block's threads.
+  const auto stage = [&](std::uint32_t b, std::uint32_t p) {
+    for (std::uint32_t i = tid; i < BR * 2; i += NT) {
+      const std::uint32_t row = i / 2, half = i % 2;
+      *reinterpret_cast<halo_v4i*>(&As[p][row * RS + half * 16]) = *reinterpret_cast<const halo_v4i*>(
+          qs + static_cast<std::size_t>(min(r0 + row, rows - 1)) * qstride + b * 32 + half * 16);
+    }
+    for (std::uint32_t i = tid; i < BT * 2; i += NT) {
+      const std::uint32_t tok = i / 2, half = i % 2;
+      *reinterpret_cast<halo_v4i*>(&Bs[p][tok * RS + half * 16]) = *reinterpret_cast<const halo_v4i*>(
+          xq + static_cast<std::size_t>(min(t0 + tok, tokens - 1)) * cols + b * 32 + half * 16);
+    }
+    for (std::uint32_t row = tid; row < BR; row += NT)
+      Ds[p][(row / 16) * 16 + (row % 2) * 8 + (row % 16) / 2] = F16(d[static_cast<std::size_t>(min(r0 + row, rows - 1)) * nblk + b]);
+    for (std::uint32_t tok = tid; tok < BT; tok += NT) Xs[p][tok] = xd[static_cast<std::size_t>(min(t0 + tok, tokens - 1)) * nblk + b];
+  };
+  float acc[WI][WK][8] = {};
+  stage(0, 0);
+  __syncthreads();
+  for (std::uint32_t b = 0; b < nblk; ++b) {
+    const std::uint32_t p = b & 1;
+    if (b + 1 < nblk) stage(b + 1, p ^ 1);
+    halo_v4i a[WI][2], bv[WK][2];
+#pragma unroll
+    for (int i = 0; i < WI; ++i) {
+      const std::uint32_t ar = (wr * 16 * WI + i * 16 + lane % 16) * RS;
+      a[i][0] = *reinterpret_cast<const halo_v4i*>(&As[p][ar]);
+      a[i][1] = *reinterpret_cast<const halo_v4i*>(&As[p][ar + 16]);
+    }
+#pragma unroll
+    for (int k = 0; k < WK; ++k) {
+      const std::uint32_t bt = (wt * 16 * WK + k * 16 + lane % 16) * RS;
+      bv[k][0] = *reinterpret_cast<const halo_v4i*>(&Bs[p][bt]);
+      bv[k][1] = *reinterpret_cast<const halo_v4i*>(&Bs[p][bt + 16]);
+    }
+    // Four independent WMMAs per K half, so the second half does not wait
+    // on a result still in flight.
+    halo_v8i c[WI][WK];
+#pragma unroll
+    for (int i = 0; i < WI; ++i)
+#pragma unroll
+      for (int k = 0; k < WK; ++k)
+        c[i][k] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a[i][0], true, bv[k][0], halo_v8i{}, false);
+#pragma unroll
+    for (int i = 0; i < WI; ++i)
+#pragma unroll
+      for (int k = 0; k < WK; ++k)
+        c[i][k] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a[i][1], true, bv[k][1], c[i][k], false);
+#pragma unroll
+    for (int i = 0; i < WI; ++i) {
+      const float* dsp = &Ds[p][(wr * 16 * WI + i * 16) + (lane / 16) * 8];
+      float dw[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) dw[j] = dsp[j];
+#pragma unroll
+      for (int k = 0; k < WK; ++k) {
+        const float dx = Xs[p][wt * 16 * WK + k * 16 + lane % 16];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[i][k][j] += static_cast<float>(c[i][k][j]) * (dw[j] * dx);
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < WI; ++i)
+#pragma unroll
+    for (int k = 0; k < WK; ++k) {
+      const std::uint32_t t = t0 + wt * 16 * WK + k * 16 + lane % 16;
+      if (t >= tokens) continue;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint32_t r = r0 + wr * 16 * WI + i * 16 + 2 * j + lane / 16;
+        if (r < rows) y[static_cast<std::size_t>(t) * rows + r] = acc[i][k][j];
+      }
+    }
+}
+
+
+// 128 x 128 per block, 64 x 32 per wave.
+//   grid (ceil(T / 128), ceil(rows / 128)), block 256
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_q8r_wmma_t(const std::int8_t* qs, const std::uint16_t* d, const std::int8_t* xq, const float* xd,
+                         float* y, std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
+  GemmQ8rWmma<4, 2, 2, 4>(qs, d, xq, xd, y, rows, cols, qstride, tokens);
+}

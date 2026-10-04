@@ -1115,8 +1115,8 @@ why = "each stream is normalized by its own RMS"
 [[mutant]]
 name = "q8act-truncate"
 file = "src/kernels/core.hip"
-find = 'static_cast<int>(rintf(v / scale))'
-replace = 'static_cast<int>(truncf(v / scale))'
+find = 'const int qv = scale > 0.0f ? static_cast<int>(rintf(v / scale)) : 0;'
+replace = 'const int qv = scale > 0.0f ? static_cast<int>(truncf(v / scale)) : 0;'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGpu.SmallQuantizedModelRunsFastPathsAndMatchesReference"
@@ -1131,3 +1131,25 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGpu.SmallQuantizedModelRunsFastPathsAndMatchesReference"
 why = "the Q4_K min term covers both sub-blocks of an item"
+
+# ---- P4 prefill GEMM (int8 WMMA) -----------------------------------------
+
+[[mutant]]
+name = "gemm-row-scale-layout"
+file = "src/kernels/core.hip"
+find = '      Ds[p][(row / 16) * 16 + (row % 2) * 8 + (row % 16) / 2] = F16('
+replace = '      Ds[p][(row / 16) * 16 + (row % 16)] = F16('
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.WmmaQ8GemmMatchesQuantizedReference"
+why = "a lane's WMMA result rows are 2j + lane / 16; the staged row scales must be de-interleaved to match"
+
+[[mutant]]
+name = "prefill-q8act-truncate"
+file = "src/kernels/core.hip"
+find = 'xq[t * cols + blk * 32 + lane] = static_cast<std::int8_t>(scale > 0.0f ? static_cast<int>(rintf(v / scale)) : 0);'
+replace = 'xq[t * cols + blk * 32 + lane] = static_cast<std::int8_t>(scale > 0.0f ? static_cast<int>(truncf(v / scale)) : 0);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.WmmaQ8GemmMatchesQuantizedReference"
+why = "prefill activations round to nearest, as the reference and the decode path do"

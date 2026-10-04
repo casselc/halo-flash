@@ -85,3 +85,28 @@ numbers are noisy.
 
 At the P0 read ceiling of 241 GB/s, that is about 26 ms per token, a decode
 roofline of about 38 tok/s at this mix.
+
+### Prefill GEMM (P4 kernel, 2026-10-04, idle machine, `halo_gemm_bench`)
+
+Int8 WMMA over repacked Q8_0 weights, activations quantized per token and 32
+values (`halo_quantize_q8_rows` + `halo_gemm_q8r_wmma_t`), timed together.
+The register-only WMMA ceiling (`halo_gemm_bench peak`) is **56 TOPS int8,
+51.5 TOPS fp16** on this gfx1151.
+
+| Shape (rows x cols) | T = 64 | T = 512 | T = 2048 |
+|---|---:|---:|---:|
+| 10240 x 2560 (DeltaNet qkv) | 9.5 TOPS | 20.8 TOPS (397k tok/s) | 18.1 TOPS |
+| 2560 x 6144 (DeltaNet out) | 6.8 | 13.1 | 12.6 |
+| 320 x 10240 (mixer down) | 1.5 | 8.3 | 8.0 |
+
+HRX within a few percent of HIP. About 36% of the int8 peak on the large
+shape; gufo's dense projections reach about 55%. What was tried:
+- per-wave tiles 32 x 32 to 64 x 32, two K blocks per stage, register
+  prefetch of the next stage, LDS row padding, interleaved WMMAs: each
+  within +-10%;
+- FP16 WMMA with weights dequantized while staging (no per-block scale
+  epilogue): 13 TOPS, slower;
+- the int8 kernel with the scale epilogue removed entirely (wrong results,
+  as a probe): 23 TOPS. The limit is staging (global to LDS and barriers),
+  not the math; the next step is a deeper pipeline or direct-to-register
+  operand loads.

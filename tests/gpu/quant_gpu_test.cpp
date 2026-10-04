@@ -876,3 +876,144 @@ TEST(GpuKernels, FusedDeltaNetPiecesMatchKernelSequences) {
     }, {.test_cases = 60});
   }
 }
+
+// The WMMA operand and result layout the P4 GEMMs assume (see core.hip):
+// C = A * B^T for 16x16 int8 A (M x K) and B (N x K).
+TEST(GpuKernels, WmmaInt8LayoutProbe) {
+  std::string error;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &error);
+  if (!dev) GTEST_SKIP() << error;
+  ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+  std::vector<std::int8_t> a(256), b(256);
+  for (int i = 0; i < 256; ++i) {
+    a[i] = static_cast<std::int8_t>((i * 37 + 11) % 255 - 127);
+    b[i] = static_cast<std::int8_t>((i * 91 + 5) % 255 - 127);
+  }
+  auto ab = dev->Alloc(256, &error), bb = dev->Alloc(256, &error), cb = dev->Alloc(1024, &error);
+  ASSERT_TRUE(dev->Upload(ab, 0, a.data(), 256, &error) && dev->Upload(bb, 0, b.data(), 256, &error));
+  const rt::Arg args[] = {rt::Arg::Buf(ab), rt::Arg::Buf(bb), rt::Arg::Buf(cb)};
+  ASSERT_TRUE(dev->Launch(dev->Kernel("halo_wmma_probe_i8", &error), {1}, {32}, args, &error)) << error;
+  std::vector<int> c(256);
+  ASSERT_TRUE(dev->Download(cb, 0, c.data(), 1024, &error)) << error;
+  for (int m = 0; m < 16; ++m)
+    for (int n = 0; n < 16; ++n) {
+      int want = 0;
+      for (int k = 0; k < 16; ++k) want += a[m * 16 + k] * b[n * 16 + k];
+      ASSERT_EQ(c[m * 16 + n], want) << "C[" << m << "][" << n << "]";
+    }
+  for (auto* x : {&ab, &bb, &cb}) dev->Free(*x);
+}
+
+// P4 prefill GEMM: int8 WMMA over repacked Q8_0 with activations quantized
+// per token and 32 values. Reference: the same quantization on the CPU, the
+// integer block sums exact, scales applied in float; ragged shapes (rows and
+// tokens not multiples of the 16 x 64 wave tile).
+TEST(GpuKernels, WmmaQ8GemmMatchesQuantizedReference) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      const std::uint32_t cols = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 96}));
+      const std::uint32_t rows = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 300}));
+      const std::uint32_t T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 300}));
+      const std::size_t row_bytes = cols / 32 * 34;
+      std::vector<std::uint8_t> w(rows * row_bytes);
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      for (auto& b : w) { seed = seed * 1664525u + 1013904223u; b = static_cast<std::uint8_t>(seed >> 24); }
+      for (std::size_t r = 0; r < rows; ++r)
+        for (std::size_t b = 0; b < cols / 32; ++b) {
+          const auto h = FiniteHalf(tc);
+          std::memcpy(w.data() + r * row_bytes + b * 34, &h, 2);
+        }
+      std::vector<float> x(static_cast<std::size_t>(T) * cols);
+      const float amp = tc.draw(gs::sampled_from(std::vector<float>{1e-3f, 1.0f, 50.0f}));
+      for (std::size_t i = 0; i < x.size(); ++i)
+        x[i] = amp * std::sin(static_cast<float>(i) * 0.37f + static_cast<float>(seed % 13)) * static_cast<float>(1 + i / 32 % 5);
+      if (tc.draw(gs::booleans())) std::fill(x.begin(), x.begin() + std::min<std::size_t>(32, x.size()), 0.0f);  // a zero block
+      auto wb = dev->Alloc(w.size(), &error), qs = dev->Alloc(static_cast<std::size_t>(rows) * cols, &error),
+           db = dev->Alloc(static_cast<std::size_t>(rows) * cols / 16, &error), xb = dev->Alloc(x.size() * 4, &error),
+           xq = dev->Alloc(x.size(), &error), xd = dev->Alloc(x.size() / 8, &error),
+           yb = dev->Alloc(static_cast<std::size_t>(T) * rows * 4, &error);
+      ASSERT_TRUE(dev->Upload(wb, 0, w.data(), w.size(), &error) && dev->Upload(xb, 0, x.data(), x.size() * 4, &error))
+          << error;
+      const rt::Arg ra[] = {rt::Arg::Buf(wb), rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                            rt::Arg::Val(cols)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_repack_q8_0", &error), {4096}, {256}, ra, &error)) << error;
+      const rt::Arg qa[] = {rt::Arg::Buf(xb), rt::Arg::Buf(xq), rt::Arg::Buf(xd), rt::Arg::Val(cols)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_quantize_q8_rows", &error), {T}, {256}, qa, &error)) << error;
+      const rt::Arg ga[] = {rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Buf(xq), rt::Arg::Buf(xd), rt::Arg::Buf(yb),
+                            rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(cols), rt::Arg::Val(T)};
+      // The simple kernel or the tiled production kernel.
+      const bool v2 = tc.draw(gs::booleans());
+      if (v2)
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemm_q8r_wmma_t", &error), {(T + 127) / 128, (rows + 127) / 128},
+                                {256}, ga, &error))
+            << error;
+      else
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemm_q8r_wmma", &error), {(T + 63) / 64, (rows + 63) / 64}, {128}, ga,
+                                &error))
+            << error;
+      std::vector<float> y(static_cast<std::size_t>(T) * rows);
+      ASSERT_TRUE(dev->Download(yb, 0, y.data(), y.size() * 4, &error)) << error;
+      for (auto* b : {&wb, &qs, &db, &xb, &xq, &xd, &yb}) dev->Free(*b);
+      const std::size_t nblk = cols / 32;
+      for (std::uint32_t t = 0; t < T; ++t) {
+        std::vector<int> q(cols);
+        std::vector<float> sx(nblk);
+        for (std::size_t b = 0; b < nblk; ++b) {
+          float amax = 0;
+          for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[t * cols + b * 32 + i]));
+          sx[b] = amax / 127.0f;
+          for (int i = 0; i < 32; ++i)
+            q[b * 32 + i] = sx[b] > 0 ? static_cast<int>(std::nearbyint(x[t * cols + b * 32 + i] / sx[b])) : 0;
+        }
+        for (std::uint32_t r = 0; r < rows; ++r) {
+          double want = 0, mag = 0;
+          for (std::size_t b = 0; b < nblk; ++b) {
+            const std::uint8_t* blk = w.data() + r * row_bytes + b * 34;
+            std::uint16_t hb;
+            std::memcpy(&hb, blk, 2);
+            const double dw = static_cast<double>(static_cast<float>(*reinterpret_cast<_Float16*>(&hb)));
+            long dot = 0;
+            for (int i = 0; i < 32; ++i) dot += static_cast<long>(static_cast<std::int8_t>(blk[2 + i])) * q[b * 32 + i];
+            want += dw * sx[b] * static_cast<double>(dot);
+            mag += std::fabs(dw * sx[b]) * 127.0 * 127.0 * 32.0;
+          }
+          ASSERT_NEAR(y[static_cast<std::size_t>(t) * rows + r], want, 1e-5 * mag + 1e-30)
+              << rt::BackendName(backend) << (v2 ? " tiled" : " simple") << " t " << t << " r " << r << " rows " << rows
+              << " cols " << cols << " T " << T;
+        }
+      }
+    }, {.test_cases = 80});
+  }
+}
+
+TEST(GpuKernels, WmmaF16LayoutProbe) {
+  std::string error;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &error);
+  if (!dev) GTEST_SKIP() << error;
+  ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+  std::vector<_Float16> a(256), b(256);
+  for (int i = 0; i < 256; ++i) {
+    a[i] = static_cast<_Float16>(static_cast<float>((i * 37 + 11) % 61 - 30) / 8.0f);
+    b[i] = static_cast<_Float16>(static_cast<float>((i * 91 + 5) % 53 - 26) / 4.0f);
+  }
+  auto ab = dev->Alloc(512, &error), bb = dev->Alloc(512, &error), cb = dev->Alloc(1024, &error);
+  ASSERT_TRUE(dev->Upload(ab, 0, a.data(), 512, &error) && dev->Upload(bb, 0, b.data(), 512, &error));
+  const rt::Arg args[] = {rt::Arg::Buf(ab), rt::Arg::Buf(bb), rt::Arg::Buf(cb)};
+  ASSERT_TRUE(dev->Launch(dev->Kernel("halo_wmma_probe_f16", &error), {1}, {32}, args, &error)) << error;
+  std::vector<float> c(256);
+  ASSERT_TRUE(dev->Download(cb, 0, c.data(), 1024, &error)) << error;
+  for (int m = 0; m < 16; ++m)
+    for (int n = 0; n < 16; ++n) {
+      float want = 0, mag = 0;  // WMMA rounds its internal sums: compare to 1e-6 of the magnitude
+      for (int k = 0; k < 16; ++k) {
+        want += static_cast<float>(a[m * 16 + k]) * static_cast<float>(b[n * 16 + k]);
+        mag += std::fabs(static_cast<float>(a[m * 16 + k]) * static_cast<float>(b[n * 16 + k]));
+      }
+      ASSERT_NEAR(c[m * 16 + n], want, 1e-6f * mag) << "C[" << m << "][" << n << "]";
+    }
+  for (auto* x : {&ab, &bb, &cb}) dev->Free(*x);
+}
