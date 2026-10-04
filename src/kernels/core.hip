@@ -3419,7 +3419,7 @@ struct Frag16 {
   // Stage prefetch (kMoeKs values from k0): Q4_K loads its quant bytes up
   // front; other formats load per fragment as before.
   struct Stage {};
-  __device__ static Stage LoadStage(const std::uint8_t*, std::uint32_t) { return {}; }
+  __device__ static Stage LoadStage(const std::uint8_t*, std::uint32_t, std::uint32_t = 128) { return {}; }
   __device__ static halo_v16h GetS(const std::uint8_t* row, std::uint32_t k0, std::uint32_t kk, const Hdr& h,
                                    const Stage&) {
     return GetH(row, k0 + kk, h);
@@ -3474,7 +3474,7 @@ struct Frag16<LoadQ4_K> {
   struct Stage {
     uint4 q[4];
   };
-  __device__ static Stage LoadStage(const std::uint8_t* row, std::uint32_t k0) {
+  __device__ static Stage LoadStage(const std::uint8_t* row, std::uint32_t k0, std::uint32_t = 128) {
     const std::uint8_t* qb = row + (k0 / 256) * 144 + 16 + ((k0 % 256) / 64) * 32;
     Stage st;
 #pragma unroll
@@ -3513,7 +3513,7 @@ struct Frag16<LoadQ4_K> {
 template <>
 struct Frag16<LoadQ5_K> {
   struct Stage {};
-  __device__ static Stage LoadStage(const std::uint8_t*, std::uint32_t) { return {}; }
+  __device__ static Stage LoadStage(const std::uint8_t*, std::uint32_t, std::uint32_t = 128) { return {}; }
   template <typename H>
   __device__ static halo_v16h GetS(const std::uint8_t* row, std::uint32_t k0, std::uint32_t kk, const H& h,
                                    const Stage&) {
@@ -3557,12 +3557,37 @@ struct Frag16<LoadQ5_K> {
 };
 template <>
 struct Frag16<LoadQ5_1> {
-  struct Stage {};
-  __device__ static Stage LoadStage(const std::uint8_t*, std::uint32_t) { return {}; }
+  // A 128-value stage is 4 blocks of 24 bytes (8-byte aligned): 12 loads
+  // up front, the blocks past `kn` remaining values left unloaded.
+  struct Stage {
+    uint2 r[12];
+  };
+  __device__ static Stage LoadStage(const std::uint8_t* row, std::uint32_t k0, std::uint32_t kn = 128) {
+    const std::uint8_t* b = row + (k0 / 32) * 24;
+    Stage st;
+#pragma unroll
+    for (std::uint32_t i = 0; i < 12; ++i)
+      st.r[i] = (i / 3) * 32 < kn ? *reinterpret_cast<const uint2*>(b + 8 * i) : make_uint2(0, 0);
+    return st;
+  }
   template <typename H>
-  __device__ static halo_v16h GetS(const std::uint8_t* row, std::uint32_t k0, std::uint32_t kk, const H& h,
-                                   const Stage&) {
-    return GetH(row, k0 + kk, h);
+  __device__ static halo_v16h GetS(const std::uint8_t*, std::uint32_t, std::uint32_t kk, const H&, const Stage& st) {
+    const std::uint32_t blk = kk / 32;
+    return Decode(st.r[3 * blk], st.r[3 * blk + 1], st.r[3 * blk + 2], kk % 32);
+  }
+  __device__ static halo_v16h Decode(uint2 hd, uint2 q0, uint2 q1, std::uint32_t j0) {
+    const _Float16 d = AsH2(hd.x).x, m = AsH2(hd.x).y;
+    const std::uint32_t qh = hd.y >> j0;
+    const std::uint32_t w[4] = {q0.x, q0.y, q1.x, q1.y};
+    halo_v16h v;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const std::uint32_t x = (qh >> (4 * j)) & 0xFu;
+      const std::uint32_t bits = (x & 1u) | ((x & 2u) << 7) | ((x & 4u) << 14) | ((x & 8u) << 21);
+      Unpack4(v, j, ((w[j] >> (j0 ? 4 : 0)) & 0x0F0F0F0Fu) | (bits << 4), halo_h2{1024, 1024}, halo_h2{d, d},
+              halo_h2{m, m});
+    }
+    return v;
   }
   struct Hdr {};
   __device__ static Hdr LoadHdr(const std::uint8_t*, std::uint32_t) { return {}; }
@@ -3596,7 +3621,7 @@ __device__ inline halo_v16h Int8Frag(const std::uint32_t w[4], _Float16 d) {
 template <>
 struct Frag16<LoadQ8_0> {
   struct Stage {};
-  __device__ static Stage LoadStage(const std::uint8_t*, std::uint32_t) { return {}; }
+  __device__ static Stage LoadStage(const std::uint8_t*, std::uint32_t, std::uint32_t = 128) { return {}; }
   template <typename H>
   __device__ static halo_v16h GetS(const std::uint8_t* row, std::uint32_t k0, std::uint32_t kk, const H& h,
                                    const Stage&) {
@@ -3709,10 +3734,11 @@ __device__ void MoeGateUp(const std::uint8_t* gate, const std::uint8_t* up, std:
 }
 
 // down: yp[pair][r] = down_e[r] . hp[pair]; the tile's pairs are contiguous.
-// frag(e, row, k0) gives 16 weights of an output row of expert e.
+// load(e, row, k0, ks) returns a stage of weights (loaded before the
+// activation staging), get(stage, e, row, k0, kk) 16 weights of it.
 //   grid (ceil(H / kMoeBlockRows), max tiles), block 256; ff % 16 == 0.
-template <typename F>
-__device__ void MoeDown(F frag, const _Float16* hp, const std::uint32_t* tiles, const std::uint32_t* ntiles,
+template <typename SL, typename SG>
+__device__ void MoeDown(SL load, SG get, const _Float16* hp, const std::uint32_t* tiles, const std::uint32_t* ntiles,
                         _Float16* yp, std::uint32_t H, std::uint32_t ff) {
   __shared__ __attribute__((aligned(16))) _Float16 Bs[kMoeTile * kMoeRs];
   const std::uint32_t tile = blockIdx.y;
@@ -3722,8 +3748,10 @@ __device__ void MoeDown(F frag, const _Float16* hp, const std::uint32_t* tiles, 
   const std::uint32_t lane = threadIdx.x % 32, wave = threadIdx.x / 32;
   const std::uint32_t r0 = blockIdx.x * kMoeBlockRows + wave * 16 * kMoeRowTiles;
   halo_v8f acc[kMoeRowTiles][kMoeSub] = {};
+  const std::uint32_t row = min(r0 + lane % 16, H - 1);
   for (std::uint32_t k0 = 0; k0 < ff; k0 += kMoeKs) {
     const std::uint32_t ks = min(kMoeKs, ff - k0);
+    const auto st = load(e, row, k0, ks);  // in flight during the staging below
     __syncthreads();
     for (std::uint32_t i = threadIdx.x; i < subs * 16 * ks / 8; i += blockDim.x) {
       const std::uint32_t r = i / (ks / 8), c = (i % (ks / 8)) * 8;
@@ -3731,11 +3759,12 @@ __device__ void MoeDown(F frag, const _Float16* hp, const std::uint32_t* tiles, 
           *reinterpret_cast<const uint4*>(hp + static_cast<std::size_t>(first + (r < n ? r : 0)) * ff + k0 + c);
     }
     __syncthreads();
-#pragma unroll 4
-    for (std::uint32_t kk = 0; kk < ks; kk += 16) {
+#pragma unroll
+    for (std::uint32_t kk = 0; kk < kMoeKs; kk += 16) {  // fully unrolled: the stage stays in registers
+      if (kk >= ks) break;
 #pragma unroll
       for (std::uint32_t rt = 0; rt < kMoeRowTiles; ++rt) {
-        const halo_v16h fw = frag(e, min(r0 + rt * 16 + lane % 16, H - 1), k0 + kk);
+        const halo_v16h fw = get(st, e, row, k0, kk);
 #pragma unroll
         for (std::uint32_t h = 0; h < kMoeSub; ++h) {
           if (h >= subs) break;
@@ -3770,9 +3799,14 @@ __device__ void MoeDown(F frag, const _Float16* hp, const std::uint32_t* tiles, 
   extern "C" __global__ void __launch_bounds__(256) halo_moe_down_grouped_##SUFFIX(                                  \
       const std::uint8_t* down, std::uint64_t expert_bytes, std::uint64_t row_bytes, const _Float16* hp,              \
       const std::uint32_t* tiles, const std::uint32_t* ntiles, _Float16* yp, std::uint32_t H, std::uint32_t ff) {     \
-    MoeDown([=](std::uint32_t e, std::uint32_t row, std::uint32_t k0) {                                               \
-      return Frag16<L>::Get(down + e * expert_bytes + row * row_bytes, k0);                                           \
-    }, hp, tiles, ntiles, yp, H, ff);                                                                                 \
+    MoeDown(                                                                                                          \
+        [=](std::uint32_t e, std::uint32_t row, std::uint32_t k0, std::uint32_t ks) {                                 \
+          return Frag16<L>::LoadStage(down + e * expert_bytes + row * row_bytes, k0, ks);                             \
+        },                                                                                                            \
+        [=](const auto& st, std::uint32_t e, std::uint32_t row, std::uint32_t k0, std::uint32_t kk) {                 \
+          return Frag16<L>::GetS(down + e * expert_bytes + row * row_bytes, k0, kk, typename Frag16<L>::Hdr{}, st);  \
+        },                                                                                                            \
+        hp, tiles, ntiles, yp, H, ff);                                                                                \
   }
 HALO_MOE_GROUPED(q4_k, LoadQ4_K)
 HALO_MOE_GROUPED(q5_k, LoadQ5_K)
@@ -3788,7 +3822,9 @@ extern "C" __global__ void __launch_bounds__(256)
     halo_moe_down_grouped_q8r(const std::int8_t* qs, const std::uint16_t* d, std::uint32_t qstride, const _Float16* hp,
                               const std::uint32_t* tiles, const std::uint32_t* ntiles, _Float16* yp, std::uint32_t H,
                               std::uint32_t ff) {
-  MoeDown([=](std::uint32_t e, std::uint32_t row, std::uint32_t k0) {
+  MoeDown([](std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) { return 0; },
+          [=](int, std::uint32_t e, std::uint32_t row, std::uint32_t k0, std::uint32_t kk) {
+    k0 += kk;
     const std::size_t r = static_cast<std::size_t>(e) * H + row;
     const int4 q = *reinterpret_cast<const int4*>(qs + r * qstride + k0);
     const std::uint32_t w[4] = {static_cast<std::uint32_t>(q.x), static_cast<std::uint32_t>(q.y),
