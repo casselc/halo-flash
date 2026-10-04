@@ -1,5 +1,7 @@
 #include "scope/records.hpp"
 
+#include <blake3.h>
+
 #include <algorithm>
 
 // HALO_SCOPE_MUTANT selects a deliberately broken encoder for the positive
@@ -162,6 +164,15 @@ Observation DecodeObservation(rb::Reader& r) {
   o.finish_reason = r.Str();
   o.decision_answer = r.Str();
   return o;
+}
+
+rb::Hash16 PayloadHash(std::string_view content) {
+  blake3_hasher h;
+  blake3_hasher_init(&h);
+  blake3_hasher_update(&h, content.data(), content.size());
+  rb::Hash16 out;
+  blake3_hasher_finalize(&h, out.data(), out.size());
+  return out;
 }
 
 void EncodePayload(const Payload& p, std::string& out) {

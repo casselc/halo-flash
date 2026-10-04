@@ -219,6 +219,14 @@ TEST(ScopeRecords, PayloadRoundTripsThroughChdb) {
   });
 }
 
+TEST(ScopeRecords, PayloadHashIsBlake3Truncated) {
+  // BLAKE3("") = af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262
+  const rb::Hash16 want = {0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6,
+                           0xa0, 0x40, 0x4d, 0xea, 0x36, 0xdc, 0xc9, 0x49};
+  EXPECT_EQ(PayloadHash(""), want);
+  EXPECT_NE(PayloadHash("a"), PayloadHash("b"));
+}
+
 TEST(ScopeRecords, InsertTokenMakesReplayExactlyOnce) {
   HALO_REQUIRE_CHDB();
   const std::string project = FreshProject("dedup");

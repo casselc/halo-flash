@@ -38,7 +38,8 @@ header.
 
 Runtime dependencies (not vendored): HRX System, Apache-2.0; libchdb (chDB,
 Apache-2.0), loaded with dlopen by halo-scope when present.
-Build dependency (fetched at build time, halo-scope only, when no system
-sqlite3 is found): the SQLite amalgamation (public domain).
+Build dependencies (fetched at build time, halo-scope only): BLAKE3 1.8.7
+(CC0-1.0 or Apache-2.0), and the SQLite amalgamation (public domain) when no
+system sqlite3 is found.
 Test dependencies (fetched at build time): GoogleTest (BSD-3-Clause),
 hegel-cpp (MIT) with its prebuilt libhegel engine.

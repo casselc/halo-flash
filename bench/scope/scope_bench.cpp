@@ -1,8 +1,12 @@
 // halo-scope write-path micro-benchmark.
 //
-//   scope_bench [--rows N] [--threads T] [--batch B] [--payloads] [--no-token] [--path DIR]
+//   scope_bench [--rows N] [--threads T] [--batch B] [--payloads] [--no-token] [--transcript]
+//               [--path DIR]
 //
 // --no-token inserts without the deduplication token (see ChdbSink).
+// --transcript adds phase 4: 20 agent sessions of 40 turns where every
+// request resends the whole history as payloads, with the writer's payload
+// cache off and on.
 //
 // 1. Producer cost: one thread records N observations through its ring
 //    while the writer drains into a counting sink (no chDB). Reports ns per
@@ -32,6 +36,7 @@
 #include <cstring>
 #include <stdlib.h>
 #include <string>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -108,7 +113,8 @@ class CountingSink : public Sink {
 
 int main(int argc, char** argv) {
   std::size_t rows = 1000000, threads = 4, batch = 10000;
-  bool payloads = false, token = true;
+  bool payloads = false, token = true, transcript = false;
+  int transcript_sessions = 20, transcript_turns = 40;
   std::string path;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -118,9 +124,10 @@ int main(int argc, char** argv) {
     else if (a == "--batch") batch = std::stoull(next());
     else if (a == "--payloads") payloads = true;
     else if (a == "--no-token") token = false;
+    else if (a == "--transcript") transcript = true;
     else if (a == "--path") path = next();
     else {
-      std::fprintf(stderr, "usage: %s [--rows N] [--threads T] [--batch B] [--payloads] [--no-token] [--path DIR]\n", argv[0]);
+      std::fprintf(stderr, "usage: %s [--rows N] [--threads T] [--batch B] [--payloads] [--no-token] [--transcript] [--path DIR]\n", argv[0]);
       return 2;
     }
   }
@@ -136,7 +143,10 @@ int main(int argc, char** argv) {
   // --- 1. producer cost ------------------------------------------------------
   {
     CountingSink sink;
-    Recorder rec(sink, {.ring_bytes = 64u << 20, .batch_rows = batch});
+    RecorderOptions opt;
+    opt.ring_bytes = 64u << 20;
+    opt.batch_rows = batch;
+    Recorder rec(sink, opt);
     Producer* p = rec.NewProducer();
     Observation o = Sample("bench");
     Payload pl{"bench", {}, 200, std::string(200, 'p')};
@@ -228,7 +238,10 @@ int main(int argc, char** argv) {
                 batch, buf.size(), kReps, wall[wall.size() / 2], wall.back(), c, c * 1e6 / static_cast<double>(batch),
                 static_cast<double>(batch) / (c / 1e3));
   }
-  Recorder rec(sink, {.ring_bytes = 16u << 20, .batch_rows = batch});
+  RecorderOptions popt;
+  popt.ring_bytes = 16u << 20;
+  popt.batch_rows = batch;
+  Recorder rec(sink, popt);
   std::vector<Producer*> ps;
   for (std::size_t t = 0; t < threads; ++t) ps.push_back(rec.NewProducer());
   std::atomic<std::uint64_t> producer_cpu{0};
@@ -276,5 +289,66 @@ int main(int argc, char** argv) {
       static_cast<unsigned long long>(st.rows_failed), static_cast<unsigned long long>(st.dropped));
 
   rec.Stop();
+
+  // --- 4. agent transcripts: every turn resends the history ------------------
+  if (transcript) {
+    for (const bool cache : {false, true}) {
+      const std::string tp = project + (cache ? "-tc" : "-tn");
+      RecorderOptions opt;
+      opt.batch_rows = batch;
+      opt.payload_cache_entries = cache ? (1u << 20) : 0;
+      Recorder tr(sink, opt);
+      Producer* p = tr.NewProducer();
+      std::mt19937_64 rng(7);
+      auto text = [&](std::size_t lo, std::size_t hi) {
+        std::string s(lo + rng() % (hi - lo + 1), ' ');
+        for (auto& ch : s) ch = static_cast<char>('a' + rng() % 26);
+        return s;
+      };
+      const std::string system = text(6000, 6000);  // shared by every session
+      std::uint64_t offered_rows = 0, offered_bytes = 0;
+      const std::uint64_t c0 = ProcessCpuNs(), m0 = ThreadCpuNs();
+      const auto w0 = Clock::now();
+      for (int sidx = 0; sidx < transcript_sessions; ++sidx) {
+        std::vector<std::string> history = {system};
+        for (int turn = 0; turn < transcript_turns; ++turn) {
+          history.push_back(text(200, 800));                             // user
+          if (turn % 3 == 2) history.push_back(text(1000, 8000));        // tool result
+          Observation o = Sample(tp);
+          o.span_id = std::to_string(sidx) + "-" + std::to_string(turn);
+          o.input_refs.clear();
+          for (const auto& m : history) {  // the request carries the whole history
+            Payload pl{tp, PayloadHash(m), static_cast<std::uint32_t>(m.size()), m};
+            while (!p->Record(pl)) std::this_thread::sleep_for(std::chrono::microseconds(50));
+            o.input_refs.push_back(pl.hash);
+            ++offered_rows;
+            offered_bytes += m.size();
+          }
+          history.push_back(text(300, 2000));  // assistant output
+          Payload out{tp, PayloadHash(history.back()), static_cast<std::uint32_t>(history.back().size()), history.back()};
+          while (!p->Record(out)) std::this_thread::sleep_for(std::chrono::microseconds(50));
+          ++offered_rows;
+          offered_bytes += history.back().size();
+          o.output_refs = {out.hash};
+          while (!p->Record(o)) std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+      }
+      tr.Flush();
+      const double secs = std::chrono::duration<double>(Clock::now() - w0).count();
+      const double producer_ms = (ThreadCpuNs() - m0) / 1e6;
+      const double other_ms = (ProcessCpuNs() - c0) / 1e6 - producer_ms;
+      const auto st = tr.stats();
+      auto q = admin->Query("SELECT count(), sum(bytes) FROM halo_scope.llm_payloads WHERE project = " + SqlQuote(tp), "TSV");
+      std::printf(
+          "transcript (%d sessions x %d turns, cache %s): payloads offered %llu rows / %.1f MB; sent %llu rows; "
+          "deduplicated %llu; in llm_payloads now (rows, bytes) %s"
+          "  %.2f s; CPU outside the producer %.0f ms; producer %.0f ms\n",
+          transcript_sessions, transcript_turns, cache ? "on" : "off", static_cast<unsigned long long>(offered_rows),
+          offered_bytes / 1e6, static_cast<unsigned long long>(st.rows_written[1]),
+          static_cast<unsigned long long>(st.payloads_deduped), q.ok ? q.data.c_str() : q.error.c_str(), secs,
+          other_ms, producer_ms);
+      tr.Stop();
+    }
+  }
   return 0;  // the sink's and admin's connections close here, before exit
 }

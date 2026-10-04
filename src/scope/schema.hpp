@@ -8,10 +8,12 @@
 //
 // Write pattern: producers insert RowBinary into `<table>_in` (ENGINE =
 // Null, plain String/Map(String, ...) types); `<table>_mv` casts each block
-// into the typed MergeTree `<table>`. Parsing straight into LowCardinality
-// costs ~2x, and chDB's stream insert refuses INSERT ... SELECT FROM input().
-// Every MV target sets non_replicated_deduplication_window so a replayed
-// batch with the same insert_deduplication_token is written once.
+// into the typed MergeTree `<table>`. Measured on libchdb 26.9.0, this is
+// the cheapest way in: inserting RowBinary straight into the typed table
+// costs ~2x per batch (LowCardinality parsing), and chDB's stream insert
+// refuses INSERT ... SELECT FROM input(). Every MV target sets
+// non_replicated_deduplication_window, so a WAL replay carrying the same
+// insert_deduplication_token is written once.
 
 #include <string>
 #include <vector>

@@ -9,7 +9,13 @@
 // Accounting, never silent: for every producer,
 //   accepted + dropped == records offered,
 // and for the recorder after Stop(),
-//   rows_written + rows_failed == sum(accepted).
+//   rows_written + rows_failed + payloads_deduped == sum(accepted).
+//
+// With a WAL (RecorderOptions::wal_path), each batch is appended to the log
+// before it is inserted, with a token derived from its log position, and
+// frames left by a crash are replayed at startup (exactly once in chDB).
+// With a payload cache, a payload whose (project, hash) is already durably
+// written, or already in the batch being built, is not sent again.
 
 #include <array>
 #include <atomic>
@@ -21,11 +27,14 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
+#include <deque>
 #include <vector>
 
 #include "scope/chdb.hpp"
 #include "scope/records.hpp"
 #include "scope/ring.hpp"
+#include "scope/wal.hpp"
 
 namespace halo::scope {
 
@@ -44,8 +53,9 @@ class Sink {
 /// chdb_stream_insert_n, FORMAT RowBinary. With `dedup_token`, the batch's
 /// token goes in insert_deduplication_token with
 /// deduplicate_blocks_in_dependent_materialized_views = 1, so replaying a
-/// batch is exactly-once; measured on libchdb 26.7.0 this about doubles the
-/// process CPU of a 10k-row insert through the staging MV.
+/// batch is exactly-once. Measured: on libchdb 26.7.0 the token about
+/// doubled the CPU of a 10k-row insert through the staging MV; on 26.9.0
+/// the difference is within noise.
 class ChdbSink : public Sink {
  public:
   explicit ChdbSink(std::unique_ptr<Conn> conn, bool dedup_token = true)
@@ -92,7 +102,16 @@ class Producer {
 struct RecorderOptions {
   std::size_t ring_bytes = 1 << 20;  // per producer
   std::size_t batch_rows = 10000;    // per table
-  std::chrono::milliseconds flush_interval{250};
+  /// Time bound on a batch. Per-row chDB CPU falls from ~42 us at 250-row
+  /// batches to ~5 us at 10k (libchdb 26.9.0), so at engine volumes
+  /// (thousands of rows/s) a 1 s bound keeps batches in the thousands.
+  std::chrono::milliseconds flush_interval{1000};
+  /// Write-ahead log path; empty: none (a crash loses the batch in flight).
+  std::string wal_path;
+  bool wal_sync = false;  // fdatasync each frame (power loss, not just a crash)
+  /// Payloads remembered as durably written, (project, hash) keys, oldest
+  /// evicted first; 0 turns payload deduplication off.
+  std::size_t payload_cache_entries = 1 << 20;
   /// false: no writer thread; the owner drives it with Pump(), Flush() and
   /// Stop() on one thread, and batches are cut only by size, Flush() or
   /// Stop(). A deterministic mode for tests (same record sequence, same
@@ -106,6 +125,9 @@ struct RecorderStats {
   std::uint64_t batches = 0;
   std::uint64_t accepted = 0;
   std::uint64_t dropped = 0;
+  std::uint64_t payloads_deduped = 0;  // not sent: already durable or in the batch
+  std::uint64_t rows_replayed = 0;     // re-inserted from the WAL at startup
+  bool crashed = false;                // the sink threw; the writer stopped
   std::uint64_t sink_ns = 0;          // writer wall time inside Sink::Write
   std::uint64_t sink_thread_cpu_ns = 0;  // writer thread CPU inside Sink::Write
   std::string last_error;
@@ -113,7 +135,10 @@ struct RecorderStats {
 
 class Recorder {
  public:
+  /// Replays any WAL frames into `sink` before returning; check error().
   Recorder(Sink& sink, RecorderOptions opt = {});
+  /// Non-empty when the WAL could not be opened or replayed.
+  const std::string& error() const { return error_; }
   ~Recorder();  // Stop()s
   Recorder(const Recorder&) = delete;
   Recorder& operator=(const Recorder&) = delete;
@@ -138,6 +163,7 @@ class Recorder {
   bool Iterate(bool send_all);
   bool DrainAll();
   void Send(std::size_t t);
+  void Append(std::uint8_t table, std::string_view body);
 
   Sink& sink_;
   RecorderOptions opt_;
@@ -165,6 +191,15 @@ class Recorder {
   std::uint64_t batch_seq_ = 0;
   std::string scratch_;
   std::uint64_t epoch_;
+  std::string error_;
+  std::unique_ptr<Wal> wal_;
+  bool crashed_ = false;
+  // payload dedup: keys durably written (FIFO-evicted), and keys in the
+  // payload batch being built (they share its fate)
+  std::unordered_set<std::string> durable_;
+  std::deque<std::string> durable_order_;
+  std::unordered_set<std::string> in_batch_;
+  std::vector<std::string> in_batch_order_;
 
   // published stats (guarded by mu_)
   RecorderStats stats_;

@@ -33,24 +33,48 @@ using hegel::stateful::Rule;
 
 namespace {
 
-/// Keeps every delivered span id; can be told to refuse batches.
+/// Keeps every delivered span id, and an ordered log of payload hashes
+/// delivered or refused; can be told to refuse batches.
 class MemorySink : public Sink {
  public:
+  struct PayloadEvent {
+    std::uint8_t key;
+    bool delivered;
+  };
   bool Write(Table table, std::string_view rows, std::size_t nrows, std::string_view, std::string* err) override {
     std::lock_guard<std::mutex> lk(mu_);
+    rb::Reader r(rows);
+    std::size_t n = 0;
+    std::vector<std::string> ids;
+    std::vector<std::uint8_t> keys;
+    while (!r.done()) {
+      if (table == Table::kObservations)
+        ids.push_back(DecodeObservation(r).span_id);
+      else
+        keys.push_back(DecodePayload(r).hash[0]);
+      ++n;
+    }
+    if (n != nrows) throw std::runtime_error("row count mismatch in batch");
+    for (auto k : keys) events_.push_back({k, !fail_});
     if (fail_) {
       *err = "injected sink failure";
       return false;
     }
-    rb::Reader r(rows);
-    std::size_t n = 0;
-    while (!r.done()) {
-      if (table != Table::kObservations) throw std::runtime_error("unexpected table");
-      ids_.push_back(DecodeObservation(r).span_id);
-      ++n;
-    }
-    if (n != nrows) throw std::runtime_error("row count mismatch in batch");
+    ids_.insert(ids_.end(), ids.begin(), ids.end());
+    payload_rows_ += keys.size();
     return true;
+  }
+  std::size_t EventCount() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return events_.size();
+  }
+  std::vector<PayloadEvent> Events() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return events_;
+  }
+  std::size_t PayloadRows() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return payload_rows_;
   }
   void SetFail(bool f) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -65,6 +89,8 @@ class MemorySink : public Sink {
   std::mutex mu_;
   bool fail_ = false;
   std::vector<std::string> ids_;
+  std::vector<PayloadEvent> events_;
+  std::size_t payload_rows_ = 0;
 };
 
 /// ChdbSink that can refuse batches, for the failure rule.
@@ -88,6 +114,8 @@ struct Model {
   std::uint64_t produced = 0;
   std::uint64_t dropped = 0;           // Record() returned false
   std::set<std::string> accepted;      // Record() returned true
+  // accepted payloads: (hash key, sink payload-event count when offered)
+  std::vector<std::pair<std::uint8_t, std::size_t>> payloads;
   bool stopped = false;
 };
 
@@ -105,7 +133,7 @@ struct WritePath : hegel::stateful::StateMachine<WritePath, Model> {
   std::vector<std::uint64_t> offered = std::vector<std::uint64_t>(kProducers, 0);
   std::uint64_t next_id = 0;
   // swarm: which optional rules this case uses
-  bool en_burst, en_overflow, en_flush, en_fail, en_stop;
+  bool en_burst, en_overflow, en_flush, en_fail, en_stop, en_payload;
 
   WritePath(hegel::TestCase& tc, bool chdb) : StateMachine({.initial_state = {}}), use_chdb(chdb) {
     project = FreshProject(chdb ? "sm-ch" : "sm-mem");
@@ -136,6 +164,8 @@ struct WritePath : hegel::stateful::StateMachine<WritePath, Model> {
     en_flush = tc.draw(gs::booleans());
     en_fail = tc.draw(gs::booleans());
     en_stop = tc.draw(gs::booleans());
+    en_payload = !use_chdb && tc.draw(gs::booleans());
+    opt.payload_cache_entries = tc.draw(gs::sampled_from<std::size_t>({0, 2, 1 << 20}));
     rec = std::make_unique<Recorder>(*sink, opt);
     for (std::size_t i = 0; i < kProducers; ++i) producers.push_back(rec->NewProducer());
   }
@@ -179,19 +209,37 @@ struct WritePath : hegel::stateful::StateMachine<WritePath, Model> {
       mem->SetFail(f);
   }
 
-  // After a flush or stop: everything accepted was either delivered or
-  // refused by the sink; nothing silent.
+  // The payload cache never suppresses a hash that is not durably written:
+  // each accepted payload was either delivered before it was offered, or
+  // reached the sink (delivered or refused, so counted) afterwards.
+  void CheckPayloads() const {
+    if (!mem) return;
+    const auto ev = mem->Events();
+    for (const auto& [key, e0] : state.payloads) {
+      bool ok = false;
+      for (std::size_t i = 0; i < ev.size() && !ok; ++i)
+        ok = ev[i].key == key && (i >= e0 || ev[i].delivered);
+      if (!ok)
+        throw std::runtime_error("payload " + std::to_string(key) + " suppressed but never written");
+    }
+  }
+
+  // After a flush or stop: everything accepted was either delivered,
+  // refused by the sink or deduplicated as already durable; nothing silent.
   void CheckSettled() const {
+    CheckPayloads();
     const auto d = Delivered();
     const auto st = rec->stats();
+    const std::size_t pd = mem ? mem->PayloadRows() : 0;
     const std::set<std::string> uniq(d.begin(), d.end());
     if (uniq.size() != d.size()) throw std::runtime_error("duplicate rows delivered");
     if (st.dropped != state.dropped)
       throw std::runtime_error("recorder counted " + std::to_string(st.dropped) + " drops, producers saw " +
                                std::to_string(state.dropped));
-    if (d.size() + st.rows_failed + state.dropped != state.produced)
-      throw std::runtime_error("read back " + std::to_string(d.size()) + " + refused " +
-                               std::to_string(st.rows_failed) + " + dropped " + std::to_string(state.dropped) +
+    if (d.size() + pd + st.rows_failed + st.payloads_deduped + state.dropped != state.produced)
+      throw std::runtime_error("read back " + std::to_string(d.size() + pd) + " + refused " +
+                               std::to_string(st.rows_failed) + " + deduplicated " +
+                               std::to_string(st.payloads_deduped) + " + dropped " + std::to_string(state.dropped) +
                                " != produced " + std::to_string(state.produced));
   }
 
@@ -245,6 +293,27 @@ struct WritePath : hegel::stateful::StateMachine<WritePath, Model> {
                           if (!m.threaded && m.state.dropped == before)
                             throw std::runtime_error("ring never overflowed");
                         }),
+        Rule<WritePath>("produce_payloads",
+                        [](hegel::TestCase& tc, WritePath& m) {
+                          if (!m.en_payload) return;
+                          // A small hash pool, so repeats (resent history) are common.
+                          const auto p = tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = kProducers - 1}));
+                          const auto n = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 10}));
+                          for (int i = 0; i < n; ++i) {
+                            Payload pl;
+                            pl.project = m.project;
+                            pl.hash[0] = tc.draw(gs::integers<std::uint8_t>({.min_value = 0, .max_value = 5}));
+                            pl.content = "content-" + std::to_string(pl.hash[0]);
+                            pl.bytes = static_cast<std::uint32_t>(pl.content.size());
+                            const std::size_t e0 = m.mem->EventCount();
+                            ++m.offered[p];
+                            ++m.state.produced;
+                            if (m.producers[p]->Record(pl))
+                              m.state.payloads.emplace_back(pl.hash[0], e0);
+                            else
+                              ++m.state.dropped;
+                          }
+                        }),
         Rule<WritePath>("pump", [](hegel::TestCase&, WritePath& m) { m.rec->Pump(); }),
         Rule<WritePath>("flush",
                         [](hegel::TestCase&, WritePath& m) {
@@ -286,7 +355,7 @@ struct WritePath : hegel::stateful::StateMachine<WritePath, Model> {
                              }),
         Invariant<WritePath>("stopped_refuses_and_counts",
                              [](const WritePath& m) {
-                               if (m.state.stopped && m.rec->stats().accepted != m.state.accepted.size())
+                               if (m.state.stopped && m.rec->stats().accepted != m.state.accepted.size() + m.state.payloads.size())
                                  throw std::runtime_error("accepted after stop");
                              }),
     };
@@ -304,7 +373,11 @@ void RunMachine(hegel::TestCase& tc, bool chdb) {
 }  // namespace
 
 TEST(ScopeWritePath, AccountingHoldsWithMemorySink) {
-  hegel::test([](hegel::TestCase& tc) { RunMachine(tc, false); }, {.test_cases = 200});
+  // HALO_SCOPE_TEST_CASES raises the budget (the payload-cache positive
+  // control needs a failing sink, a resend and a recovery in one case).
+  const char* n = std::getenv("HALO_SCOPE_TEST_CASES");
+  const std::uint64_t cases = n ? std::strtoull(n, nullptr, 10) : 200;
+  hegel::test([](hegel::TestCase& tc) { RunMachine(tc, false); }, {.test_cases = cases});
 }
 
 TEST(ScopeWritePath, AccountingHoldsWithChdbSink) {

@@ -181,7 +181,11 @@ endif()
 # --- scope: embedded LLM observability (P12 "halo-scope") --------------------
 # Optional. libchdb is dlopen()ed at run time, never linked: point
 # HALO_SCOPE_LIBCHDB (this cache path, or the environment variable of the
-# same name at run time) at a libchdb.so (chDB 26.7.x).
+# same name at run time) at a libchdb.so. The documented default is
+# chdb-core v26.9.0 (ClickHouse 26.9.2.8-stable), the release asset
+# linux-x86_64-libchdb.tar.gz with
+# sha256 c6398bcc71dc58d12fb81548540aacd5d8248830ec81cec537f51c114670543b,
+# from github.com/chdb-io/chdb-core/releases. 26.7.0 also passes the tests.
 option(HALO_SCOPE "Build halo-scope (embedded LLM observability; loads libchdb at run time)" OFF)
 set(HALO_SCOPE_LIBCHDB "" CACHE FILEPATH "Default libchdb.so for halo-scope; $HALO_SCOPE_LIBCHDB overrides it")
 if(HALO_SCOPE)
@@ -203,6 +207,14 @@ if(HALO_SCOPE)
     add_library(SQLite::SQLite3 ALIAS halo_sqlite3)
   endif()
 
+  # Payload content addressing: BLAKE3 (CC0 / Apache-2.0), fetched at build time.
+  FetchContent_Declare(blake3
+    URL https://github.com/BLAKE3-team/BLAKE3/archive/refs/tags/1.8.7.tar.gz
+    URL_HASH SHA256=c6782a28842b1c0478524ac06a4f2ede784038ee298d6e2162c0b089c4306a3c
+    SOURCE_SUBDIR c
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(blake3)
+
   # HALO_SCOPE_MUTANT builds deliberately broken copies for the positive
   # controls below; 0 is the real library.
   function(halo_scope_library name mutant)
@@ -212,9 +224,11 @@ if(HALO_SCOPE)
       src/scope/schema.cpp
       src/scope/records.cpp
       src/scope/recorder.cpp
-      src/scope/metadata.cpp)
+      src/scope/metadata.cpp
+      src/scope/wal.cpp)
     target_include_directories(${name} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(${name} PUBLIC Threads::Threads ${CMAKE_DL_LIBS} SQLite::SQLite3)
+    target_link_libraries(${name} PRIVATE BLAKE3::blake3)
     target_compile_definitions(${name} PRIVATE HALO_SCOPE_MUTANT=${mutant})
     if(HALO_SCOPE_LIBCHDB)
       target_compile_definitions(${name} PRIVATE HALO_SCOPE_LIBCHDB_DEFAULT="${HALO_SCOPE_LIBCHDB}")
@@ -230,6 +244,7 @@ if(HALO_SCOPE)
       tests/scope/records_test.cpp
       tests/scope/recorder_test.cpp
       tests/scope/metadata_test.cpp
+      tests/scope/wal_test.cpp
       tests/scope/scope_main.cpp)
     target_link_libraries(scope_tests PRIVATE halo_scope)
 
@@ -243,23 +258,29 @@ if(HALO_SCOPE)
     # The failure each mutant must produce, not merely "a failure".
     set(_scope_mutant_expect_1 "differs after the chDB round trip")
     set(_scope_mutant_expect_2 "differs after the chDB round trip")
-    set(_scope_mutant_expect_3 "read back [0-9]+ \\+ refused [0-9]+ \\+ dropped [0-9]+ != produced")
-    set(_scope_mutant_expect_4 "duplicate row")
-    set(_scope_mutants 1 2 3 4)
+    set(_scope_mutant_expect_3 "read back [0-9]+ \\+ refused [0-9]+ \\+ deduplicated [0-9]+ \\+ dropped [0-9]+ != produced")
+    # a duplicated observation is a duplicate; a duplicated payload breaks the count
+    set(_scope_mutant_expect_4 "duplicate row|read back [0-9]+ \\+ refused [0-9]+ \\+ deduplicated [0-9]+ \\+ dropped [0-9]+ != produced")
+    set(_scope_mutant_filter_6 ScopeWal.ReplayIsIdempotentByWalPosition)
+    set(_scope_mutant_expect_6 "duplicate rows after replay")
+    set(_scope_mutant_filter_7 ScopeWritePath.AccountingHoldsWithMemorySink)
+    set(_scope_mutant_expect_7 "suppressed but never written")
+    set(_scope_mutants 1 2 3 4 6 7)
     if(HALO_SANITIZE MATCHES "thread")
-      set(_scope_mutants 3 4)  # 1 and 2 need chDB, which TSan builds do not load
+      set(_scope_mutants 3 4 7)  # 1, 2 and 6 need chDB, which TSan builds do not load
     endif()
     foreach(m ${_scope_mutants})
       halo_scope_library(halo_scope_mutant${m} ${m})
       add_executable(scope_mutant${m}_tests
-        tests/scope/records_test.cpp tests/scope/recorder_test.cpp tests/scope/scope_main.cpp)
+        tests/scope/records_test.cpp tests/scope/recorder_test.cpp tests/scope/wal_test.cpp
+        tests/scope/scope_main.cpp)
       target_link_libraries(scope_mutant${m}_tests PRIVATE halo_scope_mutant${m} GTest::gtest hegel)
       target_compile_options(scope_mutant${m}_tests PRIVATE -Wno-missing-designated-field-initializers)
       add_test(NAME scope_mutant${m}_is_caught
         COMMAND scope_mutant${m}_tests --gtest_filter=${_scope_mutant_filter_${m}}
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
       set_tests_properties(scope_mutant${m}_is_caught PROPERTIES
-        ENVIRONMENT HALO_SCOPE_TEST_WRITER=manual
+        ENVIRONMENT "HALO_SCOPE_TEST_WRITER=manual;HALO_SCOPE_TEST_CASES=2000"
         PASS_REGULAR_EXPRESSION "${_scope_mutant_expect_${m}}")
     endforeach()
     if(HALO_SANITIZE MATCHES "thread")

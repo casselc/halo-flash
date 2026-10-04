@@ -90,6 +90,11 @@ struct Payload {
   bool operator==(const Payload&) const = default;
 };
 
+/// The content address of a payload: BLAKE3, truncated to 128 bits.
+/// Unkeyed: one process owns the database, so there is no tenant or day
+/// to key by (the fleet design keyed per tenant and day).
+rb::Hash16 PayloadHash(std::string_view content);
+
 void EncodeObservation(const Observation& o, std::string& out);
 Observation DecodeObservation(rb::Reader& r);
 void EncodePayload(const Payload& p, std::string& out);

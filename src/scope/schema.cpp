@@ -1,7 +1,13 @@
 // Adapted from casselc/observability (github.com/casselc/observability,
-// ca7ae8a, otel-chdb/otap-rs/sql/llm_{spans,payloads,scores}.sql), which has no repository-wide license (the otap-rs
-// crate declares Apache-2.0); relicensed under MIT for halo-flash by its
-// author, Chuck Cassel (2026-10-03). See NOTICE.
+// ca7ae8a, otel-chdb/otap-rs/sql/llm_{spans,payloads,scores}.sql), which
+// has no repository-wide license (the otap-rs crate declares Apache-2.0);
+// relicensed under MIT for halo-flash by its author, Chuck Cassel
+// (2026-10-03). See NOTICE.
+//
+// Layouts are fitted to one process and low-to-moderate volume, not to
+// fleet ingestion (measured on libchdb 26.9.0, see the spike report):
+// monthly partitions instead of daily, and keys for session and trace
+// lookup instead of time-sharded scans.
 
 #include "scope/schema.hpp"
 
@@ -12,7 +18,16 @@ namespace halo::scope {
 namespace {
 
 // Staging and typed tables share column names; the MV selects by name and
-// ClickHouse casts each column to the target's type.
+// ClickHouse casts each column to the target's type. LowCardinality only
+// on low-cardinality columns (project, type, status, level, provider,
+// model, variant, adapter, tool, finish reason, usage keys); ids, names
+// and free text stay String.
+//
+// llm_observations is keyed (session_id, trace_id, start_time): at 10M rows
+// a session lookup took 3.8 ms, a trace lookup 7 ms (bloom filter on
+// trace_id, or the key when the session is known or empty) and the 50 most
+// recent 5.9 ms (minmax on start_time); the fleet layout (time-first, daily
+// partitions) took 16, 5 and 31 ms.
 
 const Migration kTraces{
     1,
@@ -36,8 +51,8 @@ const Migration kTraces{
     INDEX idx_user_id user_id TYPE bloom_filter(0.01) GRANULARITY 1
 )
 ENGINE = MergeTree
-PARTITION BY toYYYYMMDD(start_time)
-ORDER BY (project, toStartOfMinute(start_time), xxHash32(trace_id))
+PARTITION BY toYYYYMM(start_time)
+ORDER BY (project, start_time, trace_id)
 SETTINGS non_replicated_deduplication_window = 1000)",
         R"(CREATE TABLE IF NOT EXISTS halo_scope.llm_traces_in
 (
@@ -110,12 +125,12 @@ const Migration kObservations{
     `finish_reason` LowCardinality(String),
     `decision_answer` String,
     INDEX idx_trace_id trace_id TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_user_id user_id TYPE bloom_filter(0.01) GRANULARITY 1
+    INDEX idx_user_id user_id TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_start_time start_time TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree
-PARTITION BY toYYYYMMDD(start_time)
-ORDER BY (project, toStartOfMinute(start_time), xxHash32(trace_id), span_id)
+PARTITION BY toYYYYMM(start_time)
+ORDER BY (session_id, trace_id, start_time, span_id)
 SETTINGS non_replicated_deduplication_window = 1000)",
         R"(CREATE TABLE IF NOT EXISTS halo_scope.llm_observations_in
 (
@@ -172,6 +187,10 @@ SELECT * FROM halo_scope.llm_observations_in)",
 
 // Content-addressed: any copy of a hash is its content, so no read needs
 // FINAL (LIMIT 1 BY hash); ReplacingMergeTree only reclaims space on merge.
+// The text index on lowercased content (GA in libchdb 26.9.0, no setting
+// needed) made a hasToken search over 200k ~1 KB payloads 20x faster
+// (200 -> 10 ms) for +70% insert time and +66% storage on token-dense text;
+// the writer's payload cache keeps the insert side small.
 const Migration kPayloads{
     3,
     "llm_payloads",
@@ -182,7 +201,8 @@ const Migration kPayloads{
     `hash` FixedString(16),
     `bytes` UInt32,
     `content` String CODEC(ZSTD(3)),
-    `ingested_at` DateTime64(3, 'UTC') DEFAULT now64(3) CODEC(Delta(8), ZSTD(1))
+    `ingested_at` DateTime64(3, 'UTC') DEFAULT now64(3) CODEC(Delta(8), ZSTD(1)),
+    INDEX idx_content lower(content) TYPE text(tokenizer = 'splitByNonAlpha') GRANULARITY 1
 )
 ENGINE = ReplacingMergeTree
 ORDER BY (project, hash)
@@ -221,11 +241,11 @@ const Migration kScores{
     `string_value` String,
     `comment` String,
     `event_time` DateTime64(9, 'UTC'),
-    INDEX idx_trace_id trace_id TYPE bloom_filter(0.01) GRANULARITY 1
+    INDEX idx_session_id session_id TYPE bloom_filter(0.01) GRANULARITY 1
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(event_time)
-ORDER BY (project, name, toStartOfHour(event_time), score_id)
+ORDER BY (trace_id, observation_id, name, event_time, score_id)
 SETTINGS non_replicated_deduplication_window = 1000)",
         R"(CREATE TABLE IF NOT EXISTS halo_scope.llm_scores_in
 (
