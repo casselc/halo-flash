@@ -64,14 +64,22 @@ int main(int argc, char** argv) {
       const std::size_t bytes = mb << 20;
       auto b = d->Alloc(bytes, &e);
       if (!b) break;
-      // Bandwidth: enough passes for ~1 GB of traffic.
+      // Write every page first: a fresh allocation may not be backed yet, and
+      // reads of unbacked pages can all hit one zero page in cache.
+      {
+        std::vector<float> fill(bytes / 4, 1.0f);
+        (void)d->Upload(b, 0, fill.data(), bytes, &e);
+      }
+      // Bandwidth: enough passes for ~1 GB of traffic, one pass per launch. A
+      // repeat loop inside the kernel would let each resident block re-read
+      // its own slice from cache (only ~160 of the 1280 blocks are resident).
       const std::uint64_t n = bytes / 16;
       const std::uint32_t reps = static_cast<std::uint32_t>(std::max<std::size_t>(1, (1ull << 30) / bytes));
-      const rt::Arg ra[] = {rt::Arg::Buf(b), rt::Arg::Val(n), rt::Arg::Val(reps), rt::Arg::Buf(out)};
+      const rt::Arg ra[] = {rt::Arg::Buf(b), rt::Arg::Val(n), rt::Arg::Val(std::uint32_t{1}), rt::Arg::Buf(out)};
       (void)d->Launch(kr, {1280}, {256}, ra, &e);
       (void)d->Synchronize(&e);
       auto t0 = std::chrono::steady_clock::now();
-      (void)d->Launch(kr, {1280}, {256}, ra, &e);
+      for (std::uint32_t r = 0; r < reps; ++r) (void)d->Launch(kr, {1280}, {256}, ra, &e);
       (void)d->Synchronize(&e);
       const double gbs = static_cast<double>(bytes) * reps /
                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 1e9;
