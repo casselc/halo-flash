@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -357,4 +358,29 @@ TEST(FlashNextGpu, StepSampleMatchesCpuSamplerInLockstep) {
       cpu.Accept(static_cast<sampling::TokenId>(token));
     }
   }, {.test_cases = 30});
+}
+
+// Weights read from their files (parallel O_DIRECT loader) must be the same
+// bytes as a direct upload: identical logits.
+TEST(FlashNextGpu, FileLoadedWeightsMatchDirectUpload) {
+  Tiny* t = LoadTiny();
+  if (!t) GTEST_SKIP() << "set HALO_TINY_HF_DIR";
+  auto devices = Devices();
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  std::vector<rt::FileSource> sources;
+  for (const auto& r : t->reader->GetMappedRegions()) sources.push_back({r.data, r.size, r.file_descriptor});
+  const auto tokens = ReadTokens(t->dir + "/tokens.i32");
+  const std::size_t V = t->weights->config.vocab_size;
+  for (auto& dev : devices) {
+    std::string error;
+    auto direct = engine::FlashNextGpu::Create(*dev, *t->weights, t->ngram.get(), &*t->lora, 16, &error);
+    auto loaded = engine::FlashNextGpu::Create(*dev, *t->weights, t->ngram.get(), &*t->lora, 16, &error, sources);
+    ASSERT_TRUE(direct && loaded) << error;
+    std::vector<float> a(V), b(V);
+    for (std::size_t p = 0; p < 8; ++p) {
+      ASSERT_TRUE(direct->Step(tokens[p], a, &error)) << error;
+      ASSERT_TRUE(loaded->Step(tokens[p], b, &error)) << error;
+      ASSERT_EQ(std::memcmp(a.data(), b.data(), V * 4), 0) << rt::BackendName(dev->backend()) << " position " << p;
+    }
+  }
 }

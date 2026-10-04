@@ -87,6 +87,10 @@ class Device {
   [[nodiscard]] virtual bool Download(const Buffer& src, std::size_t offset, void* dst, std::size_t bytes,
                                       std::string* error) = 0;
   [[nodiscard]] virtual bool Fill(const Buffer& dst, std::uint8_t value, std::string* error) = 0;
+  /// Host memory the backend can copy from at full speed (pinned where the
+  /// runtime supports it), 4096-byte aligned. Default: plain aligned memory.
+  [[nodiscard]] virtual void* AllocHost(std::size_t bytes, std::string* error);
+  virtual void FreeHost(void* p) noexcept;
 
   /// Loads one HSACO code object; kernels are then looked up by name.
   [[nodiscard]] virtual bool LoadModule(std::span<const std::uint8_t> hsaco, std::string* error) = 0;

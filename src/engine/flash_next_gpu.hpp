@@ -22,6 +22,7 @@
 #include "model/ngram.hpp"
 #include "model/weights.hpp"
 #include "rt/device.hpp"
+#include "rt/file_upload.hpp"
 
 namespace halo::engine {
 
@@ -29,7 +30,8 @@ class FlashNextGpu {
  public:
   [[nodiscard]] static std::unique_ptr<FlashNextGpu> Create(rt::Device& device, const model::ModelWeights& weights,
                                                             model::NgramTable* ngram, const model::LoraAdapter* lora,
-                                                            std::uint32_t max_context, std::string* error);
+                                                            std::uint32_t max_context, std::string* error,
+                                                            std::span<const rt::FileSource> sources = {});
   ~FlashNextGpu();
   [[nodiscard]] bool Step(std::int32_t token, std::span<float> logits, std::string* error);
 
@@ -88,7 +90,8 @@ class FlashNextGpu {
 
   FlashNextGpu(rt::Device& d, const model::ModelWeights& w, model::NgramTable* ngram)
       : dev_(d), w_(w), ngram_(ngram) {}
-  bool Init(const model::LoraAdapter* lora, std::uint32_t max_context, std::string* error);
+  bool Init(const model::LoraAdapter* lora, std::uint32_t max_context, std::string* error,
+            std::span<const rt::FileSource> sources);
   bool Upload(const model::TensorRef& t, std::string* error);
   rt::Buffer Scratch(std::size_t floats, std::string* error);
   bool Launch(const char* kernel, rt::Dim3 grid, rt::Dim3 block, std::initializer_list<rt::Arg> args,
@@ -130,6 +133,7 @@ class FlashNextGpu {
   rt::Buffer sample_block_out_, sample_candidates_, sample_key_, sample_rid_, sample_w_, sample_out_;
   model::NgramHistory ngram_history_;
   std::unordered_map<const void*, DevTensor> tensors_;
+  rt::FileUploader* loader_ = nullptr;  ///< during Init: weights read from their files
   std::unordered_map<const void*, DevLora> lora_;
   std::unordered_map<std::string, rt::KernelId> kernels_;
   std::vector<LinearState> linear_;

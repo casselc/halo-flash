@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <numeric>
+#include <thread>
 
 #include "kernels/core_hsaco.hpp"
 #include "kernels/sample_params.h"
@@ -35,9 +36,10 @@ std::uint32_t Blocks(std::size_t n, std::uint32_t per = kBlock) { return static_
 
 std::unique_ptr<FlashNextGpu> FlashNextGpu::Create(rt::Device& device, const model::ModelWeights& weights,
                                                    model::NgramTable* ngram, const model::LoraAdapter* lora,
-                                                   std::uint32_t max_context, std::string* error) {
+                                                   std::uint32_t max_context, std::string* error,
+                                                   std::span<const rt::FileSource> sources) {
   auto m = std::unique_ptr<FlashNextGpu>(new FlashNextGpu(device, weights, ngram));
-  if (!m->Init(lora, max_context, error)) return nullptr;
+  if (!m->Init(lora, max_context, error, sources)) return nullptr;
   return m;
 }
 
@@ -58,7 +60,8 @@ bool FlashNextGpu::Upload(const model::TensorRef& t, std::string* error) {
   DevTensor d;
   const std::size_t bytes = t.SizeBytes();
   d.buf = dev_.Alloc(bytes, error);
-  if (!d.buf || !dev_.Upload(d.buf, 0, t.data, bytes, error)) return false;
+  if (!d.buf) return false;
+  if (!(loader_ && loader_->Add(d.buf, 0, t.data, bytes)) && !dev_.Upload(d.buf, 0, t.data, bytes, error)) return false;
   if (const char* k = MatVecKernel(t.type)) {
     d.matvec = dev_.Kernel(k, error);
     d.embed = dev_.Kernel(std::string(k) + "_embed_p", error);
@@ -101,7 +104,14 @@ bool FlashNextGpu::MatVec(const model::TensorRef& t, std::uint64_t expert, const
   return true;
 }
 
-bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_context, std::string* error) {
+bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_context, std::string* error,
+                        std::span<const rt::FileSource> sources) {
+  rt::FileUploader loader(dev_, sources);
+  loader_ = &loader;
+  struct Clear {
+    rt::FileUploader*& p;
+    ~Clear() { p = nullptr; }
+  } clear{loader_};
   const auto& c = w_.config;
   max_context_ = max_context;
   if (c.num_experts > 1024 || c.num_experts_used == 0 || c.num_experts_used > c.num_experts) {
@@ -135,6 +145,9 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
                           &l.shexp_gate_inp, &l.shexp_gate, &l.shexp_up, &l.shexp_down})
       if (!up(*t)) return false;
   }
+  // Weights queued by Upload() are read from their files in parallel now.
+  if (!loader.Run(std::max(4u, std::min(16u, std::thread::hardware_concurrency() / 2)), error)) return false;
+  loader_ = nullptr;
   const std::size_t H = c.hidden_size, D = c.HcDim();
   res_ = Scratch(D, error);
   xn_ = Scratch(D, error);

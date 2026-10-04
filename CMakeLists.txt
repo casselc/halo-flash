@@ -89,6 +89,7 @@ if(HALO_GPU)
   add_library(halo_gpu STATIC
     src/rt/device.cpp
     src/rt/hip_device.cpp
+    src/rt/file_upload.cpp
     src/engine/qwen35_gpu.cpp
     src/engine/flash_next_gpu.cpp
     ${HALO_GEN}/kernels/core_hsaco.cpp)
@@ -161,6 +162,10 @@ if(HALO_BUILD_TESTS)
     target_link_libraries(halo_step_stats PRIVATE halo_gpu)
     add_executable(halo_sample_bench tools/sample_bench.cpp)
     target_link_libraries(halo_sample_bench PRIVATE halo_gpu)
+    add_executable(halo_run tools/run.cpp)
+    target_link_libraries(halo_run PRIVATE halo_gpu halo_text)
+    add_executable(halo_score tools/score.cpp)
+    target_link_libraries(halo_score PRIVATE halo_gpu halo_text)
   endif()
   halo_test(model_tests
     tests/model/reference_hf_test.cpp

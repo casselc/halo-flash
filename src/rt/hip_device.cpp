@@ -66,6 +66,14 @@ class HipDevice final : public Device {
   bool Fill(const Buffer& dst, std::uint8_t v, std::string* error) override {
     return Ok(hipMemsetAsync(dst.device, v, dst.bytes, stream_), "hipMemset", error);
   }
+  void* AllocHost(std::size_t bytes, std::string* error) override {
+    void* p = nullptr;
+    if (!Ok(hipHostMalloc(&p, bytes, hipHostMallocDefault), "hipHostMalloc", error)) return nullptr;
+    return p;
+  }
+  void FreeHost(void* p) noexcept override {
+    if (p) (void)hipHostFree(p);
+  }
   bool LoadModule(std::span<const std::uint8_t> hsaco, std::string* error) override {
     image_.assign(hsaco.begin(), hsaco.end());
     return Ok(hipModuleLoadData(&module_, image_.data()), "hipModuleLoadData", error);
