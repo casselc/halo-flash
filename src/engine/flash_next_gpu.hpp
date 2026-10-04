@@ -90,6 +90,9 @@ class FlashNextGpu {
   /// The batched attention on FP16 WMMA tiles with an online softmax (head
   /// dim 256); off, the decode kernel's arithmetic per token.
   static inline bool prefill_wmma_attention_ = true;
+  /// While every token sees every earlier position (under the QSA budget),
+  /// 4 tokens per attention block share K/V and QSA selection is skipped.
+  static inline bool prefill_mq_attention_ = true;
   /// DeltaNet recurrence with each state column over 4 lanes (2 blocks per
   /// head), its inputs staged and prefetched per 8 tokens, and a separate
   /// gated norm; exact mode keeps the fused kernel, bit-identical to
@@ -201,6 +204,7 @@ class FlashNextGpu {
   bool LinearChunk(const model::LayerWeights& l, LinearState& s, std::uint32_t tokens, std::string* error);
   bool AttentionBatched(const model::LayerWeights& l, AttnState& s, std::uint32_t T, std::string* error);
   bool AttentionChunk(const model::LayerWeights& l, AttnState& s, std::uint32_t tokens, std::string* error);
+  bool F16Route(const model::TensorRef& t) const;
   bool MixUp(const model::HcMixer& m, std::uint32_t T, std::string* error);
   bool Half(const rt::Buffer& x, const rt::Buffer& out, std::uint32_t n, std::string* error);
   bool MixedHalf(std::uint32_t T, std::string* error);

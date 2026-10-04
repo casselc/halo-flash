@@ -3119,6 +3119,42 @@ extern "C" __global__ void halo_rmsnorm_rows(const float* x, const float* w_all,
   for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) yv[i] = xv[i] * scale * w[i];
 }
 
+// halo_rmsnorm_rows that also writes an fp16 copy (the next GEMM's input on
+// the FP16 route), sparing a conversion pass.
+extern "C" __global__ void halo_rmsnorm_rows_h(const float* x, const float* w_all, float* y, _Float16* y16,
+                                               std::uint32_t d, float eps, std::uint32_t w_stride,
+                                               std::uint32_t w_period) {
+  __shared__ float scratch[32];
+  const std::size_t row = static_cast<std::size_t>(blockIdx.x) * d;
+  const float* w = w_all + (blockIdx.x % w_period) * w_stride;
+  float ss = 0.0f;
+  for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) ss += x[row + i] * x[row + i];
+  ss = BlockSum(ss, scratch);
+  const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
+  for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) {
+    const float v = x[row + i] * scale * w[i];
+    y[row + i] = v;
+    y16[row + i] = static_cast<_Float16>(v);
+  }
+}
+
+// halo_gated_norm writing its result in fp16 only (the out projection's
+// input on the FP16 route). grid (rows), rows of d.
+extern "C" __global__ void halo_gated_norm_h(const float* o, const float* w, const float* z, _Float16* y16,
+                                             std::uint32_t d, float eps, std::uint32_t mode) {
+  __shared__ float scratch[32];
+  const float* ov = o + static_cast<std::size_t>(blockIdx.x) * d;
+  const float* zv = z + static_cast<std::size_t>(blockIdx.x) * d;
+  float ss = 0.0f;
+  for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) ss += ov[i] * ov[i];
+  ss = BlockSum(ss, scratch);
+  const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
+  for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) {
+    const float g = mode == 0 ? Silu(zv[i]) : Sigmoid(zv[i]);
+    y16[static_cast<std::size_t>(blockIdx.x) * d + i] = static_cast<_Float16>(ov[i] * scale * w[i] * g);
+  }
+}
+
 // halo_hc_mix for T rows: xn, gate [T][hc][h] -> mixed [T][h].
 extern "C" __global__ void halo_hc_mix_rows(const float* xn, const float* gate, float* mixed, std::uint32_t hc,
                                             std::uint32_t h, std::uint32_t tokens) {
@@ -4037,4 +4073,140 @@ extern "C" __global__ void __launch_bounds__(256)
 extern "C" __global__ void halo_f16_rows(const float* x, _Float16* y, std::uint32_t n) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) y[i] = static_cast<_Float16>(x[i]);
+}
+
+// ---- P4: chunk attention, several query tokens per block ----------------------
+//
+// halo_attention_wmma_rows for QT = 4 consecutive tokens at once, when each
+// of them still sees every earlier position (dense causal: QSA has selected
+// nothing away). The block's rows are (token, head) pairs of one KV head:
+// QT * G <= 48 rows in up to 3 tiles of 16. Every K fragment and staged V
+// chunk serves all QT tokens, so K/V traffic falls by QT; keys past a
+// token's own position are masked. 32 keys per chunk: each of 8 waves
+// scores one (row tile, key tile) of the up to 3 x 2, then adds P . V for
+// its row tiles and 32 of the 256 output dims.
+//   grid (num_kv_heads, ceil(T / 4)), block 256; head_dim 256, G <= 12.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_attention_wmma_mq(const float* q, const float* kc, const float* vc, const float* gate, float* out,
+                           const std::uint32_t* params, std::uint32_t num_heads, std::uint32_t num_kv_heads,
+                           std::uint32_t tokens) {
+  constexpr std::uint32_t HD = 256, QT = 4, KC = 32, QR = HD + 8, VR = HD + 8, PR = KC + 8, MR = 48;
+  __shared__ __attribute__((aligned(16))) _Float16 Qs[MR * QR];
+  __shared__ __attribute__((aligned(16))) _Float16 Vs[KC * VR];
+  __shared__ __attribute__((aligned(16))) _Float16 Ps[MR * PR];
+  __shared__ float Ss[MR * KC];
+  __shared__ float mrow[MR], lrow[MR], alpha[MR];
+  __shared__ std::uint32_t nkv[QT];
+  const std::uint32_t g = blockIdx.x, t0 = blockIdx.y * QT, G = num_heads / num_kv_heads;
+  const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const std::uint32_t rows = QT * G, rtiles = (rows + 15) / 16;
+  const float scale = 1.0f / sqrtf(static_cast<float>(HD));
+  if (tid < QT) nkv[tid] = t0 + tid < tokens ? params[static_cast<std::size_t>(t0 + tid) * 16 + kHaloNVisible] : 0;
+  for (std::uint32_t i = tid; i < MR * HD; i += blockDim.x) {
+    const std::uint32_t r = i / HD, d = i % HD, tq = r / G, h = r % G;
+    const bool live = r < rows && t0 + tq < tokens;
+    Qs[r * QR + d] = static_cast<_Float16>(live ? q[(static_cast<std::size_t>(t0 + tq) * num_heads + g * G + h) * HD + d] : 0.0f);
+  }
+  if (tid < MR) {
+    mrow[tid] = -INFINITY;
+    lrow[tid] = 0.0f;
+  }
+  __syncthreads();
+  // Keys 0 .. n - 1, n the longest list in the block (the last live token's).
+  std::uint32_t n = 0;
+  for (std::uint32_t i = 0; i < QT; ++i) n = max(n, nkv[i]);
+  // P . V work: wave owns dim tiles 2 * (wave % 8) .. + 1 for every row tile.
+  halo_v8f acc[3][2] = {};
+  for (std::uint32_t c0 = 0; c0 < n; c0 += KC) {
+    __syncthreads();  // previous chunk's Vs / Ps reads done
+    for (std::uint32_t i = tid; i < KC * HD / 4; i += blockDim.x) {
+      const std::uint32_t j = i / (HD / 4), d = (i % (HD / 4)) * 4;
+      float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      if (c0 + j < n) v = *reinterpret_cast<const float4*>(vc + (static_cast<std::size_t>(c0 + j) * num_kv_heads + g) * HD + d);
+      _Float16* dst = Vs + j * VR + d;
+      dst[0] = static_cast<_Float16>(v.x);
+      dst[1] = static_cast<_Float16>(v.y);
+      dst[2] = static_cast<_Float16>(v.z);
+      dst[3] = static_cast<_Float16>(v.w);
+    }
+    // Scores: wave -> (row tile wave / 2, key tile wave % 2), up to 6 waves.
+    const std::uint32_t rt = wave / 2, kt = wave % 2;
+    if (rt < rtiles) {
+      const std::uint32_t kj = c0 + kt * 16 + lane % 16;
+      const float* krow = kc + (static_cast<std::size_t>(min(kj, n - 1)) * num_kv_heads + g) * HD;
+      halo_v8f s = {};
+      for (std::uint32_t k0 = 0; k0 < HD; k0 += 16) {
+        const halo_v16h a = LdsFrag(&Qs[(rt * 16 + lane % 16) * QR + k0]);
+        halo_v16h b;
+#pragma unroll
+        for (int i = 0; i < 16; i += 4) {
+          const float4 v = *reinterpret_cast<const float4*>(krow + k0 + i);
+          b[i] = static_cast<_Float16>(v.x);
+          b[i + 1] = static_cast<_Float16>(v.y);
+          b[i + 2] = static_cast<_Float16>(v.z);
+          b[i + 3] = static_cast<_Float16>(v.w);
+        }
+        s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, s);
+      }
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint32_t r = rt * 16 + 2 * j + lane / 16, tq = r / G;
+        const bool ok = r < rows && kj < nkv[min(tq, QT - 1)];
+        Ss[r * KC + kt * 16 + lane % 16] = ok ? s[j] * scale : -INFINITY;
+      }
+    }
+    __syncthreads();
+    // Online softmax: 4 threads per row (192 of 256), 8 keys each.
+    if (tid < MR * 4) {
+      const std::uint32_t row = tid / 4, part = tid % 4;
+      float mx = -INFINITY;
+      if (row < rows)
+        for (std::uint32_t c = part * 8; c < part * 8 + 8; ++c) mx = fmaxf(mx, Ss[row * KC + c]);
+      for (int o = 2; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 32));
+      const float m_old = mrow[row], m_new = fmaxf(m_old, mx);
+      float sum = 0.0f;
+      for (std::uint32_t c = part * 8; c < part * 8 + 8; ++c) {
+        const float p = row < rows && m_new != -INFINITY ? expf(Ss[row * KC + c] - m_new) : 0.0f;
+        Ps[row * PR + c] = static_cast<_Float16>(p);
+        sum += p;
+      }
+      for (int o = 2; o > 0; o >>= 1) sum += __shfl_xor(sum, o, 32);
+      if (part == 0) {
+        const float a = m_old == -INFINITY ? 0.0f : expf(m_old - m_new);
+        alpha[row] = a;
+        lrow[row] = lrow[row] * a + sum;
+        mrow[row] = m_new;
+      }
+    }
+    __syncthreads();
+    for (std::uint32_t r = 0; r < rtiles; ++r) {
+#pragma unroll
+      for (int dt = 0; dt < 2; ++dt)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[r][dt][j] *= alpha[r * 16 + 2 * j + lane / 16];
+      for (std::uint32_t kk = 0; kk < KC; kk += 16) {
+        const halo_v16h a = LdsFrag(&Ps[(r * 16 + lane % 16) * PR + kk]);
+#pragma unroll
+        for (int dt = 0; dt < 2; ++dt) {
+          const std::uint32_t d = (wave * 2 + dt) * 16 + lane % 16;
+          halo_v16h b;
+#pragma unroll
+          for (int i = 0; i < 16; ++i) b[i] = Vs[(kk + i) * VR + d];
+          acc[r][dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[r][dt]);
+        }
+      }
+    }
+  }
+  __syncthreads();
+  for (std::uint32_t r = 0; r < rtiles; ++r)
+#pragma unroll
+    for (int dt = 0; dt < 2; ++dt)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint32_t row = r * 16 + 2 * j + lane / 16, tq = row / G, h = row % G;
+        if (row >= rows || t0 + tq >= tokens) continue;
+        const std::uint32_t d = (wave * 2 + dt) * 16 + lane % 16;
+        const std::size_t idx = (static_cast<std::size_t>(t0 + tq) * num_heads + g * G + h) * HD + d;
+        out[idx] = acc[r][dt][j] / lrow[row] * Sigmoid(gate[idx]);
+      }
 }

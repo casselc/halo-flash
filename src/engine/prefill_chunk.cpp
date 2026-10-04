@@ -140,6 +140,15 @@ bool FlashNextGpu::Half(const rt::Buffer& x, const rt::Buffer& out, std::uint32_
   return Launch("halo_f16_rows", {Blocks(n)}, {kBlock}, {rt::Arg::Buf(x), rt::Arg::Buf(out), rt::Arg::Val(n)}, error);
 }
 
+// Whether Gemm takes the FP16 route for t (and so reads a provided x16).
+bool FlashNextGpu::F16Route(const model::TensorRef& t) const {
+  const auto& d = tensors_.at(t.data);
+  const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
+  const bool small = !(rows <= 320 && cols >= 4096) && rows <= 512;
+  return !prefill_exact_projections_ && !lora_.contains(t.data) && prefill_f16_gemm_ && d.qs &&
+         cols % (small ? 128 : 64) == 0 && d.qstride % 16 == 0;
+}
+
 bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::Buffer& y, std::uint32_t T,
                         std::string* error, const rt::Buffer* x16) {
   const auto& d = tensors_.at(t.data);
@@ -149,7 +158,7 @@ bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt
   // activations dominate), 64-row tiles up to 512, 256-row tiles beyond.
   const bool tall = rows <= 320 && cols >= 4096, small = !tall && rows <= 512;
   const std::uint32_t bm = tall ? 320 : small ? 64 : 256, bn = tall ? 64 : 128;
-  if (!per_token && prefill_f16_gemm_ && d.qs && cols % (small ? 128 : 64) == 0 && d.qstride % 16 == 0) {
+  if (F16Route(t)) {
     if (!x16 && !Half(x, ck_.xh, T * cols, error)) return false;
     return Launch(tall ? "halo_gemm_q8r_f16_m" : small ? "halo_gemm_q8r_f16_s" : "halo_gemm_q8r_f16_l",
                   {(T + bn - 1) / bn, (rows + bm - 1) / bm}, {256},
@@ -187,11 +196,19 @@ bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt
 bool FlashNextGpu::HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_t T, std::string* error) {
   const auto& c = w_.config;
   const std::uint32_t H = c.hidden_size, low = c.hc_low_rank;
-  return Launch("halo_rmsnorm_rows", {T * c.hc_count}, {kBlock},
-                {rt::Arg::Buf(ck_.res), rt::Arg::Buf(tensors_.at(m.norm.data).buf), rt::Arg::Buf(ck_.xn),
-                 rt::Arg::Val(H), rt::Arg::Val(c.rms_eps), rt::Arg::Val(H), rt::Arg::Val(c.hc_count)},
-                error) &&
-         Gemm(m.down, ck_.xn, ck_.lo, T, error) &&
+  // On the FP16 route the norm also leaves xn in fp16 for the down projection.
+  const bool h16 = F16Route(m.down);
+  const bool normed =
+      h16 ? Launch("halo_rmsnorm_rows_h", {T * c.hc_count}, {kBlock},
+                   {rt::Arg::Buf(ck_.res), rt::Arg::Buf(tensors_.at(m.norm.data).buf), rt::Arg::Buf(ck_.xn),
+                    rt::Arg::Buf(ck_.xh), rt::Arg::Val(H), rt::Arg::Val(c.rms_eps), rt::Arg::Val(H),
+                    rt::Arg::Val(c.hc_count)},
+                   error)
+          : Launch("halo_rmsnorm_rows", {T * c.hc_count}, {kBlock},
+                   {rt::Arg::Buf(ck_.res), rt::Arg::Buf(tensors_.at(m.norm.data).buf), rt::Arg::Buf(ck_.xn),
+                    rt::Arg::Val(H), rt::Arg::Val(c.rms_eps), rt::Arg::Val(H), rt::Arg::Val(c.hc_count)},
+                   error);
+  return normed && Gemm(m.down, ck_.xn, ck_.lo, T, error, h16 ? &ck_.xh : nullptr) &&
          Launch("halo_scale_silu", {Blocks(std::size_t{T} * low)}, {kBlock},
                 {rt::Arg::Buf(ck_.lo), rt::Arg::Val(1.0F / static_cast<float>(c.hc_count)), rt::Arg::Val(T * low)},
                 error) &&
@@ -276,10 +293,17 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
                         rt::Arg::Val(c.ssm_num_k_heads), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch),
                         rt::Arg::Val(vd)},
                        error) &&
-                    Launch("halo_gated_norm", {T * c.ssm_num_v_heads}, {128},
-                           {rt::Arg::Buf(ck_.gdn), rt::Arg::Buf(tensors_.at(l.ssm_norm.data).buf), rt::Arg::Buf(ck_.z),
-                            rt::Arg::Val(c.ssm_head_dim), rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(1)},
-                           error)
+                    (F16Route(l.ssm_out)
+                         ? Launch("halo_gated_norm_h", {T * c.ssm_num_v_heads}, {128},
+                                  {rt::Arg::Buf(ck_.gdn), rt::Arg::Buf(tensors_.at(l.ssm_norm.data).buf),
+                                   rt::Arg::Buf(ck_.z), rt::Arg::Buf(ck_.xh), rt::Arg::Val(c.ssm_head_dim),
+                                   rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(1)},
+                                  error)
+                         : Launch("halo_gated_norm", {T * c.ssm_num_v_heads}, {128},
+                                  {rt::Arg::Buf(ck_.gdn), rt::Arg::Buf(tensors_.at(l.ssm_norm.data).buf),
+                                   rt::Arg::Buf(ck_.z), rt::Arg::Val(c.ssm_head_dim), rt::Arg::Val(c.rms_eps),
+                                   rt::Arg::Val<std::uint32_t>(1)},
+                                  error))
               : Launch("halo_gdn_prefill_d128_norm", {c.ssm_num_v_heads}, {128},
                 {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull), rt::Arg::Buf(ck_.conv, 2ull * kd * 4),
                  rt::Arg::Buf(ck_.alpha), rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
@@ -288,7 +312,9 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
                  rt::Arg::Val(c.ssm_num_k_heads), rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(1),
                  rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)},
                 error)) &&
-         Gemm(l.ssm_out, ck_.gdn, ck_.block_out, T, error);
+         // The split path's gated norm left its output in fp16 only (in xh).
+         Gemm(l.ssm_out, ck_.gdn, ck_.block_out, T, error,
+              prefill_split_gdn_ && !prefill_exact_projections_ && F16Route(l.ssm_out) ? &ck_.xh : nullptr);
 }
 
 bool FlashNextGpu::AttentionChunk(const model::LayerWeights& l, AttnState& s, std::uint32_t T, std::string* error) {
@@ -404,6 +430,17 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
                rt::Arg::Val(b0), rt::Arg::Val(ratio), rt::Arg::Val(c.rope_theta)},
               error))
     return false;
+  // Dense causal (every token still sees every earlier position: QSA has
+  // selected nothing away yet): 4 tokens per block share K/V, and the QSA
+  // scores and selection are not needed.
+  const std::uint32_t G = nh / nkv;
+  if (wmma && prefill_mq_attention_ && (pos0 + T) / ratio <= budget && 4 * G <= 48)
+    return Launch("halo_attention_wmma_mq", {nkv, (T + 3) / 4}, {256},
+                  {rt::Arg::Buf(ck_.q), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v), rt::Arg::Buf(ck_.gate_a),
+                   rt::Arg::Buf(ck_.ctx), rt::Arg::Buf(ck_.host, ck_.params_offset), rt::Arg::Val(nh),
+                   rt::Arg::Val(nkv), rt::Arg::Val(T)},
+                  error) &&
+           Gemm(l.attn_out, ck_.ctx, ck_.block_out, T, error);
   for (std::uint32_t t0 = 0; t0 < T; t0 += kAttnSub) {
     const std::uint32_t n = std::min(kAttnSub, T - t0);
     const rt::Arg params = rt::Arg::Buf(ck_.host, ck_.params_offset + std::size_t{t0} * 64);

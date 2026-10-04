@@ -597,7 +597,8 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
                 mode == kFloatGemm);
       EXPECT_EQ(chunked->LaunchedKernel("halo_gemm_bf16_f16_k128"), mode != kExact);
       EXPECT_EQ(chunked->LaunchedKernel("halo_moe_bucket"), mode != kExact);
-      EXPECT_EQ(chunked->LaunchedKernel("halo_attention_wmma_rows"), mode != kExact);
+      EXPECT_TRUE(chunked->LaunchedKernel("halo_attention_wmma_rows") ||
+                  chunked->LaunchedKernel("halo_attention_wmma_mq") || mode == kExact);
     }
   }, {.test_cases = 30});
   E::prefill_exact_projections_ = saved_exact;

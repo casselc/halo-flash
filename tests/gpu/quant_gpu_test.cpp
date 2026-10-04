@@ -1563,3 +1563,67 @@ TEST(GpuQuant, FusedMixerUpMatchesReference) {
     }, {.test_cases = 30});
   }
 }
+
+// P4: the fp16-emitting norms against the originals: halo_rmsnorm_rows_h's
+// fp32 output bit for bit; both fp16 outputs within one fp16 ulp of the
+// fp16 rounding of the original's fp32 result. (First asserted exact; the
+// compiler can round the last product straight to fp16, a single rounding
+// where the reference rounds twice, moving rare elements by one ulp.)
+TEST(GpuKernels, Fp16EmittingNormsMatchOriginals) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      const auto d = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 90}));
+      const auto period = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 4}));
+      const auto rows = period * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 40}));
+      const auto mode = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = 1}));
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto vec = [&](std::size_t n, float amp) {
+        std::vector<float> v(n);
+        for (auto& x : v) { seed = seed * 1664525u + 1013904223u; x = amp * (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f); }
+        return v;
+      };
+      const auto x = vec(std::size_t{rows} * d, 8.0f), w = vec(std::size_t{period} * d, 2.0f), z = vec(std::size_t{rows} * d, 6.0f);
+      std::vector<rt::Buffer> owned;
+      const auto up = [&](const void* p, std::size_t bytes) {
+        auto b = dev->Alloc(bytes, &error);
+        if (p) EXPECT_TRUE(dev->Upload(b, 0, p, bytes, &error));
+        owned.push_back(b);
+        return b;
+      };
+      const std::size_t n = std::size_t{rows} * d;
+      auto xb = up(x.data(), n * 4), wb = up(w.data(), w.size() * 4), zb = up(z.data(), n * 4), y1 = up(nullptr, n * 4),
+           y2 = up(nullptr, n * 4), h2 = up(nullptr, n * 2), g1 = up(x.data(), n * 4), h3 = up(nullptr, n * 2);
+      const auto launch = [&](const char* k, std::uint32_t grid, std::initializer_list<rt::Arg> a) {
+        ASSERT_TRUE(dev->Launch(dev->Kernel(k, &error), {grid}, {256}, std::span<const rt::Arg>(a.begin(), a.size()), &error)) << k;
+      };
+      launch("halo_rmsnorm_rows", rows, {rt::Arg::Buf(xb), rt::Arg::Buf(wb), rt::Arg::Buf(y1), rt::Arg::Val(d),
+                                         rt::Arg::Val(1e-6f), rt::Arg::Val(d), rt::Arg::Val(period)});
+      launch("halo_rmsnorm_rows_h", rows, {rt::Arg::Buf(xb), rt::Arg::Buf(wb), rt::Arg::Buf(y2), rt::Arg::Buf(h2),
+                                           rt::Arg::Val(d), rt::Arg::Val(1e-6f), rt::Arg::Val(d), rt::Arg::Val(period)});
+      // Gated norm: the original in place on g1 (a copy of x), the fp16 variant from x.
+      launch("halo_gated_norm_h", rows, {rt::Arg::Buf(xb), rt::Arg::Buf(wb), rt::Arg::Buf(zb), rt::Arg::Buf(h3),
+                                         rt::Arg::Val(d), rt::Arg::Val(1e-6f), rt::Arg::Val(mode)});
+      launch("halo_gated_norm", rows, {rt::Arg::Buf(g1), rt::Arg::Buf(wb), rt::Arg::Buf(zb), rt::Arg::Val(d),
+                                       rt::Arg::Val(1e-6f), rt::Arg::Val(mode)});
+      std::vector<float> a(n), b(n), g(n);
+      std::vector<_Float16> ah(n), gh(n);
+      ASSERT_TRUE(dev->Download(y1, 0, a.data(), n * 4, &error) && dev->Download(y2, 0, b.data(), n * 4, &error) &&
+                  dev->Download(h2, 0, ah.data(), n * 2, &error) && dev->Download(g1, 0, g.data(), n * 4, &error) &&
+                  dev->Download(h3, 0, gh.data(), n * 2, &error))
+          << error;
+      for (auto& o : owned) dev->Free(o);
+      for (std::size_t i = 0; i < n; ++i) {
+        ASSERT_EQ(std::bit_cast<std::uint32_t>(a[i]), std::bit_cast<std::uint32_t>(b[i])) << "rmsnorm fp32 " << i;
+        const auto ulp = [](_Float16 x, _Float16 y) {
+          return std::abs(static_cast<int>(std::bit_cast<std::int16_t>(x)) - static_cast<int>(std::bit_cast<std::int16_t>(y)));
+        };
+        ASSERT_LE(ulp(ah[i], static_cast<_Float16>(a[i])), 1) << "rmsnorm fp16 " << i;
+        ASSERT_LE(ulp(gh[i], static_cast<_Float16>(g[i])), 1) << "gated norm fp16 " << i << " mode " << mode;
+      }
+    }, {.test_cases = 30});
+  }
+}
