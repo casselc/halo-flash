@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <string>
 #include <variant>
@@ -436,6 +437,21 @@ TEST(Gguf, MetadataOfEveryTypeRoundTrips) {
     ASSERT_FALSE(Open(image.b, &error));
     ASSERT_FALSE(error.empty());
   }, {.test_cases = 300});
+}
+
+TEST(Gguf, ElementCountGuardsOverflow) {
+  auto count = [](std::vector<std::uint64_t> dims) {
+    halo::core::GgufTensorInfo t;
+    t.dimensions = std::move(dims);
+    return t.ElementCount();
+  };
+  constexpr auto kMax = std::numeric_limits<std::uint64_t>::max();
+  EXPECT_EQ(count({}), 0U);
+  EXPECT_EQ(count({4, 0, 2}), 0U);
+  EXPECT_EQ(count({kMax / 3, 3}), kMax);  // exactly fits (2^64 - 1 is divisible by 3)
+  EXPECT_EQ(count({kMax / 3 + 1, 3}), 0U);
+  EXPECT_EQ(count({3, std::uint64_t{1} << 63}), 0U);  // wraps to 2^63 if unchecked
+  EXPECT_EQ(count({2, 3, 4}), 24U);
 }
 
 TEST(Gguf, SizeLimitsAreExact) {

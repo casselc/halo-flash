@@ -281,7 +281,7 @@ TEST(Quant, Q8_KIsScaleTimesInt) {
       for (auto& v : b.qs) v = tc.draw(gs::integers<std::int8_t>());
     }
     const std::size_t k = 256 * blocks.size();
-    std::vector<float> out(k), vec(k);
+    std::vector<float> out(k + 16, std::numeric_limits<float>::quiet_NaN()), vec(k);
     ASSERT_TRUE(q::DequantizeRow(GgmlType::kQ8_K, blocks.data(), out.data(), k));
     double ref = 0.0, mag = 0.0;
     for (std::size_t i = 0; i < k; ++i) {
@@ -291,8 +291,17 @@ TEST(Quant, Q8_KIsScaleTimesInt) {
       ref += static_cast<double>(out[i]) * vec[i];
       mag += std::fabs(static_cast<double>(out[i]) * vec[i]);
     }
+    for (std::size_t i = k; i < out.size(); ++i) ASSERT_TRUE(std::isnan(out[i])) << "wrote past k";
     ASSERT_LE(std::fabs(q::DotProductQ8_K(blocks.data(), vec, k) - ref), 1e-5 * mag + 1e-6);
   });
+}
+
+TEST(Quant, F32RowsAreCopied) {
+  const std::vector<float> row = {1.5F, -2.0F, 3.25F, 0.0F, -0.0F, 7.0F};
+  std::vector<float> out(row.size() + 4, -1.0F);
+  ASSERT_TRUE(q::DequantizeRow(GgmlType::kF32, row.data(), out.data(), row.size()));
+  EXPECT_EQ(std::memcmp(out.data(), row.data(), row.size() * sizeof(float)), 0);
+  for (std::size_t i = row.size(); i < out.size(); ++i) EXPECT_EQ(out[i], -1.0F);
 }
 
 TEST(Quant, BlockElementsAndSizes) {
@@ -323,6 +332,8 @@ TEST(Quant, BlockElementsAndSizes) {
       const std::size_t blocks = std::numeric_limits<std::size_t>::max() / r.bytes;
       EXPECT_EQ(q::EncodedSizeBytes(r.type, blocks * r.block), blocks * r.bytes) << name;
       EXPECT_EQ(q::EncodedSizeBytes(r.type, (blocks + 1) * r.block), 0U) << name;
+      // ...and a size whose byte count wraps to a small number.
+      if (r.block == 1) EXPECT_EQ(q::EncodedSizeBytes(r.type, blocks + 2), 0U) << name;
     }
   }
   EXPECT_EQ(q::EncodedSizeBytes(static_cast<GgmlType>(4), 32), 0U);  // a removed ggml type
