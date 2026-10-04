@@ -72,6 +72,19 @@
         "HALO_GPU": "ON",
         "HALO_HRX_ROOT": "$env{HRX_ROOT}"
       }
+    },
+    {
+      "name": "mull",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "HALO_GPU": "OFF",
+        "CMAKE_C_FLAGS": "-O0 -g -grecord-command-line -fpass-plugin=$env{MULL_ROOT}/usr/lib/mull-ir-frontend-21",
+        "CMAKE_CXX_FLAGS": "-O0 -g -grecord-command-line -fpass-plugin=$env{MULL_ROOT}/usr/lib/mull-ir-frontend-21"
+      },
+      "environment": {
+        "MULL_CONFIG": "${sourceDir}/mull.yml"
+      }
     }
   ],
   "buildPresets": [
@@ -102,6 +115,10 @@
     {
       "name": "gpu",
       "configurePreset": "gpu"
+    },
+    {
+      "name": "mull",
+      "configurePreset": "mull"
     }
   ],
   "testPresets": [

@@ -1,0 +1,17 @@
+# Mull (LLVM mutation testing) for the host C++ libraries. Used by the
+# compiler plugin when building the `mull` preset and by mull-runner.
+# See README.md, "Mutation testing".
+mutators:
+  - cxx_all
+# Host code that parses untrusted input or computes model numerics. Paths are
+# regexes matched against absolute source paths.
+includePaths:
+  - .*/src/core/(gguf|json|quant)\.(cpp|hpp)$
+  - .*/src/text/(tokenizer|unicode)\.(cpp|hpp)$
+  - .*/src/decide/(systemone|decider)\.(cpp|hpp)$
+  - .*/src/model/(cpu_ops|lora|ngram|config|weights)\.(cpp|hpp)$
+excludePaths:
+  - .*/_deps/.*
+  - .*/third_party/.*
+  - .*unicode_tables\.inc$
+quiet: true
