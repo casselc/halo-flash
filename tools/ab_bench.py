@@ -38,7 +38,10 @@ import subprocess
 import sys
 import time
 
-CLOCK = "/sys/devices/pci0000:00/0000:00:08.1/0000:c6:00.0/power_dpm_force_performance_level"
+# Through the DRM class link, which survives PCI bus renumbering (adding an
+# NVMe moved the GPU from c6:00.0 to c7:00.0). The sudoers rule must name
+# this exact path.
+CLOCK = "/sys/class/drm/card0/device/power_dpm_force_performance_level"
 
 
 def set_clock(level):
@@ -123,6 +126,8 @@ def main():
 
     env = dict(os.environ, HALO_PREFILL_TIMING="1")
     pinned = not args.no_pin and set_clock("profile_peak")
+    if not args.no_pin and not pinned:
+        print(f"warning: could not pin the GPU clock ({CLOCK}); measuring at auto", file=sys.stderr, flush=True)
 
     def restore(*_):
         if pinned:
