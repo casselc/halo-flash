@@ -45,6 +45,12 @@ add_library(halo_text STATIC
 )
 target_link_libraries(halo_text PUBLIC halo_core)
 
+# --- server: OpenAI request and response formats -----------------------------
+add_library(halo_server STATIC
+  src/server/openai_request.cpp
+)
+target_link_libraries(halo_server PUBLIC halo_core halo_text)
+
 # --- decide: System One decision API ---------------------------------------
 add_library(halo_decide STATIC
   src/decide/systemone.cpp
@@ -149,6 +155,9 @@ if(HALO_BUILD_TESTS)
     tests/text/tokenizer_test.cpp
     tests/text/chat_template_test.cpp
     tests/text/tool_call_parser_test.cpp)
+  halo_test(server_tests
+    tests/server/openai_request_test.cpp)
+  target_link_libraries(server_tests PRIVATE halo_server)
   halo_test(decide_tests
     tests/decide/systemone_test.cpp
     tests/decide/decider_test.cpp)

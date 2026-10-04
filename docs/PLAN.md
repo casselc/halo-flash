@@ -836,6 +836,15 @@ Completions and Chat Completions remain for compatibility.
     exactly the tokens of a stateless resend of the full history.
   - Stateful swarm tests over store, evict, rebuild and continue.
 
+**Status (2026-10-04).** `src/server/openai_request` parses Chat
+Completions, Responses and Completions bodies into one `GenerationRequest`
+(template messages, tools, options, sampling, limits). Responses items map
+onto template turns as described above; a property checks that the same
+conversation sent through either API renders the identical Flash-Next
+prompt. Unsupported features (n > 1, images, hosted tools, item
+references, encrypted reasoning) fail with an error naming the parameter.
+The HTTP layer, streaming events and the response store come next.
+
 **Context management and compaction (P6 with P12 evals).**
 1. **Truncation** (`truncation: "auto"`): drop the oldest items over budget.
    This costs a re-prefill of the changed prefix.
