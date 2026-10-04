@@ -12,7 +12,7 @@ crashes or times out), and survives when every binary that ran it passed.
 
 Each survivor is written as a key that does not move when lines do:
 
-    <repo-relative file> <function> <mutator> [#n]
+    <repo-relative file> <function> <mutator> [#n]    (root: MULL_SURVIVORS_ROOT, else the repo)
     e.g.  src/core/json.cpp Parser::number cxx_lt_to_le #2
 
 <function> is the innermost function definition enclosing the mutant, found by a small
@@ -325,7 +325,8 @@ def check(baseline, files, summary_path=None):
 
 
 def main(a):
-    root = os.environ.get('MULL_SURVIVORS_ROOT') or os.getcwd()
+    # keys name files relative to the repository (this script's parent's parent)
+    root = os.environ.get('MULL_SURVIVORS_ROOT') or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if a[:1] == ['keys'] and len(a) >= 2:
         print('\n'.join(survivor_keys(a[1:], root)))
         return 0

@@ -304,7 +304,9 @@ void DrawItem(hegel::TestCase& tc, VT t, Raw* out, Expect* expect) {
 }
 
 Entry DrawEntry(hegel::TestCase& tc) {
-  Entry e{static_cast<VT>(tc.draw(gs::integers<int>({.min_value = 0, .max_value = 12}))), {}, {}};
+  // Arrays half the time: each item type needs its own chance to appear.
+  const auto type = tc.draw(gs::booleans()) ? 9 : tc.draw(gs::sampled_from({0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12}));
+  Entry e{static_cast<VT>(type), {}, {}};
   switch (e.type) {
     case VT::kUint8: DrawInt<std::uint8_t, std::uint64_t>(tc, &e); break;
     case VT::kInt8: DrawInt<std::int8_t, std::int64_t>(tc, &e); break;
@@ -433,7 +435,20 @@ TEST(Gguf, MetadataOfEveryTypeRoundTrips) {
     image.b.resize(image.b.size() - cut);
     ASSERT_FALSE(Open(image.b, &error));
     ASSERT_FALSE(error.empty());
-  });
+  }, {.test_cases = 300});
+}
+
+TEST(Gguf, SizeLimitsAreExact) {
+  std::string error;
+  // The smallest GGUF: a 24-byte header with nothing in it.
+  ASSERT_EQ(Header(0, 0).b.size(), 24U);
+  EXPECT_TRUE(Open(Header(0, 0).b, &error)) << error;
+  // Keys up to 65535 bytes.
+  for (std::size_t len : {65535, 65536}) {
+    Raw r = Header(0, 1);
+    r.Str(std::string(len, 'k')).Pod<std::uint32_t>(4).Pod<std::uint32_t>(7);
+    EXPECT_EQ(static_cast<bool>(Open(r.b, &error)), len == 65535) << len;
+  }
 }
 
 namespace {
@@ -691,9 +706,23 @@ TEST(Gguf, SplitCountIsValidated) {
     EXPECT_FALSE(GgufReader::OpenFile(p, &error)) << p;
     EXPECT_FALSE(error.empty()) << p;
   }
-  // 65535 shards is allowed, so the reader goes on to look for the others.
+  // 65535 shards is allowed, so the reader goes on to the split metadata
+  // (absent here) instead of rejecting the count.
+  error.clear();
   EXPECT_FALSE(GgufReader::OpenFile(write("m-00001-of-65535.gguf", std::uint32_t{65535}), &error));
-  EXPECT_NE(error.find("split"), std::string::npos) << error;
+  EXPECT_NE(error.find("Invalid split GGUF metadata"), std::string::npos) << error;
+  // split.no must be below split.count.
+  {
+    GgufWriter w;
+    w.Set("split.count", std::uint32_t{2});
+    w.Set("split.no", std::uint32_t{2});
+    w.Set("split.tensors.count", std::uint64_t{0});
+    ASSERT_TRUE(w.WriteFile(dir.path / "s-00001-of-00002.gguf", &error)) << error;
+    ASSERT_TRUE(w.WriteFile(dir.path / "s-00002-of-00002.gguf", &error)) << error;
+    error.clear();
+    EXPECT_FALSE(GgufReader::OpenFile(dir.path / "s-00001-of-00002.gguf", &error));
+    EXPECT_NE(error.find("Invalid split GGUF metadata"), std::string::npos) << error;
+  }
   EXPECT_FALSE(GgufReader::OpenFile(dir.path / "missing.gguf", &error));
   EXPECT_FALSE(error.empty());
   std::filesystem::path empty = dir.path / "empty.gguf";
