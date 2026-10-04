@@ -19,6 +19,38 @@ Test data (not code): tests/text/data/chat/flash_next.jinja is the
 template fixes), and qwen35.jinja the chat template of Qwen/Qwen3.5-2B-Base
 (Apache-2.0). src/text/chat_template.cpp reproduces their output in C++.
 
-Runtime dependency (not vendored): HRX System, Apache-2.0.
+
+halo-scope (src/scope/, built only with -DHALO_SCOPE=ON) adapts code from two
+repositories by the halo-flash author, Chuck Cassel, who relicensed the copies
+in halo-flash under MIT on 2026-10-03; this applies only to those copies, and
+the source repositories keep their own terms. Each adapted file says so in its
+header.
+
+- oscope (github.com/chucklehead-dev/oscope), originally EPL-2.0, branch
+  claude/brave-pascal-0fecgh at 3a14d2c0b555000df35541fdd2e115b779e7c3b1,
+  directory spike/oscope-core:
+  - src/chdb.rs -> src/scope/chdb.{hpp,cpp} (libchdb binding: connection,
+    binary-safe query, streaming insert, signal handlers off; ported from a
+    link-time binding to dlopen);
+  - src/ring.rs -> src/scope/ring.hpp (SPSC byte ring: drop-and-count,
+    pre-faulted pages, half-full wakeup);
+  - src/pipeline.rs, src/recorder.rs -> structure of src/scope/recorder.cpp
+    (rings, one writer, batched RowBinary stream inserts).
+- casselc/observability (github.com/casselc/observability), commit
+  ca7ae8a6250f2af3623d0c0cad26c9710a6bbc4d. The repository has no top-level
+  license; the otap-rs crate that holds the SQL declares Apache-2.0 in its
+  Cargo.toml (otel-chdb/chdb-go is chDB, Inc.'s Apache-2.0 code and is not
+  used here). Relicensed under MIT for halo-flash as above:
+  - otel-chdb/otap-rs/sql/llm_spans.sql, llm_payloads.sql, llm_scores.sql ->
+    the table shapes in src/scope/schema.cpp (typed llm_observations,
+    content-addressed llm_payloads, append-only llm_scores with supersedes);
+  - otel-chdb/README.md -> the Null staging table plus materialized view
+    write pattern.
+
+Runtime dependencies (not vendored): HRX System, Apache-2.0; libchdb (chDB,
+Apache-2.0), loaded with dlopen by halo-scope when present.
+Build dependencies (fetched at build time, halo-scope only): BLAKE3 1.8.7
+(CC0-1.0 or Apache-2.0), and the SQLite amalgamation (public domain) when no
+system sqlite3 is found.
 Test dependencies (fetched at build time): GoogleTest (BSD-3-Clause),
 hegel-cpp (MIT) with its prebuilt libhegel engine.

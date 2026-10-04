@@ -189,3 +189,124 @@ if(HALO_FUZZ)
   add_executable(gguf_seed fuzz/gguf_seed.cpp)
   target_link_libraries(gguf_seed PRIVATE halo_core)
 endif()
+
+# --- scope: embedded LLM observability (P12 "halo-scope") --------------------
+# Optional. libchdb is dlopen()ed at run time, never linked: point
+# HALO_SCOPE_LIBCHDB (this cache path, or the environment variable of the
+# same name at run time) at a libchdb.so. The documented default is
+# chdb-core v26.9.0 (ClickHouse 26.9.2.8-stable), the release asset
+# linux-x86_64-libchdb.tar.gz with
+# sha256 c6398bcc71dc58d12fb81548540aacd5d8248830ec81cec537f51c114670543b,
+# from github.com/chdb-io/chdb-core/releases. 26.7.0 also passes the tests.
+option(HALO_SCOPE "Build halo-scope (embedded LLM observability; loads libchdb at run time)" OFF)
+set(HALO_SCOPE_LIBCHDB "" CACHE FILEPATH "Default libchdb.so for halo-scope; $HALO_SCOPE_LIBCHDB overrides it")
+if(HALO_SCOPE)
+  include(FetchContent)
+  find_package(SQLite3 QUIET)
+  if(NOT SQLite3_FOUND)
+    # No system sqlite3 headers: build the amalgamation.
+    FetchContent_Declare(sqlite_amalgamation
+      URL https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip
+      URL_HASH SHA256=1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_MakeAvailable(sqlite_amalgamation)
+    add_library(halo_sqlite3 STATIC ${sqlite_amalgamation_SOURCE_DIR}/sqlite3.c)
+    target_include_directories(halo_sqlite3 SYSTEM PUBLIC ${sqlite_amalgamation_SOURCE_DIR})
+    target_compile_definitions(halo_sqlite3 PRIVATE
+      SQLITE_THREADSAFE=1 SQLITE_DQS=0 SQLITE_OMIT_LOAD_EXTENSION)
+    target_compile_options(halo_sqlite3 PRIVATE -w)
+    target_link_libraries(halo_sqlite3 PUBLIC Threads::Threads)
+    add_library(SQLite::SQLite3 ALIAS halo_sqlite3)
+  endif()
+
+  # Payload content addressing: BLAKE3 (CC0 / Apache-2.0), fetched at build time.
+  FetchContent_Declare(blake3
+    URL https://github.com/BLAKE3-team/BLAKE3/archive/refs/tags/1.8.7.tar.gz
+    URL_HASH SHA256=c6782a28842b1c0478524ac06a4f2ede784038ee298d6e2162c0b089c4306a3c
+    SOURCE_SUBDIR c
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(blake3)
+
+  # HALO_SCOPE_MUTANT builds deliberately broken copies for the positive
+  # controls below; 0 is the real library.
+  function(halo_scope_library name mutant)
+    add_library(${name} STATIC
+      src/scope/chdb.cpp
+      src/scope/migrate.cpp
+      src/scope/schema.cpp
+      src/scope/records.cpp
+      src/scope/recorder.cpp
+      src/scope/metadata.cpp
+      src/scope/wal.cpp)
+    target_include_directories(${name} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(${name} PUBLIC Threads::Threads ${CMAKE_DL_LIBS} SQLite::SQLite3)
+    target_link_libraries(${name} PRIVATE BLAKE3::blake3)
+    target_compile_definitions(${name} PRIVATE HALO_SCOPE_MUTANT=${mutant})
+    if(HALO_SCOPE_LIBCHDB)
+      target_compile_definitions(${name} PRIVATE HALO_SCOPE_LIBCHDB_DEFAULT="${HALO_SCOPE_LIBCHDB}")
+    endif()
+  endfunction()
+  halo_scope_library(halo_scope 0)
+
+  add_executable(scope_bench bench/scope/scope_bench.cpp)
+  target_link_libraries(scope_bench PRIVATE halo_scope)
+
+  if(HALO_BUILD_TESTS)
+    halo_test(scope_tests
+      tests/scope/records_test.cpp
+      tests/scope/recorder_test.cpp
+      tests/scope/metadata_test.cpp
+      tests/scope/wal_test.cpp
+      tests/scope/scope_main.cpp)
+    target_link_libraries(scope_tests PRIVATE halo_scope)
+
+    # Positive controls: each mutant must make its property fail with the
+    # expected message, so a crash, a skip (no libchdb) or an unrelated
+    # failure does not count as caught.
+    set(_scope_mutant_filter_1 ScopeRecords.ObservationRoundTripsThroughChdb)
+    set(_scope_mutant_filter_2 ScopeRecords.ObservationRoundTripsThroughChdb)
+    set(_scope_mutant_filter_3 ScopeWritePath.AccountingHoldsWithMemorySink)
+    set(_scope_mutant_filter_4 ScopeWritePath.AccountingHoldsWithMemorySink)
+    # The failure each mutant must produce, not merely "a failure".
+    set(_scope_mutant_expect_1 "differs after the chDB round trip")
+    set(_scope_mutant_expect_2 "differs after the chDB round trip")
+    set(_scope_mutant_expect_3 "read back [0-9]+ \\+ refused [0-9]+ \\+ deduplicated [0-9]+ \\+ dropped [0-9]+ != produced")
+    # a duplicated observation is a duplicate; a duplicated payload breaks the count
+    set(_scope_mutant_expect_4 "duplicate row|read back [0-9]+ \\+ refused [0-9]+ \\+ deduplicated [0-9]+ \\+ dropped [0-9]+ != produced")
+    set(_scope_mutant_filter_6 ScopeWal.ReplayIsIdempotentByWalPosition)
+    set(_scope_mutant_expect_6 "duplicate rows after replay")
+    set(_scope_mutant_filter_7 ScopeWritePath.AccountingHoldsWithMemorySink)
+    set(_scope_mutant_expect_7 "suppressed but never written")
+    set(_scope_mutants 1 2 3 4 6 7)
+    if(HALO_SANITIZE MATCHES "thread")
+      set(_scope_mutants 3 4 7)  # 1, 2 and 6 need chDB, which TSan builds do not load
+    endif()
+    foreach(m ${_scope_mutants})
+      halo_scope_library(halo_scope_mutant${m} ${m})
+      add_executable(scope_mutant${m}_tests
+        tests/scope/records_test.cpp tests/scope/recorder_test.cpp tests/scope/wal_test.cpp
+        tests/scope/scope_main.cpp)
+      target_link_libraries(scope_mutant${m}_tests PRIVATE halo_scope_mutant${m} GTest::gtest hegel)
+      target_compile_options(scope_mutant${m}_tests PRIVATE -Wno-missing-designated-field-initializers)
+      add_test(NAME scope_mutant${m}_is_caught
+        COMMAND scope_mutant${m}_tests --gtest_filter=${_scope_mutant_filter_${m}}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+      set_tests_properties(scope_mutant${m}_is_caught PROPERTIES
+        ENVIRONMENT "HALO_SCOPE_TEST_WRITER=manual;HALO_SCOPE_TEST_CASES=2000"
+        PASS_REGULAR_EXPRESSION "${_scope_mutant_expect_${m}}")
+    endforeach()
+    if(HALO_SANITIZE MATCHES "thread")
+      # TSan's own positive control: an unpublished ring write must be seen.
+      halo_scope_library(halo_scope_mutant5 5)
+      add_executable(scope_mutant5_tests tests/scope/recorder_test.cpp tests/scope/scope_main.cpp)
+      target_link_libraries(scope_mutant5_tests PRIVATE halo_scope_mutant5 GTest::gtest hegel)
+      target_compile_options(scope_mutant5_tests PRIVATE -Wno-missing-designated-field-initializers)
+      add_test(NAME scope_mutant5_is_caught_by_tsan
+        COMMAND scope_mutant5_tests --gtest_filter=ScopeWritePath.AccountingHoldsWithMemorySink
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+      set_tests_properties(scope_mutant5_is_caught_by_tsan PROPERTIES
+        ENVIRONMENT "HALO_SCOPE_TEST_WRITER=thread;TSAN_OPTIONS=halt_on_error=1"
+        PASS_REGULAR_EXPRESSION "WARNING: ThreadSanitizer: data race")
+    endif()
+  endif()
+endif()
