@@ -3,9 +3,12 @@
 
 // libchdb loaded at run time with dlopen. libchdb is ~566 MB, so halo-scope
 // never links it: an engine built with HALO_SCOPE runs without it and only
-// records when the library is found. The binding follows oscope-core's
-// src/chdb.rs (oscope, spike/oscope-core): connection, binary-safe query,
-// and streaming insert. See NOTICE.
+// records when the library is found: connection, binary-safe query and
+// streaming insert.
+//
+// Adapted from oscope (github.com/chucklehead-dev/oscope, 3a14d2c,
+// spike/oscope-core/src/chdb.rs), originally EPL-2.0; relicensed under MIT for
+// halo-flash by its author, Chuck Cassel (2026-10-03). See NOTICE.
 
 #include <cstddef>
 #include <cstdint>

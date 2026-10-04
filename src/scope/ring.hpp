@@ -1,9 +1,12 @@
 #ifndef HALO_SCOPE_RING_HPP_
 #define HALO_SCOPE_RING_HPP_
 
-// Single-producer, single-consumer byte ring, after oscope-core's
-// src/ring.rs (oscope; see NOTICE). The producer is
-// an engine thread and never blocks, allocates or takes a lock: a record
+// Adapted from oscope (github.com/chucklehead-dev/oscope, 3a14d2c,
+// spike/oscope-core/src/ring.rs), originally EPL-2.0; relicensed under MIT for
+// halo-flash by its author, Chuck Cassel (2026-10-03). See NOTICE.
+//
+// Single-producer, single-consumer byte ring. The producer is an engine
+// thread and never blocks, allocates or takes a lock: a record
 // that does not fit is dropped and counted. The consumer is the writer
 // thread. Records are [u32 length][u8 table][length-1 bytes] and may wrap.
 

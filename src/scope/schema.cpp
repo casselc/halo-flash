@@ -1,5 +1,7 @@
-// Table shapes adapted from casselc/observability otel-chdb/otap-rs/sql/
-// llm_spans.sql, llm_payloads.sql and llm_scores.sql. See NOTICE.
+// Adapted from casselc/observability (github.com/casselc/observability,
+// ca7ae8a, otel-chdb/otap-rs/sql/llm_{spans,payloads,scores}.sql), which has no repository-wide license (the otap-rs
+// crate declares Apache-2.0); relicensed under MIT for halo-flash by its
+// author, Chuck Cassel (2026-10-03). See NOTICE.
 
 #include "scope/schema.hpp"
 

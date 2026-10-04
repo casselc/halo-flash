@@ -1,6 +1,7 @@
-// Write-path structure (rings -> one writer -> batched RowBinary stream
-// inserts) after oscope-core's src/pipeline.rs and src/recorder.rs (oscope;
-// see NOTICE).
+// Adapted from oscope (github.com/chucklehead-dev/oscope, 3a14d2c,
+// spike/oscope-core/src/pipeline.rs and src/recorder.rs), originally EPL-2.0; relicensed under MIT for
+// halo-flash by its author, Chuck Cassel (2026-10-03). See NOTICE.
+// Write-path structure: rings -> one writer -> batched RowBinary stream inserts.
 
 #include "scope/recorder.hpp"
 

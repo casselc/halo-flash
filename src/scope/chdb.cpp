@@ -1,6 +1,7 @@
-// Adapted from oscope-core src/chdb.rs (oscope, branch
-// claude/brave-pascal-0fecgh, spike/oscope-core); ported from a link-time
-// binding to dlopen. See NOTICE.
+// Adapted from oscope (github.com/chucklehead-dev/oscope, 3a14d2c,
+// spike/oscope-core/src/chdb.rs), originally EPL-2.0; relicensed under MIT for
+// halo-flash by its author, Chuck Cassel (2026-10-03). See NOTICE.
+// Ported from a link-time binding to dlopen.
 
 #include "scope/chdb.hpp"
 
