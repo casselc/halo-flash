@@ -141,3 +141,32 @@ stayed in the cache).
 Split-K over 4 was slower in every case. Short chunks remain latency-bound;
 a skinny (VALU, weights streamed like the decode GEMVs) kernel for T <= 16
 is the next candidate.
+
+### HRX vs HIP decode gap: what it is not (2026-10-04, idle machine)
+
+Decode is 44.8 ms/token on HIP and 63.7 ms on HRX. Measured:
+- **Not graphs.** Eager and graph replay are within 2 ms on both backends
+  (HIP 44.82 vs 44.84; HRX 65.8 eager vs 63.7 graph).
+- **Not dispatch overhead.** `halo_graph_bench`: 1.8 us per node on HIP,
+  3.2 on HRX; at 1,145 dispatches per token that is 1.6 ms of the ~19 ms.
+- **Kernels run slower under HRX**, unevenly (`halo_gemv_bench`, HBM-resident
+  data):
+
+  | Kernel | HIP | HRX |
+  |---|---:|---:|
+  | `gemv_q8r_r4`, 10240 x 2560 | 222 GB/s | 147 GB/s |
+  | `gemv_q8r_r4`, LM head 248320 x 2560 | 242 GB/s | 160 GB/s |
+  | `moe_gate_up_q4_k_dot`, 10 experts | 161 GB/s | 159 GB/s |
+  | `moe_down_q5_1_r4`, 10 experts | 180 GB/s | **28 GB/s** |
+  | `moe_down_q5_1`, 10 experts | 121 GB/s | **10 GB/s** |
+
+- **Not memory placement or the TLB:** with the same 10 experts every
+  launch (cache-hot), `moe_down_q5_1_r4` is still 28 GB/s on HRX and 180 on
+  HIP. No kernel uses scratch; the slow kernels' metadata is unremarkable
+  (89 VGPRs, 8 KB LDS).
+- rocprofv3 does not see HRX's dispatches (libhrx opens its own HSA
+  queues), so per-kernel HRX timing needs HRX's own profiling.
+
+Open: something in how HRX dispatches these kernels (kernel descriptor
+handling, LDS or kernarg setup, CU masking) differs from ROCm's. HIP stays
+the default backend until it is found.
