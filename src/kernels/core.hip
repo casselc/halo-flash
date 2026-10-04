@@ -672,3 +672,271 @@ extern "C" __global__ void halo_qsa_select(const float* score, std::uint32_t* vi
   }
   for (std::uint32_t p = n * ratio + threadIdx.x; p < n_kv; p += blockDim.x) visible[k * ratio + p - n * ratio] = p;
 }
+
+// ---- Device-side sampling (core/sampling semantics) --------------------------
+
+#include "kernels/sample_params.h"
+
+namespace {
+
+constexpr std::uint32_t kIdBits = 18;  // vocab <= 2^18
+constexpr std::uint32_t kIdMax = (1u << kIdBits) - 1;
+
+// Order-preserving key of a double; +0 and -0 compare equal, as on the CPU.
+__device__ inline std::uint64_t OrderedKey(double d) {
+  if (d == 0.0) d = 0.0;
+  const std::uint64_t b = static_cast<std::uint64_t>(__double_as_longlong(d));
+  return (b >> 63) ? ~b : (b | (1ull << 63));
+}
+
+__device__ inline double Penalize(double logit, const HaloSampleParams& p, const HaloPenalty& q) {
+  if (q.repeated && p.repeat_penalty != 1.0f) logit = logit <= 0 ? logit * p.repeat_penalty : logit / p.repeat_penalty;
+  logit -= static_cast<double>(p.frequency_penalty) * q.generated_count;
+  if (q.generated_count != 0) logit -= p.presence_penalty;
+  return logit;
+}
+
+// Position in the sampling order: logit descending, then token ascending.
+struct Cut {
+  std::uint64_t key;
+  std::uint32_t rid;  // kIdMax - token: larger sorts first
+};
+__device__ inline bool AtOrAbove(std::uint64_t key, std::uint32_t rid, const Cut& c) {
+  return key > c.key || (key == c.key && rid >= c.rid);
+}
+
+struct SampleShared {
+  unsigned long long hist[512];
+  std::uint32_t bitmap[HALO_SAMPLE_MAX_VOCAB / 32];
+  double max_v;
+  std::uint32_t argmax, count, valid, nonzero, pred;
+  unsigned long long mass;
+  std::uint64_t pre_key, pre_key_mask, rem;
+  std::uint32_t pre_rid, pre_rid_mask;
+  double red_d[32];
+  std::uint32_t red_u[32];
+};
+
+// The item at which the inclusive cumulative weight first reaches `target`
+// (>= target, or > target when `strict`); weights null counts items. The
+// order is the sampling order (logit descending, token ascending), or token
+// order alone when `by_token`. MSB-first radix over the composite (key,
+// rid): eight 8-bit key digits, then two 9-bit rid digits. Integer
+// histograms make the answer independent of thread order.
+__device__ Cut RadixSelect(const std::uint64_t* key, const std::uint32_t* rid, const std::uint64_t* w, std::uint32_t n,
+                           std::uint64_t target, bool strict, SampleShared& s, bool by_token = false) {
+  if (threadIdx.x == 0) {
+    s.pre_key = s.pre_key_mask = 0;
+    s.pre_rid = s.pre_rid_mask = 0;
+    s.rem = target;
+  }
+  for (int pass = by_token ? 8 : 0; pass < 10; ++pass) {
+    const bool on_key = pass < 8;
+    const std::uint32_t shift = on_key ? 56 - 8 * pass : (pass == 8 ? 9 : 0);
+    const std::uint32_t bins = on_key ? 256 : 512;
+    for (std::uint32_t i = threadIdx.x; i < bins; i += blockDim.x) s.hist[i] = 0;
+    __syncthreads();
+    for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+      if ((key[i] & s.pre_key_mask) != s.pre_key || (rid[i] & s.pre_rid_mask) != s.pre_rid) continue;
+      const std::uint32_t d = on_key ? static_cast<std::uint32_t>(key[i] >> shift) & 0xFF : (rid[i] >> shift) & 0x1FF;
+      atomicAdd(&s.hist[d], static_cast<unsigned long long>(w ? w[i] : 1));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      std::uint64_t acc = 0;
+      std::uint32_t d = bins - 1;
+      for (;; --d) {
+        const std::uint64_t h = s.hist[d];
+        if (h > 0 && (strict ? acc + h > s.rem : acc + h >= s.rem)) break;
+        acc += h;
+        if (d == 0) break;  // unreachable for a satisfiable target
+      }
+      s.rem -= acc;
+      if (on_key) {
+        s.pre_key |= static_cast<std::uint64_t>(d) << shift;
+        s.pre_key_mask |= 0xFFull << shift;
+      } else {
+        s.pre_rid |= d << shift;
+        s.pre_rid_mask |= 0x1FFu << shift;
+      }
+    }
+    __syncthreads();
+  }
+  return {s.pre_key, s.pre_rid};
+}
+
+// Weight (or count) of the items at or above `c`.
+__device__ std::uint64_t MassAbove(const std::uint64_t* key, const std::uint32_t* rid, const std::uint64_t* w,
+                                   std::uint32_t n, const Cut& c, SampleShared& s) {
+  if (threadIdx.x == 0) s.mass = 0;
+  __syncthreads();
+  unsigned long long local = 0;
+  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x)
+    if (AtOrAbove(key[i], rid[i], c)) local += w ? w[i] : 1;
+  atomicAdd(&s.mass, local);
+  __syncthreads();
+  const std::uint64_t r = s.mass;
+  __syncthreads();
+  return r;
+}
+
+}  // namespace
+
+// One draw from the request's distribution over `logits` (vocab floats).
+// One block of 1024 threads. `key`, `rid`, `w` are scratch lists of
+// capacity vocab.
+extern "C" __global__ void __launch_bounds__(1024)
+    halo_sample(const float* logits, const HaloSampleParams* params, const HaloPenalty* pen, std::uint64_t* key,
+                std::uint32_t* rid, std::uint64_t* w, HaloSampleOut* out) {
+  __shared__ SampleShared s;
+  const HaloSampleParams p = *params;
+  const std::uint32_t V = p.vocab, NP = p.n_penalties;
+  for (std::uint32_t i = threadIdx.x; i < HALO_SAMPLE_MAX_VOCAB / 32; i += blockDim.x) s.bitmap[i] = 0;
+  if (threadIdx.x == 0) s.count = 0;
+  __syncthreads();
+  for (std::uint32_t j = threadIdx.x; j < NP; j += blockDim.x)
+    if (pen[j].token < V) atomicOr(&s.bitmap[pen[j].token / 32], 1u << (pen[j].token % 32));
+  __syncthreads();
+  const auto penalized = [&](std::uint32_t t) { return (s.bitmap[t / 32] >> (t % 32)) & 1u; };
+
+  // Max and argmax (ties to the lower token) of the penalized logits.
+  double best = -INFINITY;
+  std::uint32_t best_t = 0xFFFFFFFFu, valid = 0;
+  const auto consider = [&](double v, std::uint32_t t) {
+    ++valid;
+    if (v > best || (v == best && t < best_t)) {
+      best = v;
+      best_t = t;
+    }
+  };
+  for (std::uint32_t i = threadIdx.x; i < V; i += blockDim.x)
+    if (!penalized(i) && isfinite(logits[i])) consider(logits[i], i);
+  for (std::uint32_t j = threadIdx.x; j < NP; j += blockDim.x)
+    if (pen[j].token < V && isfinite(logits[pen[j].token])) consider(Penalize(logits[pen[j].token], p, pen[j]), pen[j].token);
+  for (int o = kWarp / 2; o > 0; o >>= 1) {
+    const double ov = __shfl_xor(best, o, kWarp);
+    const std::uint32_t ot = __shfl_xor(best_t, o, kWarp);
+    if (ov > best || (ov == best && ot < best_t)) {
+      best = ov;
+      best_t = ot;
+    }
+    valid += __shfl_xor(valid, o, kWarp);
+  }
+  if (threadIdx.x % kWarp == 0) {
+    s.red_d[threadIdx.x / kWarp] = best;
+    s.red_u[threadIdx.x / kWarp] = best_t;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    double b = -INFINITY;
+    std::uint32_t bt = 0xFFFFFFFFu;
+    for (std::uint32_t k = 0; k < blockDim.x / kWarp; ++k)
+      if (s.red_d[k] > b || (s.red_d[k] == b && s.red_u[k] < bt)) {
+        b = s.red_d[k];
+        bt = s.red_u[k];
+      }
+    s.max_v = b;
+    s.argmax = bt;
+    s.valid = 0;
+  }
+  __syncthreads();
+  if (threadIdx.x % kWarp == 0) atomicAdd(&s.valid, valid);
+  __syncthreads();
+  const double mx = s.max_v;
+  const std::uint32_t n_valid = s.valid;
+  if (n_valid == 0 || p.temperature == 0.0f) {  // greedy: no RNG draw
+    if (threadIdx.x == 0) *out = {n_valid ? s.argmax : 0xFFFFFFFFu, n_valid ? 1u : 0u, p.rng};
+    return;
+  }
+
+  // Live candidates: fixed-point weight exp((l - max) / T) * 2^40 >= 1.
+  const double T = p.temperature, scale = static_cast<double>(1ull << HALO_SAMPLE_FIXED_BITS);
+  // core/sampling's SamplerState has two paths with one distribution but
+  // different draw orders: with no top-k, no top-p and no min-p floor it
+  // draws in token order and applies min-p as zero weight; otherwise it
+  // draws in sampling order. Both test min-p as v >= max + T * log(min_p).
+  const bool linear = p.top_k == 0 && p.top_p >= 1.0f && !(p.min_p > 0.0f && p.min_keep > 1);
+  const double min_p_cut = p.min_p > 0.0f ? mx + T * log(static_cast<double>(p.min_p)) : -INFINITY;
+  if (threadIdx.x == 0) s.nonzero = s.pred = 0;
+  __syncthreads();
+  std::uint32_t nonzero = 0, pred = 0;
+  const auto push = [&](double v, std::uint32_t t) {
+    const double e = exp((v - mx) / T);
+    const bool passes = v >= min_p_cut;
+    pred += passes;
+    if (linear && !passes) return;
+    nonzero += e > 0.0;  // the CPU keeps every token with a nonzero probability
+    const auto wq = static_cast<std::uint64_t>(e * scale + 0.5);
+    if (wq == 0) return;
+    const std::uint32_t at = atomicAdd(&s.count, 1u);
+    key[at] = OrderedKey(v);
+    rid[at] = kIdMax - t;
+    w[at] = wq;
+  };
+  for (std::uint32_t i = threadIdx.x; i < V; i += blockDim.x)
+    if (!penalized(i) && isfinite(logits[i])) push(logits[i], i);
+  for (std::uint32_t j = threadIdx.x; j < NP; j += blockDim.x)
+    if (pen[j].token < V && isfinite(logits[pen[j].token])) push(Penalize(logits[pen[j].token], p, pen[j]), pen[j].token);
+  atomicAdd(&s.nonzero, nonzero);
+  atomicAdd(&s.pred, pred);
+  __syncthreads();
+  const std::uint32_t L = s.count, n_nonzero = s.nonzero, n_pred = s.pred;
+  const auto floor_of = [&](std::uint32_t size) { return min(size, max(p.min_keep, 1u)); };
+
+  // Every filter keeps a prefix of the order: track it as a cut plus the
+  // number of live items at or above it, and the CPU-side set size.
+  Cut cut{0, 0};  // everything
+  std::uint32_t kept = L, size = linear ? n_nonzero : n_valid;
+  const auto cut_at_count = [&](std::uint32_t c) {  // first c live items
+    if (c < kept) {
+      cut = RadixSelect(key, rid, nullptr, L, c, false, s);
+      kept = c;
+    }
+  };
+  if (!linear && p.top_k > 0) {
+    size = min(n_valid, max(p.top_k, floor_of(n_valid)));
+    cut_at_count(size);
+  }
+  if (!linear && p.top_p < 1.0f && size > 1) {
+    const std::uint64_t z = MassAbove(key, rid, w, L, cut, s);
+    const auto target = static_cast<std::uint64_t>(static_cast<double>(p.top_p) * static_cast<double>(z));
+    const Cut cross = RadixSelect(key, rid, w, L, target, false, s);
+    const auto through = static_cast<std::uint32_t>(MassAbove(key, rid, nullptr, L, cross, s));
+    const std::uint32_t minimum = floor_of(size);
+    if (through >= minimum) {
+      cut = cross;
+      kept = through;
+      size = through;
+    } else {
+      size = minimum;
+      cut_at_count(minimum);
+    }
+  }
+  if (!linear && p.min_p > 0.0f && size > 1) {
+    // Tokens passing min-p form a prefix of the order; within the kept
+    // prefix there are min(n_pred, size) of them, floored at min_keep.
+    size = min(max(min(n_pred, size), floor_of(size)), size);
+    cut_at_count(size);
+  }
+
+  // Draw: the first item whose cumulative weight exceeds u * Z.
+  const std::uint64_t z = MassAbove(key, rid, w, L, cut, s);
+  std::uint64_t rng = p.rng;
+  std::uint32_t token;
+  // The CPU draws a random number whenever more than one kept token has a
+  // nonzero probability, including tokens too unlikely to be drawn here.
+  if (min(size, n_nonzero) <= 1) {
+    token = kIdMax - RadixSelect(key, rid, nullptr, L, 1, false, s, linear).rid;
+  } else {
+    std::uint64_t v = rng == 0 ? 0x9e3779b97f4a7c15ull : rng;
+    v ^= v >> 12;
+    v ^= v << 25;
+    v ^= v >> 27;
+    rng = v;
+    const double u = static_cast<double>((v * 0x2545f4914f6cdd1dull) >> 11) * 0x1.0p-53;
+    std::uint64_t target = static_cast<std::uint64_t>(u * static_cast<double>(z));
+    if (target >= z) target = z - 1;
+    token = kIdMax - RadixSelect(key, rid, w, L, target, true, s, linear).rid;
+  }
+  if (threadIdx.x == 0) *out = {token, kept, rng};
+}

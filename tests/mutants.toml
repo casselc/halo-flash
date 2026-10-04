@@ -556,3 +556,65 @@ suite = "cpu"
 binary = "text_tests"
 filter = "ChatTemplate.FlashNextMatchesTransformers:ChatTemplate.Qwen35MatchesTransformers"
 why = "Jinja |trim is Python str.strip, which also strips U+001C..U+001F"
+
+# ---- Device-side sampling (halo_sample in src/kernels/core.hip) --------------
+
+[[mutant]]
+name = "ds-sorted-draw-on-linear-path"
+file = "src/kernels/core.hip"
+find = '    token = kIdMax - RadixSelect(key, rid, w, L, target, true, s, linear).rid;'
+replace = '    token = kIdMax - RadixSelect(key, rid, w, L, target, true, s, false).rid;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuSample.*"
+why = "SamplerState's linear path draws in token order, not sampling order"
+
+[[mutant]]
+name = "ds-min-p-strict"
+file = "src/kernels/core.hip"
+find = '    const bool passes = v >= min_p_cut;'
+replace = '    const bool passes = v > min_p_cut;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuSample.*"
+why = "tokens exactly at the min-p cut are kept (v >= max + T*log(min_p), the CPU's own expression)"
+
+[[mutant]]
+name = "ds-draws-for-single-entry"
+file = "src/kernels/core.hip"
+find = '  if (min(size, n_nonzero) <= 1) {'
+replace = '  if (min(size, n_nonzero) < 1) {'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuSample.*"
+why = "no RNG draw when one token is possible, or seeded streams drift from the CPU"
+
+[[mutant]]
+name = "ds-penalty-presence-sign"
+file = "src/kernels/core.hip"
+find = '  if (q.generated_count != 0) logit -= p.presence_penalty;'
+replace = '  if (q.generated_count != 0) logit += p.presence_penalty;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuSample.*"
+why = "device penalties match the CPU's"
+
+[[mutant]]
+name = "ds-top-p-strict-crossing"
+file = "src/kernels/core.hip"
+find = '    const Cut cross = RadixSelect(key, rid, w, L, target, false, s);'
+replace = '    const Cut cross = RadixSelect(key, rid, w, L, target, true, s);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuSample.*"
+why = "top-p keeps through the first token whose cumulative mass reaches p (>=)"
+
+[[mutant]]
+name = "ds-top-k-ignores-min-keep"
+file = "src/kernels/core.hip"
+find = '    size = min(n_valid, max(p.top_k, floor_of(n_valid)));'
+replace = '    size = min(n_valid, p.top_k);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuSample.*"
+why = "top-k keeps at least min_keep tokens"
