@@ -1,0 +1,45 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    { "name": "cpu-debug", "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" } },
+    { "name": "release", "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } },
+    { "name": "cpu-asan", "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "HALO_SANITIZE": "address,undefined" } },
+    { "name": "cpu-tsan", "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "HALO_SANITIZE": "thread" } },
+    { "name": "cpu-ubsan", "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "HALO_SANITIZE": "undefined" } },
+    { "name": "fuzz", "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "HALO_FUZZ": "ON", "HALO_BUILD_TESTS": "OFF" } }
+  ],
+  "buildPresets": [
+    { "name": "cpu-debug", "configurePreset": "cpu-debug" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "cpu-asan", "configurePreset": "cpu-asan" },
+    { "name": "cpu-tsan", "configurePreset": "cpu-tsan" },
+    { "name": "cpu-ubsan", "configurePreset": "cpu-ubsan" },
+    { "name": "fuzz", "configurePreset": "fuzz" }
+  ],
+  "testPresets": [
+    { "name": "cpu-debug", "configurePreset": "cpu-debug", "output": { "outputOnFailure": true } },
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    { "name": "cpu-asan", "configurePreset": "cpu-asan", "output": { "outputOnFailure": true },
+      "environment": { "ASAN_OPTIONS": "halt_on_error=1:detect_leaks=1", "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1" } },
+    { "name": "cpu-tsan", "configurePreset": "cpu-tsan", "output": { "outputOnFailure": true },
+      "environment": { "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1" } },
+    { "name": "cpu-ubsan", "configurePreset": "cpu-ubsan", "output": { "outputOnFailure": true },
+      "environment": { "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1" } }
+  ]
+}

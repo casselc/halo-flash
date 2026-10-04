@@ -1,0 +1,13 @@
+halo-flash includes code adapted from the following MIT-licensed projects.
+Each adapted file says so in its header; full license texts are in licenses/.
+
+- gufo (Copyright (c) 2026 gufo contributors): src/core/gguf.{hpp,cpp},
+  src/core/quant.{hpp,cpp}.
+- llama.cpp / ggml (Copyright (c) 2023-2026 The ggml authors): quantized block
+  layouts and dequantization in src/core/quant.cpp (via gufo).
+- ds4 / DwarfStar (Copyright (c) 2026 the ds4.c authors): design references for
+  n-gram disk reads, expert streaming and disk KV checkpoints (licenses/ds4.txt).
+
+Runtime dependency (not vendored): HRX System, Apache-2.0.
+Test dependencies (fetched at build time): GoogleTest (BSD-3-Clause),
+hegel-cpp (MIT) with its prebuilt libhegel engine.

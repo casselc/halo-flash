@@ -1,0 +1,34 @@
+# halo-flash
+
+A narrow inference engine for one model, Qwen3.8-Flash-Next, on one
+machine class: AMD Strix Halo (Ryzen AI MAX+ 395, gfx1151 iGPU, XDNA2 NPU,
+128 GB unified memory). It runs on the HRX System runtime, with a ROCm HIP
+backend kept for A/B comparison.
+
+It will serve an OpenAI-compatible completions endpoint and expose a C ABI for
+in-process embedding. The workload it is tuned for is a single user with a few
+concurrent sessions, usually sharing a long common context.
+
+Status: early bring-up. See [docs/PLAN.md](docs/PLAN.md) for the phased plan,
+targets and quality gates.
+
+## Building and testing
+
+The core and the test suites need only clang, CMake and Ninja. GoogleTest and
+[hegel-cpp](https://github.com/hegeldev/hegel-cpp) are fetched at configure
+time.
+
+```sh
+cmake --preset cpu-asan && cmake --build --preset cpu-asan && ctest --preset cpu-asan
+cmake --preset cpu-tsan && cmake --build --preset cpu-tsan && ctest --preset cpu-tsan
+cmake --preset fuzz && cmake --build --preset fuzz && ./build/fuzz/gguf_fuzz -max_total_time=60
+```
+
+The tests are mostly properties and state machines written with Hegel. When a
+property fails, Hegel shrinks it to a minimal counterexample and prints a
+replay seed. Commit each one as a regression test.
+
+## License
+
+MIT. Code adapted from gufo, llama.cpp and ds4 is listed in [NOTICE](NOTICE),
+and their licenses are in `licenses/`.
