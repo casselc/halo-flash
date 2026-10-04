@@ -1888,3 +1888,36 @@ extern "C" __global__ void __launch_bounds__(256)
                              std::uint32_t cols, std::uint64_t row_bytes) {
   MoeGateUpQ4K<4>(gate, up, ids, x, h, expert_bytes, rows, cols, row_bytes);
 }
+
+// ---- P3: single-pass Gated DeltaNet step (head dim 128) -----------------------
+// With A = S k and B = S q over the old state, the update and the output are
+//   u = decay A, delta = (v - u) b, S' = decay S + delta k^T, o = decay B + delta (k.q)
+// so each thread reads its state column once into registers and writes it
+// once (the two-loop kernel reads it twice and writes it twice).
+extern "C" __global__ void __launch_bounds__(128)
+    halo_gdn_step_d128(const float* q, const float* k, const float* v, const float* alpha, const float* beta,
+                       const float* a, const float* dt, float* state, float* out, std::uint32_t num_k_heads) {
+  constexpr std::uint32_t d = 128;
+  __shared__ float ks[d], qs[d], red[32];
+  const std::uint32_t h = blockIdx.x, j = threadIdx.x;
+  const float* qh = q + (h % num_k_heads) * d;
+  const float* kh = k + (h % num_k_heads) * d;
+  ks[j] = kh[j];
+  qs[j] = qh[j];
+  const float kq = BlockSum(kh[j] * qh[j], red);  // syncs, so ks/qs are visible
+  const float decay = expf(a[h] * Softplus(alpha[h] + dt[h]));
+  const float b = Sigmoid(beta[h]);
+  float* S = state + static_cast<std::size_t>(h) * d * d + j;
+  float s[d];
+  float A = 0.0f, B = 0.0f;
+#pragma unroll
+  for (std::uint32_t i = 0; i < d; ++i) {
+    s[i] = S[i * d];
+    A += s[i] * ks[i];
+    B += s[i] * qs[i];
+  }
+  const float delta = (v[h * d + j] - decay * A) * b;
+#pragma unroll
+  for (std::uint32_t i = 0; i < d; ++i) S[i * d] = decay * s[i] + delta * ks[i];
+  out[h * d + j] = (decay * B + delta * kq) / sqrtf(static_cast<float>(d));
+}

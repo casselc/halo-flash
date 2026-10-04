@@ -276,8 +276,12 @@ why = "rotation direction"
 [[mutant]]
 name = "k-gdn-decay-no-dt"
 file = "src/kernels/core.hip"
-find = 'expf(a[h] * Softplus(alpha[h] + dt[h]))'
-replace = 'expf(a[h] * Softplus(alpha[h]))'
+find = """
+  if (j >= d) return;
+  const float decay = expf(a[h] * Softplus(alpha[h] + dt[h]));"""
+replace = """
+  if (j >= d) return;
+  const float decay = expf(a[h] * Softplus(alpha[h]));"""
 suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
@@ -830,8 +834,12 @@ why = "small-row F32 matvecs (router, alpha/beta, inject) multiply by x"
 [[mutant]]
 name = "p3-gdn-transposed-index"
 file = "src/kernels/core.hip"
-find = '  float* S = state + static_cast<std::size_t>(h) * d * d + j;'
-replace = '  float* S = state + static_cast<std::size_t>(h) * d * d + j * d;'
+find = """
+  float* S = state + static_cast<std::size_t>(h) * d * d + j;
+  float u = 0.0f;"""
+replace = """
+  float* S = state + static_cast<std::size_t>(h) * d * d + j * d;
+  float u = 0.0f;"""
 suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
@@ -869,3 +877,37 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuQuant.BlockGemvMatchesCpuDequant"
 why = "qh is the block's second 32-bit word"
+
+[[mutant]]
+name = "p3-gdn1-output-misses-delta-term"
+file = "src/kernels/core.hip"
+find = '  out[h * d + j] = (decay * B + delta * kq) / sqrtf(static_cast<float>(d));'
+replace = '  out[h * d + j] = (decay * B) / sqrtf(static_cast<float>(d));'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.SinglePassGdnMatchesTwoLoopKernel"
+why = "the output reads the updated state: decay (S q) + delta (k . q)"
+
+[[mutant]]
+name = "p3-gdn1-state-not-decayed"
+file = "src/kernels/core.hip"
+find = '  for (std::uint32_t i = 0; i < d; ++i) S[i * d] = decay * s[i] + delta * ks[i];'
+replace = '  for (std::uint32_t i = 0; i < d; ++i) S[i * d] = s[i] + delta * ks[i];'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.SinglePassGdnMatchesTwoLoopKernel"
+why = "the stored state is decayed"
+
+[[mutant]]
+name = "p3-gdn1-decay-no-dt"
+file = "src/kernels/core.hip"
+find = """
+  const float kq = BlockSum(kh[j] * qh[j], red);  // syncs, so ks/qs are visible
+  const float decay = expf(a[h] * Softplus(alpha[h] + dt[h]));"""
+replace = """
+  const float kq = BlockSum(kh[j] * qh[j], red);  // syncs, so ks/qs are visible
+  const float decay = expf(a[h] * Softplus(alpha[h]));"""
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.SinglePassGdnMatchesTwoLoopKernel"
+why = "decay includes the dt bias (single-pass kernel)"

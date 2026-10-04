@@ -384,3 +384,66 @@ TEST(GpuQuant, FusedMoeMatchesCpuComposition) {
     }, {.test_cases = 60});
   }
 }
+
+// P3 single-pass DeltaNet step (d = 128) against the two-loop kernel, which
+// the model tests validate end to end: several consecutive steps from a
+// random state, outputs and states compared.
+TEST(GpuKernels, SinglePassGdnMatchesTwoLoopKernel) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      constexpr std::uint32_t d = 128;
+      const auto nk = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 4}));
+      const std::uint32_t nv = nk * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 3}));
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto rnd = [&](float scale) {
+        seed = seed * 1664525u + 1013904223u;
+        return scale * (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f);
+      };
+      std::vector<float> state(std::size_t{nv} * d * d), a(nv), dt(nv);
+      for (auto& x : state) x = rnd(0.2f);
+      for (std::uint32_t h = 0; h < nv; ++h) {
+        a[h] = -std::exp(rnd(2.0f));
+        dt[h] = rnd(2.0f);
+      }
+      const auto upload = [&](const std::vector<float>& v) {
+        auto b = dev->Alloc(v.size() * 4, &error);
+        EXPECT_TRUE(b && dev->Upload(b, 0, v.data(), v.size() * 4, &error)) << error;
+        return b;
+      };
+      auto s1 = upload(state), s2 = upload(state), ab = upload(a), db = upload(dt);
+      auto o1 = dev->Alloc(nv * d * 4, &error), o2 = dev->Alloc(nv * d * 4, &error);
+      const int steps = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 4}));
+      for (int step = 0; step < steps; ++step) {
+        std::vector<float> qv(nk * d), kv(nk * d), vv(nv * d), al(nv), be(nv);
+        for (auto& x : qv) x = rnd(0.3f);
+        for (auto& x : kv) x = rnd(0.3f);
+        for (auto& x : vv) x = rnd(2.0f);
+        for (auto& x : al) x = rnd(4.0f);
+        for (auto& x : be) x = rnd(4.0f);
+        auto qb = upload(qv), kb = upload(kv), vb = upload(vv), alb = upload(al), beb = upload(be);
+        const rt::Arg a1[] = {rt::Arg::Buf(qb), rt::Arg::Buf(kb), rt::Arg::Buf(vb), rt::Arg::Buf(alb), rt::Arg::Buf(beb),
+                              rt::Arg::Buf(ab), rt::Arg::Buf(db), rt::Arg::Buf(s1), rt::Arg::Buf(o1), rt::Arg::Val(nk),
+                              rt::Arg::Val(d)};
+        const rt::Arg a2[] = {rt::Arg::Buf(qb), rt::Arg::Buf(kb), rt::Arg::Buf(vb), rt::Arg::Buf(alb), rt::Arg::Buf(beb),
+                              rt::Arg::Buf(ab), rt::Arg::Buf(db), rt::Arg::Buf(s2), rt::Arg::Buf(o2), rt::Arg::Val(nk)};
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gdn_step", &error), {nv}, {d}, a1, &error)) << error;
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gdn_step_d128", &error), {nv}, {d}, a2, &error)) << error;
+        std::vector<float> r1(nv * d), r2(nv * d);
+        ASSERT_TRUE(dev->Download(o1, 0, r1.data(), r1.size() * 4, &error)) << error;
+        ASSERT_TRUE(dev->Download(o2, 0, r2.data(), r2.size() * 4, &error)) << error;
+        for (std::size_t i = 0; i < r1.size(); ++i)
+          ASSERT_NEAR(r2[i], r1[i], 1e-5f * (1.0f + std::fabs(r1[i]))) << "output " << i << " step " << step;
+        for (auto* b : {&qb, &kb, &vb, &alb, &beb}) dev->Free(*b);
+      }
+      std::vector<float> f1(state.size()), f2(state.size());
+      ASSERT_TRUE(dev->Download(s1, 0, f1.data(), f1.size() * 4, &error)) << error;
+      ASSERT_TRUE(dev->Download(s2, 0, f2.data(), f2.size() * 4, &error)) << error;
+      for (std::size_t i = 0; i < f1.size(); ++i) ASSERT_NEAR(f2[i], f1[i], 1e-5f * (1.0f + std::fabs(f1[i]))) << "state " << i;
+      for (auto* b : {&s1, &s2, &ab, &db, &o1, &o2}) dev->Free(*b);
+    }, {.test_cases = 60});
+  }
+}

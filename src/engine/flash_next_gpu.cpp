@@ -360,12 +360,19 @@ bool FlashNextGpu::Linear(const model::LayerWeights& l, LinearState& s, std::str
                 error) &&
          Launch("halo_l2norm", {2 * c.ssm_num_k_heads}, {128},
                 {rt::Arg::Buf(conv_out_), rt::Arg::Val(d), rt::Arg::Val(c.rms_eps)}, error) &&
-         Launch("halo_gdn_step", {c.ssm_num_v_heads}, {d},
-                {rt::Arg::Buf(conv_out_), rt::Arg::Buf(conv_out_, kd * 4ull), rt::Arg::Buf(conv_out_, 2ull * kd * 4),
-                 rt::Arg::Buf(alpha_), rt::Arg::Buf(beta_), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
-                 rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(s.state), rt::Arg::Buf(gdn_out_),
-                 rt::Arg::Val(c.ssm_num_k_heads), rt::Arg::Val(d)},
-                error) &&
+         (d == 128 ? Launch("halo_gdn_step_d128", {c.ssm_num_v_heads}, {128},
+                            {rt::Arg::Buf(conv_out_), rt::Arg::Buf(conv_out_, kd * 4ull),
+                             rt::Arg::Buf(conv_out_, 2ull * kd * 4), rt::Arg::Buf(alpha_), rt::Arg::Buf(beta_),
+                             rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf), rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf),
+                             rt::Arg::Buf(s.state), rt::Arg::Buf(gdn_out_), rt::Arg::Val(c.ssm_num_k_heads)},
+                            error)
+                   : Launch("halo_gdn_step", {c.ssm_num_v_heads}, {d},
+                            {rt::Arg::Buf(conv_out_), rt::Arg::Buf(conv_out_, kd * 4ull),
+                             rt::Arg::Buf(conv_out_, 2ull * kd * 4), rt::Arg::Buf(alpha_), rt::Arg::Buf(beta_),
+                             rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf), rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf),
+                             rt::Arg::Buf(s.state), rt::Arg::Buf(gdn_out_), rt::Arg::Val(c.ssm_num_k_heads),
+                             rt::Arg::Val(d)},
+                            error)) &&
          Launch("halo_gated_norm", {c.ssm_num_v_heads}, {128},
                 {rt::Arg::Buf(gdn_out_), rt::Arg::Buf(tensors_.at(l.ssm_norm.data).buf), rt::Arg::Buf(z_),
                  rt::Arg::Val(d), rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(1)},
