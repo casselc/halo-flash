@@ -172,7 +172,6 @@ src/core/quant.cpp QuantizedRowBytes cxx_init_const | equivalent: the initial va
 src/core/sampling.cpp ApplyMinP cxx_le_to_lt #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp ApplyMinP cxx_le_to_lt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp ApplyMinP cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp ApplyMinP cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp ApplyMinP cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp ApplyPenalties cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp ApplyTopK cxx_lt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
@@ -184,7 +183,6 @@ src/core/sampling.cpp ApplyTopP cxx_ge_to_gt | new from main with the sampler/ch
 src/core/sampling.cpp ApplyTopP cxx_le_to_lt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp ApplyTopP cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp ApplyTopP cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp ApplyTopP cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp ApplyTopP cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp BuildDistribution cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp DistributionWithPenalties cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
@@ -193,7 +191,6 @@ src/core/sampling.cpp DistributionWithPenalties cxx_replace_scalar_call #2 | new
 src/core/sampling.cpp DistributionWithPenalties cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp DistributionWithPenalties cxx_replace_scalar_call #4 | equivalent: reserve() and capacity hints change no result
 src/core/sampling.cpp DistributionWithPenalties cxx_replace_scalar_call #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp DistributionWithPenalties cxx_replace_scalar_call #6 | equivalent: reserve() and capacity hints change no result
 src/core/sampling.cpp DistributionWithPenalties cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp InitialRngState cxx_lshift_to_rshift | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp InitialRngState cxx_xor_to_or | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
@@ -242,7 +239,6 @@ src/core/sampling.cpp SamplerState::Distribution cxx_replace_scalar_call #3 | ne
 src/core/sampling.cpp SamplerState::Distribution cxx_replace_scalar_call #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplerState::Distribution cxx_replace_scalar_call #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplerState::Distribution cxx_replace_scalar_call #6 | equivalent: reserve() and capacity hints change no result
-src/core/sampling.cpp SamplerState::Distribution cxx_replace_scalar_call #7 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplerState::Distribution cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplerState::Distribution cxx_sub_to_add | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplerState::LinearDistribution cxx_div_to_mul | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
@@ -254,68 +250,31 @@ src/core/sampling.cpp SamplerState::LinearDistribution cxx_replace_scalar_call #
 src/core/sampling.cpp SamplerState::LinearDistribution cxx_replace_scalar_call #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplerState::LinearDistribution cxx_replace_scalar_call | equivalent: reserve() and capacity hints change no result
 src/core/sampling.cpp SamplerState::LinearDistribution cxx_sub_to_add | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_add_assign_to_sub_assign #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_add_assign_to_sub_assign | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_assign_const #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_assign_const #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_div_to_mul #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_div_to_mul | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_ge_to_gt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_le #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_add_assign_to_sub_assign | equivalent: only chooses between the 256-candidate top-p fast path and selecting every token, which give the same distribution (a performance choice)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge #2 | equivalent: the full softmax sum includes exp(0) = 1 for the maximum, so it is never 0
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge #3 | equivalent: top_p = 1 keeps every candidate either way, and a single candidate is kept either way
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge #4 | equivalent: min_p = 0 gives a -inf threshold that keeps everything, and a single candidate is kept either way
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge #5 | equivalent: min_p = 0 gives a -inf threshold that keeps everything, and a single candidate is kept either way
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_ge | equivalent: only chooses between the 256-candidate top-p fast path and selecting every token, which give the same distribution (a performance choice)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_gt_to_le | equivalent: only chooses between the 256-candidate top-p fast path and selecting every token, which give the same distribution (a performance choice)
 src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #2 | equivalent: the initial value is overwritten before it is read
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #4 | equivalent: the initial value is overwritten before it is read
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #6 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #7 | equivalent: the initial value is overwritten before it is read
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const #8 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplerState::PrepareSelected cxx_init_const | equivalent: the initial value is overwritten before it is read
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_ge #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_ge #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_ge #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_ge | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le #6 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_minus_to_noop | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_mul_to_div | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_pre_inc_to_pre_dec #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_pre_inc_to_pre_dec | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_ge | equivalent: only chooses between the 256-candidate top-p fast path and selecting every token, which give the same distribution (a performance choice)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le #2 | equivalent: only chooses between the 256-candidate top-p fast path and selecting every token, which give the same distribution (a performance choice)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le #3 | equivalent: top_p = 1 keeps every candidate either way, and a single candidate is kept either way
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le #4 | equivalent: the top-p loop always breaks by the last candidate (target <= total mass)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_lt_to_le | equivalent: only chooses between the 256-candidate top-p fast path and selecting every token, which give the same distribution (a performance choice)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #2 | equivalent: the scratch is already empty on entry (cleared at the top of PrepareSelected)
 src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #3 | equivalent: reserve() and capacity hints change no result
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #4 | equivalent: reserve() and capacity hints change no result
 src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #5 | equivalent: reserve() and capacity hints change no result
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #6 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call #7 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #10 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #11 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #12 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #13 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #14 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #15 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #16 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #3 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #4 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #5 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #6 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #7 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #8 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #9 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_remove_void_call | equivalent: both selection lambdas clear the scratch before filling it
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #3 | equivalent: only chooses between the 256-candidate top-p fast path and selecting every token, which give the same distribution (a performance choice)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #4 | gap, not fixed: the running maximum starts at -42 instead of -inf, which differs only when every logit is below -42
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #6 | equivalent: only chooses between the 256-candidate top-p fast path and selecting every token, which give the same distribution (a performance choice)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #7 | equivalent: with no finite logit a later check throws the same runtime_error (AllMaskedLogitsAreAnError)
+src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call #8 | equivalent: the minimum only matters when it is below the candidate count, which both sides cap
 src/core/sampling.cpp SamplerState::PrepareSelected cxx_replace_scalar_call | equivalent: reserve() and capacity hints change no result
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_sub_to_add #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplerState::PrepareSelected cxx_sub_to_add | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplerState::RebuildPenaltyCounts cxx_assign_const | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplerState::RebuildPenaltyCounts cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplerState::ResetHistory cxx_remove_void_call #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
@@ -352,7 +311,6 @@ src/core/sampling.cpp SamplerState::operator= cxx_assign_const | new from main w
 src/core/sampling.cpp SamplerState::operator= cxx_eq_to_ne | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplerState::operator= cxx_remove_void_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplingConfig::Validate cxx_le_to_lt | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
-src/core/sampling.cpp SamplingConfig::Validate cxx_lt_to_le | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplingConfig::can_use_unmodified_argmax cxx_eq_to_ne | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplingConfig::can_use_unmodified_argmax cxx_replace_scalar_call | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)
 src/core/sampling.cpp SamplingConfig::penalties_enabled cxx_ne_to_eq #2 | new from main with the sampler/chat-template merge; not yet triaged (first Mull trial)

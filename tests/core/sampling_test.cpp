@@ -181,7 +181,14 @@ TEST(Sampling, LargeVocabularyTopPMatchesReferenceOnBothBranches) {
       c.logits[i] = 0.25f * static_cast<float>(v) + (i < head ? lift : 0.0f);
     }
     if (tc.draw(gs::booleans())) c.logits[tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = n - 1}))] = kNegInf;
-    c.config.top_k = 0;
+    // Anywhere in the vocabulary, not only near the front.
+    std::rotate(c.logits.begin(),
+                c.logits.begin() + static_cast<std::ptrdiff_t>(tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = n - 1}))),
+                c.logits.end());
+    // Mostly top-p alone (the fast path); sometimes a large top-k first.
+    c.config.top_k = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 3})) == 0
+                         ? tc.draw(gs::integers<std::int32_t>({.min_value = 1, .max_value = 400}))
+                         : 0;
     c.config.top_p = tc.draw(gs::sampled_from(std::vector<float>{0.95f, 0.8f, 0.5f, 0.1f}));
     c.config.temperature = tc.draw(gs::sampled_from(std::vector<float>{0.3f, 0.7f, 1.0f, 1.5f}));
     const auto want = Reference(c);
@@ -208,6 +215,44 @@ TEST(Sampling, LargeVocabularyTopPFallsBackWhenTheBest256AreTooLight) {
   SamplerState st(c.config, c.prompt);
   ExpectSame(AsMap(st.Distribution(c.logits)), want, "SamplerState");
   ExpectSame(AsMap(BuildDistribution(c.logits, c.config, c.prompt, c.generated)), want, "BuildDistribution");
+}
+
+// Seed 0 is a seed like any other (only negative seeds draw from the OS).
+// top_p keeps the shortest prefix whose mass reaches top_p, inclusive: two
+// tied tokens at top_p = 0.5 keep one.
+TEST(Sampling, TopPBoundaryIsInclusive) {
+  Case c;
+  c.logits = {1.0f, 1.0f, kNegInf};
+  c.config.temperature = 1.0f;
+  c.config.top_p = 0.5f;
+  const auto want = Reference(c);
+  ASSERT_EQ(want.size(), 1u);
+  SamplerState st(c.config, c.prompt);
+  ExpectSame(AsMap(st.Distribution(c.logits)), want, "SamplerState");
+  ExpectSame(AsMap(BuildDistribution(c.logits, c.config, c.prompt, c.generated)), want, "BuildDistribution");
+}
+
+// No finite logit is an error on every selection path.
+TEST(Sampling, AllMaskedLogitsAreAnError) {
+  for (const std::size_t n : {std::size_t{5}, std::size_t{2000}})
+    for (const auto& [top_k, top_p] : std::vector<std::pair<std::int32_t, float>>{{0, 1.0f}, {3, 1.0f}, {0, 0.9f}}) {
+      SamplingConfig k;
+      k.temperature = 1.0f;
+      k.top_k = top_k;
+      k.top_p = top_p;
+      const std::vector<float> masked(n, kNegInf);
+      SamplerState st(k, {});
+      EXPECT_THROW((void)st.Distribution(masked), std::runtime_error) << n << " " << top_k << " " << top_p;
+    }
+}
+
+TEST(Sampling, SeedZeroIsDeterministic) {
+  SamplingConfig k;
+  k.temperature = 1.0f;
+  k.seed = 0;
+  const std::vector<float> flat(64, 0.0f);
+  SamplerState a(k, {}), b(k, {});
+  for (int i = 0; i < 32; ++i) ASSERT_EQ(a.Sample(flat), b.Sample(flat)) << "draw " << i;
 }
 
 TEST(Sampling, SeededStreamsAreDeterministicAndCopiesContinueIdentically) {
