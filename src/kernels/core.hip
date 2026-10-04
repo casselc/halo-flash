@@ -3137,13 +3137,22 @@ extern "C" __global__ void __launch_bounds__(256)
   const std::uint32_t st = static_cast<std::uint32_t>(v % hc);
   const float a = 2.0f * Sigmoid(inject[t * hc + st] / static_cast<float>(hc));
   const float* w = w_all + static_cast<std::size_t>(st) * h;
-  float vals[16];
+  // All of a thread's loads are issued before any is used. Combined with the
+  // arithmetic in one loop, each k waited for its own loads (a thread trace
+  // showed every load pair followed by vmcnt(0)): no memory parallelism.
+  float vals[16], outs[16];
+#pragma unroll
+  for (std::uint32_t k = 0; k < 16; ++k) {
+    const std::uint32_t i = threadIdx.x + k * blockDim.x;
+    vals[k] = i < h ? res[row + i] : 0.0f;
+    outs[k] = i < h ? out[t * h + i] : 0.0f;
+  }
   float ss = 0.0f;
 #pragma unroll
   for (std::uint32_t k = 0; k < 16; ++k) {
     const std::uint32_t i = threadIdx.x + k * blockDim.x;
     if (i < h) {
-      const float x = res[row + i] + out[t * h + i] * a;
+      const float x = vals[k] + outs[k] * a;
       res[row + i] = x;
       vals[k] = x;
       ss += x * x;
