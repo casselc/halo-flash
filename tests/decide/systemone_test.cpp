@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -226,14 +227,33 @@ TEST(SystemOne, ParsedRequestsAlwaysRender) {
   }, {.test_cases = 500});
 }
 
+namespace {
+
+// The decider's tokenizer, built once per process: building it is the
+// slowest step of these tests (seconds at -O0, under Mull per mutant).
+const halo::text::Tokenizer* DeciderTokenizer() {
+  static const std::unique_ptr<halo::text::Tokenizer> tok = [] {
+    std::unique_ptr<halo::text::Tokenizer> t;
+    const char* path = std::getenv("HALO_DECIDER_TOKENIZER_GGUF");
+    if (!path) return t;
+    std::string error;
+    auto reader = halo::core::GgufReader::OpenFile(path, &error);
+    EXPECT_TRUE(reader) << error;
+    if (reader) {
+      t = halo::text::Tokenizer::FromGguf(*reader, &error);
+      EXPECT_TRUE(t) << error;
+    }
+    return t;
+  }();
+  return tok.get();
+}
+
+}  // namespace
+
 TEST(SystemOne, WindowFittingMatchesEngine) {
-  const char* path = std::getenv("HALO_DECIDER_TOKENIZER_GGUF");
-  if (!path) GTEST_SKIP() << "set HALO_DECIDER_TOKENIZER_GGUF";
+  const auto* tok = DeciderTokenizer();
+  if (!tok) GTEST_SKIP() << "set HALO_DECIDER_TOKENIZER_GGUF";
   std::string error;
-  auto reader = halo::core::GgufReader::OpenFile(path, &error);
-  ASSERT_TRUE(reader) << error;
-  auto tok = halo::text::Tokenizer::FromGguf(*reader, &error);
-  ASSERT_TRUE(tok) << error;
   int failures = 0;
   const auto rows = LoadJsonl("tokens.jsonl");
   ASSERT_GT(rows.size(), 400U);
@@ -266,13 +286,9 @@ TEST(SystemOne, WindowFittingMatchesEngine) {
 // A window so small that the options are cut away is an error, not an answer
 // read from arbitrary tokens.
 TEST(SystemOne, WindowTooSmallForTheOptionsIsAnError) {
-  const char* path = std::getenv("HALO_DECIDER_TOKENIZER_GGUF");
-  if (!path) GTEST_SKIP() << "set HALO_DECIDER_TOKENIZER_GGUF";
+  const auto* tok = DeciderTokenizer();
+  if (!tok) GTEST_SKIP() << "set HALO_DECIDER_TOKENIZER_GGUF";
   std::string error;
-  auto reader = halo::core::GgufReader::OpenFile(path, &error);
-  ASSERT_TRUE(reader) << error;
-  auto tok = halo::text::Tokenizer::FromGguf(*reader, &error);
-  ASSERT_TRUE(tok) << error;
   const Request r = MustParse(
       R"({"state":"s","questions":{"q":{"instructions":"pick","criteria":{"alpha":"first","beta":"second"}}}})");
   const std::vector<RenderedQuestion> rqs = {RenderQuestion(r.questions[0])};
