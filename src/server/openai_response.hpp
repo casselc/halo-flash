@@ -61,6 +61,12 @@ class OutputBuilder {
   [[nodiscard]] json::Value Final() const;
 
   [[nodiscard]] bool has_tool_calls() const { return !calls_.empty(); }
+  /// (call id, function name) of each call, in order.
+  [[nodiscard]] std::vector<std::pair<std::string, std::string>> tool_calls() const {
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const auto& c : calls_) out.emplace_back(c.call_id, c.name);
+    return out;
+  }
 
  private:
   enum class Open : std::uint8_t { kNone, kReasoning, kMessage };

@@ -27,6 +27,7 @@
 #include "core/json.hpp"
 #include "core/sampling.hpp"
 #include "server/http.hpp"
+#include "server/observer.hpp"
 #include "server/openai_request.hpp"
 #include "text/chat_template.hpp"
 
@@ -80,6 +81,8 @@ struct ServiceOptions {
   RequestDefaults defaults;
   text::ChatTemplateKind template_kind = text::ChatTemplateKind::kFlashNext;
   std::size_t max_stored_responses = 1000;  // oldest evicted first
+  /// Told about every generation (optional; must outlive the service).
+  GenerationObserver* observer = nullptr;
   /// Ids and timestamps; tests pass deterministic ones.
   std::function<std::string()> new_id;
   std::function<std::int64_t()> now_s;

@@ -83,6 +83,8 @@ struct GenerationRequest {
   bool truncation_auto = false;
   json::Value metadata;  // null or an object of strings
   std::string user;
+  // Observability context (set by the service from X-Halo-* headers).
+  std::string trace_id, session_id;
 };
 
 struct RequestError {

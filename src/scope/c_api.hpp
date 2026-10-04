@@ -14,6 +14,10 @@ namespace halo::scope {
 
 halo_scope* WrapRecorder(Recorder& rec, std::string project, Capture capture, Annotator::Clock clock = {});
 
+/// The annotator behind a handle (for engine-side recording in the same
+/// process, e.g. the server's generations).
+Annotator& AnnotatorOf(halo_scope* scope);
+
 }  // namespace halo::scope
 
 #endif  // HALO_SCOPE_C_API_HPP_

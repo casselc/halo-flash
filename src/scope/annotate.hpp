@@ -85,6 +85,11 @@ class Annotator {
   /// fields (tag appends one tag); any other key is a metadata entry.
   Outcome TraceMeta(std::string_view trace_id, std::string_view key, std::string_view value);
 
+  /// An engine-side observation (a generation) with its input and output
+  /// content under this annotator's capture policy; fills project and the
+  /// content references.
+  Outcome RecordObservation(Observation o, std::string_view input, std::string_view output);
+
   /// Steps begun and not yet ended.
   std::size_t OpenSteps() const;
 
@@ -99,6 +104,8 @@ class Annotator {
   std::int64_t Now() const;
   /// Applies the capture policy to `output`; returns false when a payload row was dropped.
   bool CaptureOutput(Producer* p, std::string_view output, Observation& o);
+  /// The same for input content; false when a payload row was dropped.
+  bool CaptureContent(Producer* p, std::string_view content, std::vector<rb::Hash16>& refs, std::uint64_t& bytes);
   Outcome Score(const ScoreTarget& target, std::string_view name, std::string_view data_type, double value,
                 std::string_view string_value, std::string_view source, std::string_view comment,
                 std::string_view supersedes, std::string* score_id);

@@ -106,6 +106,16 @@ HttpResponse OpenAiService::Models(const HttpRequest&) {
 
 namespace {
 
+void SetContext(const HttpRequest& http, GenerationRequest& req) {
+  if (const std::string* t = http.Header("x-halo-trace-id")) req.trace_id = *t;
+  if (const std::string* s = http.Header("x-halo-session-id")) req.session_id = *s;
+}
+
+std::int64_t NowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
 std::optional<Value> Body(const HttpRequest& req, RequestError* e) {
   std::string err;
   auto v = json::Parse(req.body, &err);
@@ -121,6 +131,7 @@ HttpResponse OpenAiService::Completions(const HttpRequest& http) {
   if (!body) return Error(400, e);
   auto req = ParseCompletionsRequest(*body, opt_.defaults, &e);
   if (!req) return Error(400, e);
+  SetContext(http, *req);
   return Generate(Api::kCompletions, std::move(*req), nullptr);
 }
 
@@ -130,6 +141,7 @@ HttpResponse OpenAiService::Chat(const HttpRequest& http) {
   if (!body) return Error(400, e);
   auto req = ParseChatRequest(*body, opt_.defaults, &e);
   if (!req) return Error(400, e);
+  SetContext(http, *req);
   return Generate(Api::kChat, std::move(*req), nullptr);
 }
 
@@ -139,6 +151,7 @@ HttpResponse OpenAiService::Responses(const HttpRequest& http) {
   if (!body) return Error(400, e);
   auto req = ParseResponsesRequest(*body, opt_.defaults, &e);
   if (!req) return Error(400, e);
+  SetContext(http, *req);
   std::optional<Value> prior;
   if (!req->previous_response_id.empty()) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -222,7 +235,17 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
       }
     };
     TextGenerator::Params params{run->prompt, run->req.sampling, run->req.max_tokens};
+    GenerationRecord rec;
+    rec.start_ns = NowNs();
+    std::int64_t last_ns = 0;
     const auto result = gen_.Generate(params, [&](std::string_view piece) {
+      if (opt_.observer) {
+        const std::int64_t now = NowNs();
+        if (last_ns == 0) rec.first_text_ns = now;
+        else rec.gaps_us.push_back(static_cast<std::uint32_t>(std::min<std::int64_t>((now - last_ns) / 1000, UINT32_MAX)));
+        last_ns = now;
+        rec.output += piece;
+      }
       emit(stops.Push(piece));
       return !stops.stopped() && flush();
     });
@@ -236,6 +259,31 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
     builder.Finish(result.length_limited && !stops.stopped() ? FinishReason::kLength : FinishReason::kStop, usage,
                    events);
     Value final = builder.Final();
+    if (opt_.observer) {
+      rec.end_ns = NowNs();
+      rec.api = api == Api::kChat ? "chat" : api == Api::kResponses ? "responses" : "completions";
+      rec.request_id = id;
+      rec.trace_id = run->req.trace_id;
+      rec.session_id = run->req.session_id;
+      rec.user = run->req.user;
+      rec.model = run->req.model;
+      rec.prompt_tokens = result.prompt_tokens;
+      rec.cached_tokens = result.cached_tokens;
+      rec.completion_tokens = result.completion_tokens;
+      rec.finish_reason = !result.error.empty()                                ? "error"
+                          : result.length_limited && !stops.stopped()          ? "length"
+                          : builder.has_tool_calls()                           ? "tool_calls"
+                                                                               : "stop";
+      rec.sampling = run->req.sampling;
+      rec.max_tokens = run->req.max_tokens;
+      for (const auto& [call_id, name] : builder.tool_calls()) {
+        rec.tool_call_ids.push_back(call_id);
+        rec.tool_names.push_back(name);
+      }
+      rec.input = run->prompt;
+      rec.error = result.error;
+      opt_.observer->OnGeneration(rec);
+    }
     if (api == Api::kResponses && run->req.store && result.error.empty()) {
       // The stored conversation gains this response's turn, mapped back
       // through the request parser (the round trip the tests check).

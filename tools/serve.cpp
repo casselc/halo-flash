@@ -2,6 +2,9 @@
 //   halo_serve --model <shard-00001.gguf> [--host 127.0.0.1] [--port 8080]
 //              [--device hip|hrx] [--max-context 32768] [--api-key KEY]
 //              [--model-id NAME] [--decider-dir DIR [--decider-device hip|hrx|cpu]]
+// With halo-scope built in (HALO_SCOPE=ON): --scope-dir DIR records every
+// generation as a GENERATION observation [--scope-project NAME]
+// [--scope-capture off|digest|full] [--scope-wal PATH].
 // --decider-dir serves POST /v1/systemone with strands-decider-2B (the
 // directory holds Qwen3.5-2B-Base-BF16.gguf and the strands-decider-*.gguf
 // files, as the decider tests expect).
@@ -26,6 +29,11 @@
 #include "server/openai_service.hpp"
 #include "server/systemone_service.hpp"
 #include "text/tokenizer.hpp"
+#if HALO_WITH_SCOPE
+#include "halo_scope.h"
+#include "scope/c_api.hpp"
+#include "scope/generation_observer.hpp"
+#endif
 
 using namespace halo;
 
@@ -47,7 +55,8 @@ class StrandsEngine : public server::DecisionEngine {
 
 int main(int argc, char** argv) {
   std::string model, device = "hip", host = "127.0.0.1", api_key, model_id = "qwen3.8-flash-next", decider_dir,
-                    decider_device = "hip";
+                    decider_device = "hip", scope_dir, scope_project = "halo-flash", scope_capture = "digest",
+                    scope_wal;
   int port = 8080;
   std::uint32_t max_context = 32768;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -61,6 +70,10 @@ int main(int argc, char** argv) {
     else if (a == "--model-id") model_id = v;
     else if (a == "--decider-dir") decider_dir = v;
     else if (a == "--decider-device") decider_device = v;
+    else if (a == "--scope-dir") scope_dir = v;
+    else if (a == "--scope-project") scope_project = v;
+    else if (a == "--scope-capture") scope_capture = v;
+    else if (a == "--scope-wal") scope_wal = v;
     else return std::fprintf(stderr, "unknown option %s\n", a.c_str()), 2;
   }
   if (model.empty()) return std::fprintf(stderr, "usage: halo_serve --model <gguf> [options]\n"), 2;
@@ -85,6 +98,23 @@ int main(int argc, char** argv) {
   server::FlashNextGenerator generator(*engine, *tok, max_context);
   server::ServiceOptions so;
   so.model_id = model_id;
+#if HALO_WITH_SCOPE
+  halo_scope* scope = nullptr;
+  std::unique_ptr<scope::GenerationObserver> observed;
+  if (!scope_dir.empty()) {
+    const auto capture = scope_capture == "off"    ? HALO_SCOPE_CAPTURE_OFF
+                         : scope_capture == "full" ? HALO_SCOPE_CAPTURE_FULL
+                                                   : HALO_SCOPE_CAPTURE_DIGEST;
+    char err[512] = {};
+    scope = halo_scope_open(scope_dir.c_str(), scope_project.c_str(), capture,
+                            scope_wal.empty() ? nullptr : scope_wal.c_str(), err, sizeof err);
+    if (!scope) return std::fprintf(stderr, "halo-scope: %s\n", err), 1;
+    observed = std::make_unique<scope::GenerationObserver>(scope::AnnotatorOf(scope));
+    so.observer = observed.get();
+  }
+#else
+  if (!scope_dir.empty()) return std::fprintf(stderr, "--scope-dir needs a build with HALO_SCOPE=ON\n"), 2;
+#endif
   server::OpenAiService service(generator, so);
   server::HttpServer http({.host = host, .port = port, .api_key = api_key});
   service.Register(http);
@@ -105,4 +135,15 @@ int main(int argc, char** argv) {
   std::signal(SIGTERM, OnSignal);
   while (!g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
   http.Stop();
+#if HALO_WITH_SCOPE
+  if (scope) {
+    halo_scope_flush(scope);
+    halo_scope_stats st{};
+    halo_scope_get_stats(scope, &st);
+    std::fprintf(stderr, "halo-scope: %llu rows written, %llu failed, %llu dropped\n",
+                 static_cast<unsigned long long>(st.rows_written), static_cast<unsigned long long>(st.rows_failed),
+                 static_cast<unsigned long long>(st.dropped));
+    halo_scope_close(scope);
+  }
+#endif
 }

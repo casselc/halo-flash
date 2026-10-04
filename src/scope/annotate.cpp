@@ -62,18 +62,32 @@ std::int64_t Annotator::Now() const {
       .count();
 }
 
-bool Annotator::CaptureOutput(Producer* p, std::string_view output, Observation& o) {
-  if (capture_ == Capture::kOff || output.empty()) return true;
-  const auto h = PayloadHash(output);
-  o.output_refs = {h};
-  o.output_bytes = output.size();
+bool Annotator::CaptureContent(Producer* p, std::string_view content, std::vector<rb::Hash16>& refs, std::uint64_t& bytes) {
+  if (capture_ == Capture::kOff || content.empty()) return true;
+  const auto h = PayloadHash(content);
+  refs = {h};
+  bytes = content.size();
   if (capture_ != Capture::kFull) return true;
   Payload pl;
   pl.project = project_;
   pl.hash = h;
-  pl.bytes = static_cast<std::uint32_t>(output.size());
-  pl.content = std::string(output);
+  pl.bytes = static_cast<std::uint32_t>(content.size());
+  pl.content = std::string(content);
   return p->Record(pl);
+}
+
+bool Annotator::CaptureOutput(Producer* p, std::string_view output, Observation& o) {
+  return CaptureContent(p, output, o.output_refs, o.output_bytes);
+}
+
+Outcome Annotator::RecordObservation(Observation o, std::string_view input, std::string_view output) {
+  if (o.trace_id.empty() || o.span_id.empty()) return Outcome::kInvalid;
+  o.project = project_;
+  Producer* p = ThisThread();
+  const bool in_ok = CaptureContent(p, input, o.input_refs, o.input_bytes);
+  const bool out_ok = CaptureContent(p, output, o.output_refs, o.output_bytes);
+  const bool row_ok = p->Record(o);
+  return in_ok && out_ok && row_ok ? Outcome::kOk : Outcome::kDropped;
 }
 
 Outcome Annotator::StepBegin(std::string_view trace_id, std::string_view parent, StepKind kind,

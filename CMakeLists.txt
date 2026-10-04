@@ -288,6 +288,13 @@ if(HALO_SCOPE)
     endif()
   endfunction()
   halo_scope_library(halo_scope 0)
+  # The OpenAI service's generations as observations (links the server).
+  add_library(halo_scope_server STATIC src/scope/generation_observer.cpp)
+  target_link_libraries(halo_scope_server PUBLIC halo_scope halo_server)
+  if(TARGET halo_serve)
+    target_link_libraries(halo_serve PRIVATE halo_scope_server)
+    target_compile_definitions(halo_serve PRIVATE HALO_WITH_SCOPE=1)
+  endif()
 
   add_executable(scope_bench bench/scope/scope_bench.cpp)
   target_link_libraries(scope_bench PRIVATE halo_scope)
@@ -299,8 +306,9 @@ if(HALO_SCOPE)
       tests/scope/metadata_test.cpp
       tests/scope/wal_test.cpp
       tests/scope/annotate_test.cpp
+      tests/scope/generation_observer_test.cpp
       tests/scope/scope_main.cpp)
-    target_link_libraries(scope_tests PRIVATE halo_scope)
+    target_link_libraries(scope_tests PRIVATE halo_scope halo_scope_server)
 
     # Positive controls: each mutant must make its property fail with the
     # expected message, so a crash, a skip (no libchdb) or an unrelated

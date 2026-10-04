@@ -77,9 +77,19 @@ class ScriptedGenerator : public TextGenerator {
   std::atomic<bool> stopped_early{false};
 };
 
+struct Recording : GenerationObserver {
+  void OnGeneration(const GenerationRecord& r) noexcept override {
+    std::lock_guard<std::mutex> lk(mu);
+    records.push_back(r);
+  }
+  std::mutex mu;
+  std::vector<GenerationRecord> records;
+};
+
 struct Rig {
   Rig() : server({}) {
     ServiceOptions o;
+    o.observer = &observed;
     int n = 0;
     o.new_id = [n]() mutable { return std::to_string(++n); };
     o.now_s = [] { return std::int64_t{1700000000}; };
@@ -89,21 +99,22 @@ struct Rig {
     if (!server.Start(&err)) throw std::runtime_error(err);
   }
   ScriptedGenerator gen;
+  Recording observed;
   HttpServer server;
   std::unique_ptr<OpenAiService> service;
 };
 
 /// One request on a fresh connection; returns (status, body), dechunked.
 std::pair<int, std::string> Post(int port, const std::string& method, const std::string& path, const std::string& body,
-                                 bool read_all = true) {
+                                 bool read_all = true, const std::string& headers = "") {
   const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   sockaddr_in a{};
   a.sin_family = AF_INET;
   a.sin_port = htons(static_cast<std::uint16_t>(port));
   ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
   if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0) throw std::runtime_error("connect");
-  const std::string req = method + " " + path + " HTTP/1.1\r\nConnection: close\r\nContent-Length: " +
-                          std::to_string(body.size()) + "\r\n\r\n" + body;
+  const std::string req = method + " " + path + " HTTP/1.1\r\nConnection: close\r\n" + headers +
+                          "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
   ::send(fd, req.data(), req.size(), MSG_NOSIGNAL);
   std::string raw;
   char b[8192];
@@ -312,3 +323,42 @@ TEST(OpenAiService, StopMatcherIsChunkingIndependent) {
     ASSERT_EQ(m.stopped(), hit);
   }, {.test_cases = 1000});
 }
+
+// Every generation is reported once, with the harness's trace and session
+// ids, usage, timing and the tool-call ids the reply carries.
+TEST(OpenAiService, ReportsEachGenerationToTheObserver) {
+  Rig rig;
+  const std::string script =
+      "\n</think>\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+  rig.gen.scripts = {script};
+  auto [status, text] = Post(rig.server.port(), "POST", "/v1/chat/completions",
+                             R"({"model": "m", "user": "u7", "temperature": 0.3, "max_tokens": 77,
+                                 "messages": [{"role": "user", "content": "Weather?"}],
+                                 "tools": [{"type": "function", "function": {"name": "weather"}}]})",
+                             true, "X-Halo-Trace-Id: tr-1\r\nX-Halo-Session-Id: sess-9\r\n");
+  ASSERT_EQ(status, 200) << text;
+  ASSERT_EQ(rig.observed.records.size(), 1u);
+  const auto& r = rig.observed.records[0];
+  const auto reply = J(text);
+  EXPECT_EQ(r.api, "chat");
+  EXPECT_EQ(r.request_id, reply.find("id")->str());
+  EXPECT_EQ(r.trace_id, "tr-1");
+  EXPECT_EQ(r.session_id, "sess-9");
+  EXPECT_EQ(r.user, "u7");
+  EXPECT_EQ(r.model, "m");
+  EXPECT_EQ(r.finish_reason, "tool_calls");
+  EXPECT_FLOAT_EQ(r.sampling.temperature, 0.3f);
+  EXPECT_EQ(r.max_tokens, 77u);
+  EXPECT_EQ(r.prompt_tokens, rig.gen.prompts[0].size());  // the scripted generator counts bytes
+  EXPECT_GT(r.completion_tokens, 0u);
+  EXPECT_LE(r.start_ns, r.first_text_ns);
+  EXPECT_LE(r.first_text_ns, r.end_ns);
+  EXPECT_EQ(r.gaps_us.size() + 1, r.completion_tokens);  // one piece per scripted token
+  EXPECT_EQ(r.input, rig.gen.prompts[0]);
+  EXPECT_EQ(r.output, script);
+  const auto& call = reply.find("choices")->items()[0].find("message")->find("tool_calls")->items()[0];
+  ASSERT_EQ(r.tool_call_ids.size(), 1u);
+  EXPECT_EQ(r.tool_call_ids[0], call.find("id")->str());
+  EXPECT_EQ(r.tool_names[0], "weather");
+}
+

@@ -713,6 +713,11 @@ tags accumulate). Output content follows the capture policy (off, digest,
 full). Tested with directed cases, a Hegel property (every OK return is
 exactly the rows written), concurrent threads under TSan, and a chDB round
 trip. HTTP endpoints for out-of-process harnesses come with the P7 server.
+The server's own generations are recorded too (`halo_serve --scope-dir`,
+in builds with HALO_SCOPE=ON): one GENERATION observation per request with
+usage and cache reads, time to first text, per-piece latency percentiles,
+sampler settings, finish reason and the tool-call ids, in the harness's
+trace and session when it sends `X-Halo-Trace-Id` / `X-Halo-Session-Id`.
 
 Complete traces (generation, then tool call, tool result and the next
 generation) are what P11 turns into tool-calling training rows. Harness

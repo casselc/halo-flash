@@ -71,6 +71,8 @@ halo_scope* WrapRecorder(Recorder& rec, std::string project, Capture capture, An
   return h;
 }
 
+Annotator& AnnotatorOf(halo_scope* scope) { return *scope->annotator; }
+
 }  // namespace halo::scope
 
 extern "C" {
