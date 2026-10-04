@@ -6,3 +6,4 @@ fuzz-*.log
 crash-*
 leak-*
 timeout-*
+*.hsaco
