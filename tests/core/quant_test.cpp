@@ -229,6 +229,15 @@ void CheckRow(const QuantFixture& r) {
     ASSERT_TRUE(q::DequantizeRow(type, r.block.data(), got.data(), k)) << r.type;
   }
   for (std::size_t i = k; i < got.size(); ++i) ASSERT_TRUE(std::isnan(got[i])) << r.type << " wrote past k";
+  // The model's CPU oracle decodes its formats through its own row decoder.
+  const bool cpu_format = type != GgmlType::kQ3_K && type != GgmlType::kIQ4_XS && type != GgmlType::kIQ3_S;
+  if (cpu_format) {
+    halo::model::TensorRef t{.data = r.block.data(), .type = type, .cols = k};
+    std::vector<float> cpu(k + 64, poison);
+    halo::model::cpu::DequantizeRow(t, 0, 0, cpu.data());
+    ASSERT_EQ(std::memcmp(cpu.data(), got.data(), k * sizeof(float)), 0) << r.type << " cpu::DequantizeRow";
+    for (std::size_t i = k; i < cpu.size(); ++i) ASSERT_TRUE(std::isnan(cpu[i])) << r.type << " cpu wrote past k";
+  }
   double ref = 0.0, mag = 0.0;
   std::vector<float> v(k + 512, poison);
   for (std::size_t i = 0; i < k; ++i) {
