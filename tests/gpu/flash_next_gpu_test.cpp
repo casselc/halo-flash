@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -158,4 +159,134 @@ TEST(FlashNextGpu, RandomSequencesMatchReference) {
     }
     Compare(dev, *t, use_lora ? &*t->lora : nullptr, tokens);
   }, {.test_cases = 25});
+}
+
+// Session state, swarm style: each case enables a random subset of the
+// operations, then runs a random program of them. The model is the CPU
+// reference, copied into the same snapshot slots. Every logits output must
+// match, so restore == replay and chunked prefill == token-at-a-time.
+TEST(FlashNextGpu, SnapshotsResetAndPrefillMatchReference) {
+  Tiny* t = LoadTiny();
+  if (!t) GTEST_SKIP() << "set HALO_TINY_HF_DIR";
+  auto devices = Devices();
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  const auto& c = t->weights->config;
+  const std::size_t V = c.vocab_size;
+  constexpr std::uint32_t kMaxContext = 48;
+  constexpr int kSlots = 3;
+  hegel::test([&](hegel::TestCase& tc) {
+    auto& dev = *devices[tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = devices.size() - 1}))];
+    const model::LoraAdapter* lora = tc.draw(gs::booleans()) ? &*t->lora : nullptr;
+    std::string error;
+    auto gpu = engine::FlashNextGpu::Create(dev, *t->weights, t->ngram.get(), lora, kMaxContext, &error);
+    ASSERT_TRUE(gpu) << error;
+    std::optional<model::ReferenceModel> cpu;
+    cpu.emplace(*t->weights, t->ngram.get(), kMaxContext);
+    cpu->SetAdapter(lora);
+    std::vector<std::unique_ptr<engine::FlashNextGpu::Snapshot>> gpu_slots(kSlots);
+    std::vector<std::optional<model::ReferenceModel>> cpu_slots(kSlots);
+    for (auto& s : gpu_slots) {
+      s = gpu->NewSnapshot(&error);
+      ASSERT_TRUE(s) << error;
+    }
+    enum Op { kStep, kPrefill, kSave, kRestore, kReset, kOps };
+    bool enabled[kOps];
+    for (bool& e : enabled) e = tc.draw(gs::booleans());
+    enabled[kStep] = true;  // the program must make progress
+    std::vector<float> gl(V), cl(V);
+    const auto token = [&] {
+      return tc.draw(gs::integers<int>({.min_value = 0, .max_value = 4})) == 0
+                 ? static_cast<std::int32_t>(c.ple_eos_token)
+                 : tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = static_cast<std::int32_t>(V - 1)}));
+    };
+    const auto check = [&](const char* what) {
+      ASSERT_LT(RelL2(gl, cl.data()), 1e-4) << what << " at position " << gpu->Position();
+      ASSERT_EQ(Argmax(gl.data(), V), Argmax(cl.data(), V)) << what;
+    };
+    const int ops = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 40}));
+    for (int i = 0; i < ops; ++i) {
+      // Weighted toward long histories and forks: a stale-state bug shows
+      // only after save, divergence past the save point, then restore.
+      const int pick = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 9}));
+      const Op op = pick < 3 ? kStep : pick < 6 ? kPrefill : pick < 7 ? kSave : pick < 9 ? kRestore : kReset;
+      if (!enabled[op]) continue;
+      const int slot = tc.draw(gs::integers<int>({.min_value = 0, .max_value = kSlots - 1}));
+      switch (op) {
+        case kStep: {
+          if (gpu->Position() >= kMaxContext) break;
+          const auto tok = token();
+          ASSERT_TRUE(gpu->Step(tok, gl, &error)) << error;
+          ASSERT_TRUE(cpu->Step(tok, cl, {}, &error)) << error;
+          check("step");
+          break;
+        }
+        case kPrefill: {
+          const auto n = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 12}));
+          if (gpu->Position() + n > kMaxContext) break;
+          std::vector<std::int32_t> chunk(n);
+          for (auto& tok : chunk) tok = token();
+          ASSERT_TRUE(gpu->Prefill(chunk, gl, &error)) << error;
+          for (std::uint32_t j = 0; j < n; ++j)
+            ASSERT_TRUE(cpu->Step(chunk[j], j + 1 == n ? std::span<float>(cl) : std::span<float>{}, {}, &error)) << error;
+          check("prefill");
+          break;
+        }
+        case kSave:
+          ASSERT_TRUE(gpu->Save(*gpu_slots[slot], &error)) << error;
+          cpu_slots[slot].emplace(*cpu);
+          break;
+        case kRestore:
+          if (!cpu_slots[slot]) {
+            ASSERT_FALSE(gpu->Restore(*gpu_slots[slot], &error));  // never-saved slot is refused
+            break;
+          }
+          ASSERT_TRUE(gpu->Restore(*gpu_slots[slot], &error)) << error;
+          cpu.emplace(*cpu_slots[slot]);
+          break;
+        case kReset:
+          ASSERT_TRUE(gpu->Reset(&error)) << error;
+          cpu->Reset();
+          break;
+        case kOps: break;
+      }
+      ASSERT_EQ(gpu->Position(), cpu->Position());
+    }
+  }, {.test_cases = 100});
+}
+
+// Directed: restoring a snapshot after an unrelated, longer history has
+// overwritten every row the snapshot covers. A plain fork-and-continue never
+// rewrites rows below the save point, so it cannot see a snapshot that drops
+// some of them; the random programs above reach this shape only rarely.
+TEST(FlashNextGpu, RestoreAfterOverwritingHistory) {
+  Tiny* t = LoadTiny();
+  if (!t) GTEST_SKIP() << "set HALO_TINY_HF_DIR";
+  auto devices = Devices();
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  const std::size_t V = t->weights->config.vocab_size;
+  const auto tokens = ReadTokens(t->dir + "/tokens.i32");  // 48 tokens
+  const std::span<const std::int32_t> all(tokens);
+  for (auto& dev : devices) {
+    for (std::size_t save_at : {1, 9, 13, 20}) {
+      std::string error;
+      auto gpu = engine::FlashNextGpu::Create(*dev, *t->weights, t->ngram.get(), nullptr, 48, &error);
+      ASSERT_TRUE(gpu) << error;
+      auto snap = gpu->NewSnapshot(&error);
+      ASSERT_TRUE(snap) << error;
+      model::ReferenceModel cpu(*t->weights, t->ngram.get(), 48);
+      std::vector<float> gl(V), cl(V);
+      ASSERT_TRUE(gpu->Prefill(all.first(save_at), {}, &error)) << error;
+      for (std::size_t i = 0; i < save_at; ++i) ASSERT_TRUE(cpu.Step(tokens[i], {}, {}, &error));
+      ASSERT_TRUE(gpu->Save(*snap, &error)) << error;
+      ASSERT_TRUE(gpu->Reset(&error)) << error;
+      ASSERT_TRUE(gpu->Prefill(all.last(save_at + 8), {}, &error)) << error;  // different, longer history
+      ASSERT_TRUE(gpu->Restore(*snap, &error)) << error;
+      for (std::size_t i = save_at; i < save_at + 12; ++i) {
+        ASSERT_TRUE(gpu->Step(tokens[i], gl, &error)) << error;
+        ASSERT_TRUE(cpu.Step(tokens[i], cl, {}, &error)) << error;
+        ASSERT_LT(RelL2(gl, cl.data()), 1e-4) << rt::BackendName(dev->backend()) << " saved at " << save_at
+                                              << ", position " << i;
+      }
+    }
+  }
 }

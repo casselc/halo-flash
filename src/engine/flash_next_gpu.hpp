@@ -30,7 +30,20 @@ class FlashNextGpu {
                                                             std::uint32_t max_context, std::string* error);
   ~FlashNextGpu();
   [[nodiscard]] bool Step(std::int32_t token, std::span<float> logits, std::string* error);
+  /// Runs `tokens` in order; `logits` (optional) receives the last position's.
+  /// Token at a time for now (P4 batches it); any chunking is equivalent.
+  [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error);
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
+
+  /// A device-resident copy of the whole sequence state: DeltaNet recurrent
+  /// and conv state, attention KV, QSA indexer keys and pooled blocks, PLE
+  /// conv history, n-gram window and position. Many may exist (forks).
+  class Snapshot;
+  [[nodiscard]] std::unique_ptr<Snapshot> NewSnapshot(std::string* error);
+  [[nodiscard]] bool Save(Snapshot& snapshot, std::string* error);
+  [[nodiscard]] bool Restore(const Snapshot& snapshot, std::string* error);
+  /// Rewinds to an empty sequence.
+  [[nodiscard]] bool Reset(std::string* error);
 
  private:
   struct DevTensor {
@@ -64,6 +77,10 @@ class FlashNextGpu {
   bool Linear(const model::LayerWeights& l, LinearState& s, std::string* error);
   bool Attention(const model::LayerWeights& l, AttnState& s, std::string* error);
   bool Moe(const model::LayerWeights& l, std::string* error);
+  /// Visits every state buffer with the float count currently meaningful.
+  template <typename F>
+  bool ForEachState(F&& f);
+  bool CopyFloats(const rt::Buffer& dst, const rt::Buffer& src, std::size_t n, std::string* error);
 
   rt::Device& dev_;
   const model::ModelWeights& w_;
@@ -81,6 +98,23 @@ class FlashNextGpu {
   rt::Buffer qkv_, conv_out_, z_, alpha_, beta_, gdn_out_;
   rt::Buffer qg_, q_, gate_, k_, v_, ctx_, scores_, iq_, ik_, pooled_, block_scores_, visible_;
   rt::Buffer router_, eg_, eu_, ed_, sgate_, logits_, lora_tmp_, lora_out_;
+};
+
+class FlashNextGpu::Snapshot {
+ public:
+  ~Snapshot() {
+    for (auto& b : buffers_) dev_.Free(b);
+  }
+
+ private:
+  friend class FlashNextGpu;
+  explicit Snapshot(rt::Device& d) : dev_(d) {}
+  rt::Device& dev_;
+  std::vector<rt::Buffer> buffers_;  ///< ForEachState order
+  std::vector<std::uint32_t> blocks_;
+  model::NgramHistory ngram_history_;
+  std::uint32_t position_ = 0;
+  bool valid_ = false;
 };
 
 }  // namespace halo::engine

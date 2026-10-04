@@ -420,4 +420,81 @@ bool FlashNextGpu::Step(std::int32_t token, std::span<float> logits, std::string
   return dev_.Synchronize(error);
 }
 
+template <typename F>
+bool FlashNextGpu::ForEachState(F&& f) {
+  const auto& c = w_.config;
+  const std::size_t pos = position_;
+  for (std::uint32_t l = 0; l < c.num_layers; ++l) {
+    if (c.IsLinearLayer(l)) {
+      auto& s = linear_[l];
+      if (!f(s.conv, s.conv.bytes / 4) || !f(s.state, s.state.bytes / 4)) return false;
+    } else {
+      auto& s = attn_[l];
+      if (!f(s.k, pos * c.AttentionKvDim()) || !f(s.v, pos * c.AttentionKvDim()) ||
+          !f(s.index_k, pos * c.indexer_head_dim) || !f(s.block_k, std::size_t{s.blocks} * c.indexer_head_dim))
+        return false;
+    }
+  }
+  return f(ple_history_, ple_history_.bytes / 4);
+}
+
+bool FlashNextGpu::CopyFloats(const rt::Buffer& dst, const rt::Buffer& src, std::size_t n, std::string* error) {
+  return n == 0 || Launch("halo_copy", {Blocks(n)}, {kBlock},
+                          {rt::Arg::Buf(dst), rt::Arg::Buf(src), rt::Arg::Val(static_cast<std::uint32_t>(n))}, error);
+}
+
+std::unique_ptr<FlashNextGpu::Snapshot> FlashNextGpu::NewSnapshot(std::string* error) {
+  auto snap = std::unique_ptr<Snapshot>(new Snapshot(dev_));
+  const bool ok = ForEachState([&](const rt::Buffer& live, std::size_t) {
+    rt::Buffer b = dev_.Alloc(live.bytes, error);
+    if (!b) return false;
+    snap->buffers_.push_back(b);
+    return true;
+  });
+  return ok ? std::move(snap) : nullptr;
+}
+
+bool FlashNextGpu::Save(Snapshot& snap, std::string* error) {
+  std::size_t i = 0;
+  if (!ForEachState([&](const rt::Buffer& live, std::size_t n) { return CopyFloats(snap.buffers_[i++], live, n, error); }))
+    return false;
+  snap.blocks_.clear();
+  for (const auto& s : attn_) snap.blocks_.push_back(s.blocks);
+  snap.ngram_history_ = ngram_history_;
+  snap.position_ = position_;
+  snap.valid_ = true;
+  return dev_.Synchronize(error);
+}
+
+bool FlashNextGpu::Restore(const Snapshot& snap, std::string* error) {
+  if (!snap.valid_ || &snap.dev_ != &dev_) {
+    if (error) *error = "snapshot is empty or from another device";
+    return false;
+  }
+  // Counts first: ForEachState sizes the KV copies from the restored position.
+  position_ = snap.position_;
+  for (std::size_t l = 0; l < attn_.size(); ++l) attn_[l].blocks = snap.blocks_[l];
+  ngram_history_ = snap.ngram_history_;
+  std::size_t i = 0;
+  return ForEachState([&](const rt::Buffer& live, std::size_t n) { return CopyFloats(live, snap.buffers_[i++], n, error); }) &&
+         dev_.Synchronize(error);
+}
+
+bool FlashNextGpu::Reset(std::string* error) {
+  const auto& c = w_.config;
+  for (std::uint32_t l = 0; l < c.num_layers; ++l)
+    if (c.IsLinearLayer(l) && (!dev_.Fill(linear_[l].conv, 0, error) || !dev_.Fill(linear_[l].state, 0, error)))
+      return false;
+  for (auto& s : attn_) s.blocks = 0;  // KV beyond position is never read
+  ngram_history_.Reset();
+  position_ = 0;
+  return dev_.Fill(ple_history_, 0, error) && dev_.Synchronize(error);
+}
+
+bool FlashNextGpu::Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error) {
+  for (std::size_t i = 0; i < tokens.size(); ++i)
+    if (!Step(tokens[i], i + 1 == tokens.size() ? logits : std::span<float>{}, error)) return false;
+  return true;
+}
+
 }  // namespace halo::engine
