@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "core/json.hpp"
+#include "text/tokenizer.hpp"
 
 namespace halo::decide {
 
@@ -85,6 +86,27 @@ struct Answer {
 [[nodiscard]] Answer ReadAnswer(const RenderedQuestion& rq, std::span<const float> probs,
                                 double ordinal_smoothing);
 [[nodiscard]] json::Value AnswerToJson(const Answer& a);
+
+/// Token layout of one request after the decider's window fitting
+/// (strands_decider.infer.SystemOneEngine._fit, non-strict): questions get
+/// first claim on the window and lose tokens from the FRONT (their options and
+/// trailing <answer> must survive); the state gets the rest, truncated from the
+/// right. option_index[q][k] is the token (within question q) that ends option
+/// k's line: the last token whose offsets lie entirely inside the line.
+struct FittedPrompt {
+  std::vector<text::TokenId> state_ids;
+  std::vector<std::vector<text::TokenId>> question_ids;
+  std::vector<std::vector<std::size_t>> option_index;
+};
+
+struct FitOptions {
+  std::size_t max_length = 4096;
+  double max_question_fraction = 0.75;
+};
+
+[[nodiscard]] std::optional<FittedPrompt> FitTokens(const text::Tokenizer& tok, std::string_view state_text,
+                                                    std::span<const RenderedQuestion> questions,
+                                                    const FitOptions& options, std::string* error);
 
 // Exposed for tests.
 [[nodiscard]] double PyRound(double x, int ndigits);

@@ -108,6 +108,14 @@ def main():
         {"state": "s", "questions": {"a": {"instructions": "x", "criteria": ["low", "high"]}}},
         {"state": "s", "questions": {"a": {"instructions": "x", "criteria": None}}},
         {"state": {"k": [1, 2.5, None]}, "questions": {"a": {"instructions": {"q": 1}}}},
+        # Window fitting: a state far over the budget (right-truncated), and a
+        # question over 75% of the window (front-truncated, options kept).
+        {"state": "policy clause " * 3000, "questions": {"a": {"type": "noul", "instructions": "ok?"}}},
+        {"state": "short", "questions": {"a": {"type": "choice", "instructions": "word " * 4000,
+                                               "criteria": {"yes": "approve it", "no": None}}}},
+        {"state": "long " * 2500, "questions": {
+            "a": {"type": "score", "instructions": "rate " * 3500, "criteria": ["low", "mid", "high"]},
+            "b": {"type": "noul", "instructions": "short"}}},
     ]
     requests.insert(0, {"state": "Help! My payouts have been failing for 3 days!",
                         "questions": {"is_urgent": {"type": "noul", "instructions": "Does this convey urgency?"}}})

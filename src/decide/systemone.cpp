@@ -322,6 +322,47 @@ Answer ReadAnswer(const RenderedQuestion& rq, std::span<const float> probs_f32, 
   return a;
 }
 
+std::optional<FittedPrompt> FitTokens(const text::Tokenizer& tok, std::string_view state_text,
+                                      std::span<const RenderedQuestion> questions, const FitOptions& opt,
+                                      std::string* error) {
+  FittedPrompt out;
+  std::vector<text::Tokenizer::Encoded> enc;
+  std::size_t longest = 0;
+  for (const auto& rq : questions) {
+    enc.push_back(tok.EncodeWithOffsets(rq.text));
+    longest = std::max(longest, enc.back().ids.size());
+  }
+  const auto frac_cap = static_cast<std::size_t>(static_cast<double>(opt.max_length) * opt.max_question_fraction);
+  const std::size_t reserve = std::min(longest, std::max<std::size_t>(1, frac_cap));
+  for (std::size_t q = 0; q < questions.size(); ++q) {
+    auto& e = enc[q];
+    const std::size_t cut = e.ids.size() > reserve ? e.ids.size() - reserve : 0;
+    std::vector<text::TokenId> ids(e.ids.begin() + static_cast<std::ptrdiff_t>(cut), e.ids.end());
+    std::vector<std::pair<std::size_t, std::size_t>> offs(e.offsets.begin() + static_cast<std::ptrdiff_t>(cut),
+                                                          e.offsets.end());
+    std::vector<std::size_t> option_index;
+    for (const auto& [a, b] : questions[q].option_spans) {
+      std::ptrdiff_t last = -1;
+      for (std::size_t j = 0; j < offs.size(); ++j) {
+        const auto [lo, hi] = offs[j];
+        if (hi <= lo) continue;
+        if (lo >= a && hi <= b) last = static_cast<std::ptrdiff_t>(j);
+      }
+      if (last < 0) {
+        if (error) *error = "option span has no tokens left; the prompt was truncated through its option list";
+        return std::nullopt;
+      }
+      option_index.push_back(static_cast<std::size_t>(last));
+    }
+    out.question_ids.push_back(std::move(ids));
+    out.option_index.push_back(std::move(option_index));
+  }
+  const std::size_t state_budget = std::max<std::size_t>(1, opt.max_length > reserve ? opt.max_length - reserve : 1);
+  out.state_ids = tok.Encode(state_text);
+  if (out.state_ids.size() > state_budget) out.state_ids.resize(state_budget);
+  return out;
+}
+
 json::Value AnswerToJson(const Answer& a) {
   Value o = Value::MakeObject();
   o.set("type", Value::String(KindName(a.kind)));

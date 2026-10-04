@@ -5,11 +5,13 @@
 #include <hegel/gtest.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
 
 #include "core/json.hpp"
+#include "core/gguf.hpp"
 #include "decide/systemone.hpp"
 
 namespace gs = hegel::generators;
@@ -220,4 +222,39 @@ TEST(SystemOne, ParsedRequestsAlwaysRender) {
       for (const auto& [s, e] : rq.option_spans) ASSERT_LE(e, CodepointLength(rq.text));
     }
   }, {.test_cases = 500});
+}
+
+TEST(SystemOne, WindowFittingMatchesEngine) {
+  const char* path = std::getenv("HALO_DECIDER_TOKENIZER_GGUF");
+  if (!path) GTEST_SKIP() << "set HALO_DECIDER_TOKENIZER_GGUF";
+  std::string error;
+  auto reader = halo::core::GgufReader::OpenFile(path, &error);
+  ASSERT_TRUE(reader) << error;
+  auto tok = halo::text::Tokenizer::FromGguf(*reader, &error);
+  ASSERT_TRUE(tok) << error;
+  int failures = 0;
+  const auto rows = LoadJsonl("tokens.jsonl");
+  ASSERT_GT(rows.size(), 400U);
+  for (const auto& row : rows) {
+    const Request r = MustParse(row.find("request")->str());
+    std::vector<RenderedQuestion> rqs;
+    for (const auto& q : r.questions) rqs.push_back(RenderQuestion(q));
+    auto fit = FitTokens(*tok, RenderState(r.state), rqs, {}, &error);
+    ASSERT_TRUE(fit) << error;
+    const auto ids_of = [](const Value& v) {
+      std::vector<std::size_t> out;
+      for (const auto& x : v.items()) out.push_back(static_cast<std::size_t>(x.number()));
+      return out;
+    };
+    std::vector<std::size_t> state(fit->state_ids.begin(), fit->state_ids.end());
+    bool ok = state == ids_of(*row.find("state_ids"));
+    const auto& qids = row.find("question_ids")->items();
+    const auto& opt = row.find("option_index")->items();
+    for (std::size_t q = 0; ok && q < qids.size(); ++q) {
+      std::vector<std::size_t> got(fit->question_ids[q].begin(), fit->question_ids[q].end());
+      ok = got == ids_of(qids[q]) && fit->option_index[q] == ids_of(opt[q]);
+    }
+    if (!ok && ++failures <= 5) ADD_FAILURE() << "request " << row.find("request")->str().substr(0, 200);
+  }
+  EXPECT_EQ(failures, 0) << "of " << rows.size();
 }
