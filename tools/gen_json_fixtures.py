@@ -52,6 +52,19 @@ def main(out):
         '[1,2,]', '{"a":1,}', '01', '1.', '.5', '+1', '"\x01"', '"\\x"', '[', '', ' 1 ',
         '{"nested":{"deep":[1,[2,[3,{"x":null}]]]}}', '"\xff"', '"\xc3\xa9"', 'true false',
         '{"a" 1}', '[1 2]', '"\\/"', '1e', '1e+', '-', '--1', '"\t"',
+        # Escapes, \u case and the UTF-8 length boundaries (added for Mull survivors).
+        '"\\b\\f\\n\\r\\t\\"\\\\\\/"', '"\\u00E9\\u00c9\\uABCD\\uFFFF\\uD83E\\uDD99"',
+        '"\\u0041\\u007f\\u0080\\u07ff\\u0800\\uffff"', '"\\ud800\\udc00"', '"\\udbff\\udfff"',
+        '"\\ud83e\\udbff"', '"\\ud83e\\ue000"', '"\\udfff"', '"\\udc00"', '"\\u12"', '"\\u12G4"',
+        '"\\ud83e"', '"\\ud83e\\u0041"', '"\\', '"abc', '[1,{"a":[]},"x",{}]', '{"":[{}]}',
+        '[ 1 , 2 ]', '{ "a" : 1 , "b" : [ ] }', ' { } ', '[\n]', '[1,\n2]\r\n', '{"a":1 , }',
+        '1E+2', '-1.5E-3', '1e-7', '1.5e+300', '-0e0', '[-]', '[1e]', 'tru', 'nul', 'nulL',
+        '[true,false,null]', '"\\u00aa\\u0a0A\\uFEFF\\uabcd"', '"\\u00a', '"\\u00af"',
+        b'"\x7f"', b'"\xc2\x80"', b'"\xdf\xbf"', b'"\xc1\xbf"', b'"\xc0\x80"', b'"\xe0\x80\x80"',
+        b'"\xe0\xa0\x80"', b'"\xef\xbf\xbf"', b'"\xed\x9f\xbf"', b'"\xed\xa0\x80"', b'"\xed\xbf\xbf"',
+        b'"\xee\x80\x80"', b'"\xf0\x90\x80\x80"', b'"\xf0\x8f\xbf\xbf"', b'"\xf4\x8f\xbf\xbf"',
+        b'"\xf4\x90\x80\x80"', b'"\xf5\x80\x80\x80"', b'"\xe2\x82"', b'"\xc3"', b'"\xc3\x28"',
+        b'"\xe2\x28\xa1"', b'"\xf0\x90\x28\xbc"', b'"\x80"', b'"\xf8\x88\x80\x80\x80"',
     ]
     for _ in range(1500):
         v = rand_value(rng)

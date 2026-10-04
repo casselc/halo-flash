@@ -8,7 +8,7 @@
 // score and confidence within 0.01 of the reference; the same choice unless
 // the reference's top-two margin is below 0.02; input token usage exact.
 
-#include <gtest/gtest.h>
+#include <hegel/gtest.h>
 
 #include <algorithm>
 #include <cmath>
@@ -76,4 +76,64 @@ TEST(StrandsDecider, AnswersMatchPythonEngine) {
   }
   EXPECT_EQ(failures, 0) << "of " << n;
   std::printf("%d requests, worst absolute difference %.4g\n", n, worst);
+}
+
+// The pointer head alone, against its definition evaluated in double:
+// logit_k = <K(LN(o_k)), Q(LN(d))> / sqrt(dim), LN being torch's LayerNorm
+// (biased variance, eps 1e-5). Without the 2B model this is the only test
+// of the head (Mull found it untested).
+TEST(StrandsDecider, PointerHeadMatchesItsDefinition) {
+  namespace gs = hegel::generators;
+  hegel::test([](hegel::TestCase& tc) {
+    PointerHead h;
+    h.hidden = tc.draw(gs::integers<std::uint32_t>({.min_value = 2, .max_value = 6}));
+    h.dim = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 4}));
+    auto vec = [&](std::size_t n) {
+      std::vector<float> v(n);
+      for (auto& x : v) x = tc.draw(gs::floats<float>({.min_value = -2.0F, .max_value = 2.0F}));
+      return v;
+    };
+    h.norm_w = vec(h.hidden);
+    h.norm_b = vec(h.hidden);
+    h.q_w = vec(h.dim * h.hidden);
+    h.q_b = vec(h.dim);
+    h.k_w = vec(h.dim * h.hidden);
+    h.k_b = vec(h.dim);
+    const auto decide = vec(h.hidden);
+    std::vector<std::vector<float>> options(tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 3})));
+    for (auto& o : options) o = vec(h.hidden);
+
+    auto ln = [&](const std::vector<float>& x) {
+      double mean = 0, var = 0;
+      for (float v : x) mean += v;
+      mean /= x.size();
+      for (float v : x) var += (v - mean) * (v - mean);
+      var /= x.size();
+      std::vector<double> y(x.size());
+      for (std::size_t i = 0; i < x.size(); ++i) y[i] = (x[i] - mean) / std::sqrt(var + 1e-5) * h.norm_w[i] + h.norm_b[i];
+      return y;
+    };
+    auto affine = [&](const std::vector<float>& w, const std::vector<float>& b, const std::vector<double>& x) {
+      std::vector<double> y(b.size());
+      for (std::size_t r = 0; r < b.size(); ++r) {
+        y[r] = b[r];
+        for (std::size_t c = 0; c < x.size(); ++c) y[r] += static_cast<double>(w[r * x.size() + c]) * x[c];
+      }
+      return y;
+    };
+    const auto q = affine(h.q_w, h.q_b, ln(decide));
+    const auto got = h.Logits(decide, options);
+    ASSERT_EQ(got.size(), options.size());
+    for (std::size_t k = 0; k < options.size(); ++k) {
+      const auto key = affine(h.k_w, h.k_b, ln(options[k]));
+      double dot = 0, mag = 0;
+      for (std::uint32_t i = 0; i < h.dim; ++i) {
+        dot += key[i] * q[i];
+        mag += std::fabs(key[i] * q[i]);
+      }
+      const double want = dot / std::sqrt(static_cast<double>(h.dim));
+      // FP32 LayerNorm and affine: relative to the terms' magnitude.
+      ASSERT_NEAR(got[k], want, 1e-4 * (mag + 1.0)) << "option " << k;
+    }
+  });
 }

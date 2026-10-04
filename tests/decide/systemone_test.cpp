@@ -4,10 +4,13 @@
 
 #include <hegel/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "core/json.hpp"
@@ -224,14 +227,33 @@ TEST(SystemOne, ParsedRequestsAlwaysRender) {
   }, {.test_cases = 500});
 }
 
+namespace {
+
+// The decider's tokenizer, built once per process: building it is the
+// slowest step of these tests (seconds at -O0, under Mull per mutant).
+const halo::text::Tokenizer* DeciderTokenizer() {
+  static const std::unique_ptr<halo::text::Tokenizer> tok = [] {
+    std::unique_ptr<halo::text::Tokenizer> t;
+    const char* path = std::getenv("HALO_DECIDER_TOKENIZER_GGUF");
+    if (!path) return t;
+    std::string error;
+    auto reader = halo::core::GgufReader::OpenFile(path, &error);
+    EXPECT_TRUE(reader) << error;
+    if (reader) {
+      t = halo::text::Tokenizer::FromGguf(*reader, &error);
+      EXPECT_TRUE(t) << error;
+    }
+    return t;
+  }();
+  return tok.get();
+}
+
+}  // namespace
+
 TEST(SystemOne, WindowFittingMatchesEngine) {
-  const char* path = std::getenv("HALO_DECIDER_TOKENIZER_GGUF");
-  if (!path) GTEST_SKIP() << "set HALO_DECIDER_TOKENIZER_GGUF";
+  const auto* tok = DeciderTokenizer();
+  if (!tok) GTEST_SKIP() << "set HALO_DECIDER_TOKENIZER_GGUF";
   std::string error;
-  auto reader = halo::core::GgufReader::OpenFile(path, &error);
-  ASSERT_TRUE(reader) << error;
-  auto tok = halo::text::Tokenizer::FromGguf(*reader, &error);
-  ASSERT_TRUE(tok) << error;
   int failures = 0;
   const auto rows = LoadJsonl("tokens.jsonl");
   ASSERT_GT(rows.size(), 400U);
@@ -257,4 +279,122 @@ TEST(SystemOne, WindowFittingMatchesEngine) {
     if (!ok && ++failures <= 5) ADD_FAILURE() << "request " << row.find("request")->str().substr(0, 200);
   }
   EXPECT_EQ(failures, 0) << "of " << rows.size();
+}
+
+// --- Gaps Mull found ----------------------------------------------------------
+
+// A window so small that the options are cut away is an error, not an answer
+// read from arbitrary tokens.
+TEST(SystemOne, WindowTooSmallForTheOptionsIsAnError) {
+  const auto* tok = DeciderTokenizer();
+  if (!tok) GTEST_SKIP() << "set HALO_DECIDER_TOKENIZER_GGUF";
+  std::string error;
+  const Request r = MustParse(
+      R"({"state":"s","questions":{"q":{"instructions":"pick","criteria":{"alpha":"first","beta":"second"}}}})");
+  const std::vector<RenderedQuestion> rqs = {RenderQuestion(r.questions[0])};
+  EXPECT_TRUE(FitTokens(*tok, RenderState(r.state), rqs, {}, &error)) << error;
+  error.clear();
+  EXPECT_FALSE(FitTokens(*tok, RenderState(r.state), rqs, {.max_length = 8, .max_question_fraction = 0.5}, &error));
+  EXPECT_NE(error.find("option"), std::string::npos) << error;
+}
+
+// The response body, key by key, as strands-decider serializes it.
+TEST(SystemOne, AnswerToJsonShapes) {
+  Answer noul{.kind = Kind::kNoul, .noul = 0.25};
+  EXPECT_EQ(halo::json::DumpPython(AnswerToJson(noul)), R"({"type": "noul", "noul": 0.25})");
+  Answer choice{.kind = Kind::kChoice, .choice = "b", .probabilities = {{"a", 0.25}, {"b", 0.75}}, .confidence = 0.5};
+  EXPECT_EQ(halo::json::DumpPython(AnswerToJson(choice)),
+            R"({"type": "choice", "choice": "b", "probabilities": {"a": 0.25, "b": 0.75}, "confidence": 0.5})");
+  Answer score{.kind = Kind::kScore, .score = 1.5, .legend = {{"0", "low"}, {"1", "mid"}},
+               .probabilities = {{"0", 0.5}, {"1", 0.5}}, .confidence = 0.0};
+  EXPECT_EQ(halo::json::DumpPython(AnswerToJson(score)),
+            R"({"type": "score", "score": 1.5, "legend": {"0": "low", "1": "mid"}, )"
+            R"("probabilities": {"0": 0.5, "1": 0.5}, "confidence": 0.0})");
+}
+
+// Python's max() keeps the first of equal probabilities.
+TEST(SystemOne, ChoiceTiesGoToTheFirstOption) {
+  RenderedQuestion rq;
+  rq.kind = Kind::kChoice;
+  rq.slot_labels = {"x", "y", "z"};
+  rq.slot_descriptions = {"", "", ""};
+  const std::vector<float> probs = {0.25F, 0.375F, 0.375F};
+  EXPECT_EQ(ReadAnswer(rq, probs, 0.0).choice, "y");
+}
+
+// str.isspace(), from CPython: [c for c in range(0x110000) if chr(c).isspace()].
+TEST(SystemOne, PyIsSpaceMatchesCPython) {
+  const std::vector<char32_t> spaces = {0x9,    0xa,    0xb,    0xc,    0xd,    0x1c,   0x1d,   0x1e,
+                                        0x1f,   0x20,   0x85,   0xa0,   0x1680, 0x2000, 0x2001, 0x2002,
+                                        0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a,
+                                        0x2028, 0x2029, 0x202f, 0x205f, 0x3000};
+  for (char32_t c = 0; c <= 0x3001; ++c) {
+    const bool want = std::find(spaces.begin(), spaces.end(), c) != spaces.end();
+    ASSERT_EQ(PyIsSpace(c), want) << std::hex << static_cast<std::uint32_t>(c);
+  }
+}
+
+// Option and level counts are validated at exactly their limits.
+TEST(SystemOne, CriteriaCountLimits) {
+  auto choice = [](int n) {
+    std::string crit;
+    for (int i = 0; i < n; ++i) crit += (i ? "," : "") + std::string("\"o") + std::to_string(i) + "\":null";
+    return R"({"state":"s","questions":{"q":{"type":"choice","instructions":"i","criteria":{)" + crit + "}}}}";
+  };
+  auto score = [](int n) {
+    std::string crit;
+    for (int i = 0; i < n; ++i) crit += (i ? "," : "") + std::string("\"l") + std::to_string(i) + "\"";
+    return R"({"state":"s","questions":{"q":{"type":"score","instructions":"i","criteria":[)" + crit + "]}}}";
+  };
+  auto accepts = [](const std::string& raw) {
+    std::string error;
+    auto body = halo::json::Parse(raw, &error);
+    return body && ParseRequest(*body, &error).has_value();
+  };
+  EXPECT_FALSE(accepts(choice(1)));
+  EXPECT_TRUE(accepts(choice(2)));
+  EXPECT_TRUE(accepts(choice(255)));
+  EXPECT_FALSE(accepts(choice(256)));
+  EXPECT_FALSE(accepts(score(1)));
+  EXPECT_TRUE(accepts(score(2)));
+  EXPECT_TRUE(accepts(score(10)));
+  EXPECT_FALSE(accepts(score(11)));
+  // Null criteria render as label-only options.
+  const Request r = MustParse(choice(2));
+  ASSERT_EQ(r.questions[0].criteria.size(), 2U);
+  EXPECT_FALSE(r.questions[0].criteria[0].second.has_value());
+  const Request n = MustParse(R"({"state":"s","questions":{"q":{"instructions":"i","criteria":{"true":null}}}})");
+  ASSERT_EQ(n.questions[0].criteria.size(), 1U);
+  EXPECT_FALSE(n.questions[0].criteria[0].second.has_value());
+  // Untyped: the noul attempt reads "true" before failing on "maybe"; the
+  // choice it falls back to must not keep that partial read.
+  const Request c = MustParse(R"({"state":"s","questions":{"q":{"instructions":"i","criteria":{"true":"a","maybe":"b"}}}})");
+  EXPECT_EQ(c.questions[0].kind, Kind::kChoice);
+  EXPECT_EQ(c.questions[0].criteria.size(), 2U);
+}
+
+// Python's round(x, n) on the exact binary value, ties to even (values from
+// CPython). The readout fixture's 1e-4 tolerance cannot tell rounded from
+// unrounded values, so Mull could disable the rounding unnoticed.
+TEST(SystemOne, PyRoundMatchesCPython) {
+  const std::vector<std::tuple<double, int, double>> cases = {
+      {0.123456, 4, 0.1235}, {0.5, 0, 0.0},       {1.5, 0, 2.0},        {2.5, 0, 2.0},
+      {2.675, 2, 2.67},      {0.28965, 4, 0.2897}, {-0.00005, 4, -0.0001}, {1e-5, 4, 0.0},
+      {123.456789, 4, 123.4568}, {0.99995, 4, 1.0}};
+  for (const auto& [x, n, want] : cases) EXPECT_EQ(PyRound(x, n), want) << x << " " << n;
+  EXPECT_TRUE(std::isnan(PyRound(std::nan(""), 4)));
+  EXPECT_EQ(PyRound(INFINITY, 4), INFINITY);
+}
+
+TEST(SystemOne, ScoreConfidenceEdges) {
+  EXPECT_EQ(DeriveScoreConfidence(std::vector<double>{0.0, 0.0, 0.0}, 0.1), 0.0);  // no mass
+  EXPECT_EQ(DeriveScoreConfidence(std::vector<double>{1.0}, 0.1), 1.0);
+  EXPECT_EQ(DeriveConfidence(std::vector<double>{1.0}), 1.0);
+  // Smoothing at least the widest possible spread: confident iff the spread
+  // is within it, including exactly at it.
+  EXPECT_EQ(DeriveScoreConfidence(std::vector<double>{0.5, 0.0, 0.5}, 1.0), 1.0);
+  EXPECT_EQ(DeriveScoreConfidence(std::vector<double>{1.0, 0.0, 0.0}, 4.0), 1.0);
+  // Unnormalized mass is normalized first.
+  EXPECT_EQ(DeriveScoreConfidence(std::vector<double>{0.0, 0.0, 2.0}, 0.0), 1.0);
+  EXPECT_EQ(DeriveScoreConfidence(std::vector<double>{1.0, 0.0, 1.0}, 0.0), 0.0);
 }

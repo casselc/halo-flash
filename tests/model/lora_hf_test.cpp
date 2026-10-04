@@ -12,10 +12,14 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "core/gguf.hpp"
+#include "core/gguf_writer.hpp"
+#include "core/quant.hpp"
 #include "model/lora.hpp"
 #include "model/ngram.hpp"
 #include "model/reference.hpp"
@@ -102,4 +106,105 @@ TEST(LoraAdapter, RejectsNonAdapterFiles) {
   ASSERT_TRUE(base) << error;
   EXPECT_FALSE(halo::model::LoraAdapter::Bind(*base, *base, &error));
   EXPECT_NE(error.find("adapter"), std::string::npos);
+}
+
+// Adapters come from users, so Bind checks every field; each check rejects
+// exactly its defect (synthetic files, no fixture needed). Mull found all of
+// them untested. (Rank 0 cannot be tested: the GGUF reader already rejects a
+// zero dimension.)
+namespace {
+
+struct LoraSpec {
+  std::string general_type = "adapter", adapter_type = "lora", arch = "qwen4exp";
+  std::optional<float> alpha = 8.0F;
+  std::vector<std::uint64_t> a_dims = {4, 2}, b_dims = {2, 3};
+  halo::core::GgmlType a_type = halo::core::GgmlType::kF32;
+  std::string target = "blk.0.w";
+  bool with_b = true, extra = false;
+};
+
+std::vector<std::uint8_t> Image(const halo::core::GgufWriter& w) {
+  std::string error;
+  auto image = w.Serialize(&error);
+  EXPECT_FALSE(image.empty()) << error;
+  return image;
+}
+
+std::optional<halo::model::LoraAdapter> BindSpec(const LoraSpec& s, std::string* error) {
+  using halo::core::GgmlType;
+  halo::core::GgufWriter base;
+  base.Set("general.architecture", std::string("qwen4exp"));
+  base.AddTensor("blk.0.w", {4, 3}, GgmlType::kF32, std::vector<std::uint8_t>(48));
+  base.AddTensor("blk.0.experts", {4, 3, 2}, GgmlType::kF32, std::vector<std::uint8_t>(96));
+  halo::core::GgufWriter ad;
+  ad.Set("general.type", s.general_type);
+  ad.Set("adapter.type", s.adapter_type);
+  ad.Set("general.architecture", s.arch);
+  if (s.alpha) ad.Set("adapter.lora.alpha", *s.alpha);
+  auto bytes = [](GgmlType t, const std::vector<std::uint64_t>& d) {
+    std::uint64_t n = 1;
+    for (auto x : d) n *= x;
+    return std::vector<std::uint8_t>(halo::quant::EncodedSizeBytes(t, n));
+  };
+  ad.AddTensor(s.target + ".lora_a", s.a_dims, s.a_type, bytes(s.a_type, s.a_dims));
+  if (s.with_b) ad.AddTensor(s.target + ".lora_b", s.b_dims, GgmlType::kF32, bytes(GgmlType::kF32, s.b_dims));
+  if (s.extra) ad.AddTensor("blk.0.bias", {3}, GgmlType::kF32, std::vector<std::uint8_t>(12));
+  // The bound adapter points into these images; they outlive each call's checks.
+  static std::vector<std::uint8_t> base_image, ad_image;
+  static std::unique_ptr<halo::core::GgufReader> a, b;
+  base_image = Image(base);
+  ad_image = Image(ad);
+  b = halo::core::GgufReader::OpenMemory(base_image.data(), base_image.size(), error);
+  a = halo::core::GgufReader::OpenMemory(ad_image.data(), ad_image.size(), error);
+  EXPECT_TRUE(a && b) << *error;
+  if (!a || !b) return std::nullopt;
+  return halo::model::LoraAdapter::Bind(*a, *b, error);
+}
+
+}  // namespace
+
+TEST(LoraAdapter, BindChecksEachField) {
+  std::string error;
+  const auto ok = BindSpec({}, &error);
+  ASSERT_TRUE(ok) << error;
+  EXPECT_EQ(ok->alpha, 8.0F);
+  const auto* p = ok->Find("blk.0.w");
+  ASSERT_NE(p, nullptr);
+  EXPECT_EQ(ok->Find("blk.0.v"), nullptr);
+  EXPECT_EQ(p->rank, 2U);
+  EXPECT_EQ(p->a.cols, 4U);
+  EXPECT_EQ(p->a.rows, 2U);
+  EXPECT_EQ(p->b.cols, 2U);
+  EXPECT_EQ(p->b.rows, 3U);
+  EXPECT_EQ(p->a.name, "blk.0.w.lora_a");
+
+  struct Bad {
+    const char* what;
+    LoraSpec spec;
+  };
+  using halo::core::GgmlType;
+  const Bad bad[] = {
+      {"general.type", {.general_type = "model"}},
+      {"adapter.type", {.adapter_type = "ia3"}},
+      {"architecture", {.arch = "qwen35"}},
+      {"no alpha", {.alpha = std::nullopt}},
+      {"zero alpha", {.alpha = 0.0F}},
+      {"negative alpha", {.alpha = -1.0F}},
+      {"NaN alpha", {.alpha = std::nanf("")}},
+      {"unpaired", {.with_b = false}},
+      {"unknown base tensor", {.target = "blk.9.w"}},
+      {"3-D base tensor", {.target = "blk.0.experts"}},
+      {"F16 A", {.a_type = GgmlType::kF16}},
+      {"3-D A", {.a_dims = {4, 2, 1}}},
+      {"3-D B", {.b_dims = {2, 3, 1}}},
+      {"A input width", {.a_dims = {5, 2}}},
+      {"B rank", {.b_dims = {3, 3}}},
+      {"B output width", {.b_dims = {2, 4}}},
+      {"stray tensor", {.extra = true}},
+  };
+  for (const auto& b : bad) {
+    error.clear();
+    EXPECT_FALSE(BindSpec(b.spec, &error)) << b.what;
+    EXPECT_FALSE(error.empty()) << b.what;
+  }
 }
