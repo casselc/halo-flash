@@ -158,6 +158,39 @@ it after the engine changes nothing).
 | direct n-gram reads | 567 |
 | resident n-gram table | 600 |
 
+### Dedicated NVMe vs ZFS (2026-10-04)
+
+A WD Blue SN5000 4 TB as XFS (`noatime`) at `/data`, against ZFS `/home` (128 KiB records) on the
+system drive. Both links train at PCIe Gen3 x4 (8 GT/s), though both drives and slots support
+Gen4; that is a platform setting (candidate: BIOS `AMD CBS > NBIO Common Options > PSPP Policy`).
+
+`halo_disk_bench`: random `O_DIRECT` reads over a 46 GiB shard. ZFS 2.4 Direct I/O was on; the ARC
+stayed at 1.1 GiB.
+
+| Block, reads in flight | ZFS IOPS | XFS IOPS | ZFS median | XFS median |
+|---|---:|---:|---:|---:|
+| 4K, 1 | 6,968 | 21,605 | 137 µs | 45 µs |
+| 4K, 16 | 26,430 | **218,199** | 596 µs | 72 µs |
+| 4K, 64 | 26,477 | 222,118 | 2,398 µs | 267 µs |
+| 64K, 16 | 26,459 | 53,074 | 597 µs | 267 µs |
+| 1M, 64 | 3,399 (3.56 GB/s) | 3,373 (3.54 GB/s) | 18.9 ms | 17.5 ms |
+
+On ZFS a 4 KiB read costs a 128 KiB record: 26.4K IOPS x 128 KiB is the same 3.5 GB/s as the
+1 MiB reads.
+
+**In the engine** (`halo_run --prefill-bench 2048`, n-gram table read from disk, default clock):
+
+| | ZFS | XFS |
+|---|---:|---:|
+| n-gram read, first prefill | 1,103 ms | 121 ms |
+| n-gram read, later prefills | 374 ms | 38 ms |
+| prefill end to end | 888 tok/s | 1,041 tok/s |
+| model load | 28.8 s | 26.7 s |
+
+The weights (sha256-verified against the HF ETags) live at
+`/data/models/qwen3.8-flash-next/`. With them there, the resident table (28.8 GB of RAM) buys
+about 32 ms per 2048 tokens.
+
 ### Prefill on gufo's protocol, resident n-gram table (P4, 2026-10-04, idle)
 
 Each step's prediction was written down before measuring.
