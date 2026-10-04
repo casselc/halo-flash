@@ -4136,7 +4136,7 @@ extern "C" __global__ void __launch_bounds__(256)
                            std::uint32_t o_stride) {
   constexpr std::uint32_t d = 128, kStage = 8;
   __shared__ __attribute__((aligned(16))) float ks[kStage][d], qs[kStage][d];  // float4 reads
-  __shared__ float vs[kStage][64], decay_s[kStage], beta_s[kStage];
+  __shared__ float vs[kStage][64], decay_s[kStage], beta_s[kStage], kq_s[kStage];
   const std::uint32_t h = blockIdx.y, heads = gridDim.y, tid = threadIdx.x;
   const std::uint32_t j = blockIdx.x * 64 + tid / 4, part = tid % 4, i0 = part * 32;
   float* S = state + static_cast<std::size_t>(h) * d * d + j;  // S[i][j] at S[i * d]
@@ -4187,6 +4187,18 @@ extern "C" __global__ void __launch_bounds__(256)
       beta_s[tid] = Sigmoid(rb);
     }
     __syncthreads();
+    // k . q is the same for every column of the head: one wave per token
+    // computes it once (it was 32 FMAs and two exchanges per token in every
+    // thread).
+    {
+      const std::uint32_t tt = tid / 32, l = tid % 32;
+      float p = 0.0f;
+#pragma unroll
+      for (std::uint32_t i = 0; i < d; i += 32) p += ks[tt][i + l] * qs[tt][i + l];
+      p = WarpSum(p);
+      if (l == 0) kq_s[tt] = p;
+    }
+    __syncthreads();
     if (t0 + kStage < tokens) load(t0 + kStage, min(kStage, tokens - t0 - kStage));  // in flight below
     for (std::uint32_t tt = 0; tt < n; ++tt) {
       const std::uint32_t t = t0 + tt;
@@ -4202,10 +4214,9 @@ extern "C" __global__ void __launch_bounds__(256)
         kr[i] = k4.x, kr[i + 1] = k4.y, kr[i + 2] = k4.z, kr[i + 3] = k4.w;
         qr[i] = q4.x, qr[i + 1] = q4.y, qr[i + 2] = q4.z, qr[i + 3] = q4.w;
       }
-      float kq = 0.0f, A = 0.0f, B = 0.0f;
+      float A = 0.0f, B = 0.0f;
 #pragma unroll
       for (std::uint32_t i = 0; i < 32; ++i) {
-        kq += kr[i] * qr[i];
         A += s[i] * kr[i];
         B += s[i] * qr[i];
       }
@@ -4213,13 +4224,11 @@ extern "C" __global__ void __launch_bounds__(256)
       // to register): __shfl_xor compiles to ds_bpermute here, an LDS round
       // trip on the serial per-token path (thread trace: 73% of the kernel's
       // time was LDS waits). Same additions in the same order as before.
-      kq += QuadXor1(kq);
       A += QuadXor1(A);
       B += QuadXor1(B);
-      kq += QuadXor2(kq);
       A += QuadXor2(A);
       B += QuadXor2(B);
-      const float decay = decay_s[tt], b = beta_s[tt];
+      const float decay = decay_s[tt], b = beta_s[tt], kq = kq_s[tt];
       const float delta = (vs[tt][tid / 4] - decay * A) * b;
 #pragma unroll
       for (std::uint32_t i = 0; i < 32; ++i) s[i] = decay * s[i] + delta * kr[i];
