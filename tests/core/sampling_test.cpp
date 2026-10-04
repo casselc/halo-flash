@@ -164,6 +164,52 @@ TEST(Sampling, FilterChainMatchesIndependentReferenceOnBothPaths) {
   }, {.test_cases = 600});
 }
 
+// Above 1024 tokens, top-p without top-k first keeps the best 256 and falls
+// back to every token only when they hold less than top_p of the mass; the
+// cut-off then uses the full softmax sum. Drawn so both branches occur: a
+// flat tail makes the best 256 too light for high top_p, a steep head makes
+// them enough for low top_p.
+TEST(Sampling, LargeVocabularyTopPMatchesReferenceOnBothBranches) {
+  hegel::test([](hegel::TestCase& tc) {
+    Case c = DrawCase(tc, 24);
+    const auto n = tc.draw(gs::integers<std::size_t>({.min_value = 1025, .max_value = 3000}));
+    const auto head = tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = 400}));
+    const float lift = tc.draw(gs::sampled_from(std::vector<float>{0.0f, 2.0f, 6.0f}));
+    c.logits.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      const auto v = tc.draw(gs::integers<int>({.min_value = -4, .max_value = 4}));
+      c.logits[i] = 0.25f * static_cast<float>(v) + (i < head ? lift : 0.0f);
+    }
+    if (tc.draw(gs::booleans())) c.logits[tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = n - 1}))] = kNegInf;
+    c.config.top_k = 0;
+    c.config.top_p = tc.draw(gs::sampled_from(std::vector<float>{0.95f, 0.8f, 0.5f, 0.1f}));
+    c.config.temperature = tc.draw(gs::sampled_from(std::vector<float>{0.3f, 0.7f, 1.0f, 1.5f}));
+    const auto want = Reference(c);
+    SamplerState st(c.config, c.prompt);
+    st.Accept(c.generated);
+    ExpectSame(AsMap(st.Distribution(c.logits)), want, "SamplerState");
+    ExpectSame(AsMap(BuildDistribution(c.logits, c.config, c.prompt, c.generated)), want, "BuildDistribution");
+  }, {.test_cases = 150});
+}
+
+// The fallback decision itself: 200 tokens at 0 and 900 at -1, temperature
+// 0.3. The best 256 hold 86.9% of the mass, below top_p = 0.95, so every
+// token must be considered; misjudging their mass (by 17% here is enough)
+// would cut the distribution to 256 tokens.
+TEST(Sampling, LargeVocabularyTopPFallsBackWhenTheBest256AreTooLight) {
+  Case c;
+  c.logits.assign(1100, -1.0f);
+  std::fill(c.logits.begin(), c.logits.begin() + 200, 0.0f);
+  c.config.top_k = 0;
+  c.config.top_p = 0.95f;
+  c.config.temperature = 0.3f;
+  const auto want = Reference(c);
+  ASSERT_GT(want.size(), 256u);
+  SamplerState st(c.config, c.prompt);
+  ExpectSame(AsMap(st.Distribution(c.logits)), want, "SamplerState");
+  ExpectSame(AsMap(BuildDistribution(c.logits, c.config, c.prompt, c.generated)), want, "BuildDistribution");
+}
+
 TEST(Sampling, SeededStreamsAreDeterministicAndCopiesContinueIdentically) {
   hegel::test([](hegel::TestCase& tc) {
     Case c = DrawCase(tc, 16);
