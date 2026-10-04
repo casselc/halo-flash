@@ -36,10 +36,12 @@ add_library(halo_core STATIC
 )
 target_include_directories(halo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-# --- text: Unicode, NFC, tokenizer -----------------------------------------
+# --- text: Unicode, NFC, tokenizer, chat template, output parser -------------
 add_library(halo_text STATIC
   src/text/unicode.cpp
   src/text/tokenizer.cpp
+  src/text/chat_template.cpp
+  src/text/tool_call_parser.cpp
 )
 target_link_libraries(halo_text PUBLIC halo_core)
 
@@ -143,7 +145,9 @@ if(HALO_BUILD_TESTS)
   target_compile_definitions(core_tests PRIVATE
     HALO_CORE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/core/data")
   halo_test(text_tests
-    tests/text/tokenizer_test.cpp)
+    tests/text/tokenizer_test.cpp
+    tests/text/chat_template_test.cpp
+    tests/text/tool_call_parser_test.cpp)
   halo_test(decide_tests
     tests/decide/systemone_test.cpp
     tests/decide/decider_test.cpp)
@@ -176,6 +180,9 @@ if(HALO_FUZZ)
   add_executable(tokenizer_fuzz fuzz/tokenizer_fuzz.cpp)
   target_link_options(tokenizer_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
   target_link_libraries(tokenizer_fuzz PRIVATE halo_text)
+  add_executable(tool_call_fuzz fuzz/tool_call_fuzz.cpp)
+  target_link_options(tool_call_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_link_libraries(tool_call_fuzz PRIVATE halo_text)
   add_executable(json_fuzz fuzz/json_fuzz.cpp)
   target_link_options(json_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
   target_link_libraries(json_fuzz PRIVATE halo_core)

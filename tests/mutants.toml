@@ -14,6 +14,9 @@ env = []
 build_dir = "build/gpu"
 env = ["HALO_TINY_HF_DIR", "HALO_TINY_QWEN35_DIR"]
 
+[suite.cpu]
+build_dir = "build/cpu-debug"
+
 # Filters. Directed tests first: --gtest_fail_fast stops before Hegel shrinks.
 #   forward: tiny Flash-Next vs reference + transformers, random sequences, tiny Qwen3.5
 #   state:   snapshots, reset, prefill
@@ -510,3 +513,46 @@ suite = "cpu-asan"
 binary = "core_tests"
 filter = "Sampling.*"
 why = "a copied state (speculative rollback) continues the same random stream"
+# ---- Chat template and tool-call parser (src/text, CPU) ----------------------
+# Filters name only the property tests (and the HF fixtures), so each kill
+# shows that the property itself sees the defect.
+
+[[mutant]]
+name = "tc-finish-drops-held-bytes"
+file = "src/text/tool_call_parser.cpp"
+find = '  Run(true, events);'
+replace = '  // (end-of-stream flush dropped)'
+suite = "cpu"
+binary = "text_tests"
+filter = "ToolCallParser.MalformedStreamsLoseNoBytes:ToolCallParser.StatefulStreams"
+why = "bytes held at the end of the last chunk (partial tag, whitespace, buffered call) must still be emitted"
+
+[[mutant]]
+name = "tc-partial-tag-off-by-one"
+file = "src/text/tool_call_parser.cpp"
+find = 'for (std::size_t n = std::min(s.size(), tag.size() - 1); n > 0; --n)'
+replace = 'for (std::size_t n = std::min(s.size(), tag.size() - 2); n > 0; --n)'
+suite = "cpu"
+binary = "text_tests"
+filter = "ToolCallParser.ChunkingInvariance"
+why = "a tag split one byte before its end ('<tool_call' + '>') must not leak as content"
+
+[[mutant]]
+name = "tc-parameter-keeps-framing-newline"
+file = "src/text/tool_call_parser.cpp"
+find = 'raw = close == 0 ? std::string_view{} : rest.substr(1, close - 1);'
+replace = 'raw = close == 0 ? std::string_view{} : rest.substr(1, close);'
+suite = "cpu"
+binary = "text_tests"
+filter = "ToolCallParser.RenderThenParseRoundTrips"
+why = "the newline before </parameter> is template framing, not part of the value"
+
+[[mutant]]
+name = "ct-strip-misses-info-separators"
+file = "src/text/chat_template.cpp"
+find = '(c >= 0x1c && c <= 0x20)'
+replace = '(c == 0x20)'
+suite = "cpu"
+binary = "text_tests"
+filter = "ChatTemplate.FlashNextMatchesTransformers:ChatTemplate.Qwen35MatchesTransformers"
+why = "Jinja |trim is Python str.strip, which also strips U+001C..U+001F"
