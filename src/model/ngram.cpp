@@ -159,6 +159,10 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
   if (row >= rows_) {
     return false;
   }
+  if (resident_) {
+    DecodeRow(resident_.get() + resident_skew_ + std::size_t{row} * row_bytes_, dst);
+    return true;
+  }
   if (ReadCached(row, dst)) {
     return true;
   }
@@ -239,6 +243,54 @@ void NgramTable::Worker() {
   }
 }
 
+bool NgramTable::LoadResident(std::string* error_msg) {
+  if (resident_) {
+    return true;
+  }
+  const std::uint64_t begin = base_offset_ & ~(kPage - 1);
+  const std::uint64_t end = (base_offset_ + rows_ * row_bytes_ + kPage - 1) & ~(kPage - 1);
+  const std::size_t bytes = end - begin;
+  auto* mem = static_cast<std::uint8_t*>(std::aligned_alloc(kPage, bytes));
+  if (mem == nullptr) {
+    if (error_msg != nullptr) *error_msg = "cannot allocate the resident n-gram table";
+    return false;
+  }
+  std::unique_ptr<std::uint8_t, FreeDeleter> owned(mem);
+  // Parallel 64 MiB direct reads; the last one may stop short at end of file.
+  constexpr std::size_t kPiece = std::size_t{64} << 20;
+  std::atomic<std::size_t> next{0};
+  std::atomic<bool> ok{true};
+  const auto work = [&] {
+    for (;;) {
+      const std::size_t at = next.fetch_add(kPiece);
+      if (at >= bytes || !ok) return;
+      const std::size_t want = std::min(kPiece, bytes - at);
+      std::size_t got = 0;
+      while (got < want) {
+        const ssize_t n = ::pread(fd_, mem + at + got, want - got, static_cast<off_t>(begin + at + got));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+          // Past the end of the file is fine as long as every table byte arrived.
+          if (begin + at + got < base_offset_ + rows_ * row_bytes_) ok = false;
+          return;
+        }
+        got += static_cast<std::size_t>(n);
+      }
+    }
+  };
+  std::vector<std::thread> threads;
+  for (std::size_t i = 0; i < 16; ++i) threads.emplace_back(work);
+  for (auto& t : threads) t.join();
+  if (!ok) {
+    if (error_msg != nullptr) *error_msg = std::string("reading the n-gram table failed: ") + std::strerror(errno);
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);  // no read in flight sees a half-set table
+  resident_skew_ = base_offset_ - begin;
+  resident_ = std::move(owned);
+  return true;
+}
+
 bool NgramTable::Read(std::span<const std::uint32_t> rows,
                       std::span<float> out) {
   return StartRead(rows, out) && WaitRead();
@@ -270,6 +322,12 @@ bool NgramTable::StartRead(std::span<const std::uint32_t> rows,
   if (jobs_.size() >= kBatchJobs) {
     std::sort(jobs_.begin(), jobs_.end(),
               [](const Job& a, const Job& b) { return a.row < b.row; });
+  } else if (resident_) {
+    // Small gathers from memory: decoding inline beats waking the pool.
+    for (const Job& job : jobs_) {
+      DecodeRow(resident_.get() + resident_skew_ + std::size_t{job.row} * row_bytes_, job.dst);
+    }
+    jobs_.clear();
   } else {
     // Small cached gathers avoid waking the I/O pool for every decode
     // token. Large prefills still parallelize their row conversions.

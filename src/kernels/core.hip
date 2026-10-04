@@ -530,6 +530,56 @@ extern "C" __global__ void halo_ple_conv(const float* normalized, const float* g
   }
 }
 
+// P4: halo_ple_gate over T tokens: vector t * hc + s of key / gated, row t
+// of value. grid (T * hc)
+extern "C" __global__ void halo_ple_gate_rows(const float* key, const float* query, const float* value, float* gated,
+                                              std::uint32_t h, std::uint32_t hc) {
+  __shared__ float scratch[32];
+  const std::size_t v = blockIdx.x, t = v / hc;
+  float dot = 0.0f;
+  for (std::uint32_t i = threadIdx.x; i < h; i += blockDim.x) dot += key[v * h + i] * query[v * h + i];
+  dot = BlockSum(dot, scratch);
+  const float sc = dot / sqrtf(static_cast<float>(h));
+  const float mag = sqrtf(fmaxf(fabsf(sc), 1e-6f));
+  const float gate = Sigmoid((sc < 0.0f ? -1.0f : (sc > 0.0f ? 1.0f : 0.0f)) * mag);
+  for (std::uint32_t i = threadIdx.x; i < h; i += blockDim.x) gated[v * h + i] = value[t * h + i] * gate;
+}
+
+// P4: halo_ple_conv for T tokens at once (same sums, same order): token t's
+// tap `back` tokens back reads the chunk or, before it, the history; the
+// history is not touched (halo_ple_history_advance moves it afterwards).
+//   rows [T][dim]; grid (ceil(dim / 256), T)
+extern "C" __global__ void halo_ple_conv_prefill(const float* normalized, const float* gated, const float* history,
+                                                 const float* w, float* res, std::uint32_t dim, std::uint32_t kern,
+                                                 std::uint32_t dil) {
+  const std::uint32_t hist = (kern - 1) * dil, t = blockIdx.y;
+  const std::uint32_t ch = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ch >= dim) return;
+  const std::size_t row = static_cast<std::size_t>(t) * dim;
+  float acc = 0.0f;
+  for (std::uint32_t k = 0; k < kern; ++k) {
+    const std::uint32_t back = (kern - 1 - k) * dil;
+    const float src = back == 0 ? normalized[row + ch]
+                      : back <= t ? normalized[static_cast<std::size_t>(t - back) * dim + ch]
+                                  : history[static_cast<std::size_t>(hist + t - back) * dim + ch];
+    acc += w[ch * kern + k] * src;
+  }
+  res[row + ch] += gated[row + ch] + Silu(acc);
+}
+
+// The PLE conv history after T tokens: the last `hist` of (history, rows).
+//   grid (ceil(dim / 256))
+extern "C" __global__ void halo_ple_history_advance(const float* normalized, float* history, std::uint32_t dim,
+                                                    std::uint32_t hist, std::uint32_t tokens) {
+  const std::uint32_t ch = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ch >= dim) return;
+  for (std::uint32_t i = 0; i < hist; ++i) {  // reads index tokens + i > i: not yet overwritten
+    const std::uint32_t j = tokens + i;
+    history[static_cast<std::size_t>(i) * dim + ch] =
+        j < hist ? history[static_cast<std::size_t>(j) * dim + ch] : normalized[static_cast<std::size_t>(j - hist) * dim + ch];
+  }
+}
+
 // QSA: pooled[i] = mean over `ratio` raw indexer keys of one block.
 // The block is the one holding this step's token: pooled every step, so the
 // value written when the block completes is final, and an incomplete

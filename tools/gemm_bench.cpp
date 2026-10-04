@@ -6,6 +6,8 @@
 //   halo_gemm_bench peak      register-only WMMA throughput (the ceiling)
 //   halo_gemm_bench deltanet  one DeltaNet layer's chunk: decode steps vs chunked kernels
 //   halo_gemm_bench bf16      the Qwen3.5 BF16 GEMMs (fp16 WMMA), weights from DRAM
+//   halo_gemm_bench model     every Flash-Next dense int8 GEMM shape at T = 2048,
+//                             weighted by its count per 2048-token prefill
 
 #include <chrono>
 #include <cmath>
@@ -143,13 +145,26 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
-  const int reps = argc > 1 ? std::atoi(argv[1]) : 20;
+  const bool model = argc > 1 && std::string(argv[1]) == "model";
+  const int reps = argc > 1 && !model ? std::atoi(argv[1]) : 20;
   for (auto be : {rt::Backend::kHip, rt::Backend::kHrx}) {
     auto d = rt::Device::Create(be, &e);
     if (!d || !d->LoadModule(kernels::CoreHsaco(), &e)) continue;
-    struct Shape { const char* name; std::uint32_t rows, cols; };
-    for (const Shape s : {Shape{"ssm qkv 10240x2560", 10240, 2560}, Shape{"ssm out  2560x6144", 2560, 6144},
-                          Shape{"hc down   320x10240", 320, 10240}}) {
+    struct Shape { const char* name; std::uint32_t rows, cols, count; };
+    const std::vector<Shape> base = {Shape{"ssm qkv 10240x2560", 10240, 2560, 36},
+                                     Shape{"ssm out  2560x6144", 2560, 6144, 48},
+                                     Shape{"hc down   320x10240", 320, 10240, 96}};
+    // Per 2048-token prefill: 36 DeltaNet and 12 attention layers, two mixers
+    // and a shared expert per layer (attn out shares ssm out's shape).
+    const std::vector<Shape> all = {
+        Shape{"ssm qkv 10240x2560", 10240, 2560, 36}, Shape{"ssm z    6144x2560", 6144, 2560, 36},
+        Shape{"out      2560x6144", 2560, 6144, 48},  Shape{"attn qg 12288x2560", 12288, 2560, 12},
+        Shape{"attn kv   512x2560", 512, 2560, 24},   Shape{"hc down   320x10240", 320, 10240, 96},
+        Shape{"hc up   10240x320", 10240, 320, 96},   Shape{"shexp gu  640x2560", 640, 2560, 96},
+        Shape{"shexp dn 2560x640", 2560, 640, 48}};
+    double total = 0;
+    if (model && be != rt::Backend::kHip) break;
+    for (const Shape s : model ? all : base) {
       std::vector<std::uint8_t> raw(std::size_t{s.rows} * (s.cols / 32) * 34);
       std::mt19937 g(1);
       for (auto& b : raw) b = static_cast<std::uint8_t>(g());
@@ -163,7 +178,8 @@ int main(int argc, char** argv) {
       const rt::Arg ra[] = {rt::Arg::Buf(rb), rt::Arg::Buf(qs), rt::Arg::Buf(dd), rt::Arg::Val(s.rows),
                             rt::Arg::Val(s.cols), rt::Arg::Val(s.cols)};
       (void)d->Launch(d->Kernel("halo_repack_q8_0", &e), {4096}, {256}, ra, &e);
-      for (const std::uint32_t T : {16u, 64u, 256u, 512u, 2048u}) {
+      for (const std::uint32_t T : model ? std::vector<std::uint32_t>{2048u}
+                                         : std::vector<std::uint32_t>{16u, 64u, 256u, 512u, 2048u}) {
         std::vector<float> x(std::size_t{T} * s.cols);
         for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::sin(0.01f * static_cast<float>(i));
         auto xb = d->Alloc(x.size() * 4, &e), xq = d->Alloc(x.size(), &e), xd = d->Alloc(x.size() / 8, &e),
@@ -183,11 +199,18 @@ int main(int argc, char** argv) {
         for (int i = 0; i < reps; ++i) run();
         (void)d->Synchronize(&e);
         const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / reps;
-        std::printf("%s %-20s T %5u  %9.1f us  %6.2f TOPS  %9.0f tok/s\n", rt::BackendName(be), s.name, T, sec * 1e6,
-                    2.0 * s.rows * s.cols * T / sec / 1e12, T / sec);
+        if (model) {
+          total += sec * s.count;
+          std::printf("%-20s %9.1f us  %6.2f TOPS  x %3u = %7.1f ms\n", s.name, sec * 1e6,
+                      2.0 * s.rows * s.cols * T / sec / 1e12, s.count, 1e3 * sec * s.count);
+        } else {
+          std::printf("%s %-20s T %5u  %9.1f us  %6.2f TOPS  %9.0f tok/s\n", rt::BackendName(be), s.name, T, sec * 1e6,
+                      2.0 * s.rows * s.cols * T / sec / 1e12, T / sec);
+        }
         for (auto* b : {&xb, &xq, &xd, &yb}) d->Free(*b);
       }
       for (auto* b : {&rb, &qs, &dd}) d->Free(*b);
     }
+    if (model) std::printf("total per 2048-token prefill: %.1f ms\n", 1e3 * total);
   }
 }

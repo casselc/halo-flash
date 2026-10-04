@@ -63,6 +63,7 @@ int main(int argc, char** argv) {
   int limit = 1 << 30;
   bool eager = true;  // graph replay is the default once instantiation is fast on the real model
   bool prefill = false;
+  bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
   setvbuf(stdout, nullptr, _IOLBF, 0);
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
@@ -73,6 +74,7 @@ int main(int argc, char** argv) {
     else if (a == "--eager") eager = std::string(argv[i + 1]) == "1";
     else if (a == "--int8-moe") engine::FlashNextGpu::int8_act_moe_ = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill") prefill = std::string(argv[i + 1]) == "1";
+    else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill-int8") engine::FlashNextGpu::prefill_int8_gemm_ = std::string(argv[i + 1]) == "1";
     else return std::fprintf(stderr, "unknown option %s\n", a.c_str()), 2;
   }
@@ -89,6 +91,12 @@ int main(int argc, char** argv) {
   auto ngram = model::NgramTable::Open(reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset, t.rows,
                                        c.ple_head_dim, t.type, &error);
   if (!ngram) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+  if (ngram_resident) {
+    const auto tr = std::chrono::steady_clock::now();
+    if (!ngram->LoadResident(&error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    std::fprintf(stderr, "n-gram table resident (%.1f GB) in %.1f s\n", ngram->Rows() * ngram->RowBytes() / 1e9,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tr).count());
+  }
   std::unordered_map<std::string, text::TokenId> by_bytes;
   for (text::TokenId id = 0; id < c.vocab_size; ++id) by_bytes.emplace(std::string(tok->TokenBytes(id)), id);
 

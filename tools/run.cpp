@@ -6,10 +6,14 @@
 //            [--device cpu|hip|hrx|both-hip|both-hrx] [--max-context 512]
 //   halo_run --model <shard-00001.gguf> --prefill-bench 2048 --max-context 2048
 //            [--batched-prefill 0|1] [--prefill-int8 0|1] [--reps 3]
+//            [--prefill-file text] [--prefill-warm text]
 //
 // --prefill-bench N times Prefill over N pseudo-random tokens (fixed seed,
 // as llama-bench's pp test uses random tokens) from a reset engine, --reps
-// times, and reports the median.
+// times, and reports the median. --prefill-file takes the tokens from a
+// text file instead (the first N of its raw encoding), and --prefill-warm
+// prefills another file once, untimed, first: gufo's model_bench protocol
+// (synthetic prose over a fixed vocabulary, a warm-up request first).
 //
 // The prompt is encoded raw (no chat template), as `gufo prompt --raw`.
 // Output: one line per generated token (id, top-2 logit margin, piece),
@@ -17,6 +21,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <cmath>
 #include <cstdio>
@@ -117,7 +123,9 @@ struct Profiling final : rt::Device {
 int main(int argc, char** argv) {
   std::string model, prompt = "The capital of France is", device = "hip";
   int n = 16, prefill_bench = 0, reps = 3;
+  std::string prefill_file, prefill_warm;
   bool eager = false, profile = false, device_sample = false;
+  bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
   setvbuf(stdout, nullptr, _IOLBF, 0);
   std::uint32_t max_context = 512;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -132,6 +140,9 @@ int main(int argc, char** argv) {
     else if (a == "--device-sample") device_sample = std::string(argv[i + 1]) == "1";
     else if (a == "--int8-moe") engine::FlashNextGpu::int8_act_moe_ = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill-bench") prefill_bench = std::atoi(argv[i + 1]);
+    else if (a == "--prefill-file") prefill_file = argv[i + 1];
+    else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";
+    else if (a == "--prefill-warm") prefill_warm = argv[i + 1];
     else if (a == "--reps") reps = std::max(1, std::atoi(argv[i + 1]));
     else if (a == "--batched-prefill") engine::FlashNextGpu::batched_prefill_ = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill-int8") engine::FlashNextGpu::prefill_int8_gemm_ = std::string(argv[i + 1]) == "1";
@@ -183,15 +194,37 @@ int main(int argc, char** argv) {
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tu).count());
     gpu->SetUseGraphs(!eager);
   }
+  // After the engine: its allocations come first (see BENCHMARKS.md).
+  if (ngram_resident) {
+    const auto tr = std::chrono::steady_clock::now();
+    if (!ngram->LoadResident(&error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    std::fprintf(stderr, "n-gram table resident (%.1f GB) in %.1f s\n", ngram->Rows() * ngram->RowBytes() / 1e9,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tr).count());
+  }
   if (prefill_bench > 0) {
     if (!gpu) return std::fprintf(stderr, "--prefill-bench needs a GPU device\n"), 2;
+    const auto from_file = [&](const std::string& path) {
+      std::ifstream f(path);
+      const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+      const auto ids = tok->Encode(text);
+      std::vector<std::int32_t> out(ids.begin(), ids.begin() + std::min<std::size_t>(ids.size(), prefill_bench));
+      if (out.size() < static_cast<std::size_t>(prefill_bench))
+        std::fprintf(stderr, "%s: only %zu tokens\n", path.c_str(), out.size());
+      return out;
+    };
     std::vector<std::int32_t> toks(static_cast<std::size_t>(prefill_bench));
     std::uint32_t seed = 1234;
     for (auto& x : toks) {
       seed = seed * 1664525u + 1013904223u;
       x = static_cast<std::int32_t>((seed >> 4) % c.vocab_size);
     }
+    if (!prefill_file.empty()) toks = from_file(prefill_file);
     std::vector<float> logits(c.vocab_size);
+    if (!prefill_warm.empty()) {
+      const auto warm = from_file(prefill_warm);
+      if (!gpu->Reset(&error) || !gpu->Prefill(warm, logits, &error))
+        return std::fprintf(stderr, "warm-up: %s\n", error.c_str()), 1;
+    }
     std::vector<double> secs;
     if (profile) static_cast<Profiling*>(dev.get())->on = true;
     for (int r = 0; r < reps; ++r) {
@@ -199,12 +232,12 @@ int main(int argc, char** argv) {
       const auto st = std::chrono::steady_clock::now();
       if (!gpu->Prefill(toks, logits, &error)) return std::fprintf(stderr, "prefill: %s\n", error.c_str()), 1;
       secs.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - st).count());
-      std::printf("prefill %d tokens: %.3f s (%.1f tok/s), argmax %u\n", prefill_bench, secs.back(),
-                  prefill_bench / secs.back(), Argmax(logits).best);
+      std::printf("prefill %zu tokens: %.3f s (%.1f tok/s), argmax %u\n", toks.size(), secs.back(),
+                  toks.size() / secs.back(), Argmax(logits).best);
     }
     std::sort(secs.begin(), secs.end());
-    std::printf("prefill median: %.1f tok/s over %d reps (batched %d, int8 GEMMs %d)\n",
-                prefill_bench / secs[secs.size() / 2], reps, engine::FlashNextGpu::batched_prefill_ ? 1 : 0,
+    std::printf("prefill median: %.1f tok/s over %d reps of %zu tokens (batched %d, int8 GEMMs %d)\n",
+                toks.size() / secs[secs.size() / 2], reps, toks.size(), engine::FlashNextGpu::batched_prefill_ ? 1 : 0,
                 engine::FlashNextGpu::prefill_int8_gemm_ ? 1 : 0);
     if (profile) {
       auto* p = static_cast<Profiling*>(dev.get());

@@ -99,6 +99,36 @@ HIP. Stepping a token at a time runs at about 22 tok/s.
 | + grouped down over repacked Q8_0 | 363 | F32 router/alpha/beta/inject row GEMMs 1.1 s |
 | + tiled FP32 GEMM (1db436f) | **407** | int8 GEMMs 1.0 s, grouped experts 1.4 s, DeltaNet 0.43 s |
 
+### The n-gram table on this machine's storage (2026-10-04)
+
+The PLE n-gram table is IQ4_NL inside the first GGUF shard: 320M rows of
+90 bytes, 28.8 GB. A 2048-token prompt touches 32,768 rows (16 heads),
+28,559 distinct for gufo's synthetic prose. The shard lives on ZFS (128K
+records, lz4, `direct=standard`), so a direct read of one 90-byte row
+costs a record read; ARC never holds the table.
+
+| n-gram rows for 2048 tokens | Host time before the device starts |
+|---|---:|
+| Direct reads, cold (fresh text) | 1,058-1,252 ms |
+| Direct reads, warm (row cache, 16K entries) | 373-482 ms |
+| Resident in RAM (`--ngram-resident 1`, 8 s to load) | 5 ms |
+
+gufo's `model_bench` uses the same reader and the same file, so its pp2048
+pays this too; its synthetic prose (96 words) repeats rows across its warm-up
+and measured prompts. Comparisons below use its protocol
+(`halo_run --prefill-file` with `synthetic_text(1)` after a
+`synthetic_text(8888)` warm-up).
+
+Open: with the table resident, device time per prefill rises by about 5%
+(3,230 -> 3,405 ms, steady over 8 reps). Not transient compaction (flat over
+reps), not reclaim (kswapd idle, 12 GB free), not allocation order (loading
+it after the engine changes nothing).
+
+| pp2048, gufo's prose protocol | tok/s |
+|---|---:|
+| direct n-gram reads | 567 |
+| resident n-gram table | 600 |
+
 gufo is at 1599. The dense int8 GEMMs (about 13.5 TFLOP per 2048 tokens)
 run near 13 TOPS and the grouped experts near 5-7 TFLOPS; both have to
 roughly double for parity.

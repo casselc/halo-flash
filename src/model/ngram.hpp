@@ -10,6 +10,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 
@@ -61,6 +62,13 @@ public:
                                std::span<float> out);
   [[nodiscard]] bool WaitRead();
 
+  /// Reads the whole table into memory (row_bytes * rows, about 28.8 GB for
+  /// Flash-Next's IQ4_NL table) with parallel direct reads; afterwards every
+  /// row is decoded from memory and the disk is never touched. Opt-in: on
+  /// a 128K-record ZFS dataset each cold row otherwise costs a record read.
+  [[nodiscard]] bool LoadResident(std::string* error_msg);
+  [[nodiscard]] bool Resident() const noexcept { return resident_ != nullptr; }
+
   [[nodiscard]] std::uint32_t RowDim() const noexcept { return row_dim_; }
   [[nodiscard]] std::uint64_t Rows() const noexcept { return rows_; }
   [[nodiscard]] std::size_t RowBytes() const noexcept { return row_bytes_; }
@@ -92,6 +100,11 @@ private:
 
   int fd_{-1};
   bool direct_{false};
+  struct FreeDeleter {
+    void operator()(std::uint8_t* p) const noexcept { std::free(p); }
+  };
+  std::unique_ptr<std::uint8_t, FreeDeleter> resident_;  // row 0 at resident_ + resident_skew_
+  std::size_t resident_skew_{0};
   std::uint64_t base_offset_{0};
   std::uint64_t rows_{0};
   std::uint32_t row_dim_{0};

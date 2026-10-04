@@ -13,6 +13,9 @@
 //   expert routing and (for now) the routed experts.
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "engine/flash_next_gpu.hpp"
@@ -81,6 +84,8 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   k.hp = f(pairs * c.expert_ff);
   k.yp = f(pairs * H);
   k.x16 = f(T * H / 2 + 1);
+  k.pa = f(T * D);
+  k.pb = f(T * D);
   const std::size_t sub = std::min<std::size_t>(T, kAttnSub);
   k.bscores = f(sub * (max_context_ / c.compress_ratio + 1));
   k.vis = f(sub * AttnVisibleStride());
@@ -92,7 +97,7 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   for (const auto* b : {&k.res, &k.xn, &k.lo, &k.gate, &k.mixed, &k.inject, &k.block_out, &k.embd, &k.xq, &k.xd,
                         &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg, &k.q, &k.gate_a, &k.k, &k.v, &k.ctx,
                         &k.iq, &k.ik, &k.router, &k.ids, &k.wts, &k.eg, &k.eu, &k.ed, &k.sgate, &k.host,
-                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16,
+                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16, &k.pa, &k.pb,
                         &k.bscores, &k.vis, &k.ascores})
     if (!*b) return false;
   k.cap = static_cast<std::uint32_t>(T);
@@ -153,29 +158,32 @@ bool FlashNextGpu::HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_
 
 bool FlashNextGpu::PleChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error) {
   const auto& c = w_.config;
-  const std::uint32_t D = c.HcDim(), H = c.hidden_size;
-  for (std::uint32_t t = 0; t < T; ++t) {
-    const std::size_t row = std::size_t{t} * D * 4;
-    if (!MatVec(l.ple_key, 0, ck_.host, ple_key_, error, std::size_t{t} * c.PleEmbeddingDim() * 4) ||
-        !MatVec(l.ple_value, 0, ck_.host, ple_value_, error, std::size_t{t} * c.PleEmbeddingDim() * 4) ||
-        !GroupedNorm(ple_key_, l.ple_norm_key, ple_key_, error) ||
-        !Launch("halo_rmsnorm", {c.hc_count}, {kBlock},
-                {rt::Arg::Buf(ck_.res, row), rt::Arg::Buf(tensors_.at(l.ple_norm_query.data).buf),
-                 rt::Arg::Buf(ple_query_), rt::Arg::Val(H), rt::Arg::Val(c.rms_eps), rt::Arg::Val(H)},
-                error) ||
-        !Launch("halo_ple_gate", {c.hc_count}, {kBlock},
-                {rt::Arg::Buf(ple_key_), rt::Arg::Buf(ple_query_), rt::Arg::Buf(ple_value_), rt::Arg::Buf(ple_gated_),
-                 rt::Arg::Val(H)},
-                error) ||
-        !GroupedNorm(ple_gated_, l.ple_norm_conv, ple_norm_, error) ||
-        !Launch("halo_ple_conv", {Blocks(D)}, {kBlock},
-                {rt::Arg::Buf(ple_norm_), rt::Arg::Buf(ple_gated_), rt::Arg::Buf(ple_history_),
-                 rt::Arg::Buf(tensors_.at(l.ple_conv1d.data).buf), rt::Arg::Buf(ck_.res, row), rt::Arg::Val(D),
+  const std::uint32_t D = c.HcDim(), H = c.hidden_size, hc = c.hc_count;
+  // Rows: key pa, value mixed, query xn, gated gate, normalized pb (the
+  // mixer buffers are free until this layer's mixer runs).
+  const auto norm = [&](const rt::Buffer& x, const model::TensorRef& w, const rt::Buffer& y) {
+    return Launch("halo_rmsnorm_rows", {T * hc}, {kBlock},
+                  {rt::Arg::Buf(x), rt::Arg::Buf(tensors_.at(w.data).buf), rt::Arg::Buf(y), rt::Arg::Val(H),
+                   rt::Arg::Val(c.rms_eps), rt::Arg::Val(H), rt::Arg::Val(hc)},
+                  error);
+  };
+  return Gemm(l.ple_key, ck_.host, ck_.pa, T, error) &&
+         Gemm(l.ple_value, ck_.host, ck_.mixed, T, error) && norm(ck_.pa, l.ple_norm_key, ck_.pa) &&
+         norm(ck_.res, l.ple_norm_query, ck_.xn) &&
+         Launch("halo_ple_gate_rows", {T * hc}, {kBlock},
+                {rt::Arg::Buf(ck_.pa), rt::Arg::Buf(ck_.xn), rt::Arg::Buf(ck_.mixed), rt::Arg::Buf(ck_.gate),
+                 rt::Arg::Val(H), rt::Arg::Val(hc)},
+                error) &&
+         norm(ck_.gate, l.ple_norm_conv, ck_.pb) &&
+         Launch("halo_ple_conv_prefill", {Blocks(D), T}, {kBlock},
+                {rt::Arg::Buf(ck_.pb), rt::Arg::Buf(ck_.gate), rt::Arg::Buf(ple_history_),
+                 rt::Arg::Buf(tensors_.at(l.ple_conv1d.data).buf), rt::Arg::Buf(ck_.res), rt::Arg::Val(D),
                  rt::Arg::Val(c.ple_conv_kernel), rt::Arg::Val(c.ple_ngram_size)},
-                error))
-      return false;
-  }
-  return true;
+                error) &&
+         Launch("halo_ple_history_advance", {Blocks(D)}, {kBlock},
+                {rt::Arg::Buf(ck_.pb), rt::Arg::Buf(ple_history_), rt::Arg::Val(D), rt::Arg::Val(c.PleConvHistory()),
+                 rt::Arg::Val(T)},
+                error);
 }
 
 bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std::uint32_t T, std::string* error) {
@@ -517,6 +525,10 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
       return false;
     }
   if (!AllocChunk(error)) return false;
+  // HALO_PREFILL_TIMING: host preparation, upload and device time per chunk.
+  static const bool timing = std::getenv("HALO_PREFILL_TIMING") != nullptr;
+  const auto t_start = std::chrono::steady_clock::now();
+  auto t_hash = t_start, t_read = t_start;
   // Host side: every token's n-gram rows and step parameters, one upload.
   model::NgramHistory history = ngram_history_;
   const std::uint32_t ratio = c.compress_ratio, budget = c.indexer_top_k / ratio;
@@ -524,11 +536,13 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
     // One sorted, batched read for the chunk's rows.
     std::vector<std::uint32_t> rows(std::size_t{T} * c.ple_heads);
     model::HashNgramRows(c, history, tokens, rows);
+    t_hash = std::chrono::steady_clock::now();
     const std::span<float> emb(reinterpret_cast<float*>(ck_host_.data()), std::size_t{T} * c.PleEmbeddingDim());
     if (!ngram_ || !ngram_->Read(rows, emb)) {
       if (error) *error = "n-gram table read failed";
       return false;
     }
+    t_read = std::chrono::steady_clock::now();
   }
   for (std::uint32_t t = 0; t < T; ++t) {
     const std::uint32_t pos = position_ + t, n_kv = pos + 1, complete = n_kv / ratio;
@@ -541,7 +555,9 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
     params[kHaloNVisible] = complete <= budget ? n_kv : budget * ratio + (n_kv - complete * ratio);
     std::memcpy(ck_host_.data() + ck_.params_offset + std::size_t{t} * 64, params, sizeof(params));
   }
+  const auto t_prep = std::chrono::steady_clock::now();
   if (!dev_.Upload(ck_.host, 0, ck_host_.data(), ck_.params_offset + std::size_t{T} * 64, error)) return false;
+  const auto t_upload = std::chrono::steady_clock::now();
 
   const std::uint32_t H = c.hidden_size, D = c.HcDim();
   const auto& emb = tensors_.at(w_.token_embd.data);
@@ -578,6 +594,14 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
       return false;
   } else if (!dev_.Synchronize(error)) {
     return false;
+  }
+  if (timing) {
+    const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    std::fprintf(stderr,
+                 "prefill chunk %u tokens: host prep %.1f ms (hash %.1f, n-gram read %.1f), upload %.1f ms, "
+                 "device %.1f ms\n",
+                 T, ms(t_start, t_prep), ms(t_start, t_hash), ms(t_hash, t_read), ms(t_prep, t_upload),
+                 ms(t_upload, std::chrono::steady_clock::now()));
   }
   ngram_history_ = history;
   const std::uint32_t complete = (position_ + T) / ratio;

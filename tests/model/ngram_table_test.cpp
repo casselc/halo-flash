@@ -1,5 +1,5 @@
 // NgramTable: the PLE row reader (O_DIRECT reads, a lossy row cache, a worker
-// pool). A Hegel state machine drives random gathers against a file of known
+// pool, or the whole table resident in memory). A Hegel state machine drives random gathers against a file of known
 // rows and checks every result against a direct decode of the same bytes.
 
 #include <hegel/gtest.h>
@@ -91,7 +91,13 @@ TEST(NgramTable, GathersMatchDirectDecode) {
     auto table = NgramTable::Open(file->fd, file->offset, file->rows, file->dim, file->type, &error);
     ASSERT_TRUE(table) << error;
     const auto steps = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 12}));
+    // From a drawn step on (or never), the table is resident in memory.
+    const auto resident_at = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 12}));
     for (int s = 0; s < steps; ++s) {
+      if (s == resident_at) {
+        ASSERT_TRUE(table->LoadResident(&error)) << error;
+        ASSERT_TRUE(table->Resident());
+      }
       // A gather: small (decode-like, cache path) or large (prefill-like,
       // sorted batch path), with deliberate duplicates.
       const bool large = tc.draw(gs::booleans());
