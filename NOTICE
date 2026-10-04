@@ -9,6 +9,31 @@ Each adapted file says so in its header; full license texts are in licenses/.
 - ds4 / DwarfStar (Copyright (c) 2026 the ds4.c authors): design references for
   n-gram disk reads, expert streaming and disk KV checkpoints (licenses/ds4.txt).
 
-Runtime dependency (not vendored): HRX System, Apache-2.0.
+halo-scope (src/scope/, built only with -DHALO_SCOPE=ON) adapts code from the
+halo-flash author's own repositories, used here with the author's permission
+(2026-10-03; docs/PLAN.md P12). Each adapted file says so in its header.
+
+- oscope (github.com/chucklehead-dev/oscope, EPL-2.0), branch
+  claude/brave-pascal-0fecgh at 3a14d2c0b555000df35541fdd2e115b779e7c3b1,
+  directory spike/oscope-core:
+  - src/chdb.rs -> src/scope/chdb.{hpp,cpp} (libchdb binding: connection,
+    binary-safe query, streaming insert, signal handlers off; ported from a
+    link-time binding to dlopen);
+  - src/ring.rs -> src/scope/ring.hpp (SPSC byte ring: drop-and-count,
+    pre-faulted pages, half-full wakeup);
+  - src/pipeline.rs, src/recorder.rs -> structure of src/scope/recorder.cpp
+    (rings, one writer, batched RowBinary stream inserts).
+- casselc/observability (github.com/casselc/observability), commit
+  ca7ae8a6250f2af3623d0c0cad26c9710a6bbc4d:
+  - otel-chdb/otap-rs/sql/llm_spans.sql, llm_payloads.sql, llm_scores.sql ->
+    the table shapes in src/scope/schema.cpp (typed llm_observations,
+    content-addressed llm_payloads, append-only llm_scores with supersedes);
+  - otel-chdb/README.md -> the Null staging table plus materialized view
+    write pattern.
+
+Runtime dependencies (not vendored): HRX System, Apache-2.0; libchdb (chDB,
+Apache-2.0), loaded with dlopen by halo-scope when present.
+Build dependency (fetched at build time, halo-scope only, when no system
+sqlite3 is found): the SQLite amalgamation (public domain).
 Test dependencies (fetched at build time): GoogleTest (BSD-3-Clause),
 hegel-cpp (MIT) with its prebuilt libhegel engine.
