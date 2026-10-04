@@ -15,6 +15,12 @@ is pinned to profile_peak through the sudoers rule for the measurement and
 always set back to auto; a run starts only if MemAvailable covers its need;
 results are written to --out after every run.
 
+Attribution: unless --no-kernels, each run adds one more rep with
+`--kernel-timing 1` (sync-free per-kernel GPU timestamps). That rep is left
+out of the end-to-end median; its per-kernel times are kept per arm, and the
+report lists the kernels whose median time moved most against the first arm,
+so a surprising result shows where the time went without a re-run.
+
   ab_bench.py --model shard-00001.gguf --prompt prose_1.txt --warm prose_8888.txt \\
       --arm base=/path/halo_run_old --arm new=build/gpu/halo_run \\
       --arm 'new-noskinny=build/gpu/halo_run --skinny-f32 0' \\
@@ -52,20 +58,36 @@ def mem_available_gb():
     return 0.0
 
 
+KERNEL_LINE = re.compile(r"^  (\S.*?)\s{2,}([0-9.]+) ms\s+[0-9.]+%\s+(\d+) calls", re.M)
+
+
 def run_once(cmd, args, env):
+    kernels = not args.no_kernels
     full = shlex.split(cmd) + ["--model", args.model, "--prefill-bench", str(args.tokens), "--max-context",
-                               str(args.tokens), "--reps", str(args.reps), "--prefill-file", args.prompt]
+                               str(args.tokens), "--reps", str(args.reps + (1 if kernels else 0)),
+                               "--prefill-file", args.prompt]
+    if kernels:
+        full += ["--kernel-timing", "1"]
     if args.warm:
         full += ["--prefill-warm", args.warm]
     if args.resident:
         full += ["--ngram-resident", "1"]
     p = subprocess.run(full, env=env, capture_output=True, text=True, timeout=args.timeout)
-    device = [float(m.group(1)) for m in re.finditer(r"device ([0-9.]+) ms", p.stdout + p.stderr)]
-    if p.returncode != 0 or len(device) < args.reps:
-        raise RuntimeError(f"run failed ({p.returncode}): {' '.join(full)}\n{(p.stdout + p.stderr)[-2000:]}")
-    # With --prefill-warm the first timed line is the warm-up prefill.
-    reps = device[-args.reps:]
-    return statistics.median(reps), reps
+    out = p.stdout + p.stderr
+    device = [float(m.group(1)) for m in re.finditer(r"device ([0-9.]+) ms", out)]
+    n = args.reps + (1 if kernels else 0)
+    if p.returncode != 0 or len(device) < n:
+        raise RuntimeError(f"run failed ({p.returncode}): {' '.join(full)}\n{out[-2000:]}")
+    # With --prefill-warm the first timed line is the warm-up prefill; the
+    # kernel-timed rep (last) is excluded from the end-to-end numbers.
+    reps = device[-n:][:args.reps]
+    per_kernel = {}
+    if kernels:
+        for m in KERNEL_LINE.finditer(out):
+            per_kernel[m.group(1).strip()] = float(m.group(2))
+        if not per_kernel:
+            raise RuntimeError(f"no kernel timing in the output of: {' '.join(full)}")
+    return statistics.median(reps), reps, per_kernel
 
 
 def main():
@@ -83,6 +105,8 @@ def main():
     ap.add_argument("--need-gb", type=float, default=None)
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--out", default="ab_bench.json")
+    ap.add_argument("--no-kernels", action="store_true", help="skip the extra kernel-timed rep")
+    ap.add_argument("--top", type=int, default=12, help="kernels listed per arm in the attribution")
     args = ap.parse_args()
 
     arms = []
@@ -115,8 +139,9 @@ def main():
                 avail = mem_available_gb()
                 if avail < need:
                     sys.exit(f"MemAvailable {avail:.0f} GB < {need:.0f} GB needed; refusing to start a run")
-                med, reps = run_once(cmd, args, env)
-                results["arms"][name]["runs"].append({"round": rnd, "device_ms": med, "reps": reps})
+                med, reps, per_kernel = run_once(cmd, args, env)
+                results["arms"][name]["runs"].append({"round": rnd, "device_ms": med, "reps": reps,
+                                                      "kernels_ms": per_kernel})
                 with open(args.out, "w") as f:
                     json.dump(results, f, indent=1)
                 print(f"round {rnd} {name:24} device {med:8.1f} ms  (reps {', '.join(f'{r:.1f}' for r in reps)})",
@@ -141,6 +166,34 @@ def main():
             line += f"  vs {base_name}: {diff:+.1f} ms ({100 * diff / b_med:+.1f}%) {'significant' if abs(diff) > noise else 'within noise'}"
         print(line)
     results["summary"] = {n: {"median": s[0], "min": s[1], "max": s[2]} for n, s in summary.items()}
+    if not args.no_kernels:
+        # Per kernel: median over rounds of the kernel-timed rep, and the
+        # round-to-round spread, against the first arm.
+        def per_kernel(name):
+            runs = results["arms"][name]["runs"]
+            keys = set().union(*(r["kernels_ms"] for r in runs))
+            return {k: [r["kernels_ms"].get(k, 0.0) for r in runs] for k in keys}
+
+        base_k = per_kernel(base_name)
+        results["kernel_summary"] = {}
+        for name, _ in arms:
+            if name == base_name:
+                continue
+            arm_k = per_kernel(name)
+            rows = []
+            for k in set(base_k) | set(arm_k):
+                b = base_k.get(k, [0.0])
+                a = arm_k.get(k, [0.0])
+                spread = max(max(b) - min(b), max(a) - min(a))
+                rows.append((statistics.median(a) - statistics.median(b), k, statistics.median(b),
+                             statistics.median(a), spread))
+            rows.sort(key=lambda r: -abs(r[0]))
+            results["kernel_summary"][name] = [
+                {"kernel": k, "base_ms": b, "arm_ms": a, "diff_ms": d, "spread_ms": sp} for d, k, b, a, sp in rows]
+            total = sum(r[0] for r in rows)
+            print(f"\nper-kernel, {name} vs {base_name} (kernel-timed rep; sum of differences {total:+.1f} ms):")
+            for d, k, b, a, sp in rows[:args.top]:
+                print(f"  {k:58} {b:8.2f} -> {a:8.2f} ms  {d:+7.2f}  (spread {sp:.2f})")
     with open(args.out, "w") as f:
         json.dump(results, f, indent=1)
     return 0
