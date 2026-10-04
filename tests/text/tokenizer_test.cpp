@@ -561,6 +561,78 @@ TEST(Tokenizer, FromVocabularyRejectsEachDefect) {
   rejects("special byte token", tokens, ty3, {"h e"});
   rejects("merge without a space", tokens, types, {"he"});
   rejects("merge with two spaces", tokens, types, {"h e x"});
-  rejects("merge of unknown tokens", tokens, types, {"h q"});
+  rejects("merge to unknown token", tokens, types, {"h q"});
   rejects("merge to unknown token", tokens, types, {"e h"});
+  // Each side of a merge must be a token, even when the merged text is one.
+  auto t4 = tokens;
+  t4.push_back("abc");
+  auto ty4 = types;
+  ty4.push_back(TokenType::kNormal);
+  rejects("unknown left side", t4, ty4, {"ab c"});
+  rejects("unknown right side", t4, ty4, {"a bc"});
+}
+
+// BPE merges the lowest rank first and, among equal ranks (the same pair
+// twice), the leftmost: "eee" is "ee" + "e", not "e" + "ee".
+TEST(Tokenizer, EqualRankMergesGoLeftmostFirst) {
+  std::vector<std::string> tokens;
+  std::vector<TokenType> types;
+  char32_t n = 0;
+  for (int b = 0; b < 256; ++b) {
+    const bool printable = (b >= '!' && b <= '~') || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF);
+    std::string s;
+    AppendUtf8(s, printable ? static_cast<char32_t>(b) : 256 + n++);
+    tokens.push_back(s);
+    types.push_back(TokenType::kNormal);
+  }
+  tokens.push_back("ee");
+  types.push_back(TokenType::kNormal);
+  std::string error;
+  auto tok = Tokenizer::FromVocabulary(tokens, std::vector<std::string>{"e e"}, types, &error);
+  ASSERT_TRUE(tok) << error;
+  const TokenId ee = 256, e = static_cast<TokenId>('e');
+  EXPECT_EQ(tok->Encode("eee"), (std::vector<TokenId>{ee, e}));
+  EXPECT_EQ(tok->Encode("eeeee"), (std::vector<TokenId>{ee, ee, e}));
+}
+
+// A special that prefixes another never wins: "<|im_start|>" is one token,
+// not "<|im" followed by text (which decodes to the same bytes, so the
+// round-trip properties cannot see the difference).
+TEST(Tokenizer, LongestSpecialWins) {
+  auto tok = SyntheticTokenizer();
+  ASSERT_TRUE(tok);
+  const auto start = tok->Find("<|im_start|>");
+  ASSERT_TRUE(start);
+  EXPECT_EQ(tok->Encode("<|im_start|>"), std::vector<TokenId>{*start});
+  const auto offsets = tok->EncodeWithOffsets("<|im_start|>");
+  EXPECT_EQ(offsets.ids, std::vector<TokenId>{*start});
+}
+
+// Canonical ordering and blocking in NFC: marks are reordered by combining
+// class, and a mark composes only if no mark of equal or higher class sits
+// between it and the starter (expected values from Python unicodedata).
+TEST(Unicode, NfcOrdersAndBlocksMarks) {
+  const std::pair<const char*, const char*> cases[] = {
+      {"ą́", "ą́"},
+      {"ȩ́", "ȩ́"},
+      {"ậ", "ậ"},
+      {"ậ", "ậ"},
+      {"á́", "á́"},
+      {"Ǻ", "Ǻ"},
+      {"ᄀ́ᅡ", "ᄀ́ᅡ"},
+      {"ợ̀", "ợ̀"},
+      {"ǖ́", "ǖ́"},
+      {"ᾌ", "ᾌ"},
+      {"à́̕", "à́̕"},
+      {"é̀̕", "é̀̕"},
+      {"ൊൗ", "ൊൗ"},
+      // Low combining classes (overlays 1, nukta 7): earlier marks of lower
+      // class, blocked or not, do not block the nukta.
+      {"ऩ̴", "ऩ̴"},
+      {"ऩ̴̵", "ऩ̴̵"},
+  };
+  // NFC follows HF tokenizers' Unicode 9 tables, not the host's: U+16FF0
+  // (Unicode 13, class 6) is unassigned there, a starter that blocks.
+  EXPECT_EQ(Hex(Nfc("न\U00016FF0़")), Hex("न\U00016FF0़"));
+  for (const auto& [in, out] : cases) EXPECT_EQ(Hex(Nfc(in)), Hex(out)) << Hex(in);
 }
