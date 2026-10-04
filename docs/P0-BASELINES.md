@@ -70,15 +70,39 @@ event timing agree to within about 1%, as the HIP and shim rows show.
 - **Fallback:** keep the ROCm HIP backend first-class. HRX is v0.1.0, and
   this run already found three defects.
 
-## HRX findings (reported upstream-ready; investigation in progress)
+## HRX findings (root-caused; patch in docs/hrx-patches/)
 
-1. `hrx_event_elapsed_time` returns about 1e-6 ms for an approximately 35 ms
-   kernel, with default event flags.
-2. HIP shim: a graph of independent kernel nodes (`hipGraphAddKernelNode` with
-   no dependencies) fails at launch with
-   `graph_exec.c:2344: INTERNAL; graph block signals no timeline value`.
-   Captured chains work, and so do native HRX graphs with independent nodes.
-3. `HRX_DEVICE_PROPERTY_COMPUTE_UNITS` returns OK but leaves 0 on gfx1151.
+All three were confirmed as HRX bugs at hrx-system 1618350, not misuse on our
+side. `docs/hrx-patches/0001-event-timing-graph-join-compute-units.patch`
+fixes them. The fixes were verified on this machine, and the patch is not yet
+upstreamed.
+
+1. **`hrx_event_elapsed_time` measures host enqueue time.**
+   `libhrx/src/libhrx/event.c:76` stores `iree_time_now()` at record time, and
+   record submits only a barrier, so no device timestamp exists. The HIP
+   shim's events use `iree_hal_queue_timestamp` and are correct.
+   - The fix records a device timestamp into an 8-byte coherent buffer and
+     converts ticks the way the shim does.
+   - With the fix, event times match wall clock: 9.2 ms against 9.4 ms for a
+     2 GiB read.
+2. **HIP shim graphs with 17 or more independent kernel nodes fail at launch.**
+   The scheduler (`graph_analysis.c:622-672`) splits a final partition of 16 or
+   more nodes across up to 8 streams. Only the last block receives the
+   external signal, so the others reach the zero-signal check at
+   `graph_exec.c:2342`. Separately, only block 0 waits on external work.
+   - The fix adds a join barrier after a multi-stream final partition, and
+     makes every first-partition block wait on external work.
+   - Verified for 16 to 1000 independent nodes. An ordering test saw no
+     violations, but no positive control showed that the test can fail.
+   - Native `libhrx/graph_exec.c` has the same structure without the check, so
+     it probably has a silent ordering race. That is untested and the patch
+     does not touch it yet.
+   - Until this is fixed, halo-flash keeps decode graphs to single chains or
+     to fewer than 17 independent nodes per stage.
+3. **`HRX_DEVICE_PROPERTY_COMPUTE_UNITS` is hard-coded to 0**
+   (`libhrx/src/libhrx/device.c:124`). The fix reads the device's dispatch
+   spec and returns 40, the raw CU count. HIP reports 20, because the shim
+   halves it on RDNA.
 
 Still to measure in P0: host-call round trip, and NVMe random-read IOPS on the
 dedicated drive, once it is installed.

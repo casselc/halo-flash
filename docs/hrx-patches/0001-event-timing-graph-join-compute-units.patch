@@ -1,0 +1,241 @@
+diff --git a/libhrx/src/binding/common/graph_exec.c b/libhrx/src/binding/common/graph_exec.c
+index 20cc70b024..f6f4bca964 100644
+--- a/libhrx/src/binding/common/graph_exec.c
++++ b/libhrx/src/binding/common/graph_exec.c
+@@ -1777,8 +1777,15 @@ iree_status_t iree_hal_streaming_graph_exec_instantiate_from_template(
+               exec->node_disabled_state_count, additional_edges,
+               &exec->arena_allocator, &schedule));
+ 
++  // A multi-stream final partition has no single block whose completion means
++  // the graph is done, so its streams signal internal semaphores and a trailing
++  // barrier block joins them and carries the launch's external signals.
++  const bool join_final_partition =
++      schedule.partition_count > 0 &&
++      schedule.partitions[schedule.partition_count - 1].stream_count > 1;
++
+   // Allocate block array.
+-  exec->block_count = schedule.block_count;
++  exec->block_count = schedule.block_count + (join_final_partition ? 1 : 0);
+   if (schedule.partition_count == 0) {
+     exec->block_count = 0;
+     exec->blocks = NULL;
+@@ -1813,6 +1820,10 @@ iree_status_t iree_hal_streaming_graph_exec_instantiate_from_template(
+       }
+     }
+   }
++  if (join_final_partition) {
++    semaphore_count +=
++        schedule.partitions[schedule.partition_count - 1].stream_count;
++  }
+   exec->semaphore_count = semaphore_count;
+ 
+   if (exec->semaphore_count > 0) {
+@@ -1881,7 +1892,7 @@ iree_status_t iree_hal_streaming_graph_exec_instantiate_from_template(
+     // semaphores. Note that we don't allocate space for the final semaphores as
+     // those are part of the submission, not the exec object.
+     uint16_t signal_semaphore_count = 0;
+-    if (p < schedule.partition_count - 1) {
++    if (p < schedule.partition_count - 1 || join_final_partition) {
+       signal_semaphore_count =
+           partition->stream_count > 1 ? partition->stream_count : 1;
+     }
+@@ -2061,6 +2072,23 @@ iree_status_t iree_hal_streaming_graph_exec_instantiate_from_template(
+       exec->blocks[block_index++] = block;
+     }
+   }
++
++  if (join_final_partition) {
++    const uint16_t join_wait_count =
++        schedule.partitions[schedule.partition_count - 1].stream_count;
++    iree_hal_streaming_graph_block_t* block = NULL;
++    iree_hal_streaming_graph_block_ptrs_t ptrs;
++    IREE_RETURN_AND_END_ZONE_IF_ERROR(
++        z0, iree_hal_streaming_graph_create_barrier_block(
++                exec, /*node_start_index=*/0, /*node_count=*/0,
++                join_wait_count, /*signal_semaphore_count=*/0,
++                IREE_HAL_QUEUE_BARRIER_FLAG_NONE, &block, &ptrs));
++    for (uint16_t w = 0; w < join_wait_count; w++) {
++      ptrs.wait_semaphore_indices[w] = semaphore_index - join_wait_count + w;
++      ptrs.wait_payload_deltas[w] = 1;
++    }
++    exec->blocks[block_index++] = block;
++  }
+   exec->block_count = block_index;
+ 
+   IREE_TRACE_ZONE_END(z0);
+@@ -2515,9 +2543,12 @@ static iree_status_t iree_hal_streaming_graph_exec_submit_blocks_locked(
+         block->type == IREE_HAL_STREAMING_GRAPH_BLOCK_TYPE_EVENT_WAIT;
+     const bool block_records_event =
+         block->type == IREE_HAL_STREAMING_GRAPH_BLOCK_TYPE_EVENT_RECORD;
++    // Blocks of the first partition are the only ones with no internal waits,
++    // and each of them (one per stream) is ordered behind the launch's waits.
++    const bool block_waits_external = block->wait_semaphore_count == 0;
+     const iree_host_size_t total_wait_count =
+         block->wait_semaphore_count +
+-        (block_index == 0 ? external_wait_semaphores.count : 0) +
++        (block_waits_external ? external_wait_semaphores.count : 0) +
+         (block_waits_event ? 1 : 0);
+     const iree_host_size_t total_signal_count =
+         block->signal_semaphore_count + (block_index == exec->block_count - 1
+@@ -2579,7 +2610,7 @@ static iree_status_t iree_hal_streaming_graph_exec_submit_blocks_locked(
+     uint64_t* signal_vals = value_array ? value_array + total_wait_count : NULL;
+ 
+     iree_host_size_t wait_count = 0;
+-    if (block_index == 0) {
++    if (block_waits_external) {
+       for (iree_host_size_t i = 0; i < external_wait_semaphores.count; ++i) {
+         wait_sems[wait_count] = external_wait_semaphores.semaphores[i];
+         wait_vals[wait_count] = external_wait_semaphores.payload_values[i];
+diff --git a/libhrx/src/libhrx/device.c b/libhrx/src/libhrx/device.c
+index afdfa7d582..9d8a86928e 100644
+--- a/libhrx/src/libhrx/device.c
++++ b/libhrx/src/libhrx/device.c
+@@ -127,7 +127,18 @@ hrx_status_t hrx_device_get_property(hrx_device_t device,
+         return hrx_make_status(HRX_STATUS_OUT_OF_RANGE,
+                                "buffer too small for uint32_t");
+       }
+-      *(uint32_t*)value = 0;  // Not available from the task driver.
++      // Read from the HAL device spec; 0 only when the driver publishes no
++      // dispatch facts (e.g. the task driver).
++      const iree_hal_device_dispatch_spec_t* dispatch =
++          iree_hal_device_spec_dispatch(
++              iree_hal_device_spec(device->hal_device));
++      uint32_t fact = 0;
++      if (dispatch) {
++        fact = prop == HRX_DEVICE_PROPERTY_COMPUTE_UNITS
++                   ? dispatch->execution.unit_count
++                   : dispatch->launch.maximum_workgroup_invocations;
++      }
++      *(uint32_t*)value = fact;
+       return hrx_ok_status();
+     }
+     default:
+diff --git a/libhrx/src/libhrx/event.c b/libhrx/src/libhrx/event.c
+index 57f6c11d7b..b22a8d42b1 100644
+--- a/libhrx/src/libhrx/event.c
++++ b/libhrx/src/libhrx/event.c
+@@ -41,6 +41,31 @@ hrx_status_t hrx_event_create(hrx_device_t device, hrx_event_flags_t flags,
+     return status;
+   }
+ 
++  // Timed events capture a device tick at the record point when the device
++  // publishes a timestamp domain.
++  const iree_hal_device_timing_spec_t* timing =
++      iree_hal_device_spec_timing(iree_hal_device_spec(device->hal_device));
++  if (!(flags & HRX_EVENT_FLAG_DISABLE_TIMING) &&
++      iree_all_bits_set(timing->flags,
++                        IREE_HAL_DEVICE_TIMING_SPEC_FLAG_DEVICE_TIMESTAMPS)) {
++    iree_hal_buffer_params_t params = {0};
++    params.type = IREE_HAL_MEMORY_TYPE_HOST_LOCAL |
++                  IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE |
++                  IREE_HAL_MEMORY_TYPE_HOST_COHERENT;
++    params.usage =
++        IREE_HAL_BUFFER_USAGE_TRANSFER | IREE_HAL_BUFFER_USAGE_MAPPING;
++    params.access = IREE_HAL_MEMORY_ACCESS_ALL;
++    params.queue_family_affinity = IREE_HAL_QUEUE_FAMILY_AFFINITY_ANY;
++    iree_status_t iree_status = iree_hal_allocator_allocate_buffer(
++        device->allocator.hal_allocator, params, sizeof(uint64_t),
++        &event->timestamp_buffer);
++    if (!iree_status_is_ok(iree_status)) {
++      hrx_semaphore_release(event->semaphore);
++      free(event);
++      return hrx_status_from_iree(iree_status);
++    }
++  }
++
+   *out_event = event;
+   return hrx_ok_status();
+ }
+@@ -59,6 +84,7 @@ void hrx_event_release(hrx_event_t event) {
+   if (iree_atomic_ref_count_dec(&event->ref_count) == 1) {
+     hrx_semaphore_release(event->semaphore);
+     hrx_stream_release(event->recording_stream);
++    iree_hal_buffer_release(event->timestamp_buffer);
+     free(event);
+   }
+ }
+@@ -111,12 +137,28 @@ hrx_status_t hrx_event_record(hrx_event_t event, hrx_stream_t stream) {
+       .payload_values = sig_vals,
+   };
+ 
++  // A timed event writes the device tick at the point everything before it on
++  // the stream has completed; the host clock read above only says when the
++  // record was enqueued.
++  const iree_hal_queue_family_spec_t* family =
++      iree_hal_queue_family_spec(iree_hal_queue_family(stream->hal_queue));
++  const bool captures_tick = event->timestamp_buffer &&
++                             family->timestamp_frequency_hz != 0 &&
++                             family->timestamp_valid_bits != 0 &&
++                             family->timestamp_valid_bits <= 64;
+   iree_status_t iree_status =
+-      iree_hal_queue_barrier(stream->hal_queue, wait_list, signal_list,
+-                             IREE_HAL_QUEUE_BARRIER_FLAG_NONE);
++      captures_tick
++          ? iree_hal_queue_timestamp(stream->hal_queue, wait_list, signal_list,
++                                     event->timestamp_buffer, 0,
++                                     IREE_HAL_TIMESTAMP_FLAG_NONE)
++          : iree_hal_queue_barrier(stream->hal_queue, wait_list, signal_list,
++                                   IREE_HAL_QUEUE_BARRIER_FLAG_NONE);
+   if (!iree_status_is_ok(iree_status)) {
+     return hrx_status_from_iree(iree_status);
+   }
++  event->timestamp_frequency_hz =
++      captures_tick ? family->timestamp_frequency_hz : 0;
++  event->timestamp_valid_bits = captures_tick ? family->timestamp_valid_bits : 0;
+ 
+   return hrx_ok_status();
+ }
+@@ -191,6 +233,35 @@ hrx_status_t hrx_event_elapsed_time(hrx_event_t start, hrx_event_t stop,
+                            "stop event has not completed");
+   }
+ 
++  if (start->timestamp_frequency_hz != 0 || stop->timestamp_frequency_hz != 0) {
++    if (start->timestamp_frequency_hz != stop->timestamp_frequency_hz ||
++        start->timestamp_valid_bits != stop->timestamp_valid_bits) {
++      return hrx_make_status(
++          HRX_STATUS_INVALID_ARGUMENT,
++          "events were recorded in different timestamp domains");
++    }
++    uint64_t start_tick = 0, stop_tick = 0;
++    iree_status_t iree_status = iree_hal_buffer_map_read(
++        start->timestamp_buffer, 0, &start_tick, sizeof(start_tick));
++    if (iree_status_is_ok(iree_status)) {
++      iree_status = iree_hal_buffer_map_read(stop->timestamp_buffer, 0,
++                                             &stop_tick, sizeof(stop_tick));
++    }
++    if (!iree_status_is_ok(iree_status)) {
++      return hrx_status_from_iree(iree_status);
++    }
++    const uint32_t bits = start->timestamp_valid_bits;
++    const uint64_t mask = bits == 64 ? UINT64_MAX : ((1ull << bits) - 1ull);
++    const uint64_t delta = (stop_tick - start_tick) & mask;
++    const uint64_t sign_bit = (mask >> 1) + 1ull;
++    const double signed_delta =
++        delta >= sign_bit ? -(double)(mask - delta) - 1.0 : (double)delta;
++    *ms = (float)(signed_delta * 1000.0 /
++                  (double)start->timestamp_frequency_hz);
++    return hrx_ok_status();
++  }
++
++  // No device timestamp domain: fall back to host enqueue times.
+   int64_t elapsed_ns = stop->record_time_ns - start->record_time_ns;
+   *ms = (float)elapsed_ns / 1000000.0f;
+   return hrx_ok_status();
+diff --git a/libhrx/src/libhrx/hrx_internal.h b/libhrx/src/libhrx/hrx_internal.h
+index afc9b662a3..d3932269f0 100644
+--- a/libhrx/src/libhrx/hrx_internal.h
++++ b/libhrx/src/libhrx/hrx_internal.h
+@@ -277,6 +277,13 @@ typedef struct hrx_event_s {
+   hrx_stream_t recording_stream;
+   hrx_device_t device;
+   int64_t record_time_ns;  // Host-side timestamp at record time.
++  // 8-byte host-coherent buffer the device writes its queue timestamp tick
++  // into at the record point. NULL when timing is disabled or the device
++  // publishes no timestamp domain (host time is used instead).
++  iree_hal_buffer_t* timestamp_buffer;
++  // Domain of the queue family the tick was captured in (0 = no tick).
++  uint64_t timestamp_frequency_hz;
++  uint32_t timestamp_valid_bits;
+ } hrx_event_s;
+ 
+ // Stream with pending command buffer.
