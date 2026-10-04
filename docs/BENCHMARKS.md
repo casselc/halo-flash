@@ -126,3 +126,18 @@ Bit-identical to stepping (outputs and both states). Across 36 DeltaNet
 layers that is about 0.21 ms per prompt token, a ceiling near 4,800 tok/s
 for this part alone; the recurrence is still serial in T with one block per
 head (48 blocks), so the chunked parallel (WY) form is the next lever.
+
+### BF16 prefill GEMM (Qwen3.5 torso, 2026-10-04, `halo_gemm_bench bf16`)
+
+FP16 WMMA over BF16 weights, eight weight copies cycled so they come from
+DRAM (the single-copy numbers were 2-4x better and misleading: the matrix
+stayed in the cache).
+
+| Kernel | 6144 x 2048, T = 16 | T = 64 | T = 256 |
+|---|---:|---:|---:|
+| 32-value K stages (`halo_gemm_bf16_f16`) | 937 us (27 GB/s) | 902 us | 1459 us (4.4 TFLOPS) |
+| 128-value K stages, loads in flight (`_k128`) | 500 us (50 GB/s) | 617 us | 641 us (10.1 TFLOPS) |
+
+Split-K over 4 was slower in every case. Short chunks remain latency-bound;
+a skinny (VALU, weights streamed like the decode GEMVs) kernel for T <= 16
+is the next candidate.

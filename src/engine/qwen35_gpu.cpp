@@ -294,6 +294,10 @@ bool Qwen35Gpu::AllocChunk(std::string* error) {
   k.ctx = Scratch(T * nh * hd, error);
   k.lora_tmp = Scratch(T * max_rank, error);
   k.lora_out = Scratch(T * widest, error);
+  if (max_context_ <= kMaxBatchedAttention) {
+    k.scores = Scratch(T * nh * max_context_, error);
+    if (!k.scores) return false;
+  }
   for (const auto* b : {&k.res, &k.xn, &k.out, &k.g, &k.up, &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg,
                         &k.q, &k.gate, &k.k, &k.v, &k.ctx, &k.lora_tmp, &k.lora_out})
     if (!*b) return false;
@@ -305,14 +309,21 @@ bool Qwen35Gpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::B
                      std::string* error) {
   const auto& d = tensors_.at(t.data);
   const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
-  if (t.type == core::GgmlType::kBF16 && cols % 32 == 0) {
+  if (t.type == core::GgmlType::kBF16 && cols % 128 == 0) {
+    // Weights streamed 256 bytes per row at a time (docs/BENCHMARKS.md).
+    if (!Launch("halo_gemm_bf16_f16_k128", {(tokens + 63) / 64, (rows + 63) / 64}, {128},
+                {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                 rt::Arg::Val(tokens)},
+                error))
+      return false;
+  } else if (t.type == core::GgmlType::kBF16 && cols % 32 == 0) {
     if (!Launch("halo_gemm_bf16_f16", {(tokens + 63) / 64, (rows + 127) / 128}, {256},
                 {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols),
                  rt::Arg::Val(tokens)},
                 error))
       return false;
   } else if (t.type == core::GgmlType::kF32 && cols <= 8192) {
-    if (!Launch("halo_gemm_f32_rows", {Blocks(rows), tokens}, {kBlock},
+    if (!Launch("halo_gemm_f32_rows", {Blocks(rows, 8), tokens}, {kBlock},
                 {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols)}, error))
       return false;
   } else {
@@ -330,11 +341,11 @@ bool Qwen35Gpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::B
   }
   if (auto it = lora_.find(t.data); it != lora_.end()) {
     const auto& l = it->second;
-    if (!Launch("halo_gemm_f32_rows", {Blocks(l.rank), tokens}, {kBlock},
+    if (!Launch("halo_gemm_f32_rows", {Blocks(l.rank, 8), tokens}, {kBlock},
                 {rt::Arg::Buf(l.a), rt::Arg::Buf(x), rt::Arg::Buf(chunk_.lora_tmp), rt::Arg::Val(l.rank),
                  rt::Arg::Val(cols)},
                 error) ||
-        !Launch("halo_gemm_f32_rows", {Blocks(rows), tokens}, {kBlock},
+        !Launch("halo_gemm_f32_narrow", {Blocks(rows), tokens}, {kBlock},
                 {rt::Arg::Buf(l.b), rt::Arg::Buf(chunk_.lora_tmp), rt::Arg::Buf(chunk_.lora_out), rt::Arg::Val(rows),
                  rt::Arg::Val(l.rank)},
                 error) ||
@@ -424,38 +435,67 @@ bool Qwen35Gpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<flo
       if (!Gemm(L.attn_q, K.xn, K.qg, T, error) || !Gemm(L.attn_k, K.xn, K.k, T, error) ||
           !Gemm(L.attn_v, K.xn, K.v, T, error) || !norm(K.k, L.attn_k_norm, K.k, T * nkv, hd))
         return false;
-      for (std::uint32_t t = 0; t < T; ++t) {
-        const std::uint32_t pos = position_ + t;
-        const std::size_t qo = std::size_t{t} * nh * hd * 4, ko = std::size_t{t} * nkv * hd * 4,
-                          kv_off = std::size_t{pos} * nkv * hd * 4;
-        if (!Launch("halo_split_qgate", {nh}, {kBlock},
-                    {rt::Arg::Buf(K.qg, std::size_t{t} * 2 * nh * hd * 4), rt::Arg::Buf(K.q, qo), rt::Arg::Buf(K.gate, qo),
-                     rt::Arg::Val(hd)},
+      const std::size_t kv_base = std::size_t{position_} * nkv * hd * 4;
+      if (K.scores) {
+        // The whole chunk at once: split, norm and rotate every token's heads,
+        // write the chunk's K and V into the cache, then each query attends
+        // to the positions up to its own.
+        if (!Launch("halo_split_qgate", {T * nh}, {kBlock},
+                    {rt::Arg::Buf(K.qg), rt::Arg::Buf(K.q), rt::Arg::Buf(K.gate), rt::Arg::Val(hd)}, error) ||
+            !norm(K.q, L.attn_q_norm, K.q, T * nh, hd) ||
+            !Launch("halo_rope_neox_rows", {T * nh}, {64},
+                    {rt::Arg::Buf(K.q), rt::Arg::Val(hd), rt::Arg::Val(c.rotary_dim), rt::Arg::Val(position_),
+                     rt::Arg::Val(nh), rt::Arg::Val(c.rope_theta)},
                     error) ||
-            !Launch("halo_rmsnorm", {nh}, {kBlock},
-                    {rt::Arg::Buf(K.q, qo), buf(L.attn_q_norm), rt::Arg::Buf(K.q, qo), rt::Arg::Val(hd),
-                     rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(0)},
+            !Launch("halo_rope_neox_rows", {T * nkv}, {64},
+                    {rt::Arg::Buf(K.k), rt::Arg::Val(hd), rt::Arg::Val(c.rotary_dim), rt::Arg::Val(position_),
+                     rt::Arg::Val(nkv), rt::Arg::Val(c.rope_theta)},
                     error) ||
-            !Launch("halo_rope_neox", {nh}, {64},
-                    {rt::Arg::Buf(K.q, qo), rt::Arg::Val(hd), rt::Arg::Val(c.rotary_dim), rt::Arg::Val(pos),
-                     rt::Arg::Val(c.rope_theta)},
+            !Launch("halo_copy", {Blocks(std::size_t{T} * nkv * hd)}, {kBlock},
+                    {rt::Arg::Buf(S.k, kv_base), rt::Arg::Buf(K.k), rt::Arg::Val(T * nkv * hd)}, error) ||
+            !Launch("halo_copy", {Blocks(std::size_t{T} * nkv * hd)}, {kBlock},
+                    {rt::Arg::Buf(S.v, kv_base), rt::Arg::Buf(K.v), rt::Arg::Val(T * nkv * hd)}, error) ||
+            !Launch("halo_attention_prefill", {nh, T}, {kBlock},
+                    {rt::Arg::Buf(K.q), rt::Arg::Buf(S.k), rt::Arg::Buf(S.v), rt::Arg::Buf(K.gate), rt::Arg::Buf(K.ctx),
+                     rt::Arg::Buf(K.scores), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(hd),
+                     rt::Arg::Val(position_), rt::Arg::Val(max_context_)},
                     error) ||
-            !Launch("halo_rope_neox", {nkv}, {64},
-                    {rt::Arg::Buf(K.k, ko), rt::Arg::Val(hd), rt::Arg::Val(c.rotary_dim), rt::Arg::Val(pos),
-                     rt::Arg::Val(c.rope_theta)},
-                    error) ||
-            !Launch("halo_copy", {Blocks(nkv * hd)}, {kBlock},
-                    {rt::Arg::Buf(S.k, kv_off), rt::Arg::Buf(K.k, ko), rt::Arg::Val(nkv * hd)}, error) ||
-            !Launch("halo_copy", {Blocks(nkv * hd)}, {kBlock},
-                    {rt::Arg::Buf(S.v, kv_off), rt::Arg::Buf(K.v, ko), rt::Arg::Val(nkv * hd)}, error) ||
-            !Launch("halo_attention_decode", {nh}, {kBlock},
-                    {rt::Arg::Buf(K.q, qo), rt::Arg::Buf(S.k), rt::Arg::Buf(S.v), rt::Arg::Buf(K.gate, qo),
-                     rt::Arg::Buf(K.ctx, qo), rt::Arg::Buf(scores_), rt::Arg::Val(nh), rt::Arg::Val(nkv),
-                     rt::Arg::Val(hd), rt::Arg::Val(pos + 1), rt::Arg::Val(max_context_)},
-                    error))
+            !Gemm(L.attn_out, K.ctx, K.out, T, error))
           return false;
+      } else {
+        for (std::uint32_t t = 0; t < T; ++t) {
+          const std::uint32_t pos = position_ + t;
+          const std::size_t qo = std::size_t{t} * nh * hd * 4, ko = std::size_t{t} * nkv * hd * 4,
+                            kv_off = std::size_t{pos} * nkv * hd * 4;
+          if (!Launch("halo_split_qgate", {nh}, {kBlock},
+                      {rt::Arg::Buf(K.qg, std::size_t{t} * 2 * nh * hd * 4), rt::Arg::Buf(K.q, qo), rt::Arg::Buf(K.gate, qo),
+                       rt::Arg::Val(hd)},
+                      error) ||
+              !Launch("halo_rmsnorm", {nh}, {kBlock},
+                      {rt::Arg::Buf(K.q, qo), buf(L.attn_q_norm), rt::Arg::Buf(K.q, qo), rt::Arg::Val(hd),
+                       rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(0)},
+                      error) ||
+              !Launch("halo_rope_neox", {nh}, {64},
+                      {rt::Arg::Buf(K.q, qo), rt::Arg::Val(hd), rt::Arg::Val(c.rotary_dim), rt::Arg::Val(pos),
+                       rt::Arg::Val(c.rope_theta)},
+                      error) ||
+              !Launch("halo_rope_neox", {nkv}, {64},
+                      {rt::Arg::Buf(K.k, ko), rt::Arg::Val(hd), rt::Arg::Val(c.rotary_dim), rt::Arg::Val(pos),
+                       rt::Arg::Val(c.rope_theta)},
+                      error) ||
+              !Launch("halo_copy", {Blocks(nkv * hd)}, {kBlock},
+                      {rt::Arg::Buf(S.k, kv_off), rt::Arg::Buf(K.k, ko), rt::Arg::Val(nkv * hd)}, error) ||
+              !Launch("halo_copy", {Blocks(nkv * hd)}, {kBlock},
+                      {rt::Arg::Buf(S.v, kv_off), rt::Arg::Buf(K.v, ko), rt::Arg::Val(nkv * hd)}, error) ||
+              !Launch("halo_attention_decode", {nh}, {kBlock},
+                      {rt::Arg::Buf(K.q, qo), rt::Arg::Buf(S.k), rt::Arg::Buf(S.v), rt::Arg::Buf(K.gate, qo),
+                       rt::Arg::Buf(K.ctx, qo), rt::Arg::Buf(scores_), rt::Arg::Val(nh), rt::Arg::Val(nkv),
+                       rt::Arg::Val(hd), rt::Arg::Val(pos + 1), rt::Arg::Val(max_context_)},
+                      error))
+            return false;
+        }
+        if (!Gemm(L.attn_out, K.ctx, K.out, T, error)) return false;
       }
-      if (!Gemm(L.attn_out, K.ctx, K.out, T, error)) return false;
     }
     if (!Launch("halo_add", {Blocks(std::size_t{T} * H)}, {kBlock},
                 {rt::Arg::Buf(K.res), rt::Arg::Buf(K.out), rt::Arg::Val(T * H)}, error) ||

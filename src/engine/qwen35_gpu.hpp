@@ -34,6 +34,9 @@ class Qwen35Gpu {
   /// normalized hidden state. Long inputs run in chunks of kMaxChunk.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> hidden, std::string* error);
   static constexpr std::uint32_t kMaxChunk = 256;
+  /// Up to this context the chunk's attention runs in one launch (its score
+  /// scratch is kMaxChunk x heads x max_context floats); beyond, a token at a time.
+  static constexpr std::uint32_t kMaxBatchedAttention = 8192;
   /// Saves / restores the whole sequence state (recurrent state, conv
   /// history, KV cache, position) in device memory, for prefix forking.
   /// Rewinds to an empty sequence (position 0, zero recurrent state).
@@ -84,6 +87,7 @@ class Qwen35Gpu {
   // Chunk activations, [kMaxChunk][dim] (allocated on the first Prefill).
   struct Chunk {
     rt::Buffer res, xn, out, g, up, qkv, conv, z, alpha, beta, gdn, qg, q, gate, k, v, ctx, lora_tmp, lora_out;
+    rt::Buffer scores;  // [kMaxChunk][heads][max_context], when max_context <= kMaxBatchedAttention
   } chunk_;
   bool chunk_ready_ = false;
 };

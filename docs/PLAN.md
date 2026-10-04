@@ -452,8 +452,14 @@ Done the same night: `Qwen35Gpu::Prefill` runs a chunk as T-token GEMMs
 through `halo_gemm_f32_rows`), the DeltaNet chunk kernels, and attention a
 token at a time. Hidden states match stepping to 5e-4 relative L2; the
 decider parity test against the Python engine passes (worst difference
-0.0018 of the 0.01 budget). The same request now takes 225 ms (was 3.5 s);
-a three-question 248-token request 0.61 s (was 10.6 s).
+0.0018 of the 0.01 budget). The same request first took 225 ms (was
+3.5 s). Then: a BF16 GEMM that streams 256 bytes per row per stage with the
+next stage's loads in flight (2x the DRAM throughput of the 64-byte
+version), the chunk's attention in one launch per layer, and coalesced LoRA
+factors: 145 ms for 83 tokens, 314 ms for a three-question 248-token
+request (was 10.6 s). The BF16 GEMM is now 80% of the decider's GPU time
+and still reads weights at only 40-80 GB/s from DRAM for short chunks
+(docs/BENCHMARKS.md); split-K made it slower.
 
 **P10: variants, first-class (supersedes "LoRA inference"; user, 2026-10-03).**
 

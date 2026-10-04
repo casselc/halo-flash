@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <string>
@@ -190,5 +191,14 @@ TEST(Qwen35Gpu, DeciderTorsoPrefillMatchesSteps) {
     EXPECT_LT(std::sqrt(dd / mm), 2e-2);
     std::printf("%s: prefill vs steps over %zu tokens: worst relative L2 %.3g, worst cosine %.6f; next step %.3g\n",
                 rt::BackendName(b), tokens.size(), worst, worst_cos, std::sqrt(dd / mm));
+    // Beyond kMaxBatchedAttention the chunk's attention runs a token at a
+    // time; it must agree with the batched path bit for bit.
+    auto wide = engine::Qwen35Gpu::Create(*dev, *w, &*lora, engine::Qwen35Gpu::kMaxBatchedAttention + 8, &error);
+    ASSERT_TRUE(wide) << error;
+    std::vector<float> hw(40 * H);
+    ASSERT_TRUE(wide->Prefill(std::span<const std::int32_t>(tokens.data(), 40), hw, &error)) << error;
+    for (std::size_t i = 0; i < 40 * H; ++i)
+      ASSERT_EQ(std::bit_cast<std::uint32_t>(hw[i]), std::bit_cast<std::uint32_t>(got[i]))
+          << "per-token attention fallback differs at " << i;
   }
 }

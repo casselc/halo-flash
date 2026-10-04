@@ -1233,3 +1233,13 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "Qwen35Gpu.DeciderTorsoPrefillMatchesSteps"
 why = "each token of a chunk is rotated and cached at its own position"
+
+[[mutant]]
+name = "prefill-attention-excludes-self"
+file = "src/kernels/core.hip"
+find = '  const std::uint32_t h = blockIdx.x, t = blockIdx.y, kvh = h / (num_heads / num_kv_heads), n = pos0 + t + 1;'
+replace = '  const std::uint32_t h = blockIdx.x, t = blockIdx.y, kvh = h / (num_heads / num_kv_heads), n = pos0 + t + (t == 0);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Qwen35Gpu.DeciderTorsoPrefillMatchesSteps"
+why = "each query of a chunk attends to every position up to and including its own"

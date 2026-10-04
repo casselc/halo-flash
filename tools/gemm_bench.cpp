@@ -5,6 +5,7 @@
 //   halo_gemm_bench [reps]
 //   halo_gemm_bench peak      register-only WMMA throughput (the ceiling)
 //   halo_gemm_bench deltanet  one DeltaNet layer's chunk: decode steps vs chunked kernels
+//   halo_gemm_bench bf16      the Qwen3.5 BF16 GEMMs (fp16 WMMA), weights from DRAM
 
 #include <chrono>
 #include <cmath>
@@ -95,6 +96,50 @@ int main(int argc, char** argv) {
       std::printf("deltanet T %5u: %8.1f us as steps, %8.1f us chunked (%.1fx), %.1f us per token chunked\n", T,
                   steps * 1e6, chunk * 1e6, steps / chunk, chunk * 1e6 / T);
       for (auto* b : {&in, &cs, &cw, &conv, &ab, &st, &nw, &z, &out, &hv}) d->Free(*b);
+    }
+    return 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "bf16") {
+    // The Qwen3.5 torso's BF16 GEMM (fp16 WMMA), with split-K when the chunk
+    // is short, at the 2B model's shapes.
+    auto d = rt::Device::Create(rt::Backend::kHip, &e);
+    if (!d || !d->LoadModule(kernels::CoreHsaco(), &e)) return std::printf("%s\n", e.c_str()), 1;
+    struct Shape { const char* name; std::uint32_t rows, cols; };
+    for (const Shape s : {Shape{"ffn up  6144x2048", 6144, 2048}, Shape{"ffn down 2048x6144", 2048, 6144},
+                          Shape{"qkv     6144x2048", 6144, 2048}}) {
+      // Eight copies cycled per launch (200 MB): weights come from DRAM, as
+      // in a model whose layers each have their own.
+      constexpr std::uint32_t kCopies = 8;
+      std::vector<std::uint16_t> w(std::size_t{s.rows} * s.cols, 0x3c00);
+      auto wb = d->Alloc(w.size() * 2 * kCopies, &e);
+      for (std::uint32_t c = 0; c < kCopies; ++c) (void)d->Upload(wb, std::size_t{c} * w.size() * 2, w.data(), w.size() * 2, &e);
+      std::uint32_t next = 0;
+      for (const std::uint32_t T : {16u, 64u, 128u, 256u}) {
+        std::vector<float> x(std::size_t{T} * s.cols, 0.01f);
+        auto xb = d->Alloc(x.size() * 4, &e), yb = d->Alloc(std::size_t{T} * s.rows * 4 * 8, &e);
+        (void)d->Upload(xb, 0, x.data(), x.size() * 4, &e);
+        for (const char* name : {"halo_gemm_bf16_f16", "halo_gemm_bf16_f16_k128"}) {
+          const auto k = d->Kernel(name, &e);
+          const bool k128 = std::string(name).ends_with("k128");
+          const auto run = [&] {
+            const rt::Arg a[] = {rt::Arg::Buf(wb, std::size_t{next++ % kCopies} * w.size() * 2), rt::Arg::Buf(xb),
+                                 rt::Arg::Buf(yb), rt::Arg::Val(s.rows), rt::Arg::Val(s.cols), rt::Arg::Val(T)};
+            if (k128) (void)d->Launch(k, {(T + 63) / 64, (s.rows + 63) / 64}, {128}, a, &e);
+            else (void)d->Launch(k, {(T + 63) / 64, (s.rows + 127) / 128}, {256}, a, &e);
+          };
+          for (int i = 0; i < 3; ++i) run();
+          (void)d->Synchronize(&e);
+          const auto t0 = std::chrono::steady_clock::now();
+          for (int i = 0; i < 20; ++i) run();
+          (void)d->Synchronize(&e);
+          const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 20;
+          std::printf("%-24s %-20s T %4u  %8.1f us  %6.2f TFLOPS  %6.1f GB/s weights\n", name, s.name, T, sec * 1e6,
+                      2.0 * s.rows * s.cols * T / sec / 1e12, 2.0 * s.rows * s.cols / sec / 1e9);
+        }
+        d->Free(xb);
+        d->Free(yb);
+      }
+      d->Free(wb);
     }
     return 0;
   }
