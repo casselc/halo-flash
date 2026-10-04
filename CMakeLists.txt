@@ -42,6 +42,12 @@ add_library(halo_text STATIC
 )
 target_link_libraries(halo_text PUBLIC halo_core)
 
+# --- decide: System One decision API ---------------------------------------
+add_library(halo_decide STATIC
+  src/decide/systemone.cpp
+)
+target_link_libraries(halo_decide PUBLIC halo_core halo_text)
+
 # --- model: config, weight binding, n-gram table, CPU reference -------------
 find_package(Threads REQUIRED)
 add_library(halo_model STATIC
@@ -76,7 +82,7 @@ if(HALO_BUILD_TESTS)
 
   function(halo_test name)
     add_executable(${name} ${ARGN})
-    target_link_libraries(${name} PRIVATE halo_core halo_text halo_model GTest::gtest_main hegel)
+    target_link_libraries(${name} PRIVATE halo_core halo_text halo_model halo_decide GTest::gtest_main hegel)
     # Hegel's params structs are meant for partial designated initializers.
     target_compile_options(${name} PRIVATE -Wno-missing-designated-field-initializers)
     # Hegel's example database: failures found once are replayed first.
@@ -93,6 +99,10 @@ if(HALO_BUILD_TESTS)
     HALO_CORE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/core/data")
   halo_test(text_tests
     tests/text/tokenizer_test.cpp)
+  halo_test(decide_tests
+    tests/decide/systemone_test.cpp)
+  target_compile_definitions(decide_tests PRIVATE
+    HALO_DECIDE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/decide/data")
   halo_test(model_tests
     tests/model/reference_hf_test.cpp
     tests/model/ngram_table_test.cpp
