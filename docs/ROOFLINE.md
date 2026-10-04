@@ -526,7 +526,16 @@ GEMM's separate pass anyway.
 - Prediction: 0.5-0.65 ms per call, so **-60 to -75 ms** over 96 calls. This is a step toward
   kernel A in 3.3.
 
-**4b. Router F32 GEMM (`f32_tiled [32x8]`, 512 x 2560 x 2048 per layer).**
+**4b. Router F32 GEMM (`f32_tiled [32x8]`, 512 x 2560 x 2048 per layer).** DONE, partly. A
+trace first: 52% of cycles in `s_waitcnt vmcnt`, 33% at barriers, ~4% in FMAs. With a 32-wide K
+step and a one-stage register prefetch it measured **-36.5 ms** against a predicted -65 to -85:
+router 87.9 -> 61.4 ms, alpha/beta/sgate 43.8 -> 32.4 ms. The long-set scores are identical on
+all 12 cases (same summation order).
+
+A second trace explains the shortfall: 63% of cycles still wait on `vmcnt(0)` once per stage.
+One stage of math (~600 cycles) covers too little of the load latency. Each 64 x 64 fp32 tile
+re-reads its operands, about 335 MB per call, or ~260 GB/s at 1.28 ms. Next: a deeper prefetch,
+or 128-row tiles to halve the traffic. Trace that version before predicting.
 - Hypothesis: 1.79 ms per call against ~0.2 ms of fp32 issue. Its 64 x 64 tiles with
   `ds_load_b128` and ~2 waves per SIMD leave it latency-bound. A register-blocked fp32 tile, or
   WMMA on a hi/lo fp16 split for near-fp32 sums, keeps the routing exact enough. The route must

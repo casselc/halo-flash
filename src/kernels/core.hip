@@ -4058,36 +4058,62 @@ extern "C" __global__ void __launch_bounds__(128)
 }
 
 // ---- P4: tiled FP32 GEMM for the F32 projections (router, DeltaNet
-// alpha/beta, mixer inject, shared-expert gate) -------------------------------
+// alpha/beta, shared-expert gate) ---------------------------------------------
 // y[t][r] = sum_c W[r][c] x[t][c], fp32 throughout: 64 rows x 64 tokens per
-// block, K staged 16 at a time in LDS, 4 x 4 outputs per thread.
-//   grid (ceil(T / 64), ceil(rows / 64)), block 256; cols % 16 == 0.
+// block, K staged 32 at a time in LDS, 4 x 4 outputs per thread, products
+// added in ascending k. The next stage's operands load into registers while
+// the current one is multiplied out (a thread trace of the unprefetched
+// version: 52% of cycles waiting on these loads, 33% at barriers).
+//   grid (ceil(T / 64), ceil(rows / 64)), block 256; cols % 16 == 0 (a
+//   trailing half stage is zero-filled).
 extern "C" __global__ void __launch_bounds__(256)
     halo_gemm_f32_tiled(const float* w, const float* x, float* y, std::uint32_t rows, std::uint32_t cols,
                         std::uint32_t tokens) {
-  constexpr std::uint32_t BM = 64, BN = 64, BK = 16;
+  constexpr std::uint32_t BM = 64, BN = 64, BK = 32;
   __shared__ float As[BK][BM + 4], Bs[BK][BN + 4];
   const std::uint32_t tid = threadIdx.x, r0 = blockIdx.y * BM, t0 = blockIdx.x * BN;
   const std::uint32_t tr = (tid % 16) * 4, tt = (tid / 16) * 4;
-  // Loads: 64 x 16 floats per operand, one float4 per thread.
-  const std::uint32_t lrow = tid / 4, lk = (tid % 4) * 4;
-  const float* wp = w + static_cast<std::size_t>(min(r0 + lrow, rows - 1)) * cols + lk;
-  const float* xp = x + static_cast<std::size_t>(min(t0 + lrow, tokens - 1)) * cols + lk;
+  // Loads: 64 x 32 floats per operand, two float4 per thread (rows lrow and
+  // lrow + 32).
+  const std::uint32_t lrow = tid / 8, lk = (tid % 8) * 4;
+  const float* wp0 = w + static_cast<std::size_t>(min(r0 + lrow, rows - 1)) * cols + lk;
+  const float* wp1 = w + static_cast<std::size_t>(min(r0 + lrow + 32, rows - 1)) * cols + lk;
+  const float* xp0 = x + static_cast<std::size_t>(min(t0 + lrow, tokens - 1)) * cols + lk;
+  const float* xp1 = x + static_cast<std::size_t>(min(t0 + lrow + 32, tokens - 1)) * cols + lk;
+  const auto ld = [&](const float* p, std::uint32_t k0) {
+    return k0 + lk < cols ? *reinterpret_cast<const float4*>(p + k0) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  };
+  float4 a0 = ld(wp0, 0), a1 = ld(wp1, 0), b0 = ld(xp0, 0), b1 = ld(xp1, 0);
   float acc[4][4] = {};
   for (std::uint32_t k0 = 0; k0 < cols; k0 += BK) {
-    const float4 a = *reinterpret_cast<const float4*>(wp + k0), b = *reinterpret_cast<const float4*>(xp + k0);
+    __syncthreads();  // the previous stage's reads are done
+    As[lk][lrow] = a0.x;
+    As[lk + 1][lrow] = a0.y;
+    As[lk + 2][lrow] = a0.z;
+    As[lk + 3][lrow] = a0.w;
+    As[lk][lrow + 32] = a1.x;
+    As[lk + 1][lrow + 32] = a1.y;
+    As[lk + 2][lrow + 32] = a1.z;
+    As[lk + 3][lrow + 32] = a1.w;
+    Bs[lk][lrow] = b0.x;
+    Bs[lk + 1][lrow] = b0.y;
+    Bs[lk + 2][lrow] = b0.z;
+    Bs[lk + 3][lrow] = b0.w;
+    Bs[lk][lrow + 32] = b1.x;
+    Bs[lk + 1][lrow + 32] = b1.y;
+    Bs[lk + 2][lrow + 32] = b1.z;
+    Bs[lk + 3][lrow + 32] = b1.w;
     __syncthreads();
-    As[lk][lrow] = a.x;
-    As[lk + 1][lrow] = a.y;
-    As[lk + 2][lrow] = a.z;
-    As[lk + 3][lrow] = a.w;
-    Bs[lk][lrow] = b.x;
-    Bs[lk + 1][lrow] = b.y;
-    Bs[lk + 2][lrow] = b.z;
-    Bs[lk + 3][lrow] = b.w;
-    __syncthreads();
+    if (k0 + BK < cols) {  // next stage, in flight during the math below
+      a0 = ld(wp0, k0 + BK);
+      a1 = ld(wp1, k0 + BK);
+      b0 = ld(xp0, k0 + BK);
+      b1 = ld(xp1, k0 + BK);
+    }
+    const std::uint32_t kn = min(BK, cols - k0);  // 16 or 32: a zero-filled half adds nothing
 #pragma unroll
     for (std::uint32_t k = 0; k < BK; ++k) {
+      if (k >= kn) break;
       float av[4], bv[4];
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
