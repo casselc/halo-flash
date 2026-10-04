@@ -4307,6 +4307,8 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
   constexpr std::uint32_t APR = KS / 16, BPR = KS / 8;  // 16-byte pieces per row: int8 weights, fp16 tokens
   constexpr std::uint32_t AP = BM * APR / NT, BP = BN * BPR / NT;  // per thread
   static_assert(WM * WN == 8 && AP >= 1 && BP >= 1, "8 waves; every thread stages A and B");
+  static_assert(BM * APR % NT == 0 && BN * BPR % NT == 0,
+                "the stage splits evenly over the threads (else rows go unstaged: <320, 64, .., 32> faulted)");
   // One buffer: the A and B stages, later the epilogue's per-wave slices.
   constexpr std::uint32_t kStage = (BM + BN) * RS, kSlices = 8 * TM * 16 * 16 * 2;
   __shared__ __attribute__((aligned(16))) _Float16 smem[kStage > kSlices ? kStage : kSlices];
@@ -4441,7 +4443,7 @@ extern "C" __global__ void __launch_bounds__(256)
     halo_gemm_q8r_f16_mix(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
                           std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens,
                           const float* xn, _Float16* y16, const float* rs, const float* nw) {
-  GemmQ8rF16<256, 128, 8, 1, 64, true>(qs, d, x, y, rows, cols, qstride, tokens, xn, y16, rs, nw);
+  GemmQ8rF16<256, 128, 8, 1, 32, true>(qs, d, x, y, rows, cols, qstride, tokens, xn, y16, rs, nw);
 }
 
 // Repacked Q8_0 rows reordered stream-major -> index-major: destination row
