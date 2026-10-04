@@ -29,7 +29,8 @@ TEST(StrandsDecider, AnswersMatchPythonEngine) {
   const std::string d = dir;
   std::string error;
   auto decider = StrandsDecider::Open({d + "/Qwen3.5-2B-Base-BF16.gguf", d + "/strands-decider-lora-f32.gguf",
-                                       d + "/strands-decider-head.gguf", d + "/strands-decider-tokenizer.gguf"},
+                                       d + "/strands-decider-head.gguf", d + "/strands-decider-tokenizer.gguf",
+                                       std::getenv("HALO_DECIDER_DEVICE") ? std::getenv("HALO_DECIDER_DEVICE") : "cpu"},
                                       &error);
   ASSERT_TRUE(decider) << error;
   std::ifstream f(std::string(HALO_DECIDE_TEST_DATA_DIR) + "/engine.jsonl");

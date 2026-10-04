@@ -101,6 +101,19 @@ std::unique_ptr<StrandsDecider> StrandsDecider::Open(const DeciderFiles& f, std:
       d->temperature_by_kind_.emplace_back(k, *t);
   d->ordinal_smoothing_ = h.GetMetadataFloat32("decider.ordinal_smoothing").value_or(0.0F);
   d->fit_.max_length = h.GetMetadataUint32("decider.max_length").value_or(4096);
+  if (f.device != "cpu") {
+#if HALO_WITH_HIP
+    const auto backend = f.device == "hrx" ? rt::Backend::kHrx : rt::Backend::kHip;
+    d->dev_ = rt::Device::Create(backend, error);
+    if (!d->dev_) return nullptr;
+    d->gpu_ = engine::Qwen35Gpu::Create(*d->dev_, *d->torso_, d->lora_ ? &*d->lora_ : nullptr,
+                                        static_cast<std::uint32_t>(d->fit_.max_length + 8), error);
+    if (!d->gpu_) return nullptr;
+#else
+    if (error) *error = "built without GPU support";
+    return nullptr;
+#endif
+  }
   return d;
 }
 
@@ -123,20 +136,41 @@ std::optional<json::Value> StrandsDecider::Evaluate(const Request& r, std::strin
   const auto& c = torso_->config;
   std::size_t total = fit->state_ids.size();
   for (const auto& q : fit->question_ids) total += q.size();
-  model::Qwen35Reference prefix(*torso_, static_cast<std::uint32_t>(total));
-  if (lora_) prefix.SetAdapter(&*lora_);
-  for (auto id : fit->state_ids)
-    if (!prefix.Step(static_cast<std::int32_t>(id), {}, {}, error)) return std::nullopt;
-
-  json::Value answers = json::Value::MakeObject();
+  std::vector<std::vector<std::vector<float>>> hidden_by_q(rqs.size());
   std::vector<float> h(c.hidden_size);
-  for (std::size_t q = 0; q < rqs.size(); ++q) {
-    model::Qwen35Reference run = prefix;  // snapshot of the shared state prefix
-    std::vector<std::vector<float>> hidden;
-    for (auto id : fit->question_ids[q]) {
-      if (!run.Step(static_cast<std::int32_t>(id), h, {}, error)) return std::nullopt;
-      hidden.push_back(h);
+#if HALO_WITH_HIP
+  if (gpu_) {
+    // The GPU model is reused across requests: rewind by restoring an empty
+    // state, run the state prefix once, save it, and restore it per question.
+    if (!gpu_->Reset(error)) return std::nullopt;
+    for (auto id : fit->state_ids)
+      if (!gpu_->Step(static_cast<std::int32_t>(id), {}, {}, error)) return std::nullopt;
+    if (!gpu_->SaveState(error)) return std::nullopt;
+    for (std::size_t q = 0; q < rqs.size(); ++q) {
+      if (q > 0 && !gpu_->RestoreState(error)) return std::nullopt;
+      for (auto id : fit->question_ids[q]) {
+        if (!gpu_->Step(static_cast<std::int32_t>(id), h, {}, error)) return std::nullopt;
+        hidden_by_q[q].push_back(h);
+      }
     }
+  }
+#endif
+  if (hidden_by_q.empty() || hidden_by_q[0].empty()) {
+    model::Qwen35Reference prefix(*torso_, static_cast<std::uint32_t>(total));
+    if (lora_) prefix.SetAdapter(&*lora_);
+    for (auto id : fit->state_ids)
+      if (!prefix.Step(static_cast<std::int32_t>(id), {}, {}, error)) return std::nullopt;
+    for (std::size_t q = 0; q < rqs.size(); ++q) {
+      model::Qwen35Reference run = prefix;  // snapshot of the shared state prefix
+      for (auto id : fit->question_ids[q]) {
+        if (!run.Step(static_cast<std::int32_t>(id), h, {}, error)) return std::nullopt;
+        hidden_by_q[q].push_back(h);
+      }
+    }
+  }
+  json::Value answers = json::Value::MakeObject();
+  for (std::size_t q = 0; q < rqs.size(); ++q) {
+    const auto& hidden = hidden_by_q[q];
     std::vector<std::vector<float>> options;
     for (auto idx : fit->option_index[q]) options.push_back(hidden.at(idx));
     const auto logits = head_.Logits(hidden.back(), options);

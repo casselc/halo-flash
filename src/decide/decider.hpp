@@ -16,6 +16,10 @@
 #include "model/lora.hpp"
 #include "model/qwen35.hpp"
 #include "text/tokenizer.hpp"
+#if HALO_WITH_HIP
+#include "engine/qwen35_gpu.hpp"
+#include "rt/device.hpp"
+#endif
 
 namespace halo::decide {
 
@@ -24,6 +28,8 @@ struct DeciderFiles {
   std::string lora_gguf;       ///< tools/convert_lora_gguf.py output ("" = none)
   std::string head_gguf;       ///< tools/convert_decider_head.py output
   std::string tokenizer_gguf;  ///< tools/tokenizer_json_to_gguf.py output of the checkpoint's tokenizer.json
+  /// "cpu" (reference), "hip" or "hrx".
+  std::string device = "cpu";
 };
 
 /// Pointer readout: logit_k = <k(LN(h_option_k)), q(LN(h_answer))> / sqrt(dim).
@@ -58,6 +64,10 @@ class StrandsDecider {
   std::vector<std::pair<Kind, float>> temperature_by_kind_;
   double ordinal_smoothing_ = 0.0;
   FitOptions fit_;
+#if HALO_WITH_HIP
+  std::unique_ptr<rt::Device> dev_;
+  std::unique_ptr<engine::Qwen35Gpu> gpu_;
+#endif
 };
 
 }  // namespace halo::decide

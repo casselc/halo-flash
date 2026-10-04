@@ -63,6 +63,44 @@ add_library(halo_model STATIC
 target_link_libraries(halo_model PUBLIC halo_core Threads::Threads)
 
 
+# --- GPU: device layer (HIP, HRX), kernels, GPU models -----------------------
+option(HALO_GPU "Build the GPU runtime layer and kernels" ON)
+set(HALO_HRX_ROOT "" CACHE PATH "hrx-system checkout built into build/cmake (empty: no HRX backend)")
+if(HALO_GPU)
+  find_program(HIPCC hipcc REQUIRED)
+  set(HALO_GEN ${CMAKE_BINARY_DIR}/gen)
+  add_custom_command(
+    OUTPUT ${HALO_GEN}/core.hsaco
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${HALO_GEN}/kernels
+    COMMAND ${HIPCC} -x hip --offload-arch=gfx1151 --offload-device-only --no-gpu-bundle-output
+            -O3 -std=c++20 -o ${HALO_GEN}/core.hsaco ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/core.hip
+    DEPENDS src/kernels/core.hip
+    COMMENT "Compiling GPU kernels (gfx1151 HSACO)")
+  add_custom_command(
+    OUTPUT ${HALO_GEN}/kernels/core_hsaco.cpp ${HALO_GEN}/kernels/core_hsaco.hpp
+    COMMAND ${CMAKE_COMMAND} -DINPUT=${HALO_GEN}/core.hsaco -DNAME=core -DFUNC=CoreHsaco
+            -DOUTPUT_CPP=${HALO_GEN}/kernels/core_hsaco.cpp -DOUTPUT_HPP=${HALO_GEN}/kernels/core_hsaco.hpp
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed.cmake
+    DEPENDS ${HALO_GEN}/core.hsaco cmake/embed.cmake)
+  add_library(halo_gpu STATIC
+    src/rt/device.cpp
+    src/rt/hip_device.cpp
+    src/engine/qwen35_gpu.cpp
+    ${HALO_GEN}/kernels/core_hsaco.cpp)
+  target_include_directories(halo_gpu PUBLIC ${HALO_GEN})
+  target_compile_definitions(halo_gpu PUBLIC __HIP_PLATFORM_AMD__ HALO_WITH_HIP=1)
+  target_link_libraries(halo_gpu PUBLIC halo_model amdhip64)
+  target_link_libraries(halo_decide PUBLIC halo_gpu)
+  if(HALO_HRX_ROOT)
+    target_sources(halo_gpu PRIVATE src/rt/hrx_device.cpp)
+    target_compile_definitions(halo_gpu PUBLIC HALO_WITH_HRX=1)
+    target_include_directories(halo_gpu PRIVATE ${HALO_HRX_ROOT}/libhrx/include)
+    set(HALO_HRX_LIBDIR ${HALO_HRX_ROOT}/build/cmake/libhrx/src/libhrx)
+    target_link_libraries(halo_gpu PUBLIC ${HALO_HRX_LIBDIR}/libhrx.so)
+    target_link_options(halo_gpu PUBLIC -Wl,-rpath,${HALO_HRX_LIBDIR})
+  endif()
+endif()
+
 # --- tools ------------------------------------------------------------------
 add_executable(gguf_inspect tools/gguf_inspect.cpp)
 target_link_libraries(gguf_inspect PRIVATE halo_core)
@@ -107,6 +145,11 @@ if(HALO_BUILD_TESTS)
     tests/decide/decider_test.cpp)
   target_compile_definitions(decide_tests PRIVATE
     HALO_DECIDE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/decide/data")
+  if(HALO_GPU)
+    halo_test(gpu_tests tests/gpu/qwen35_gpu_test.cpp tests/gpu/quant_gpu_test.cpp)
+    target_link_libraries(gpu_tests PRIVATE halo_gpu)
+    target_link_libraries(decide_tests PRIVATE halo_gpu)
+  endif()
   halo_test(model_tests
     tests/model/reference_hf_test.cpp
     tests/model/ngram_table_test.cpp
