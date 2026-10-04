@@ -890,7 +890,13 @@ chat request (320 prompt tokens) returned reasoning and a parsed
 `get_weather` call in 17 s, almost all of it token-at-a-time prefill; the
 Responses continuation with the tool's output (`previous_response_id`)
 reused 368 of 399 prompt tokens, including the first turn's reasoning,
-and finished in 5.3 s. Next: P4 batched prefill (the dominant cost), the
+and finished in 5.3 s. The official OpenAI Python SDK (3.24) passes
+`tests/functional/openai_sdk_check.py` against `halo_serve` on the real
+model: models, chat (whole, streamed with usage, a tool round trip),
+completions with stop sequences, responses (whole, retrieved, the
+`responses.stream()` helper that reassembles the response from events,
+function calling continued through `previous_response_id`), error shapes
+and `/metrics`. Next: P4 batched prefill (the dominant cost), the
 SQLite response store and per-session engine state (P6).
 
 **Context management and compaction (P6 with P12 evals).**
