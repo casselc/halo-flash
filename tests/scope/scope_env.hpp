@@ -60,6 +60,7 @@ inline void Shutdown() {
   if (!g_env) return;  // chDB never booted
   g_env->writer.reset();
   g_env->reader.reset();
+  if (g_env->lib) g_env->lib->Shutdown();  // no chDB thread outlives main()
 }
 
 /// Skips the calling test when libchdb is unavailable.

@@ -31,6 +31,7 @@ struct ChdbLib::Fns {
   Result* (*stream_done)(void*);
   const char* (*stream_insert_error)(void*);
   void (*destroy_insert_stream)(void*);
+  int (*shutdown)() = nullptr;  // chdb_shutdown, libchdb >= 26.7.2; optional
 };
 
 namespace {
@@ -67,9 +68,13 @@ const ChdbLib* ChdbLib::Load(std::string_view path, std::string* err) {
   }
 #if defined(__has_feature)
 #if __has_feature(thread_sanitizer)
-  // Measured with libchdb 26.7.0: chDB's own threads crash inside TSan's
-  // allocator on their first TLS access (__tls_get_addr -> malloc), before
-  // any query runs. A TSan build records nothing rather than crash.
+  // Measured with libchdb 26.7.0 and 26.9.0: chDB's own threads crash in
+  // TSan's malloc interposition on their first TLS access (glibc
+  // __tls_get_addr -> malloc -> TSan allocator), before any query runs,
+  // also with TSAN_OPTIONS=ignore_noninstrumented_modules=1 and
+  // called_from_lib/race/thread suppressions for libchdb.so. Consistent
+  // with chDB starting threads TSan never registered, so not fixable from
+  // our side. A TSan build records nothing rather than crash.
   if (!std::getenv("HALO_SCOPE_CHDB_UNDER_TSAN")) {
     *err = "libchdb is not usable under ThreadSanitizer (its threads crash in TSan's allocator); "
            "set HALO_SCOPE_CHDB_UNDER_TSAN=1 to try anyway";
@@ -101,6 +106,7 @@ const ChdbLib* ChdbLib::Load(std::string_view path, std::string* err) {
     dlclose(h);
     return nullptr;
   }
+  fns->shutdown = reinterpret_cast<int (*)()>(dlsym(h, "chdb_shutdown"));
   // Before the first connection: the engine owns its signals, not chDB.
   fns->set_signal_handlers_enabled(0);
   auto* lib = new ChdbLib();
@@ -109,6 +115,8 @@ const ChdbLib* ChdbLib::Load(std::string_view path, std::string* err) {
   g_lib = lib;
   return g_lib;
 }
+
+bool ChdbLib::Shutdown() const { return fns_->shutdown && fns_->shutdown() == 0; }
 
 std::string ChdbLib::version() const {
   const char* v = fns_->version();

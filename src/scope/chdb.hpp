@@ -34,6 +34,17 @@ class ChdbLib {
   /// chdb_version() of the loaded library.
   std::string version() const;
   const std::string& path() const { return path_; }
+  /// The owner must destroy every Conn (and should call Shutdown()) before
+  /// the process exits: measured on libchdb 26.7.0 and 26.9.0, exiting
+  /// with a disk-backed connection open segfaults in chDB's own exit
+  /// handlers, and so does closing it from an atexit handler, because
+  /// chDB's statics constructed after registration are destroyed first.
+  ///
+  /// chdb_shutdown(): joins every chDB thread so the host's exit handlers
+  /// never race the engine. Every connection must be closed first; chDB
+  /// cannot be used again in this process. False when unsupported (libchdb
+  /// before 26.7.2) or refused (a connection is still open).
+  bool Shutdown() const;
 
   struct Fns;
   const Fns& fns() const { return *fns_; }
