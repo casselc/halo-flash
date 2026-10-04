@@ -6,6 +6,7 @@
 #include <numeric>
 
 #include "kernels/core_hsaco.hpp"
+#include "kernels/sample_params.h"
 #include "kernels/step_params.h"
 
 namespace halo::engine {
@@ -146,7 +147,9 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   // One upload per step: n-gram rows first (read in place by the PLE
   // matvecs), then the step parameters at a 64-byte aligned offset.
   params_offset_ = (std::size_t{c.PleEmbeddingDim()} * 4 + 63) / 64 * 64;
-  step_host_.assign(params_offset_ + 64, 0);
+  sample_offset_ = params_offset_ + 64;
+  penalty_offset_ = sample_offset_ + (sizeof(HaloSampleParams) + 63) / 64 * 64;
+  step_host_.assign(penalty_offset_ + std::size_t{HALO_SAMPLE_MAX_PENALTIES} * sizeof(HaloPenalty), 0);
   ple_emb_ = dev_.Alloc(step_host_.size(), error);
   if (!ple_emb_) return false;
   owned_.push_back(ple_emb_);
@@ -183,6 +186,19 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   ed_ = Scratch(H, error);
   sgate_ = Scratch(1, error);
   logits_ = Scratch(c.vocab_size, error);
+  sample_blocks_ = (c.vocab_size + HALO_SAMPLE_BLOCK - 1) / HALO_SAMPLE_BLOCK;
+  {
+    const std::size_t cap = std::max<std::size_t>(c.vocab_size, std::size_t{sample_blocks_} * HALO_SAMPLE_TOPK) +
+                            HALO_SAMPLE_MAX_PENALTIES;
+    for (auto [buf, bytes] : {std::pair{&sample_block_out_, sample_blocks_ * sizeof(HaloSampleBlock)},
+                              std::pair{&sample_candidates_, std::size_t{sample_blocks_} * HALO_SAMPLE_TOPK * 8},
+                              std::pair{&sample_key_, cap * 8}, std::pair{&sample_rid_, cap * 4},
+                              std::pair{&sample_w_, cap * 8}, std::pair{&sample_out_, sizeof(HaloSampleOut)}}) {
+      *buf = dev_.Alloc(bytes, error);
+      if (!*buf) return false;
+      owned_.push_back(*buf);
+    }
+  }
   lora_tmp_ = Scratch(max_rank, error);
   lora_out_ = Scratch(std::max<std::size_t>({D, c.SsmConvChannels(), 2ull * c.AttentionQDim(), c.vocab_size}), error);
   linear_.resize(c.num_layers);
@@ -369,7 +385,7 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
                 {rt::Arg::Buf(block_out_), rt::Arg::Buf(ed_), rt::Arg::Buf(sgate_), rt::Arg::Val(H)}, error);
 }
 
-bool FlashNextGpu::Record(bool logits, std::string* error) {
+bool FlashNextGpu::Record(Head head, std::string* error) {
   const auto& c = w_.config;
   const auto& emb = tensors_.at(w_.token_embd.data);
   const rt::Arg eargs[] = {rt::Arg::Buf(emb.buf), rt::Arg::Buf(embd_), rt::Arg::Buf(ple_emb_, params_offset_),
@@ -391,10 +407,50 @@ bool FlashNextGpu::Record(bool logits, std::string* error) {
     if (l.linear ? !Linear(l, linear_[il], error) : !Attention(l, attn_[il], error)) return false;
     if (!combine() || !HcMix(l.hc_ffn, true, error) || !Moe(l, error) || !combine()) return false;
   }
-  return !logits || (HcMix(w_.hc_head, false, error) && MatVec(w_.output, 0, mixed_, logits_, error));
+  if (head == Head::kNone) return true;
+  if (!HcMix(w_.hc_head, false, error) || !MatVec(w_.output, 0, mixed_, logits_, error)) return false;
+  if (head == Head::kLogits) return true;
+  // Sampling: fast blocks + final, then the exact kernel, which runs only
+  // when the final kernel asked for it (or always, in exact mode).
+  const rt::Arg sp = rt::Arg::Buf(ple_emb_, sample_offset_), pen = rt::Arg::Buf(ple_emb_, penalty_offset_);
+  return Launch("halo_sample_blocks", {sample_blocks_}, {1024},
+                {rt::Arg::Buf(logits_), sp, pen, rt::Arg::Buf(sample_block_out_), rt::Arg::Buf(sample_candidates_)},
+                error) &&
+         Launch("halo_sample_final", {1}, {1024},
+                {sp, rt::Arg::Buf(sample_block_out_), rt::Arg::Buf(sample_candidates_), rt::Arg::Val(sample_blocks_),
+                 rt::Arg::Buf(sample_key_), rt::Arg::Buf(sample_rid_), rt::Arg::Buf(sample_w_),
+                 rt::Arg::Buf(sample_out_)},
+                error) &&
+         Launch("halo_sample", {1}, {1024},
+                {rt::Arg::Buf(logits_), sp, pen, rt::Arg::Buf(sample_key_), rt::Arg::Buf(sample_rid_),
+                 rt::Arg::Buf(sample_w_), rt::Arg::Buf(sample_out_)},
+                error);
 }
 
 bool FlashNextGpu::Step(std::int32_t token, std::span<float> logits, std::string* error) {
+  return Run(token, logits.empty() ? Head::kNone : Head::kLogits, nullptr, logits, nullptr, error);
+}
+
+bool FlashNextGpu::StepSample(std::int32_t token, const SampleRequest& request, SampleResult* result,
+                              std::string* error) {
+  const auto fail = [&](const char* what) {
+    if (error) *error = what;
+    return false;
+  };
+  if (request.config == nullptr || result == nullptr) return fail("StepSample needs a config and a result");
+  if (request.penalties.size() > HALO_SAMPLE_MAX_PENALTIES) return fail("too many penalized tokens for the device");
+  if (w_.config.vocab_size > HALO_SAMPLE_MAX_VOCAB) return fail("vocabulary too large for device sampling");
+  try {
+    request.config->Validate();
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return false;
+  }
+  return Run(token, Head::kSample, &request, {}, result, error);
+}
+
+bool FlashNextGpu::Run(std::int32_t token, Head head, const SampleRequest* request, std::span<float> logits,
+                       SampleResult* result, std::string* error) {
   const auto& c = w_.config;
   if (position_ >= max_context_ || token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size) {
     if (error) *error = position_ >= max_context_ ? "context is full" : "token out of range";
@@ -422,14 +478,37 @@ bool FlashNextGpu::Step(std::int32_t token, std::span<float> logits, std::string
   params[kHaloBlock] = position_ / ratio;
   params[kHaloNVisible] = complete <= budget ? n_kv : budget * ratio + (n_kv - complete * ratio);
   std::memcpy(step_host_.data() + params_offset_, params, sizeof(params));
-  if (!dev_.Upload(ple_emb_, 0, step_host_.data(), step_host_.size(), error)) return false;
+  std::size_t upload = sample_offset_;
+  if (head == Head::kSample) {
+    const auto& k = *request->config;
+    HaloSampleParams sp{k.temperature,
+                        k.top_p,
+                        k.min_p,
+                        k.repeat_penalty,
+                        k.frequency_penalty,
+                        k.presence_penalty,
+                        static_cast<std::uint32_t>(std::max(k.top_k, 0)),
+                        static_cast<std::uint32_t>(std::min<std::size_t>(k.min_keep, UINT32_MAX)),
+                        static_cast<std::uint32_t>(request->penalties.size()),
+                        c.vocab_size,
+                        request->rng,
+                        sampling_mode_ == SamplingMode::kFast ? 1u : 0u,
+                        0};
+    std::memcpy(step_host_.data() + sample_offset_, &sp, sizeof(sp));
+    auto* pen = reinterpret_cast<HaloPenalty*>(step_host_.data() + penalty_offset_);
+    for (std::size_t i = 0; i < request->penalties.size(); ++i) {
+      const auto& t = request->penalties[i];
+      pen[i] = {t.token, t.generated_count, t.repeated, 0};
+    }
+    upload = penalty_offset_ + request->penalties.size() * sizeof(HaloPenalty);
+  }
+  if (!dev_.Upload(ple_emb_, 0, step_host_.data(), upload, error)) return false;
 
-  const bool want = !logits.empty();
   if (use_graphs_) {
-    rt::Graph& g = graphs_[want ? 1 : 0];
+    rt::Graph& g = graphs_[static_cast<int>(head)];
     if (!g) {
       if (!dev_.BeginCapture(error)) return false;
-      const bool recorded = Record(want, error);
+      const bool recorded = Record(head, error);
       std::string end_error;
       const bool ended = dev_.EndCapture(&g, &end_error);
       if (!recorded || !ended) {
@@ -438,10 +517,20 @@ bool FlashNextGpu::Step(std::int32_t token, std::span<float> logits, std::string
       }
     }
     if (!dev_.LaunchGraph(g, error)) return false;
-  } else if (!Record(want, error)) {
+  } else if (!Record(head, error)) {
     return false;
   }
-  if (want && !dev_.Download(logits_, 0, logits.data(), c.vocab_size * 4, error)) return false;
+  if (head == Head::kLogits && !dev_.Download(logits_, 0, logits.data(), c.vocab_size * 4, error)) return false;
+  if (head == Head::kSample) {
+    HaloSampleOut out{};
+    if (!dev_.Download(sample_out_, 0, &out, sizeof(out), error)) return false;
+    if (out.token >= c.vocab_size) {
+      if (error) *error = out.token == 0xFFFFFFFFu ? "no finite logit to sample" : "device sampling did not finish";
+      return false;
+    }
+    result->token = static_cast<std::int32_t>(out.token);
+    result->rng = out.rng;
+  }
   ngram_history_ = history;
   for (auto& s : attn_) s.blocks = complete;
   ++position_;

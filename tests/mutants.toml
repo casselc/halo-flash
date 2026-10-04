@@ -420,8 +420,8 @@ why = "pooled keys rotate at block * ratio, a token position"
 [[mutant]]
 name = "fn-graph-stale-upload"
 file = "src/engine/flash_next_gpu.cpp"
-find = '  if (!dev_.Upload(ple_emb_, 0, step_host_.data(), step_host_.size(), error)) return false;'
-replace = '  if (position_ == 0 && !dev_.Upload(ple_emb_, 0, step_host_.data(), step_host_.size(), error)) return false;'
+find = '  if (!dev_.Upload(ple_emb_, 0, step_host_.data(), upload, error)) return false;'
+replace = '  if (position_ == 0 && !dev_.Upload(ple_emb_, 0, step_host_.data(), upload, error)) return false;'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGpu.TinyModelMatchesReferenceAndTransformers:FlashNextGpu.RandomSequencesMatchReference:Qwen35Gpu.TinyModelMatchesCpuReference"
@@ -430,7 +430,7 @@ why = "a replayed graph must see this step's parameters, not those captured"
 [[mutant]]
 name = "fn-graph-wrong-variant"
 file = "src/engine/flash_next_gpu.cpp"
-find = 'rt::Graph& g = graphs_[want ? 1 : 0];'
+find = 'rt::Graph& g = graphs_[static_cast<int>(head)];'
 replace = 'rt::Graph& g = graphs_[0];'
 suite = "gpu"
 binary = "gpu_tests"
@@ -686,3 +686,38 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuFastSample.*"
 why = "greedy ties go to the lower token, as on the CPU"
+
+# ---- Engine sampling plumbing (FlashNextGpu::StepSample) --------------------
+
+[[mutant]]
+name = "fn-sample-penalties-not-uploaded"
+file = "src/engine/flash_next_gpu.cpp"
+find = '    upload = penalty_offset_ + request->penalties.size() * sizeof(HaloPenalty);'
+replace = '    upload = penalty_offset_;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.StepSampleMatchesCpuSamplerInLockstep"
+why = "the step upload carries the request's penalty list"
+timeout = 1200
+
+[[mutant]]
+name = "fn-sample-mode-inverted"
+file = "src/engine/flash_next_gpu.cpp"
+find = '                        sampling_mode_ == SamplingMode::kFast ? 1u : 0u,'
+replace = '                        sampling_mode_ == SamplingMode::kFast ? 0u : 1u,'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.StepSampleMatchesCpuSamplerInLockstep"
+why = "exact mode must run the draw-identical kernel unconditionally"
+timeout = 1200
+
+[[mutant]]
+name = "fn-sample-rng-not-returned"
+file = "src/engine/flash_next_gpu.cpp"
+find = '    result->rng = out.rng;'
+replace = '    result->rng = request->rng;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGpu.StepSampleMatchesCpuSamplerInLockstep"
+why = "the advanced RNG state comes back with the token"
+timeout = 1200

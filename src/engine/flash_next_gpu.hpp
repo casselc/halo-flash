@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "core/sampling.hpp"
 #include "model/lora.hpp"
 #include "model/ngram.hpp"
 #include "model/weights.hpp"
@@ -31,6 +32,26 @@ class FlashNextGpu {
                                                             std::uint32_t max_context, std::string* error);
   ~FlashNextGpu();
   [[nodiscard]] bool Step(std::int32_t token, std::span<float> logits, std::string* error);
+
+  /// Runs `token` and samples the next one on the device; only the token
+  /// and the advanced RNG state come back. `penalties` is the request's
+  /// state (sampling::SamplerState::penalties(), sorted by token, at most
+  /// 8192 entries); `rng` its RNG state.
+  struct SampleRequest {
+    const sampling::SamplingConfig* config = nullptr;
+    std::span<const sampling::TokenPenalty> penalties;
+    std::uint64_t rng = 0;
+  };
+  struct SampleResult {
+    std::int32_t token = -1;
+    std::uint64_t rng = 0;
+  };
+  [[nodiscard]] bool StepSample(std::int32_t token, const SampleRequest& request, SampleResult* result,
+                                std::string* error);
+  /// Fast (default): distribution-exact, falls back to the exact kernel
+  /// when needed. Exact: draw-identical to core/sampling (debugging).
+  enum class SamplingMode { kFast, kExact };
+  void SetSamplingMode(SamplingMode m) noexcept { sampling_mode_ = m; }
   /// Runs `tokens` in order; `logits` (optional) receives the last position's.
   /// Token at a time for now (P4 batches it); any chunking is equivalent.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error);
@@ -79,7 +100,10 @@ class FlashNextGpu {
   bool Ple(const model::LayerWeights& l, std::string* error);
   /// Emits one whole step (everything after the host upload) as device
   /// work; run eagerly or captured into a graph.
-  bool Record(bool logits, std::string* error);
+  enum class Head { kNone, kLogits, kSample };
+  bool Record(Head head, std::string* error);
+  bool Run(std::int32_t token, Head head, const SampleRequest* request, std::span<float> logits,
+           SampleResult* result, std::string* error);
   bool Linear(const model::LayerWeights& l, LinearState& s, std::string* error);
   bool Attention(const model::LayerWeights& l, AttnState& s, std::string* error);
   bool Moe(const model::LayerWeights& l, std::string* error);
@@ -96,9 +120,14 @@ class FlashNextGpu {
   model::NgramTable* ngram_;
   std::uint32_t max_context_ = 0, position_ = 0;
   bool use_graphs_ = true;
-  rt::Graph graphs_[2];  ///< [0] without the LM head, [1] with it
-  std::size_t params_offset_ = 0;
-  std::vector<std::uint8_t> step_host_;  ///< n-gram rows, then step parameters
+  rt::Graph graphs_[3];  ///< by Head: none, logits, sample
+  SamplingMode sampling_mode_ = SamplingMode::kFast;
+  /// One upload per step: n-gram rows, step parameters, sampling parameters,
+  /// penalties (only the used prefix is sent).
+  std::size_t params_offset_ = 0, sample_offset_ = 0, penalty_offset_ = 0;
+  std::vector<std::uint8_t> step_host_;
+  std::uint32_t sample_blocks_ = 0;
+  rt::Buffer sample_block_out_, sample_candidates_, sample_key_, sample_rid_, sample_w_, sample_out_;
   model::NgramHistory ngram_history_;
   std::unordered_map<const void*, DevTensor> tensors_;
   std::unordered_map<const void*, DevLora> lora_;

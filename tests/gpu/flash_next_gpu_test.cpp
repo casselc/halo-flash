@@ -18,6 +18,7 @@
 
 #include "core/gguf.hpp"
 #include "engine/flash_next_gpu.hpp"
+#include "core/sampling.hpp"
 #include "model/lora.hpp"
 #include "model/ngram.hpp"
 #include "model/reference.hpp"
@@ -299,4 +300,61 @@ TEST(FlashNextGpu, RestoreAfterOverwritingHistory) {
       }
     }
   }
+}
+
+// Device sampling through the engine. Two engines run the same token
+// stream in lockstep: one returns logits to the CPU sampler (the oracle),
+// the other samples on the device and returns only the token. Greedy must
+// agree exactly; exact mode must agree token for token and in RNG state,
+// with penalties; fast mode must stay in the CPU support and be
+// deterministic. Graph and eager modes both.
+TEST(FlashNextGpu, StepSampleMatchesCpuSamplerInLockstep) {
+  Tiny* t = LoadTiny();
+  if (!t) GTEST_SKIP() << "set HALO_TINY_HF_DIR";
+  auto devices = Devices();
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  const std::size_t V = t->weights->config.vocab_size;
+  hegel::test([&](hegel::TestCase& tc) {
+    auto& dev = *devices[tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = devices.size() - 1}))];
+    sampling::SamplingConfig c;
+    c.temperature = tc.draw(gs::sampled_from(std::vector<float>{0.0f, 0.7f, 1.0f}));
+    c.top_k = tc.draw(gs::sampled_from(std::vector<std::int32_t>{0, 1, 20}));
+    c.top_p = tc.draw(gs::sampled_from(std::vector<float>{1.0f, 0.9f}));
+    c.min_p = tc.draw(gs::sampled_from(std::vector<float>{0.0f, 0.05f}));
+    c.repeat_penalty = tc.draw(gs::sampled_from(std::vector<float>{1.0f, 1.2f}));
+    c.presence_penalty = tc.draw(gs::sampled_from(std::vector<float>{0.0f, 0.5f}));
+    c.seed = 1;
+    const bool exact = tc.draw(gs::booleans()), graphs = tc.draw(gs::booleans());
+    std::string error;
+    auto oracle = engine::FlashNextGpu::Create(dev, *t->weights, t->ngram.get(), nullptr, 32, &error);
+    auto sampler = engine::FlashNextGpu::Create(dev, *t->weights, t->ngram.get(), nullptr, 32, &error);
+    ASSERT_TRUE(oracle && sampler) << error;
+    sampler->SetUseGraphs(graphs);
+    sampler->SetSamplingMode(exact ? engine::FlashNextGpu::SamplingMode::kExact
+                                   : engine::FlashNextGpu::SamplingMode::kFast);
+    sampling::SamplerState cpu(c);
+    cpu.SetRngState(tc.draw(gs::integers<std::uint64_t>()));
+    std::vector<float> logits(V);
+    std::int32_t token = tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = static_cast<std::int32_t>(V - 1)}));
+    const int steps = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 12}));
+    for (int i = 0; i < steps; ++i) {
+      ASSERT_TRUE(oracle->Step(token, logits, &error)) << error;
+      const auto penalties = cpu.penalties();
+      const std::vector<sampling::TokenPenalty> pen(penalties.begin(), penalties.end());
+      const std::uint64_t rng = cpu.rng_state();
+      engine::FlashNextGpu::SampleResult got;
+      ASSERT_TRUE(sampler->StepSample(token, {&c, pen, rng}, &got, &error)) << error;
+      const auto d = cpu.Distribution(logits);
+      const auto want = static_cast<std::int32_t>(cpu.Sample(logits));
+      if (c.temperature == 0.0f || exact) {
+        ASSERT_EQ(got.token, want) << (exact ? "exact" : "greedy") << " step " << i;
+        ASSERT_EQ(got.rng, cpu.rng_state()) << "step " << i;
+      } else {
+        ASSERT_GT(d.probability(static_cast<sampling::TokenId>(got.token)), 0.0) << "outside the support at step " << i;
+        cpu.SetRngState(got.rng);  // the fast sampler advances the RNG once per draw
+      }
+      token = got.token;  // both engines continue with the device's choice
+      cpu.Accept(static_cast<sampling::TokenId>(token));
+    }
+  }, {.test_cases = 30});
 }
