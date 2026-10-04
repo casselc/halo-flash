@@ -167,6 +167,7 @@ void OpenAiService::Store(const std::string& id, Stored s) {
 }
 
 HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value* prior) {
+  if (req.model.empty()) req.model = opt_.model_id;
   // The conversation: instructions (this request's only), stored turns, new input.
   Value conversation = Value::MakeArray();
   Value messages = Value::MakeArray();

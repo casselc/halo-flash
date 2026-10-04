@@ -854,8 +854,18 @@ layer (incremental parser, keep-alive, chunked SSE, bounded connections);
 `/v1/chat/completions`, `/v1/responses` and `GET /v1/responses/{id}` over
 a `TextGenerator` interface, with stop sequences (byte-at-a-time semantics,
 chunking-independent) and an in-memory response store for
-`previous_response_id`. Next: the Flash-Next `TextGenerator` (tokenizer,
-engine session, sampler), the SQLite store and session binding.
+`previous_response_id`. `FlashNextGenerator` runs it on the engine
+(device sampling, stop tokens, whole-UTF-8 pieces) and keeps the engine's
+state when a prompt extends everything already run; `halo_serve` is the
+binary.
+
+Measured on the real model (2026-10-04, HIP, greedy): a tool-calling
+chat request (320 prompt tokens) returned reasoning and a parsed
+`get_weather` call in 17 s, almost all of it token-at-a-time prefill; the
+Responses continuation with the tool's output (`previous_response_id`)
+reused 368 of 399 prompt tokens, including the first turn's reasoning,
+and finished in 5.3 s. Next: P4 batched prefill (the dominant cost), the
+SQLite response store and per-session engine state (P6).
 
 **Context management and compaction (P6 with P12 evals).**
 1. **Truncation** (`truncation: "auto"`): drop the oldest items over budget.

@@ -167,6 +167,7 @@ TEST(OpenAiService, ChatWholeAndStreamed) {
   EXPECT_EQ(msg.find("content")->str(), "The answer is 4.");
   EXPECT_EQ(msg.find("reasoning_content")->str(), "Thinking hard.");
   EXPECT_EQ(v.find("id")->str(), "chatcmpl-1");
+  EXPECT_EQ(v.find("model")->str(), "m");
   EXPECT_EQ(rig.gen.prompts[0], Render(R"([{"role": "user", "content": "2+2?"}])"));
   // Streamed: deltas add up to the same, then [DONE].
   auto [s2, sse] = Post(rig.server.port(), "POST", "/v1/chat/completions",
@@ -174,6 +175,7 @@ TEST(OpenAiService, ChatWholeAndStreamed) {
   ASSERT_EQ(s2, 200);
   bool done = false;
   std::string content;
+  EXPECT_EQ(Events(sse, &done).front().find("model")->str(), "qwen3.8-flash-next");  // the service's id when omitted
   for (const auto& e : Events(sse, &done))
     if (const Value* c = e.find("choices")->items()[0].find("delta")->find("content")) content += c->str();
   EXPECT_TRUE(done);
