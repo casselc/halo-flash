@@ -66,6 +66,7 @@ class FlashNextGpu {
   static inline bool fused_hc_ = true;  ///< P3 hyper-connection mixer in two launches
   static inline bool fused_shexp_ = true;  ///< P3 shared expert in two launches
   static inline bool fused_linear_ = true;  ///< P3 DeltaNet block in five launches
+  static constexpr std::uint32_t kHcParts = 8;  ///< column chunks of the fused mixer's down projection
   /// Runs `tokens` in order; `logits` (optional) receives the last position's.
   /// Token at a time for now (P4 batches it); any chunking is equivalent.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error);
@@ -159,7 +160,7 @@ class FlashNextGpu {
   rt::Buffer ple_emb_, ple_key_, ple_value_, ple_query_, ple_gated_, ple_norm_, ple_history_;
   rt::Buffer qkv_, conv_out_, z_, alpha_, beta_, gdn_out_;
   rt::Buffer qg_, q_, gate_, k_, v_, ctx_, scores_, iq_, ik_, pooled_, block_scores_, visible_;
-  rt::Buffer router_, expert_ids_, expert_weights_, moe_h_, moe_part_, eg_, eu_, ed_, sgate_, logits_, lora_tmp_, lora_out_;
+  rt::Buffer router_, expert_ids_, expert_weights_, moe_h_, moe_part_, hc_lo_part_, hc_inject_part_, hc_scale_, eg_, eu_, ed_, sgate_, logits_, lora_tmp_, lora_out_;
 };
 
 class FlashNextGpu::Snapshot {

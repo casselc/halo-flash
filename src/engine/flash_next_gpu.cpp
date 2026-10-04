@@ -250,6 +250,9 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   expert_ids_ = Scratch(c.num_experts_used, error);
   expert_weights_ = Scratch(c.num_experts_used, error);
   moe_h_ = Scratch(std::size_t{c.num_experts_used} * c.expert_ff, error);
+  hc_lo_part_ = Scratch(std::size_t{kHcParts + 1} * c.hc_low_rank, error);
+  hc_inject_part_ = Scratch(std::size_t{kHcParts + 1} * c.hc_count, error);
+  hc_scale_ = Scratch(c.hc_count, error);
   moe_part_ = Scratch(std::size_t{c.num_experts_used} * c.hidden_size, error);
   eg_ = Scratch(std::max(c.expert_ff, c.shared_expert_ff), error);
   eu_ = Scratch(std::max(c.expert_ff, c.shared_expert_ff), error);
@@ -328,17 +331,25 @@ bool FlashNextGpu::HcMix(const model::HcMixer& m, bool inject, std::string* erro
   if (fused_hc_ && dn.qs && upt.qs && c.HcDim() <= 12288 && c.hc_low_rank <= 1024 && c.hc_count <= 4 &&
       c.hc_low_rank % 32 == 0 && inject_f32) {
     const std::uint32_t down_blocks = Blocks(c.hc_low_rank, 16), inject_rows = inject ? c.hc_count : 0;
-    return Launch("halo_hc_mix_a", {down_blocks + inject_rows}, {256},
-                  {rt::Arg::Buf(res_), rt::Arg::Buf(tensors_.at(m.norm.data).buf), rt::Arg::Buf(dn.qs),
-                   rt::Arg::Buf(dn.d), rt::Arg::Buf(inject ? tensors_.at(m.inject.data).buf : res_), rt::Arg::Buf(xn_),
-                   rt::Arg::Buf(lo_), rt::Arg::Buf(inject_), rt::Arg::Val(c.hc_count), rt::Arg::Val(c.hidden_size),
-                   rt::Arg::Val(c.hc_low_rank), rt::Arg::Val(c.rms_eps), rt::Arg::Val(down_blocks),
-                   rt::Arg::Val(dn.qstride)},
+    // Columns split into kHcParts chunks (multiples of 512) so the 320-row
+    // down projection fills the GPU.
+    const std::uint32_t chunk = (c.HcDim() / kHcParts + 511) / 512 * 512;
+    const std::uint32_t parts = (c.HcDim() + chunk - 1) / chunk;
+    return Launch("halo_hc_norm_scales", {c.hc_count}, {256},
+                  {rt::Arg::Buf(res_), rt::Arg::Buf(hc_scale_), rt::Arg::Val(c.hidden_size), rt::Arg::Val(c.rms_eps)},
+                  error) &&
+           Launch("halo_hc_mix_a", {down_blocks + inject_rows, parts}, {256},
+                  {rt::Arg::Buf(res_), rt::Arg::Buf(tensors_.at(m.norm.data).buf), rt::Arg::Buf(hc_scale_),
+                   rt::Arg::Buf(dn.qs), rt::Arg::Buf(dn.d), rt::Arg::Buf(inject ? tensors_.at(m.inject.data).buf : res_),
+                   rt::Arg::Buf(xn_), rt::Arg::Buf(hc_lo_part_), rt::Arg::Buf(hc_inject_part_), rt::Arg::Val(c.hc_count),
+                   rt::Arg::Val(c.hidden_size), rt::Arg::Val(c.hc_low_rank), rt::Arg::Val(down_blocks),
+                   rt::Arg::Val(dn.qstride), rt::Arg::Val(chunk)},
                   error) &&
            Launch("halo_hc_mix_b", {Blocks(c.hidden_size, 8)}, {256},
-                  {rt::Arg::Buf(lo_), rt::Arg::Buf(upt.qs), rt::Arg::Buf(upt.d), rt::Arg::Buf(xn_), rt::Arg::Buf(mixed_),
-                   rt::Arg::Val(c.hc_count), rt::Arg::Val(c.hidden_size), rt::Arg::Val(c.hc_low_rank),
-                   rt::Arg::Val(upt.qstride)},
+                  {rt::Arg::Buf(hc_lo_part_), rt::Arg::Val(parts), rt::Arg::Buf(hc_inject_part_), rt::Arg::Buf(inject_),
+                   rt::Arg::Val(inject_rows), rt::Arg::Buf(upt.qs), rt::Arg::Buf(upt.d), rt::Arg::Buf(xn_),
+                   rt::Arg::Buf(mixed_), rt::Arg::Val(c.hc_count), rt::Arg::Val(c.hidden_size),
+                   rt::Arg::Val(c.hc_low_rank), rt::Arg::Val(upt.qstride)},
                   error);
   }
   return GroupedNorm(res_, m.norm, xn_, error) && MatVec(m.down, 0, xn_, lo_, error) &&

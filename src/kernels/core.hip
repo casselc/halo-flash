@@ -2062,33 +2062,40 @@ constexpr std::uint32_t kHcMaxDim = 12288;  // hc * hidden
 constexpr std::uint32_t kHcMaxLow = 1024;   // low rank
 }  // namespace
 
+// Per-stream RMS scales of the residual for the fused mixer: one block per
+// stream, scale[s] = 1 / sqrt(mean(res_s^2) + eps).
+extern "C" __global__ void halo_hc_norm_scales(const float* res, float* scale, std::uint32_t h, float eps) {
+  __shared__ float scratch[32];
+  const float* x = res + blockIdx.x * h;
+  float ss = 0.0f;
+  for (std::uint32_t i = threadIdx.x; i < h; i += blockDim.x) ss += x[i] * x[i];
+  ss = BlockSum(ss, scratch);
+  if (threadIdx.x == 0) scale[blockIdx.x] = 1.0f / sqrtf(ss / static_cast<float>(h) + eps);
+}
+
 extern "C" __global__ void __launch_bounds__(256)
-    halo_hc_mix_a(const float* res, const float* norm_w, const std::int8_t* dqs, const std::uint16_t* dd,
-                  const float* inject_w, float* xn, float* lo, float* inject, std::uint32_t hc, std::uint32_t h,
-                  std::uint32_t low_rank, float eps, std::uint32_t down_blocks, std::uint32_t qstride) {
+    halo_hc_mix_a(const float* res, const float* norm_w, const float* scale, const std::int8_t* dqs,
+                  const std::uint16_t* dd, const float* inject_w, float* xn, float* lo_part, float* inject_part,
+                  std::uint32_t hc, std::uint32_t h, std::uint32_t low_rank, std::uint32_t down_blocks,
+                  std::uint32_t qstride, std::uint32_t chunk) {
+  // Split over columns: block (bx, ky) normalizes and covers columns
+  // [ky * chunk, ...) of its rows and writes partial sums; halo_hc_mix_b
+  // finishes them. The stream scales come from halo_hc_norm_scales.
   __shared__ float xs[kHcMaxDim];
   __shared__ float scratch[32];
-  const std::uint32_t D = hc * h;
-  for (std::uint32_t i = threadIdx.x; i < D; i += blockDim.x) xs[i] = res[i];
-  __syncthreads();
-  for (std::uint32_t s = 0; s < hc; ++s) {
-    float ss = 0.0f;
-    for (std::uint32_t i = threadIdx.x; i < h; i += blockDim.x) ss += xs[s * h + i] * xs[s * h + i];
-    ss = BlockSum(ss, scratch);
-    const float scale = 1.0f / sqrtf(ss / static_cast<float>(h) + eps);
-    for (std::uint32_t i = threadIdx.x; i < h; i += blockDim.x) xs[s * h + i] = xs[s * h + i] * scale * norm_w[s * h + i];
-  }
+  const std::uint32_t D = hc * h, ky = blockIdx.y, c0 = ky * chunk, c1 = min(D, c0 + chunk);
+  for (std::uint32_t i = c0 + threadIdx.x; i < c1; i += blockDim.x) xs[i] = res[i] * scale[i / h] * norm_w[i];
   __syncthreads();
   if (blockIdx.x == 0)
-    for (std::uint32_t i = threadIdx.x; i < D; i += blockDim.x) xn[i] = xs[i];
+    for (std::uint32_t i = c0 + threadIdx.x; i < c1; i += blockDim.x) xn[i] = xs[i];
   const std::uint32_t lane = threadIdx.x % kWarp;
-  if (blockIdx.x >= down_blocks) {  // inject row: the whole block on one row
+  if (blockIdx.x >= down_blocks) {  // inject row: the whole block on one row's chunk
     const std::uint32_t r = blockIdx.x - down_blocks;
     const float* w = inject_w + static_cast<std::size_t>(r) * D;
     float acc = 0.0f;
-    for (std::uint32_t c = threadIdx.x; c < D; c += blockDim.x) acc += w[c] * xs[c];
+    for (std::uint32_t c = c0 + threadIdx.x; c < c1; c += blockDim.x) acc += w[c] * xs[c];
     acc = BlockSum(acc, scratch);
-    if (threadIdx.x == 0) inject[r] = acc;
+    if (threadIdx.x == 0) inject_part[ky * hc + r] = acc;
     return;
   }
   constexpr int kRows = 2;
@@ -2096,7 +2103,7 @@ extern "C" __global__ void __launch_bounds__(256)
   if (r0 >= low_rank) return;
   const std::uint32_t nblk = D / 32;
   float acc[kRows] = {};
-  for (std::uint32_t c = lane * 16; c < D; c += kWarp * 16) {
+  for (std::uint32_t c = c0 + lane * 16; c < c1; c += kWarp * 16) {
     float xr[16];
 #pragma unroll
     for (int i = 0; i < 16; ++i) xr[i] = xs[c + i];
@@ -2115,15 +2122,27 @@ extern "C" __global__ void __launch_bounds__(256)
 #pragma unroll
   for (int k = 0; k < kRows; ++k) {
     const float a = WarpSum(acc[k]);
-    if (lane == 0 && r0 + k < low_rank) lo[r0 + k] = Silu(a / static_cast<float>(hc));
+    if (lane == 0 && r0 + k < low_rank) lo_part[ky * low_rank + r0 + k] = a;
   }
 }
 
 extern "C" __global__ void __launch_bounds__(256)
-    halo_hc_mix_b(const float* lo, const std::int8_t* uqs, const std::uint16_t* ud, const float* xn, float* mixed,
-                  std::uint32_t hc, std::uint32_t h, std::uint32_t low_rank, std::uint32_t qstride) {
+    halo_hc_mix_b(const float* lo_part, std::uint32_t parts, const float* inject_part, float* inject,
+                  std::uint32_t inject_rows, const std::int8_t* uqs, const std::uint16_t* ud, const float* xn,
+                  float* mixed, std::uint32_t hc, std::uint32_t h, std::uint32_t low_rank, std::uint32_t qstride) {
+  // Finishes halo_hc_mix_a: lo = silu(sum of partials / hc), inject = sum
+  // of partials (block 0), in a fixed order.
   __shared__ float ls[kHcMaxLow];
-  for (std::uint32_t i = threadIdx.x; i < low_rank; i += blockDim.x) ls[i] = lo[i];
+  for (std::uint32_t i = threadIdx.x; i < low_rank; i += blockDim.x) {
+    float a = 0.0f;
+    for (std::uint32_t p = 0; p < parts; ++p) a += lo_part[p * low_rank + i];
+    ls[i] = Silu(a / static_cast<float>(hc));
+  }
+  if (blockIdx.x == 0 && threadIdx.x < inject_rows) {
+    float a = 0.0f;
+    for (std::uint32_t p = 0; p < parts; ++p) a += inject_part[p * hc + threadIdx.x];
+    inject[threadIdx.x] = a;
+  }
   __syncthreads();
   const std::uint32_t i = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp;
   if (i >= h) return;

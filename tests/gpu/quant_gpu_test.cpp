@@ -613,17 +613,25 @@ TEST(GpuKernels, FusedHcMixerMatchesKernelSequence) {
       if (with_inject)
         launch("halo_matvec_f32_rowblock", {hc}, {256}, {rt::Arg::Buf(ib), rt::Arg::Buf(xn1), rt::Arg::Buf(i1),
                                                          rt::Arg::Val(hc), rt::Arg::Val(D)});
-      // Fused.
-      auto xn2 = dev->Alloc(D * 4ull, &error), lo2 = dev->Alloc(L * 4ull, &error), m2 = dev->Alloc(H * 4ull, &error),
+      // Fused, split over a random number of column chunks.
+      const std::uint32_t want_parts = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 8}));
+      const std::uint32_t chunk = (D / want_parts + 15) / 16 * 16, parts = (D + chunk - 1) / chunk;
+      auto xn2 = dev->Alloc(D * 4ull, &error), lop = dev->Alloc(std::size_t{parts} * L * 4, &error),
+           m2 = dev->Alloc(H * 4ull, &error), ip = dev->Alloc(std::size_t{parts} * hc * 4, &error),
            i2 = dev->Alloc(16 * 4, &error);
       const std::uint32_t down_blocks = (L + 15) / 16;
-      launch("halo_hc_mix_a", {down_blocks + (with_inject ? hc : 0)}, {256},
-             {rt::Arg::Buf(rb), rt::Arg::Buf(nb), rt::Arg::Buf(dqs), rt::Arg::Buf(dd), rt::Arg::Buf(ib), rt::Arg::Buf(xn2),
-              rt::Arg::Buf(lo2), rt::Arg::Buf(i2), rt::Arg::Val(hc), rt::Arg::Val(H), rt::Arg::Val(L), rt::Arg::Val(eps),
-              rt::Arg::Val(down_blocks), rt::Arg::Val(D)});
-      launch("halo_hc_mix_b", {(H + 7) / 8}, {256}, {rt::Arg::Buf(lo2), rt::Arg::Buf(uqs), rt::Arg::Buf(ud),
-                                                     rt::Arg::Buf(xn2), rt::Arg::Buf(m2), rt::Arg::Val(hc), rt::Arg::Val(H),
-                                                     rt::Arg::Val(L), rt::Arg::Val(L)});
+      auto sc = dev->Alloc(16 * 4, &error);
+      launch("halo_hc_norm_scales", {hc}, {256}, {rt::Arg::Buf(rb), rt::Arg::Buf(sc), rt::Arg::Val(H), rt::Arg::Val(eps)});
+      launch("halo_hc_mix_a", {down_blocks + (with_inject ? hc : 0), parts}, {256},
+             {rt::Arg::Buf(rb), rt::Arg::Buf(nb), rt::Arg::Buf(sc), rt::Arg::Buf(dqs), rt::Arg::Buf(dd), rt::Arg::Buf(ib),
+              rt::Arg::Buf(xn2), rt::Arg::Buf(lop), rt::Arg::Buf(ip), rt::Arg::Val(hc), rt::Arg::Val(H), rt::Arg::Val(L),
+              rt::Arg::Val(down_blocks), rt::Arg::Val(D), rt::Arg::Val(chunk)});
+      launch("halo_hc_mix_b", {(H + 7) / 8}, {256}, {rt::Arg::Buf(lop), rt::Arg::Val(parts), rt::Arg::Buf(ip),
+                                                     rt::Arg::Buf(i2), rt::Arg::Val(with_inject ? hc : 0u),
+                                                     rt::Arg::Buf(uqs), rt::Arg::Buf(ud), rt::Arg::Buf(xn2),
+                                                     rt::Arg::Buf(m2), rt::Arg::Val(hc), rt::Arg::Val(H), rt::Arg::Val(L),
+                                                     rt::Arg::Val(L)});
+      auto lo2 = lop;  // freed below
       const auto get = [&](const rt::Buffer& b, std::size_t n) {
         std::vector<float> v(n);
         EXPECT_TRUE(dev->Download(b, 0, v.data(), n * 4, &error)) << error;
@@ -640,7 +648,7 @@ TEST(GpuKernels, FusedHcMixerMatchesKernelSequence) {
       expect_close(get(xn2, D), get(xn1, D), "xn");
       expect_close(get(m2, H), get(m1, H), "mixed");
       if (with_inject) expect_close(get(i2, hc), get(i1, hc), "inject");
-      for (auto* b : {&rb, &nb, &ib, &draw, &uraw, &dqs, &dd, &uqs, &ud, &xn1, &lo1, &g1, &m1, &i1, &xn2, &lo2, &m2, &i2})
+      for (auto* b : {&rb, &nb, &ib, &draw, &uraw, &dqs, &dd, &uqs, &ud, &xn1, &lo1, &g1, &m1, &i1, &xn2, &lo2, &m2, &i2, &ip, &sc})
         dev->Free(*b);
     }, {.test_cases = 80});
   }

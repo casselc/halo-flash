@@ -979,8 +979,8 @@ why = "the mixer averages the streams"
 [[mutant]]
 name = "p3-hcmix-a-norm-shared-gamma"
 file = "src/kernels/core.hip"
-find = '    for (std::uint32_t i = threadIdx.x; i < h; i += blockDim.x) xs[s * h + i] = xs[s * h + i] * scale * norm_w[s * h + i];'
-replace = '    for (std::uint32_t i = threadIdx.x; i < h; i += blockDim.x) xs[s * h + i] = xs[s * h + i] * scale * norm_w[i];'
+find = '  for (std::uint32_t i = c0 + threadIdx.x; i < c1; i += blockDim.x) xs[i] = res[i] * scale[i / h] * norm_w[i];'
+replace = '  for (std::uint32_t i = c0 + threadIdx.x; i < c1; i += blockDim.x) xs[i] = res[i] * scale[i / h] * norm_w[i % h];'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuKernels.FusedHcMixerMatchesKernelSequence"
@@ -989,8 +989,8 @@ why = "each stream has its own norm gamma"
 [[mutant]]
 name = "p3-hcmix-a-silu-unscaled"
 file = "src/kernels/core.hip"
-find = '    if (lane == 0 && r0 + k < low_rank) lo[r0 + k] = Silu(a / static_cast<float>(hc));'
-replace = '    if (lane == 0 && r0 + k < low_rank) lo[r0 + k] = Silu(a);'
+find = '    ls[i] = Silu(a / static_cast<float>(hc));'
+replace = '    ls[i] = Silu(a);'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuKernels.FusedHcMixerMatchesKernelSequence"
@@ -1079,3 +1079,33 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "GpuKernels.FusedDeltaNetPiecesMatchKernelSequences"
 why = "the stored state is decayed (fused DeltaNet + norm kernel)"
+
+[[mutant]]
+name = "p3-hcmix-drops-last-part"
+file = "src/kernels/core.hip"
+find = '    for (std::uint32_t p = 0; p < parts; ++p) a += lo_part[p * low_rank + i];'
+replace = '    for (std::uint32_t p = 0; p + 1 < parts; ++p) a += lo_part[p * low_rank + i];'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedHcMixerMatchesKernelSequence"
+why = "every column chunk's partial sum is included"
+
+[[mutant]]
+name = "p3-hcmix-inject-first-part-only"
+file = "src/kernels/core.hip"
+find = '    for (std::uint32_t p = 0; p < parts; ++p) a += inject_part[p * hc + threadIdx.x];'
+replace = '    for (std::uint32_t p = 0; p < 1; ++p) a += inject_part[p * hc + threadIdx.x];'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedHcMixerMatchesKernelSequence"
+why = "the inject logits sum every column chunk"
+
+[[mutant]]
+name = "p3-hcmix-scale-wrong-stream"
+file = "src/kernels/core.hip"
+find = '  for (std::uint32_t i = c0 + threadIdx.x; i < c1; i += blockDim.x) xs[i] = res[i] * scale[i / h] * norm_w[i];'
+replace = '  for (std::uint32_t i = c0 + threadIdx.x; i < c1; i += blockDim.x) xs[i] = res[i] * scale[0] * norm_w[i];'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "GpuKernels.FusedHcMixerMatchesKernelSequence"
+why = "each stream is normalized by its own RMS"
