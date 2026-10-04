@@ -6,6 +6,9 @@
 //   halo_gemm_bench peak      register-only WMMA throughput (the ceiling)
 //   halo_gemm_bench deltanet  one DeltaNet layer's chunk: decode steps vs chunked kernels
 //   halo_gemm_bench bf16      the Qwen3.5 BF16 GEMMs (fp16 WMMA), weights from DRAM
+//   halo_gemm_bench memory    read bandwidth and dependent-load latency against
+//                             working-set size (1 MB .. 512 MB): last-level cache
+//                             size and bandwidth, DRAM bandwidth and latency
 //   halo_gemm_bench moe       one layer's routed experts at the real shapes (512
 //                             experts, top 10, Q4_K gate/up 640 x 2560, Q5_1 down
 //                             2560 x 640), random routing, T = 2048: bucket,
@@ -13,6 +16,7 @@
 //   halo_gemm_bench model     every Flash-Next dense int8 GEMM shape at T = 2048,
 //                             weighted by its count per 2048-token prefill
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -48,6 +52,49 @@ int main(int argc, char** argv) {
         std::printf("%s blocks %4u: %.1f TOPS\n", f16 ? "fp16" : "int8", blocks,
                     double(blocks) * 8 * iters * 4 * 16 * 16 * 16 * 2 / s / 1e12);
       }
+    return 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "memory") {
+    auto d = rt::Device::Create(rt::Backend::kHip, &e);
+    if (!d || !d->LoadModule(kernels::CoreHsaco(), &e)) return std::printf("%s\n", e.c_str()), 1;
+    const auto kr = d->Kernel("halo_bench_read", &e), kc = d->Kernel("halo_bench_chase", &e);
+    auto out = d->Alloc(64, &e);
+    std::printf("%10s %12s %14s\n", "set", "read GB/s", "chase ns/load");
+    for (std::size_t mb : {1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 256, 512}) {
+      const std::size_t bytes = mb << 20;
+      auto b = d->Alloc(bytes, &e);
+      if (!b) break;
+      // Bandwidth: enough passes for ~1 GB of traffic.
+      const std::uint64_t n = bytes / 16;
+      const std::uint32_t reps = static_cast<std::uint32_t>(std::max<std::size_t>(1, (1ull << 30) / bytes));
+      const rt::Arg ra[] = {rt::Arg::Buf(b), rt::Arg::Val(n), rt::Arg::Val(reps), rt::Arg::Buf(out)};
+      (void)d->Launch(kr, {1280}, {256}, ra, &e);
+      (void)d->Synchronize(&e);
+      auto t0 = std::chrono::steady_clock::now();
+      (void)d->Launch(kr, {1280}, {256}, ra, &e);
+      (void)d->Synchronize(&e);
+      const double gbs = static_cast<double>(bytes) * reps /
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 1e9;
+      // Latency: a random cycle over 128-byte lines.
+      const std::size_t lines = bytes / 128, stride = 32;  // uint32 per line
+      std::vector<std::uint32_t> perm(lines), next(bytes / 4, 0);
+      for (std::size_t i = 0; i < lines; ++i) perm[i] = static_cast<std::uint32_t>(i);
+      std::mt19937 g(3);
+      std::shuffle(perm.begin() + 1, perm.end(), g);
+      for (std::size_t i = 0; i < lines; ++i)
+        next[perm[i] * stride] = static_cast<std::uint32_t>(perm[(i + 1) % lines] * stride);
+      (void)d->Upload(b, 0, next.data(), next.size() * 4, &e);
+      const std::uint32_t steps = 200000;
+      const rt::Arg ca[] = {rt::Arg::Buf(b), rt::Arg::Val(steps), rt::Arg::Buf(out)};
+      (void)d->Launch(kc, {1}, {1}, ca, &e);
+      (void)d->Synchronize(&e);
+      t0 = std::chrono::steady_clock::now();
+      (void)d->Launch(kc, {1}, {1}, ca, &e);
+      (void)d->Synchronize(&e);
+      const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / steps;
+      std::printf("%7zu MB %12.1f %14.1f\n", mb, gbs, ns);
+      d->Free(b);
+    }
     return 0;
   }
   if (argc > 1 && std::string(argv[1]) == "moe") {

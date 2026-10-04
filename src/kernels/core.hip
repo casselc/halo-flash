@@ -4596,3 +4596,23 @@ extern "C" __global__ void __launch_bounds__(256)
 extern "C" __global__ void halo_timestamp(unsigned long long* stamps, std::uint32_t slot) {
   if (threadIdx.x == 0) stamps[slot] = __builtin_amdgcn_s_sendmsg_rtnl(0x83);  // MSG_RTN_GET_REALTIME
 }
+
+// ---- Bench: memory hierarchy (halo_gemm_bench memory) ------------------------
+// Streaming read of n float4 (summed so the loads stay), `reps` passes.
+//   grid (blocks), block 256
+extern "C" __global__ void halo_bench_read(const float4* p, std::uint64_t n, std::uint32_t reps, float* out) {
+  float acc = 0.0f;
+  const std::uint64_t stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+  for (std::uint32_t r = 0; r < reps; ++r)
+    for (std::uint64_t i = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x; i < n; i += stride) {
+      const float4 v = p[i];
+      acc += v.x + v.y + v.z + v.w;
+    }
+  if (acc == 12345.678f) out[0] = acc;  // keeps the loads
+}
+// Dependent loads: i = next[i] for `steps` steps from 0 (one thread).
+extern "C" __global__ void halo_bench_chase(const std::uint32_t* next, std::uint32_t steps, std::uint32_t* out) {
+  std::uint32_t i = 0;
+  for (std::uint32_t s = 0; s < steps; ++s) i = next[i];
+  out[0] = i;
+}
