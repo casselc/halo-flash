@@ -3931,6 +3931,15 @@ extern "C" __global__ void __launch_bounds__(256)
   }
 }
 
+// Lane exchange within aligned groups of 4 lanes by DPP quad permutes:
+// QuadXor1 reads lane ^ 1, QuadXor2 lane ^ 2 (quad_perm [1,0,3,2], [2,3,0,1]).
+__device__ inline float QuadXor1(float v) {
+  return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0xB1, 0xF, 0xF, false));
+}
+__device__ inline float QuadXor2(float v) {
+  return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x4E, 0xF, 0xF, false));
+}
+
 // ---- P4: DeltaNet recurrence over a chunk, state split across lanes ----------
 //
 // halo_gdn_prefill_d128_norm's recurrence with each state column (value
@@ -4021,12 +4030,16 @@ extern "C" __global__ void __launch_bounds__(256)
         A += s[i] * kr[i];
         B += s[i] * qr[i];
       }
-#pragma unroll
-      for (int o = 1; o < 4; o <<= 1) {
-        kq += __shfl_xor(kq, o, 32);
-        A += __shfl_xor(A, o, 32);
-        B += __shfl_xor(B, o, 32);
-      }
+      // Sum over the 4 lanes of this column with DPP quad permutes (register
+      // to register): __shfl_xor compiles to ds_bpermute here, an LDS round
+      // trip on the serial per-token path (thread trace: 73% of the kernel's
+      // time was LDS waits). Same additions in the same order as before.
+      kq += QuadXor1(kq);
+      A += QuadXor1(A);
+      B += QuadXor1(B);
+      kq += QuadXor2(kq);
+      A += QuadXor2(A);
+      B += QuadXor2(B);
       const float decay = decay_s[tt], b = beta_s[tt];
       const float delta = (vs[tt][tid / 4] - decay * A) * b;
 #pragma unroll
@@ -4326,7 +4339,9 @@ extern "C" __global__ void __launch_bounds__(256)
       }
     }
     __syncthreads();
-    for (std::uint32_t r = 0; r < rtiles; ++r) {
+#pragma unroll
+    for (std::uint32_t r = 0; r < 3; ++r) {  // fully unrolled: acc stays in registers
+      if (r >= rtiles) break;
 #pragma unroll
       for (int dt = 0; dt < 2; ++dt)
 #pragma unroll
@@ -4345,13 +4360,14 @@ extern "C" __global__ void __launch_bounds__(256)
     }
   }
   __syncthreads();
-  for (std::uint32_t r = 0; r < rtiles; ++r)
+#pragma unroll
+  for (std::uint32_t r = 0; r < 3; ++r)
 #pragma unroll
     for (int dt = 0; dt < 2; ++dt)
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
         const std::uint32_t row = r * 16 + 2 * j + lane / 16, tq = row / G, h = row % G;
-        if (row >= rows || t0 + tq >= tokens) continue;
+        if (r >= rtiles || row >= rows || t0 + tq >= tokens) continue;
         const std::uint32_t d = (wave * 2 + dt) * 16 + lane % 16;
         const std::size_t idx = (static_cast<std::size_t>(t0 + tq) * num_heads + g * G + h) * HD + d;
         out[idx] = acc[r][dt][j] / lrow[row] * Sigmoid(gate[idx]);
