@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace halo::text {
 
@@ -29,10 +31,21 @@ void AppendUtf8(std::string& out, char32_t cp);
 [[nodiscard]] int CombiningClass(char32_t cp) noexcept;
 [[nodiscard]] const char* UnicodeVersion() noexcept;
 
+/// True when `cp` starts a segment whose NFC is independent of everything
+/// before it: a starter (ccc 0) that is never the second half of a canonical
+/// or Hangul composition. NFC(a + b) == NFC(a) + NFC(b) when b begins so.
+[[nodiscard]] bool IsStableStarter(char32_t cp) noexcept;
+
 /// Unicode Normalization Form C. Ill-formed bytes are passed through
 /// unchanged and act as normalization boundaries, so the function is total
 /// over arbitrary bytes and the identity on ASCII.
 [[nodiscard]] std::string Nfc(std::string_view text);
+
+/// NFC plus, for every output byte, the [begin, end) byte range of the input
+/// code point it derives from (composition keeps the starter's range, as HF
+/// tokenizers aligns offsets). Ill-formed bytes map to themselves.
+[[nodiscard]] std::string NfcAligned(std::string_view text,
+                                     std::vector<std::pair<std::size_t, std::size_t>>* origin);
 
 }  // namespace halo::text
 

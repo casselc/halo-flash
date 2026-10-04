@@ -26,6 +26,7 @@ struct Ch {
   bool NL() const { return valid && (cp == '\r' || cp == '\n'); }
   bool LM() const { return L() || M(); }
   bool Other() const { return !S() && !L() && !M() && !N(); }
+  bool Other2() const { return !S() && !L() && !N(); }
 };
 
 Ch At(std::string_view t, std::size_t i) {
@@ -64,23 +65,27 @@ std::size_t RunOf(std::string_view t, std::size_t i, bool (Ch::*pred)() const) {
   return i;
 }
 
-std::size_t PieceEnd(std::string_view t, std::size_t i) {
+std::size_t PieceEnd(std::string_view t, std::size_t i, bool marks_are_letters) {
+  // Qwen3.5/3.8: letter runs are [\p{L}\p{M}]+ and "other" excludes \p{M}.
+  // Qwen2-style: letter runs are \p{L}+ and marks count as "other".
+  const auto word = marks_are_letters ? &Ch::LM : &Ch::L;
+  const auto other = marks_are_letters ? &Ch::Other : &Ch::Other2;
   // 1. Contractions.
   if (const auto e = ContractionEnd(t, i); e != i) return e;
   const Ch c = At(t, i);
   const std::size_t after = i + c.len;
-  // 2. [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
-  if (c.LM()) return RunOf(t, after, &Ch::LM);
-  if (!c.NL() && !c.L() && !c.N() && after < t.size() && At(t, after).LM()) {
-    return RunOf(t, after, &Ch::LM);
+  // 2. [^\r\n\p{L}\p{N}]?<word>+
+  if ((c.*word)()) return RunOf(t, after, word);
+  if (!c.NL() && !c.L() && !c.N() && after < t.size() && (At(t, after).*word)()) {
+    return RunOf(t, after, word);
   }
   // 3. \p{N}
   if (c.N()) return after;
-  // 4. ' ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*'
+  // 4. ' ?<other>+[\r\n]*'
   std::size_t p = i;
-  if (c.valid && c.cp == ' ' && after < t.size() && At(t, after).Other()) p = after;
-  if (At(t, p).Other()) {
-    const std::size_t e = RunOf(t, p, &Ch::Other);
+  if (c.valid && c.cp == ' ' && after < t.size() && (At(t, after).*other)()) p = after;
+  if ((At(t, p).*other)()) {
+    const std::size_t e = RunOf(t, p, other);
     return RunOf(t, e, &Ch::NL);
   }
   // c is whitespace here.
@@ -138,9 +143,13 @@ bool UnByteLevel(std::string_view token, std::string& out) {
 }  // namespace
 
 std::vector<std::string_view> PreTokenizeQwen35(std::string_view text) {
+  return PreTokenize(text, PreTokenizer::kQwen35);
+}
+
+std::vector<std::string_view> PreTokenize(std::string_view text, PreTokenizer kind) {
   std::vector<std::string_view> pieces;
   for (std::size_t i = 0; i < text.size();) {
-    const std::size_t e = PieceEnd(text, i);
+    const std::size_t e = PieceEnd(text, i, kind == PreTokenizer::kQwen35);
     pieces.push_back(text.substr(i, e - i));
     i = e;
   }
@@ -155,8 +164,9 @@ std::unique_ptr<Tokenizer> Tokenizer::FromGguf(const core::GgufReader& r, std::s
   if (r.GetMetadataString("tokenizer.ggml.model") != std::optional<std::string_view>{"gpt2"}) {
     return fail("tokenizer.ggml.model is not gpt2 (byte-level BPE)");
   }
-  if (r.GetMetadataString("tokenizer.ggml.pre") != std::optional<std::string_view>{"qwen35"}) {
-    return fail("tokenizer.ggml.pre is not qwen35");
+  const auto pre = r.GetMetadataString("tokenizer.ggml.pre");
+  if (pre != std::optional<std::string_view>{"qwen35"} && pre != std::optional<std::string_view>{"qwen2"}) {
+    return fail("tokenizer.ggml.pre must be qwen35 or qwen2");
   }
   const auto tv = r.GetMetadataStringArray("tokenizer.ggml.tokens");
   const auto mv = r.GetMetadataStringArray("tokenizer.ggml.merges");
@@ -171,6 +181,7 @@ std::unique_ptr<Tokenizer> Tokenizer::FromGguf(const core::GgufReader& r, std::s
   for (auto v : *type_values) types.push_back(static_cast<TokenType>(v));
   auto tok = FromVocabulary(tokens, merges, types, error);
   if (!tok) return nullptr;
+  tok->pre_ = *pre == "qwen2" ? PreTokenizer::kQwen2 : PreTokenizer::kQwen35;
   if (auto v = r.GetMetadataUint32("tokenizer.ggml.eos_token_id"); v && *v < tok->VocabSize()) tok->eos_ = *v;
   if (auto v = r.GetMetadataUint32("tokenizer.ggml.padding_token_id"); v && *v < tok->VocabSize()) tok->pad_ = *v;
   return tok;
@@ -236,12 +247,14 @@ std::unique_ptr<Tokenizer> Tokenizer::FromVocabulary(std::span<const std::string
   return t;
 }
 
-void Tokenizer::MergePiece(std::string_view piece, std::vector<TokenId>& out) const {
+void Tokenizer::MergePiece(std::string_view piece, std::vector<TokenId>& out,
+                           std::vector<std::pair<std::size_t, std::size_t>>* ranges) const {
   const std::size_t count = piece.size();
   std::vector<TokenId> sym(count);
   for (std::size_t i = 0; i < count; ++i) sym[i] = byte_token_[static_cast<unsigned char>(piece[i])];
   if (count == 1) {
     out.push_back(sym[0]);
+    if (ranges) ranges->emplace_back(0, 1);
     return;
   }
   // Lowest-rank adjacent pair first, leftmost on ties; linked list + heap with
@@ -279,12 +292,74 @@ void Tokenizer::MergePiece(std::string_view piece, std::vector<TokenId>& out) co
     if (prev[c.index] != kNone) offer(prev[c.index], c.index);
     if (next[c.index] != kNone) offer(c.index, next[c.index]);
   }
-  for (std::size_t i = 0; i != kNone; i = next[i]) out.push_back(sym[i]);
+  for (std::size_t i = 0; i != kNone; i = next[i]) {
+    out.push_back(sym[i]);
+    // A merged symbol at i covers bytes [i, next symbol start).
+    if (ranges) ranges->emplace_back(i, next[i] == kNone ? count : next[i]);
+  }
+}
+
+void Tokenizer::EncodeOrdinaryWithOffsets(std::string_view text, std::size_t base, Encoded& out) const {
+  std::vector<std::pair<std::size_t, std::size_t>> origin;  // per normalized byte
+  const std::string norm = NfcAligned(text, &origin);
+  for (auto& [a, b] : origin) {
+    a += base;
+    b += base;
+  }
+  std::size_t piece_start = 0;
+  for (const auto piece : PreTokenize(norm, pre_)) {
+    piece_start = static_cast<std::size_t>(piece.data() - norm.data());
+    std::vector<std::pair<std::size_t, std::size_t>> ranges;
+    MergePiece(piece, out.ids, &ranges);
+    for (const auto& [a, b] : ranges) {
+      out.offsets.emplace_back(origin[piece_start + a].first, origin[piece_start + b - 1].second);
+    }
+  }
+}
+
+Tokenizer::Encoded Tokenizer::EncodeWithOffsets(std::string_view text, bool parse_special) const {
+  Encoded out;  // offsets in bytes until the final conversion
+  std::size_t pos = 0;
+  while (pos < text.size()) {
+    std::size_t best = std::string_view::npos, best_s = 0;
+    if (parse_special) {
+      for (std::size_t s = 0; s < specials_.size(); ++s) {
+        const auto f = text.find(specials_[s].first, pos);
+        if (f < best) {
+          best = f;
+          best_s = s;
+        }
+      }
+    }
+    const std::size_t end = best == std::string_view::npos ? text.size() : best;
+    if (end > pos) EncodeOrdinaryWithOffsets(text.substr(pos, end - pos), pos, out);
+    if (best == std::string_view::npos) break;
+    out.ids.push_back(specials_[best_s].second);
+    out.offsets.emplace_back(best, best + specials_[best_s].first.size());
+    pos = best + specials_[best_s].first.size();
+  }
+  // Byte offsets -> code point offsets: [char containing lo, char containing hi-1].
+  std::vector<std::size_t> char_of(text.size() + 1, 0);
+  std::size_t chars = 0;
+  for (std::size_t i = 0; i < text.size();) {
+    const auto u = DecodeUtf8(text, i);
+    for (std::size_t k = 0; k < u.length; ++k) char_of[i + k] = chars;
+    i += u.length;
+    ++chars;
+  }
+  char_of[text.size()] = chars;
+  for (auto& [lo, hi] : out.offsets) {
+    const std::size_t a = char_of[lo];
+    const std::size_t b = hi > lo ? char_of[hi - 1] + 1 : a;
+    lo = a;
+    hi = b;
+  }
+  return out;
 }
 
 void Tokenizer::EncodeOrdinary(std::string_view text, std::vector<TokenId>& out) const {
   const std::string nfc = Nfc(text);
-  for (const auto piece : PreTokenizeQwen35(nfc)) MergePiece(piece, out);
+  for (const auto piece : PreTokenize(nfc, pre_)) MergePiece(piece, out);
 }
 
 std::vector<TokenId> Tokenizer::Encode(std::string_view text, bool parse_special) const {

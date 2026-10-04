@@ -2,13 +2,17 @@
 """Generates differential fixtures for the tokenizer tests.
 
 The references are independent of halo-flash's implementation:
-  * NFC: Python unicodedata.normalize.
+  * NFC: HF tokenizers' own NFC normalizer (unicode-normalization-alignments,
+    Unicode 9.0), which differs from current unicodedata for newer scripts.
   * Pre-tokenizer pieces: the `regex` module running the exact Split pattern
     from Qwen3.8-Flash-Next's tokenizer.json, applied to the NFC text.
   * Token ids: HF `tokenizers` loading that tokenizer.json,
     encode(text, add_special_tokens=False).
 
 Usage: gen_tokenizer_fixtures.py <tokenizer.json> <out-dir> [llama-qwen35.inp]
+       DECIDER_TOKENIZER=<strands-decider tokenizer.json> adds:
+  pretok_qwen2.tsv  input_hex  pieces (the decider's Qwen2-style split regex)
+  encode_decider.tsv input_hex  ids  char offsets "lo:hi ..." (HF offsets)
 
 Output files (one case per line, fields tab-separated, strings hex-encoded):
   nfc.tsv        input_hex  nfc_hex
@@ -17,6 +21,7 @@ Output files (one case per line, fields tab-separated, strings hex-encoded):
 The first line of each file is a '#' header recording the reference versions.
 """
 import json
+import os
 import random
 import sys
 import unicodedata
@@ -25,6 +30,7 @@ import regex
 import tokenizers
 
 SEED = 20261003
+HF_NFC = tokenizers.normalizers.NFC()
 
 
 def hx(s):
@@ -43,6 +49,10 @@ def random_corpus(rng, n):
         ["é", "Å", "ñ", "ß", "Ω", "Ж", "щ", "ا", "ש", "क", "中", "文", "日本", "한국어", "ไทย"],
         ["🦙", "👍🏽", "‍", "️", "€", "©", "™"],
         ["<", "|", ">", "im_start", "think"],
+        # Post-Unicode-9 combining marks and compositions (Unicode 10-16), where
+        # HF's Unicode 9 NFC differs from current unicodedata.
+        ["\u1ab0", "\u1dfa", "\u0d00", "\u0afa", "\U00011f00", "\U00011383", "\U000113c2\U000113b8",
+         "\U00016d63\U00016d67", "\U0001e4ec", "\U00011f41", "a\u1dfa\u0301"],
     ]
     out = []
     for _ in range(n):
@@ -98,12 +108,12 @@ def main():
     with open(f"{out_dir}/nfc.tsv", "w") as f:
         f.write(header)
         for s in nfc_cases:
-            f.write(f"{hx(s)}\t{hx(unicodedata.normalize('NFC', s))}\n")
+            f.write(f"{hx(s)}\t{hx(HF_NFC.normalize_str(s))}\n")
 
     with open(f"{out_dir}/pretok.tsv", "w") as f:
         f.write(header)
         for s in corpus:
-            n = unicodedata.normalize("NFC", s)
+            n = HF_NFC.normalize_str(s)
             pieces = [m.group() for m in rx.finditer(n)]
             assert "".join(pieces) == n, repr(s)
             f.write(f"{hx(n)}\t{','.join(hx(p) for p in pieces)}\n")
@@ -113,6 +123,24 @@ def main():
         for s in corpus:
             ids = tk.encode(s, add_special_tokens=False).ids
             f.write(f"{hx(s)}\t{' '.join(map(str, ids))}\n")
+    dec = os.environ.get("DECIDER_TOKENIZER")
+    if dec:
+        dspec = json.load(open(dec, encoding="utf-8"))
+        drx = regex.compile(dspec["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"])
+        dtk = tokenizers.Tokenizer.from_file(dec)
+        with open(f"{out_dir}/pretok_qwen2.tsv", "w") as f:
+            f.write(header)
+            for s in corpus:
+                n = HF_NFC.normalize_str(s)
+                pieces = [m.group() for m in drx.finditer(n)]
+                assert "".join(pieces) == n
+                f.write(f"{hx(n)}\t{','.join(hx(p) for p in pieces)}\n")
+        with open(f"{out_dir}/encode_decider.tsv", "w") as f:
+            f.write(header)
+            for s in corpus:
+                e = dtk.encode(s, add_special_tokens=False)
+                offs = " ".join(f"{a}:{b}" for a, b in e.offsets)
+                f.write(f"{hx(s)}\t{' '.join(map(str, e.ids))}\t{offs}\n")
     print(f"nfc {len(nfc_cases)} pretok/encode {len(corpus)}", file=sys.stderr)
 
 

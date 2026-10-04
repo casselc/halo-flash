@@ -1,84 +1,93 @@
 #!/usr/bin/env python3
-"""Generates src/text/unicode_tables.inc from Python's unicodedata.
+"""Generates src/text/unicode_tables.inc from the implementation the Qwen
+tokenizers were trained with: HF `tokenizers`.
 
-Emits sorted codepoint ranges for the general-category classes the Qwen
-pre-tokenizer regex uses (\\p{L}, \\p{M}, \\p{N}), and the canonical
-decomposition, combining class and primary composition tables NFC needs.
-Hangul syllables are handled algorithmically in unicode.cpp and are excluded
-here. Regenerate when changing the Unicode version, and re-run the
-differential fixtures (tools/gen_tokenizer_fixtures.py) afterwards.
+  gen_unicode_tables.py <unicode-normalization-alignments/src/tables.rs> <out.inc>
+
+  * \\p{L}, \\p{M}, \\p{N} and \\s are probed through `tokenizers`' own regex
+    engine (Oniguruma), one call per class over every scalar value, so the
+    tables are whatever Unicode version that build ships.
+  * NFC data (canonical combining classes, full canonical decompositions,
+    primary compositions) is extracted from the unicode-normalization-alignments
+    crate that `tokenizers` normalizes with (Unicode 9.0 at 0.1.12).
+
+Needs the `tokenizers` Python package. Re-run tools/gen_tokenizer_fixtures.py
+after regenerating.
 """
+import re
 import sys
-import unicodedata
 
-MAX_CP = 0x110000
-HANGUL_S_BASE, HANGUL_S_COUNT = 0xAC00, 11172
+import tokenizers
+from tokenizers import Regex, pre_tokenizers
+
+MAX = 0x110000
+SCALARS = "".join(chr(c) for c in range(MAX) if not 0xD800 <= c <= 0xDFFF)
 
 
-def ranges(pred):
-    out, start = [], None
-    for cp in range(MAX_CP):
-        if pred(cp):
-            if start is None:
-                start = cp
-        elif start is not None:
-            out.append((start, cp - 1))
-            start = None
+def probe(cls):
+    """Code points matching `cls`, by removing every non-member run."""
+    split = pre_tokenizers.Split(Regex(f"[^{cls}]+"), behavior="removed")
+    members = set()
+    for piece, _ in split.pre_tokenize_str(SCALARS):
+        members.update(ord(c) for c in piece)
+    return members
+
+
+def ranges(members):
+    out, start, prev = [], None, None
+    for c in sorted(members):
+        if start is None:
+            start = prev = c
+        elif c == prev + 1:
+            prev = c
+        else:
+            out.append((start, prev))
+            start = prev = c
     if start is not None:
-        out.append((start, MAX_CP - 1))
+        out.append((start, prev))
     return out
 
 
-def cat(cp):
-    return unicodedata.category(chr(cp))
-
-
-def is_hangul_syllable(cp):
-    return HANGUL_S_BASE <= cp < HANGUL_S_BASE + HANGUL_S_COUNT
-
-
 def emit_ranges(name, rs):
-    lines = [f"inline constexpr CodepointRange {name}[] = {{"]
-    for a, b in rs:
-        lines.append(f"    {{0x{a:X}, 0x{b:X}}},")
-    lines.append("};")
-    return "\n".join(lines)
+    return "\n".join([f"inline constexpr CodepointRange {name}[] = {{"]
+                     + [f"    {{0x{a:X}, 0x{b:X}}}," for a, b in rs] + ["};"])
 
 
-def main(out_path):
-    letter = ranges(lambda c: cat(c).startswith("L"))
-    mark = ranges(lambda c: cat(c).startswith("M"))
-    number = ranges(lambda c: cat(c).startswith("N"))
+def main(tables_rs, out_path):
+    if not tables_rs.endswith("tables.rs") or not out_path.endswith(".inc"):
+        raise SystemExit("usage: gen_unicode_tables.py <crate src/tables.rs> <out.inc>")
+    src = open(tables_rs, encoding="utf-8").read()
+    version = re.search(r"UNICODE_VERSION: \(u64, u64, u64\) = \((\d+), (\d+), (\d+)\)", src).groups()
 
-    ccc = [(cp, unicodedata.combining(chr(cp))) for cp in range(MAX_CP)
-           if unicodedata.combining(chr(cp))]
-    decomp = []  # canonical, single-level
-    for cp in range(MAX_CP):
-        if is_hangul_syllable(cp):
-            continue
-        d = unicodedata.decomposition(chr(cp))
-        if d and not d.startswith("<"):
-            decomp.append((cp, [int(x, 16) for x in d.split()]))
-    # Primary composites: a two-codepoint canonical decomposition that NFC
-    # recomposes (this excludes composition exclusions and singletons).
-    compose = []
-    for cp, parts in decomp:
-        if len(parts) == 2:
-            pair = chr(parts[0]) + chr(parts[1])
-            if unicodedata.normalize("NFC", pair) == chr(cp):
-                compose.append((parts[0], parts[1], cp))
-    compose.sort()
+    def block(name):
+        return re.search(rf"const {name}: [^=]+= &\[(.*?)\n\];", src, re.S).group(1)
 
+    kv = [int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]+)", block("CANONICAL_COMBINING_CLASS_KV"))]
+    ccc = sorted((v >> 8, v & 0xFF) for v in kv if v & 0xFF)
+    comps = []
+    for key, ch in re.findall(r"\(0x([0-9A-Fa-f]+), '\\u\{([0-9A-Fa-f]+)\}'\)", block("COMPOSITION_TABLE_KV")):
+        k = int(key, 16)
+        comps.append((k >> 16, k & 0xFFFF, int(ch, 16)))
+    astral = re.search(r"fn composition_table_astral.*?match \(c1, c2\) \{(.*?)_ => None", src, re.S).group(1)
+    for a, b, r in re.findall(r"\('\\u\{(\w+)\}', '\\u\{(\w+)\}'\) => Some\('\\u\{(\w+)\}'\)", astral):
+        comps.append((int(a, 16), int(b, 16), int(r, 16)))
+    comps.sort()
+    decomp = sorted((int(key, 16), [int(x, 16) for x in re.findall(r"\\u\{(\w+)\}", chars)])
+                    for key, chars in re.findall(r"\(0x([0-9a-fA-F]+), &\[([^\]]*)\]\)",
+                                                 block("CANONICAL_DECOMPOSED_KV")))
+
+    letter, mark, number, space = probe(r"\p{L}"), probe(r"\p{M}"), probe(r"\p{N}"), probe(r"\s")
+    tag = (f"tokenizers {tokenizers.__version__} (Oniguruma classes); NFC from "
+           f"unicode-normalization-alignments (Unicode {'.'.join(version)})")
     with open(out_path, "w") as f:
-        f.write("// Generated by tools/gen_unicode_tables.py from Python unicodedata "
-                f"(Unicode {unicodedata.unidata_version}). Do not edit.\n")
-        f.write(f"inline constexpr const char kUnicodeVersion[] = \"{unicodedata.unidata_version}\";\n\n")
-        f.write(emit_ranges("kLetterRanges", letter) + "\n\n")
-        f.write(emit_ranges("kMarkRanges", mark) + "\n\n")
-        f.write(emit_ranges("kNumberRanges", number) + "\n\n")
+        f.write("// Generated by tools/gen_unicode_tables.py from HF tokenizers' own Unicode\n"
+                f"// data: {tag}. Do not edit.\n")
+        f.write(f'inline constexpr const char kUnicodeVersion[] = "{tag}";\n\n')
+        for name, members in (("kLetterRanges", letter), ("kMarkRanges", mark),
+                              ("kNumberRanges", number), ("kSpaceRanges", space)):
+            f.write(emit_ranges(name, ranges(members)) + "\n\n")
         f.write("inline constexpr CombiningClassEntry kCombiningClasses[] = {\n")
-        for cp, c in ccc:
-            f.write(f"    {{0x{cp:X}, {c}}},\n")
+        f.writelines(f"    {{0x{cp:X}, {c}}},\n" for cp, c in ccc)
         f.write("};\n\n")
         flat, index = [], []
         for cp, parts in decomp:
@@ -89,16 +98,14 @@ def main(out_path):
             f.write("    " + ", ".join(f"0x{x:X}" for x in flat[i:i + 8]) + ",\n")
         f.write("};\n\n")
         f.write("inline constexpr Decomposition kDecompositions[] = {\n")
-        for cp, off, n in index:
-            f.write(f"    {{0x{cp:X}, {off}, {n}}},\n")
+        f.writelines(f"    {{0x{cp:X}, {off}, {n}}},\n" for cp, off, n in index)
         f.write("};\n\n")
         f.write("inline constexpr Composition kCompositions[] = {\n")
-        for a, b, c in compose:
-            f.write(f"    {{0x{a:X}, 0x{b:X}, 0x{c:X}}},\n")
+        f.writelines(f"    {{0x{a:X}, 0x{b:X}, 0x{c:X}}},\n" for a, b, c in comps)
         f.write("};\n")
-    print(f"letters {len(letter)} marks {len(mark)} numbers {len(number)} "
-          f"ccc {len(ccc)} decomp {len(decomp)} compose {len(compose)}", file=sys.stderr)
+    print(f"{tag}: L {len(letter)} M {len(mark)} N {len(number)} \\s {len(space)} "
+          f"ccc {len(ccc)} decomp {len(decomp)} compose {len(comps)}", file=sys.stderr)
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(sys.argv[1], sys.argv[2])

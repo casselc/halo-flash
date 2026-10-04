@@ -39,6 +39,14 @@ enum class TokenType : std::int32_t {
 /// `text`, non-empty, and concatenate to it.
 [[nodiscard]] std::vector<std::string_view> PreTokenizeQwen35(std::string_view text);
 
+/// The pre-tokenizer regexes this tokenizer implements (GGUF
+/// tokenizer.ggml.pre). kQwen2 is the older pattern
+///   ...|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|...
+/// in which combining marks are punctuation rather than part of words; the
+/// strands-decider checkpoint's tokenizer.json uses it.
+enum class PreTokenizer { kQwen35, kQwen2 };
+[[nodiscard]] std::vector<std::string_view> PreTokenize(std::string_view text, PreTokenizer kind);
+
 /// Byte-level BPE tokenizer for Qwen3.8-Flash-Next (HF `tokenizers` model
 /// with NFC normalizer, the regex above, and ByteLevel pre-tokenizer/decoder).
 ///
@@ -57,6 +65,16 @@ class Tokenizer {
 
   [[nodiscard]] std::vector<TokenId> Encode(std::string_view text,
                                             bool parse_special = true) const;
+  /// Encode, plus each token's [start, end) in the ORIGINAL text counted in
+  /// code points, as HF `tokenizers` reports offsets for a Python str. Spans
+  /// that NFC changes map every token inside them to the whole original
+  /// segment.
+  struct Encoded {
+    std::vector<TokenId> ids;
+    std::vector<std::pair<std::size_t, std::size_t>> offsets;
+  };
+  [[nodiscard]] Encoded EncodeWithOffsets(std::string_view text, bool parse_special = true) const;
+
   [[nodiscard]] std::string Decode(std::span<const TokenId> tokens) const;
   /// Raw bytes of one token (special tokens decode to their text).
   [[nodiscard]] std::string_view TokenBytes(TokenId id) const noexcept;
@@ -67,12 +85,15 @@ class Tokenizer {
     return id < special_.size() && special_[id];
   }
   [[nodiscard]] TokenId eos() const noexcept { return eos_; }
+  [[nodiscard]] PreTokenizer pre_tokenizer() const noexcept { return pre_; }
   [[nodiscard]] TokenId pad() const noexcept { return pad_; }
 
  private:
   Tokenizer() = default;
   void EncodeOrdinary(std::string_view text, std::vector<TokenId>& out) const;
-  void MergePiece(std::string_view piece, std::vector<TokenId>& out) const;
+  void MergePiece(std::string_view piece, std::vector<TokenId>& out,
+                  std::vector<std::pair<std::size_t, std::size_t>>* ranges = nullptr) const;
+  void EncodeOrdinaryWithOffsets(std::string_view text, std::size_t base, Encoded& out) const;
 
   struct PairHash {
     std::size_t operator()(std::pair<TokenId, TokenId> p) const noexcept {
@@ -90,6 +111,7 @@ class Tokenizer {
   std::unordered_map<std::pair<TokenId, TokenId>, Merge, PairHash> merges_;
   std::vector<std::pair<std::string, TokenId>> specials_;  // matched in raw text
   std::array<TokenId, 256> byte_token_{};
+  PreTokenizer pre_ = PreTokenizer::kQwen35;
   TokenId eos_ = kNoToken;
   TokenId pad_ = kNoToken;
 };

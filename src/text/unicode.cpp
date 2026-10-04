@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace halo::text {
@@ -73,43 +74,96 @@ char32_t Compose(char32_t a, char32_t b) noexcept {
   return it != std::end(kCompositions) && it->first == a && it->second == b ? it->composite : 0;
 }
 
-// Normalizes one run of well-formed codepoints in place.
-void NfcRun(std::vector<char32_t>& cps) {
-  std::vector<char32_t> d;
-  d.reserve(cps.size() + 8);
-  for (char32_t cp : cps) DecomposeInto(cp, d);
-  // Canonical ordering: stable sort each maximal run of non-starters.
-  for (std::size_t i = 0; i < d.size();) {
-    if (CombiningClass(d[i]) == 0) { ++i; continue; }
-    std::size_t j = i;
-    while (j < d.size() && CombiningClass(d[j]) != 0) ++j;
-    std::stable_sort(d.begin() + i, d.begin() + j,
-                     [](char32_t a, char32_t b) { return CombiningClass(a) < CombiningClass(b); });
-    i = j;
+// One normalized code point and its alignment change, as the
+// unicode-normalization-alignments crate (HF tokenizers' NFC) emits them:
+//   0  replaces the current original character,
+//   +1 is inserted (aligned to the previous original character),
+//   -N replaces the current character and absorbs the N that follow.
+struct Changed {
+  char32_t cp;
+  int change;
+};
+
+// Port of the crate's Decompositions + Recompositions iterators (canonical),
+// kept literal so its ordering of changes is reproduced exactly.
+std::vector<Changed> NfcWithChanges(const std::vector<char32_t>& input) {
+  // Decomposition: each input character's first decomposed code point
+  // replaces it (0), the rest are insertions (+1); before every starter the
+  // pending tail is stably sorted by combining class.
+  struct Item { std::uint8_t ccc; char32_t cp; int change; };
+  std::vector<Item> buf;
+  std::size_t ready = 0;
+  const auto push = [&](char32_t c, bool first) {
+    const auto cls = static_cast<std::uint8_t>(CombiningClass(c));
+    if (cls == 0) {
+      std::stable_sort(buf.begin() + static_cast<std::ptrdiff_t>(ready), buf.end(),
+                       [](const Item& a, const Item& b) { return a.ccc < b.ccc; });
+      ready = buf.size();
+    }
+    buf.push_back({cls, c, first ? 0 : 1});
+  };
+  std::vector<char32_t> tmp;
+  for (char32_t c : input) {
+    tmp.clear();
+    DecomposeInto(c, tmp);
+    for (std::size_t k = 0; k < tmp.size(); ++k) push(tmp[k], k == 0);
   }
-  // Canonical composition.
-  cps.clear();
-  std::size_t starter = SIZE_MAX;  // index in cps of the last starter
-  int last_ccc = -1;               // ccc of the last character appended after the starter
-  for (char32_t cp : d) {
-    const int ccc = CombiningClass(cp);
-    if (starter != SIZE_MAX) {
-      const bool blocked = last_ccc != -1 && (last_ccc == 0 || last_ccc >= ccc);
-      if (!blocked) {
-        if (const char32_t c = Compose(cps[starter], cp)) {
-          cps[starter] = c;
+  std::stable_sort(buf.begin() + static_cast<std::ptrdiff_t>(ready), buf.end(),
+                   [](const Item& a, const Item& b) { return a.ccc < b.ccc; });
+
+  // Recomposition (canonical), with the composee absorbing changes.
+  std::vector<Changed> out;
+  std::vector<Changed> pending;  // the crate's buffer of blocked non-starters
+  std::optional<Changed> composee;
+  int last_ccc = -1;  // None
+  for (const auto& it : buf) {
+    const Changed ch{it.cp, it.change};
+    const int ch_class = it.ccc;
+    if (!composee) {
+      if (ch_class != 0) {
+        out.push_back(ch);
+        continue;
+      }
+      composee = ch;
+      continue;
+    }
+    if (last_ccc < 0) {
+      if (const char32_t r = Compose(composee->cp, ch.cp)) {
+        composee = Changed{r, composee->change + ch.change - 1};
+        continue;
+      }
+      if (ch_class == 0) {
+        out.push_back(*composee);
+        composee = ch;
+        continue;
+      }
+      pending.push_back(ch);
+      last_ccc = ch_class;
+    } else {
+      if (last_ccc >= ch_class) {
+        if (ch_class == 0) {
+          out.push_back(*composee);
+          out.insert(out.end(), pending.begin(), pending.end());
+          pending.clear();
+          composee = ch;
+          last_ccc = -1;
           continue;
         }
+        pending.push_back(ch);
+        last_ccc = ch_class;
+        continue;
       }
+      if (const char32_t r = Compose(composee->cp, ch.cp)) {
+        composee = Changed{r, composee->change + ch.change - 1};
+        continue;
+      }
+      pending.push_back(ch);
+      last_ccc = ch_class;
     }
-    if (ccc == 0) {
-      starter = cps.size();
-      last_ccc = -1;
-    } else {
-      last_ccc = ccc;
-    }
-    cps.push_back(cp);
   }
+  if (composee) out.push_back(*composee);
+  out.insert(out.end(), pending.begin(), pending.end());
+  return out;
 }
 
 }  // namespace
@@ -155,12 +209,7 @@ bool IsLetter(char32_t cp) noexcept { return InRanges(kLetterRanges, cp); }
 bool IsMark(char32_t cp) noexcept { return InRanges(kMarkRanges, cp); }
 bool IsNumber(char32_t cp) noexcept { return InRanges(kNumberRanges, cp); }
 
-bool IsWhiteSpace(char32_t cp) noexcept {
-  // The White_Space property (PropList.txt); stable across Unicode versions.
-  return (cp >= 0x09 && cp <= 0x0D) || cp == 0x20 || cp == 0x85 || cp == 0xA0 || cp == 0x1680 ||
-         (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029 || cp == 0x202F ||
-         cp == 0x205F || cp == 0x3000;
-}
+bool IsWhiteSpace(char32_t cp) noexcept { return InRanges(kSpaceRanges, cp); }
 
 int CombiningClass(char32_t cp) noexcept {
   const auto it = std::lower_bound(std::begin(kCombiningClasses), std::end(kCombiningClasses), cp,
@@ -170,26 +219,69 @@ int CombiningClass(char32_t cp) noexcept {
 
 const char* UnicodeVersion() noexcept { return kUnicodeVersion; }
 
-std::string Nfc(std::string_view text) {
-  if (std::all_of(text.begin(), text.end(), [](char c) { return static_cast<unsigned char>(c) < 0x80; })) {
+bool IsStableStarter(char32_t cp) noexcept {
+  if (CombiningClass(cp) != 0) return false;
+  if (cp >= kVBase && cp < kVBase + kVCount) return false;          // Hangul V joins L
+  if (cp > kTBase && cp < kTBase + kTCount) return false;            // Hangul T joins LV
+  static const std::vector<char32_t> seconds = [] {
+    std::vector<char32_t> v;
+    for (const auto& c : kCompositions) v.push_back(c.second);
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+    return v;
+  }();
+  return !std::binary_search(seconds.begin(), seconds.end(), cp);
+}
+
+std::string Nfc(std::string_view text) { return NfcAligned(text, nullptr); }
+
+std::string NfcAligned(std::string_view text, std::vector<std::pair<std::size_t, std::size_t>>* origin) {
+  const bool ascii = std::all_of(text.begin(), text.end(), [](char c) { return static_cast<unsigned char>(c) < 0x80; });
+  if (ascii) {
+    if (origin) {
+      origin->clear();
+      for (std::size_t i = 0; i < text.size(); ++i) origin->emplace_back(i, i + 1);
+    }
     return std::string(text);
   }
   std::string out;
   out.reserve(text.size());
+  if (origin) origin->clear();
+  // Runs of well-formed code points are normalized; ill-formed bytes (which
+  // HF never sees) pass through as boundaries.
   std::vector<char32_t> run;
+  std::vector<std::pair<std::size_t, std::size_t>> run_bytes;  // byte range per run code point
   auto flush = [&] {
     if (run.empty()) return;
-    NfcRun(run);
-    for (char32_t cp : run) AppendUtf8(out, cp);
+    // HF tokenizers' transform: walk the original characters positionally.
+    std::size_t cur = 0;
+    for (const auto& [cp, change] : NfcWithChanges(run)) {
+      std::pair<std::size_t, std::size_t> align;
+      if (change > 0) {
+        align = cur > 0 ? run_bytes[cur - 1]
+                : run_bytes[0].first > 0 && origin && !origin->empty() ? origin->back()
+                                                                       : std::pair<std::size_t, std::size_t>{0, 0};
+      } else {
+        align = run_bytes[std::min(cur, run_bytes.size() - 1)];
+        cur += 1 + static_cast<std::size_t>(-change);
+      }
+      const std::size_t before = out.size();
+      AppendUtf8(out, cp);
+      if (origin)
+        for (std::size_t k = before; k < out.size(); ++k) origin->push_back(align);
+    }
     run.clear();
+    run_bytes.clear();
   };
   for (std::size_t i = 0; i < text.size();) {
     const auto u = DecodeUtf8(text, i);
     if (u.valid) {
       run.push_back(u.value);
+      run_bytes.emplace_back(i, i + u.length);
     } else {
       flush();
       out.push_back(text[i]);
+      if (origin) origin->emplace_back(i, i + 1);
     }
     i += u.length;
   }
