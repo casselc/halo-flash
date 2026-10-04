@@ -291,7 +291,7 @@ if(HALO_SCOPE)
   endfunction()
   halo_scope_library(halo_scope 0)
   # The OpenAI service's generations as observations (links the server).
-  add_library(halo_scope_server STATIC src/scope/generation_observer.cpp)
+  add_library(halo_scope_server STATIC src/scope/generation_observer.cpp src/scope/response_store.cpp)
   target_link_libraries(halo_scope_server PUBLIC halo_scope halo_server)
   if(TARGET halo_serve)
     target_link_libraries(halo_serve PRIVATE halo_scope_server)
@@ -309,6 +309,7 @@ if(HALO_SCOPE)
       tests/scope/wal_test.cpp
       tests/scope/annotate_test.cpp
       tests/scope/generation_observer_test.cpp
+      tests/scope/response_store_test.cpp
       tests/scope/scope_main.cpp)
     target_link_libraries(scope_tests PRIVATE halo_scope halo_scope_server)
 

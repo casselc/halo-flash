@@ -41,7 +41,8 @@ TEST(ScopeMetadata, OpensInWalModeAndMigratesOnce) {
 
   // A failing migration leaves nothing behind: it runs in one transaction.
   auto extended = MetadataStore::Migrations();
-  extended.push_back({2, "broken", {"CREATE TABLE t2 (a)", "THIS IS NOT SQL"}});
+  const auto next = static_cast<std::uint32_t>(extended.back().version + 1);
+  extended.push_back({next, "broken", {"CREATE TABLE t2 (a)", "THIS IS NOT SQL"}});
   EXPECT_FALSE(MetadataStore::Open(path, extended, &err));
   extended.back().statements = {"CREATE TABLE t2 (a)"};
   auto fixed = MetadataStore::Open(path, extended, &err);

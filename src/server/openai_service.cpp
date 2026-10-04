@@ -73,6 +73,12 @@ std::string StopMatcher::Flush() {
 
 OpenAiService::OpenAiService(TextGenerator& generator, ServiceOptions options)
     : gen_(generator), opt_(std::move(options)) {
+  if (opt_.store) {
+    store_ = opt_.store;
+  } else {
+    own_store_ = std::make_unique<InMemoryResponseStore>(opt_.max_stored_responses);
+    store_ = own_store_.get();
+  }
   if (!opt_.new_id) opt_.new_id = RandomId;
   if (!opt_.now_s)
     opt_.now_s = [] {
@@ -154,29 +160,18 @@ HttpResponse OpenAiService::Responses(const HttpRequest& http) {
   SetContext(http, *req);
   std::optional<Value> prior;
   if (!req->previous_response_id.empty()) {
-    std::lock_guard<std::mutex> lk(mu_);
-    const auto it = stored_.find(req->previous_response_id);
-    if (it == stored_.end())
+    auto stored = store_->Get(req->previous_response_id);
+    if (!stored)
       return Error(404, {"previous response not found: " + req->previous_response_id, "previous_response_id"});
-    prior = it->second.messages;
+    prior = std::move(stored->conversation);
   }
   return Generate(Api::kResponses, std::move(*req), prior ? &*prior : nullptr);
 }
 
 HttpResponse OpenAiService::GetResponse(const std::string& id) {
-  std::lock_guard<std::mutex> lk(mu_);
-  const auto it = stored_.find(id);
-  if (it == stored_.end()) return Error(404, {"no stored response " + id, ""});
-  return HttpResponse::Json(200, CompactJson(it->second.response));
-}
-
-void OpenAiService::Store(const std::string& id, Stored s) {
-  std::lock_guard<std::mutex> lk(mu_);
-  if (stored_.emplace(id, std::move(s)).second) stored_order_.push_back(id);
-  while (stored_order_.size() > opt_.max_stored_responses) {
-    stored_.erase(stored_order_.front());
-    stored_order_.erase(stored_order_.begin());
-  }
+  const auto stored = store_->Get(id);
+  if (!stored) return Error(404, {"no stored response " + id, ""});
+  return HttpResponse::Json(200, CompactJson(stored->response));
 }
 
 HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value* prior) {
@@ -306,7 +301,7 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
       if (auto turn = ParseResponsesRequest(body, opt_.defaults, &e)) {
         Value conv = run->conversation;
         for (std::size_t i = 1; i < turn->messages.items().size(); ++i) conv.push(turn->messages.items()[i]);
-        Store(id, {std::move(conv), final});
+        store_->Put(id, {std::move(conv), final});
       }
     }
     return std::make_pair(result.error, std::move(final));

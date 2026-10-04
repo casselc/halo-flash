@@ -879,8 +879,9 @@ layer (incremental parser, keep-alive, chunked SSE, bounded connections);
 `src/server/openai_service` serves `/v1/models`, `/v1/completions`,
 `/v1/chat/completions`, `/v1/responses` and `GET /v1/responses/{id}` over
 a `TextGenerator` interface, with stop sequences (byte-at-a-time semantics,
-chunking-independent) and an in-memory response store for
-`previous_response_id`. `FlashNextGenerator` runs it on the engine
+chunking-independent) and a response store for `previous_response_id` (in
+memory by default; in halo-scope's SQLite metadata store with
+`halo_serve --scope-dir`, where stored responses survive restarts). `FlashNextGenerator` runs it on the engine
 (device sampling, stop tokens, whole-UTF-8 pieces) and keeps the engine's
 state when a prompt extends everything already run; `halo_serve` is the
 binary.

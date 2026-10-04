@@ -38,6 +38,22 @@ BEGIN SELECT RAISE(ABORT, 'prompt versions are immutable'); END)",
 ) WITHOUT ROWID)",
     }};
 
+// Stored /v1/responses (P7): the conversation through each response's own
+// turn and the response object, both JSON. Pruned oldest first.
+const Migration kResponses{
+    2,
+    "responses",
+    {
+        R"(CREATE TABLE responses (
+  id TEXT PRIMARY KEY,
+  seq INTEGER NOT NULL,
+  conversation TEXT NOT NULL,
+  response TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+) WITHOUT ROWID)",
+        R"(CREATE INDEX responses_seq ON responses (seq))",
+    }};
+
 class Stmt {
  public:
   Stmt(sqlite3* db, const char* sql) { sqlite3_prepare_v2(db, sql, -1, &s_, nullptr); }
@@ -65,7 +81,7 @@ class Stmt {
 }  // namespace
 
 const std::vector<Migration>& MetadataStore::Migrations() {
-  static const std::vector<Migration> m = {kPrompts};
+  static const std::vector<Migration> m = {kPrompts, kResponses};
   return m;
 }
 
@@ -117,6 +133,7 @@ std::unique_ptr<MetadataStore> MetadataStore::Open(const std::string& path, cons
     if (!s->Exec("COMMIT", err)) return nullptr;
   }
   return s;
+
 }
 
 MetadataStore::~MetadataStore() {
@@ -207,6 +224,40 @@ std::vector<std::string> MetadataStore::LabelsOf(std::string_view name, std::int
   std::vector<std::string> out;
   while (q.Step() == SQLITE_ROW) out.push_back(q.Text(0));
   return out;
+}
+
+bool MetadataStore::PutResponse(std::string_view id, std::string_view conversation, std::string_view response,
+                                std::size_t keep, std::string* err) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!Exec("BEGIN IMMEDIATE", err)) return false;
+  bool ok;
+  {
+    Stmt p(db_,
+           "INSERT INTO responses (id, seq, conversation, response) "
+           "VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM responses), ?, ?) "
+           "ON CONFLICT(id) DO UPDATE SET conversation = excluded.conversation, response = excluded.response");
+    ok = p.Bind(1, id).Bind(2, conversation).Bind(3, response).Step() == SQLITE_DONE;
+  }
+  if (ok && keep > 0) {
+    Stmt d(db_,
+           "DELETE FROM responses WHERE seq <= (SELECT MAX(seq) FROM responses) - ?");
+    ok = d.Bind(1, static_cast<std::int64_t>(keep)).Step() == SQLITE_DONE;
+  }
+  if (!ok) {
+    *err = sqlite3_errmsg(db_);
+    std::string ignored;
+    Exec("ROLLBACK", &ignored);
+    return false;
+  }
+  return Exec("COMMIT", err);
+}
+
+std::optional<std::pair<std::string, std::string>> MetadataStore::GetResponse(std::string_view id) {
+  std::lock_guard<std::mutex> lk(mu_);
+  Stmt q(db_, "SELECT conversation, response FROM responses WHERE id = ?");
+  q.Bind(1, id);
+  if (q.Step() != SQLITE_ROW) return std::nullopt;
+  return std::make_pair(q.Text(0), q.Text(1));
 }
 
 std::string MetadataStore::JournalMode() {

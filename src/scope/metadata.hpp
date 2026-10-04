@@ -3,11 +3,12 @@
 
 // Mutable halo-scope metadata in SQLite (WAL mode), where Langfuse uses
 // Postgres. This spike holds prompts, their immutable versions and movable
-// labels (`production`, `latest`, ...), enough to prove the pattern:
-// ordered checksummed migrations, each applied in one transaction.
+// labels (`production`, `latest`, ...), and stored /v1/responses: ordered
+// checksummed migrations, each applied in one transaction.
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -47,6 +48,12 @@ class MetadataStore {
   std::optional<PromptVersion> GetByVersion(std::string_view name, std::int64_t version);
   /// The labels pointing at (name, version), sorted.
   std::vector<std::string> LabelsOf(std::string_view name, std::int64_t version);
+  /// Stores a /v1/responses response (JSON texts), replacing one with the
+  /// same id, and keeps only the newest `keep` (0: all). Thread-safe.
+  bool PutResponse(std::string_view id, std::string_view conversation, std::string_view response, std::size_t keep,
+                   std::string* err);
+  /// (conversation, response) JSON texts. Thread-safe.
+  std::optional<std::pair<std::string, std::string>> GetResponse(std::string_view id);
   /// PRAGMA journal_mode (expected "wal").
   std::string JournalMode();
 
@@ -54,6 +61,7 @@ class MetadataStore {
   MetadataStore() = default;
   bool Exec(const char* sql, std::string* err);
   sqlite3* db_ = nullptr;
+  std::mutex mu_;  // the response methods may be called from any thread
 };
 
 }  // namespace halo::scope

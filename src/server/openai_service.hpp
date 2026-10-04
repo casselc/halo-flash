@@ -28,6 +28,7 @@
 #include "core/sampling.hpp"
 #include "server/http.hpp"
 #include "server/observer.hpp"
+#include "server/response_store.hpp"
 #include "server/openai_request.hpp"
 #include "text/chat_template.hpp"
 
@@ -80,7 +81,10 @@ struct ServiceOptions {
   std::string model_id = "qwen3.8-flash-next";
   RequestDefaults defaults;
   text::ChatTemplateKind template_kind = text::ChatTemplateKind::kFlashNext;
-  std::size_t max_stored_responses = 1000;  // oldest evicted first
+  std::size_t max_stored_responses = 1000;  // for the default in-memory store
+  /// Where stored responses live (optional; must outlive the service).
+  /// Default: in memory, max_stored_responses of them.
+  ResponseStore* store = nullptr;
   /// Told about every generation (optional; must outlive the service).
   GenerationObserver* observer = nullptr;
   /// Called when a generation starts and ends (optional), e.g. for the
@@ -104,18 +108,12 @@ class OpenAiService {
   HttpResponse GetResponse(const std::string& id);
 
  private:
-  struct Stored {
-    json::Value messages;  // the conversation including this response's turn
-    json::Value response;  // the response object
-  };
   HttpResponse Generate(Api api, GenerationRequest req, const json::Value* prior);
-  void Store(const std::string& id, Stored s);
 
   TextGenerator& gen_;
   ServiceOptions opt_;
-  std::mutex mu_;
-  std::map<std::string, Stored> stored_;  // guarded by mu_
-  std::vector<std::string> stored_order_;  // guarded by mu_
+  std::unique_ptr<InMemoryResponseStore> own_store_;
+  ResponseStore* store_ = nullptr;
 };
 
 }  // namespace halo::server

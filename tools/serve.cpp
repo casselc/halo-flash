@@ -3,8 +3,9 @@
 //              [--device hip|hrx] [--max-context 32768] [--api-key KEY]
 //              [--model-id NAME] [--decider-dir DIR [--decider-device hip|hrx|cpu]]
 // With halo-scope built in (HALO_SCOPE=ON): --scope-dir DIR records every
-// generation as a GENERATION observation [--scope-project NAME]
-// [--scope-capture off|digest|full] [--scope-wal PATH].
+// generation as a GENERATION observation in DIR/chdb and keeps stored
+// /v1/responses in DIR/metadata.sqlite, so they survive restarts
+// [--scope-project NAME] [--scope-capture off|digest|full] [--scope-wal PATH].
 // --decider-dir serves POST /v1/systemone with strands-decider-2B (the
 // directory holds Qwen3.5-2B-Base-BF16.gguf and the strands-decider-*.gguf
 // files, as the decider tests expect).
@@ -12,6 +13,7 @@
 //            POST /v1/completions, /v1/chat/completions, /v1/responses.
 
 #include <csignal>
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -34,6 +36,8 @@
 #include "halo_scope.h"
 #include "scope/c_api.hpp"
 #include "scope/generation_observer.hpp"
+#include "scope/metadata.hpp"
+#include "scope/response_store.hpp"
 #endif
 
 using namespace halo;
@@ -107,12 +111,19 @@ int main(int argc, char** argv) {
 #if HALO_WITH_SCOPE
   halo_scope* scope = nullptr;
   std::unique_ptr<scope::GenerationObserver> observed;
+  std::unique_ptr<scope::MetadataStore> metadata;
+  std::unique_ptr<scope::SqliteResponseStore> responses;
   if (!scope_dir.empty()) {
     const auto capture = scope_capture == "off"    ? HALO_SCOPE_CAPTURE_OFF
                          : scope_capture == "full" ? HALO_SCOPE_CAPTURE_FULL
                                                    : HALO_SCOPE_CAPTURE_DIGEST;
     char err[512] = {};
-    scope = halo_scope_open(scope_dir.c_str(), scope_project.c_str(), capture,
+    std::filesystem::create_directories(scope_dir);
+    metadata = scope::MetadataStore::Open(scope_dir + "/metadata.sqlite", &error);
+    if (!metadata) return std::fprintf(stderr, "halo-scope metadata: %s\n", error.c_str()), 1;
+    responses = std::make_unique<scope::SqliteResponseStore>(*metadata, 100000);
+    so.store = responses.get();
+    scope = halo_scope_open((scope_dir + "/chdb").c_str(), scope_project.c_str(), capture,
                             scope_wal.empty() ? nullptr : scope_wal.c_str(), err, sizeof err);
     if (!scope) return std::fprintf(stderr, "halo-scope: %s\n", err), 1;
     observed = std::make_unique<scope::GenerationObserver>(scope::AnnotatorOf(scope));
