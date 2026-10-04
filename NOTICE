@@ -2,12 +2,21 @@ halo-flash includes code adapted from the following MIT-licensed projects.
 Each adapted file says so in its header; full license texts are in licenses/.
 
 - gufo (Copyright (c) 2026 gufo contributors): src/core/gguf.{hpp,cpp},
-  src/core/quant.{hpp,cpp}, the BPE merge loop in src/text/tokenizer.cpp, and
-  src/model/{config,weights,ngram,cpu_ops,reference}.{hpp,cpp}.
+  src/core/quant.{hpp,cpp}, the BPE merge loop in src/text/tokenizer.cpp,
+  src/model/{config,weights,ngram,cpu_ops,reference}.{hpp,cpp}, and parts of
+  src/text/chat_template.cpp (from gufo src/models/qwen/chat_template.cpp: the
+  Qwen3.8 prompt strings, Python-style trimming) and src/text/tool_call_parser.cpp
+  (from gufo src/cli/serve/openai_chat.cpp: parameter framing, held tag prefixes,
+  recovery after a malformed call, Python literal arguments).
 - llama.cpp / ggml (Copyright (c) 2023-2026 The ggml authors): quantized block
   layouts and dequantization in src/core/quant.cpp (via gufo).
 - ds4 / DwarfStar (Copyright (c) 2026 the ds4.c authors): design references for
   n-gram disk reads, expert streaming and disk KV checkpoints (licenses/ds4.txt).
+
+Test data (not code): tests/text/data/chat/flash_next.jinja is the
+`tokenizer.chat_template` of the Qwen3.8-Flash-Next GGUF (Qwen, with Unsloth's
+template fixes), and qwen35.jinja the chat template of Qwen/Qwen3.5-2B-Base
+(Apache-2.0). src/text/chat_template.cpp reproduces their output in C++.
 
 Runtime dependency (not vendored): HRX System, Apache-2.0.
 Test dependencies (fetched at build time): GoogleTest (BSD-3-Clause),
