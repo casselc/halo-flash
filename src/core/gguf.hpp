@@ -162,6 +162,13 @@ public:
   [[nodiscard]] static std::unique_ptr<GgufReader> OpenFile(
       const std::filesystem::path& path, std::string* error_msg = nullptr);
 
+  /// Opens one file of a split set on its own (no sibling shards needed), for
+  /// metadata such as the tokenizer, which the first shard carries in full.
+  [[nodiscard]] static std::unique_ptr<GgufReader> OpenShard(
+      const std::filesystem::path& path, std::string* error_msg = nullptr) {
+    return OpenSingleFile(path, error_msg);
+  }
+
   /// Parses a GGUF file from an existing in-memory buffer without file mapping.
   [[nodiscard]] static std::unique_ptr<GgufReader> OpenMemory(
       const void* data, std::size_t size, std::string* error_msg = nullptr);

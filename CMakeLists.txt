@@ -34,6 +34,13 @@ add_library(halo_core STATIC
 )
 target_include_directories(halo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# --- text: Unicode, NFC, tokenizer -----------------------------------------
+add_library(halo_text STATIC
+  src/text/unicode.cpp
+  src/text/tokenizer.cpp
+)
+target_link_libraries(halo_text PUBLIC halo_core)
+
 # --- tools ------------------------------------------------------------------
 add_executable(gguf_inspect tools/gguf_inspect.cpp)
 target_link_libraries(gguf_inspect PRIVATE halo_core)
@@ -56,7 +63,7 @@ if(HALO_BUILD_TESTS)
 
   function(halo_test name)
     add_executable(${name} ${ARGN})
-    target_link_libraries(${name} PRIVATE halo_core GTest::gtest_main hegel)
+    target_link_libraries(${name} PRIVATE halo_core halo_text GTest::gtest_main hegel)
     # Hegel's params structs are meant for partial designated initializers.
     target_compile_options(${name} PRIVATE -Wno-missing-designated-field-initializers)
     # Hegel's example database: failures found once are replayed first.
@@ -68,6 +75,10 @@ if(HALO_BUILD_TESTS)
   halo_test(core_tests
     tests/core/gguf_test.cpp
     tests/core/quant_test.cpp)
+  halo_test(text_tests
+    tests/text/tokenizer_test.cpp)
+  target_compile_definitions(text_tests PRIVATE
+    HALO_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/text/data")
 endif()
 
 # --- fuzzers ----------------------------------------------------------------
@@ -78,6 +89,9 @@ if(HALO_FUZZ)
   target_link_libraries(gguf_fuzz PRIVATE halo_core)
   # Writes valid GGUF images as a seed corpus: random bytes almost never get
   # past the magic and counts, so the fuzzer needs well-formed starting points.
+  add_executable(tokenizer_fuzz fuzz/tokenizer_fuzz.cpp)
+  target_link_options(tokenizer_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_link_libraries(tokenizer_fuzz PRIVATE halo_text)
   add_executable(gguf_seed fuzz/gguf_seed.cpp)
   target_link_libraries(gguf_seed PRIVATE halo_core)
 endif()

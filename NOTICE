@@ -2,7 +2,7 @@ halo-flash includes code adapted from the following MIT-licensed projects.
 Each adapted file says so in its header; full license texts are in licenses/.
 
 - gufo (Copyright (c) 2026 gufo contributors): src/core/gguf.{hpp,cpp},
-  src/core/quant.{hpp,cpp}.
+  src/core/quant.{hpp,cpp}, and the BPE merge loop in src/text/tokenizer.cpp.
 - llama.cpp / ggml (Copyright (c) 2023-2026 The ggml authors): quantized block
   layouts and dequantization in src/core/quant.cpp (via gufo).
 - ds4 / DwarfStar (Copyright (c) 2026 the ds4.c authors): design references for
