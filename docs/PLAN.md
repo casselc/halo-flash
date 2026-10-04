@@ -318,6 +318,24 @@ not one-off checks:
   - an OpenAI-SDK functional suite (ported from gufo `tests/functional`);
   - a C ABI example and test that embeds the engine in-process.
 
+- **Template facts the server must honour** (found by `src/text/chat_template`
+  against HF `apply_chat_template`, 2026-10-03):
+  - **Thinking defaults are opposite.** With `enable_thinking` unset,
+    Flash-Next opens a think block and Qwen3.5 closes one. The parser's
+    start state comes from `GenerationPrompt()`.
+  - **Flash-Next always adds a reasoning-effort system block** (default
+    xhigh; "high" maps to xhigh, any other value is an error). It also
+    shows past thinking by default.
+  - **Qwen3.5** allows a system message only first and no developer role.
+    It requires a real user query, and prints scalar arguments with
+    Python `str()`.
+  - **Tool arguments.** OpenAI `arguments` strings must be parsed into
+    objects before rendering. String arguments print raw and everything
+    else as JSON, so the parser uses the tool schema to recover types.
+  - **The parser does not stop at `<|im_end|>`**; the server cuts at EOS or
+    a stop string. Tool calls are buffered whole (up to 1 MiB), not
+    streamed as argument fragments.
+
 **P8 — Expert streaming from disk.**
 - A hot-expert cache budget.
 - io_uring O_DIRECT reads into the unified-memory cache.
