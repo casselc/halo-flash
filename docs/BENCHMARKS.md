@@ -21,7 +21,14 @@ Teacher-forced scoring on ds4's `qwen38-flash-alibaba-100` fixtures
 | Engine | Kernels | Cases | Target tokens | NLL | API top-token agreement | Gate |
 |---|---|---:|---:|---:|---:|---|
 | halo-flash, HIP, eager | P2 (correctness) | 98 | 5,568 | **0.2859** | **92.46%** | pass |
+| halo-flash, HIP, graphs | P3 GEMVs, float expert activations | 98 | 5,568 | 0.285956 | 92.47% | pass |
+| halo-flash, HIP, graphs | P3 + int8 expert activations | 98 | 5,568 | 0.285943 | 92.67% | pass |
+| halo-flash, HIP, graphs | P3 + int8 + fused mixer / shared expert / DeltaNet (66dae81) | 98 | 5,568 | 0.286366 | 92.47% | pass |
 | ds4 Q4 on DGX Spark (ds4's own GGUF) | — | 100 | 5,696 | 0.2903 | 92.08% | reference |
+
+Paired by case, P2 and the fused build differ by +0.0005 ± 0.0006 per case (standard error),
+with 51 cases up and 47 down: noise from float reordering, not a systematic
+shift.
 
 ds4's NLL row also includes the two cases that have damaged emoji metadata.
 Its agreement column uses the same 5,568 tokens as ours. ds4's Q4 is a
@@ -38,6 +45,25 @@ not an identity.
   `6e29a188870a63130d14c840b32d7a59d561f81c612ba57e62031dadb98c33e2`.
 
 ## Speed
+
+### Decode, real model (2026-10-04, idle machine, greedy, `halo_run --device-sample 1`)
+
+Median of 60 steady steps after warm-up (the "Capital of France" prompt).
+
+| Build | HIP | HRX |
+|---|---:|---:|
+| P2 kernels, eager | ~180 ms (5.6 tok/s) | — |
+| First P3 GEMVs + graphs (019be74) | ~110 ms | — |
+| Multi-row GEMVs, tuned experts (95245c0) | 51.1 ms (19.6 tok/s) | 93.7 ms |
+| + int8 expert activations | 47.4 ms (21.1 tok/s) | — |
+| + fused mixer, shared expert, DeltaNet block (66dae81) | **44.7 ms (22.4 tok/s)** | 64.0 ms (15.6 tok/s) |
+
+The commit message of 66dae81 quotes 46.7 and 84 ms; those were measured
+with a stale `halo_run` binary built before the fusions.
+
+At this quant mix the roofline is about 26 ms per token (38 tok/s). gufo
+reports 25.9 tok/s on the same machine (its own benchmark protocol, not yet
+rerun here).
 
 Measured 2026-10-03/04 while other jobs were running, so the absolute
 numbers are noisy.
