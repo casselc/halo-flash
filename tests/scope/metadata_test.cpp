@@ -10,6 +10,7 @@
 #include <string>
 
 #include "scope/metadata.hpp"
+#include "scope_env.hpp"
 
 namespace gs = hegel::generators;
 using namespace halo::scope;
@@ -17,9 +18,7 @@ using namespace halo::scope;
 namespace {
 
 std::string TempDb() {
-  std::string tmpl = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/halo-scope-meta-XXXXXX";
-  if (!mkdtemp(tmpl.data())) throw std::runtime_error("mkdtemp");
-  return tmpl + "/meta.db";
+  return halo::scope::testing::TempDir("halo-scope-meta") + "/meta.db";
 }
 
 }  // namespace

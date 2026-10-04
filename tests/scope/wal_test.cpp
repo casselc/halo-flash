@@ -26,9 +26,7 @@ using halo::scope::testing::Read;
 namespace {
 
 std::string TempPath(const char* name) {
-  std::string tmpl = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/halo-scope-wal-XXXXXX";
-  if (!mkdtemp(tmpl.data())) throw std::runtime_error("mkdtemp");
-  return tmpl + "/" + name;
+  return halo::scope::testing::TempDir("halo-scope-wal") + "/" + name;
 }
 
 struct SimulatedCrash : std::runtime_error {

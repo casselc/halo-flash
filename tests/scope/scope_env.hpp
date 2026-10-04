@@ -14,6 +14,9 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <filesystem>
+#include <stdexcept>
+#include <vector>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -34,18 +37,33 @@ struct ChdbEnv {
 
 inline ChdbEnv* g_env = nullptr;
 
+/// Temporary directories made by this process. Shutdown() removes them
+/// after chDB has stopped (each holds a database), unless
+/// HALO_SCOPE_KEEP_TMP is set for debugging. Without this every run leaks
+/// thousands of files into $TMPDIR.
+inline std::mutex g_tmp_mu;
+inline std::vector<std::string> g_tmp_dirs;
+
+inline std::string TempDir(const char* prefix) {
+  std::string tmpl = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/" + prefix + "-XXXXXX";
+  if (!mkdtemp(tmpl.data())) throw std::runtime_error("mkdtemp failed");
+  std::lock_guard<std::mutex> lk(g_tmp_mu);
+  g_tmp_dirs.push_back(tmpl);
+  return tmpl;
+}
+
 inline ChdbEnv& Env() {
   static ChdbEnv* env = g_env = [] {
     auto* e = new ChdbEnv();  // leaked: chDB lives until process exit
     e->lib = ChdbLib::Load("", &e->error);
     if (!e->lib) return e;
-    std::string tmpl = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/halo-scope-XXXXXX";
-    if (!mkdtemp(tmpl.data())) {
-      e->error = "mkdtemp failed";
+    try {
+      e->path = TempDir("halo-scope");
+    } catch (const std::exception& ex) {
+      e->error = ex.what();
       e->lib = nullptr;
       return e;
     }
-    e->path = tmpl;
     e->reader = Conn::Open(*e->lib, e->path, &e->error);
     if (!e->reader || MigrateChdb(*e->reader, &e->error) < 0) e->lib = nullptr;
     if (e->lib) e->writer = Conn::Open(*e->lib, e->path, &e->error);
@@ -57,10 +75,18 @@ inline ChdbEnv& Env() {
 
 /// Closes the shared connections (the last ones open) before exit.
 inline void Shutdown() {
-  if (!g_env) return;  // chDB never booted
-  g_env->writer.reset();
-  g_env->reader.reset();
-  if (g_env->lib) g_env->lib->Shutdown();  // no chDB thread outlives main()
+  if (g_env) {
+    g_env->writer.reset();
+    g_env->reader.reset();
+    if (g_env->lib) g_env->lib->Shutdown();  // no chDB thread outlives main()
+  }
+  if (std::getenv("HALO_SCOPE_KEEP_TMP")) return;
+  std::lock_guard<std::mutex> lk(g_tmp_mu);
+  for (const auto& d : g_tmp_dirs) {
+    std::error_code ec;
+    std::filesystem::remove_all(d, ec);
+  }
+  g_tmp_dirs.clear();
 }
 
 /// Skips the calling test when libchdb is unavailable.
