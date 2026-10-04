@@ -1,0 +1,19 @@
+# Kernels allowed to spill registers or use scratch (tools/kernel_report.py
+# --check). Every entry says why; remove an entry when its kernel is fixed
+# (the check fails while a listed kernel no longer needs it).
+
+# Decode DeltaNet steps: a 128-float state column per thread (256 VGPRs).
+# A decode lead: the lane-split layout used in prefill has no spills.
+halo_gdn_step_d128
+halo_gdn_step_d128_norm
+# The fused, bit-identical prefill recurrence (exact mode only).
+halo_gdn_prefill_d128_norm
+# Generic per-element Q6_K fragments in the grouped gate/up (no Q6_K experts
+# in the Flash-Next quant mix; the path exists for other mixes).
+halo_moe_gate_up_grouped_q6_k
+# Scratch without spills: private arrays the compiler did not keep in
+# registers. Open: in hot loops these cost memory traffic.
+halo_gemm_q8r_f16_l
+halo_gemm_q8r_f16_s
+halo_gemm_q8r_f16_mix
+halo_attention_wmma_mq

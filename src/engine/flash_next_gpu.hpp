@@ -9,6 +9,7 @@
 // reference's tie rules (equal scores keep the lower index), so a step
 // needs no host round trip except the n-gram rows and the final logits.
 
+#include <chrono>
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
@@ -84,6 +85,14 @@ class FlashNextGpu {
   /// Routed experts of a chunk grouped by expert (one GEMM per expert's
   /// tokens) instead of token by token.
   static inline bool prefill_grouped_moe_ = true;
+  /// Expert bucketing in three parallel passes instead of one block.
+  static inline bool prefill_parallel_bucket_ = true;
+  /// F32 projections of <= 16 rows (mixer inject, shared-expert gate): one
+  /// warp per token instead of 64-row tiles. Off: predicted -100 ms,
+  /// measured +490 ms per 2048-token prefill (~3.4 ms per call).
+  static inline bool prefill_skinny_f32_ = false;
+  /// The combine after a block fused with the next mixer's norm (bit-identical).
+  static inline bool prefill_fused_combine_ = true;
   /// Attention of a chunk's tokens in batched launches (same arithmetic as
   /// stepping) instead of token by token.
   static inline bool prefill_batched_attention_ = true;
@@ -109,6 +118,24 @@ class FlashNextGpu {
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
   /// Graph replay (default) or eager launches; both run the same sequence.
   void SetUseGraphs(bool on) noexcept { use_graphs_ = on; }
+
+  /// Sync-free per-kernel timing (profiling). Between Start and Stop, every
+  /// kernel the engine launches eagerly is followed by a one-thread kernel
+  /// that writes the GPU's constant-rate counter; Stop synchronizes, reads
+  /// the stamps and returns each (kernel name, grid) key's total time and
+  /// call count, longest first. Unlike a synchronize after every launch,
+  /// this keeps the clocks and back-to-back execution of the real workload
+  /// (about 5 us per stamp is added). Use around Prefill; decode graphs are
+  /// not captured while timing is on. `ticks_per_ms` converts counter ticks
+  /// (measured against host time when 0: pass the device's known rate when
+  /// it is, 100 MHz on gfx11 -> 1e5).
+  struct KernelTime {
+    std::string key;
+    double ms = 0;
+    std::uint64_t calls = 0;
+  };
+  [[nodiscard]] bool StartKernelTiming(std::size_t capacity, std::string* error);
+  [[nodiscard]] std::vector<KernelTime> StopKernelTiming(double* span_ms, double* ticks_per_ms, std::string* error);
   /// Kernels launched so far by name (not the per-type embedding lookups), so
   /// tests can assert which paths a model's shapes and types select.
   [[nodiscard]] bool LaunchedKernel(const std::string& name) const { return kernels_.contains(name); }
@@ -179,7 +206,7 @@ class FlashNextGpu {
     rt::Buffer res, xn, lo, gate, mixed, inject, block_out, embd, xq, xd, host;
     rt::Buffer qkv, conv, z, alpha, beta, gdn, qg, q, gate_a, k, v, ctx, iq, ik;
     rt::Buffer router, ids, wts, eg, eu, ed, sgate;
-    rt::Buffer sorted, pos, tiles, ntiles, hp, yp, x16;
+    rt::Buffer sorted, pos, tiles, ntiles, hp, yp, x16, bcounts, bbase;
     rt::Buffer pa, pb;  // PLE key and normalized rows
     rt::Buffer xh, mh;  // fp16 activations: per GEMM, and the shared `mixed`  // grouped experts (hp, x16 fp16)
     rt::Buffer bscores, vis, ascores;                // batched attention, kAttnSub tokens at a time
@@ -199,7 +226,7 @@ class FlashNextGpu {
   /// x16: x already converted to fp16 rows (shared by several GEMMs), or null.
   bool Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::Buffer& y, std::uint32_t tokens,
             std::string* error, const rt::Buffer* x16 = nullptr);
-  bool HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_t tokens, std::string* error);
+  bool HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_t tokens, std::string* error, bool normed = false);
   bool PleChunk(const model::LayerWeights& l, std::uint32_t tokens, std::string* error);
   bool LinearChunk(const model::LayerWeights& l, LinearState& s, std::uint32_t tokens, std::string* error);
   bool AttentionBatched(const model::LayerWeights& l, AttnState& s, std::uint32_t T, std::string* error);
@@ -209,6 +236,7 @@ class FlashNextGpu {
   bool Half(const rt::Buffer& x, const rt::Buffer& out, std::uint32_t n, std::string* error);
   bool MixedHalf(std::uint32_t T, std::string* error);
   const rt::Buffer* MixedH() const;
+  bool Bucket(std::uint32_t pairs, std::uint32_t E, std::string* error);
   bool GroupedMoeFits(const model::LayerWeights& l) const;
   bool GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std::string* error);
   bool SharedExpertChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error);
@@ -219,6 +247,12 @@ class FlashNextGpu {
   model::NgramTable* ngram_;
   std::uint32_t max_context_ = 0, position_ = 0;
   bool use_graphs_ = true;
+  void Stamp(const std::string& key);  // after a kernel, while timing
+  bool timing_ = false;
+  rt::Buffer stamps_;
+  std::vector<std::string> stamp_keys_;  // key of the kernel each stamp follows (0: the start)
+  std::size_t stamp_cap_ = 0;
+  std::chrono::steady_clock::time_point timing_start_;
   rt::Graph graphs_[3];  ///< by Head: none, logits, sample
   SamplingMode sampling_mode_ = SamplingMode::kFast;
   /// One upload per step: n-gram rows, step parameters, sampling parameters,

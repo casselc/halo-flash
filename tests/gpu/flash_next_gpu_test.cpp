@@ -596,7 +596,8 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
       EXPECT_EQ(chunked->LaunchedKernel("halo_gemm_q8r_f16_l") || chunked->LaunchedKernel("halo_gemm_q8r_f16_s"),
                 mode == kFloatGemm);
       EXPECT_EQ(chunked->LaunchedKernel("halo_gemm_bf16_f16_k128"), mode != kExact);
-      EXPECT_EQ(chunked->LaunchedKernel("halo_moe_bucket"), mode != kExact);
+      EXPECT_EQ(chunked->LaunchedKernel(E::prefill_parallel_bucket_ ? "halo_moe_bucket_count" : "halo_moe_bucket"),
+                mode != kExact);
       EXPECT_TRUE(chunked->LaunchedKernel("halo_attention_wmma_rows") ||
                   chunked->LaunchedKernel("halo_attention_wmma_mq") || mode == kExact);
     }

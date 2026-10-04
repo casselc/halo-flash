@@ -25,6 +25,7 @@ namespace halo::engine {
 
 namespace {
 constexpr std::uint32_t kBlock = 256;
+constexpr std::uint32_t kMoeBlockRows = 128;  // = core.hip's kMoeBlockRows (grouped expert block rows)
 std::uint32_t Blocks(std::size_t n, std::uint32_t per = kBlock) {
   return static_cast<std::uint32_t>(std::min<std::size_t>((n + per - 1) / per, 1u << 20));
 }
@@ -84,6 +85,8 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   k.hp = f(pairs * c.expert_ff);
   k.yp = f(pairs * H);
   k.x16 = f(T * H / 2 + 1);
+  k.bcounts = f((pairs + 1023) / 1024 * c.num_experts);
+  k.bbase = f(c.num_experts);
   k.pa = f(T * D);
   k.xh = f(T * max_cols / 2 + 1);
   k.mh = f(T * H / 2 + 1);
@@ -99,7 +102,7 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   for (const auto* b : {&k.res, &k.xn, &k.lo, &k.gate, &k.mixed, &k.inject, &k.block_out, &k.embd, &k.xq, &k.xd,
                         &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg, &k.q, &k.gate_a, &k.k, &k.v, &k.ctx,
                         &k.iq, &k.ik, &k.router, &k.ids, &k.wts, &k.eg, &k.eu, &k.ed, &k.sgate, &k.host,
-                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16, &k.pa, &k.pb, &k.xh, &k.mh,
+                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16, &k.bcounts, &k.bbase, &k.pa, &k.pb, &k.xh, &k.mh,
                         &k.bscores, &k.vis, &k.ascores})
     if (!*b) return false;
   // Index-major copies of the mixers' up projections (fused GEMM + mix).
@@ -179,6 +182,11 @@ bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt
                   {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols),
                    rt::Arg::Val(T)},
                   error);
+  if (!per_token && t.type == core::GgmlType::kF32 && rows <= 16 && prefill_skinny_f32_)
+    return Launch("halo_gemm_f32_skinny", {(T + 7) / 8}, {256},
+                  {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                   rt::Arg::Val(T)},
+                  error);
   if (!per_token && t.type == core::GgmlType::kF32 && cols % 16 == 0)
     return Launch("halo_gemm_f32_tiled", {(T + 63) / 64, (rows + 63) / 64}, {256},
                   {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols),
@@ -193,13 +201,15 @@ bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt
   return true;
 }
 
-bool FlashNextGpu::HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_t T, std::string* error) {
+bool FlashNextGpu::HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_t T, std::string* error,
+                              bool normed) {
   const auto& c = w_.config;
   const std::uint32_t H = c.hidden_size, low = c.hc_low_rank;
   // On the FP16 route the norm also leaves xn in fp16 for the down projection.
   const bool h16 = F16Route(m.down);
-  const bool normed =
-      h16 ? Launch("halo_rmsnorm_rows_h", {T * c.hc_count}, {kBlock},
+  const bool norm_ok =
+      normed ||
+      (h16 ? Launch("halo_rmsnorm_rows_h", {T * c.hc_count}, {kBlock},
                    {rt::Arg::Buf(ck_.res), rt::Arg::Buf(tensors_.at(m.norm.data).buf), rt::Arg::Buf(ck_.xn),
                     rt::Arg::Buf(ck_.xh), rt::Arg::Val(H), rt::Arg::Val(c.rms_eps), rt::Arg::Val(H),
                     rt::Arg::Val(c.hc_count)},
@@ -207,8 +217,8 @@ bool FlashNextGpu::HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_
           : Launch("halo_rmsnorm_rows", {T * c.hc_count}, {kBlock},
                    {rt::Arg::Buf(ck_.res), rt::Arg::Buf(tensors_.at(m.norm.data).buf), rt::Arg::Buf(ck_.xn),
                     rt::Arg::Val(H), rt::Arg::Val(c.rms_eps), rt::Arg::Val(H), rt::Arg::Val(c.hc_count)},
-                   error);
-  return normed && Gemm(m.down, ck_.xn, ck_.lo, T, error, h16 ? &ck_.xh : nullptr) &&
+                   error));
+  return norm_ok && Gemm(m.down, ck_.xn, ck_.lo, T, error, h16 ? &ck_.xh : nullptr) &&
          Launch("halo_scale_silu", {Blocks(std::size_t{T} * low)}, {kBlock},
                 {rt::Arg::Buf(ck_.lo), rt::Arg::Val(1.0F / static_cast<float>(c.hc_count)), rt::Arg::Val(T * low)},
                 error) &&
@@ -556,6 +566,28 @@ const char* GroupedSuffix(core::GgmlType t) {
 }
 }  // namespace
 
+// Pairs sorted by expert (pair order within one), positions and tiles: one
+// block, or (prefill_parallel_bucket_) three parallel passes with the same
+// output.
+bool FlashNextGpu::Bucket(std::uint32_t pairs, std::uint32_t E, std::string* error) {
+  if (!prefill_parallel_bucket_)
+    return Launch("halo_moe_bucket", {1}, {1024},
+                  {rt::Arg::Buf(ck_.ids), rt::Arg::Val(pairs), rt::Arg::Val(E), rt::Arg::Buf(ck_.sorted),
+                   rt::Arg::Buf(ck_.pos), rt::Arg::Buf(ck_.tiles), rt::Arg::Buf(ck_.ntiles)},
+                  error);
+  const std::uint32_t chunks = (pairs + 1023) / 1024;
+  return Launch("halo_moe_bucket_count", {chunks}, {1024},
+                {rt::Arg::Buf(ck_.ids), rt::Arg::Val(pairs), rt::Arg::Val(E), rt::Arg::Buf(ck_.bcounts)}, error) &&
+         Launch("halo_moe_bucket_scan", {1}, {1024},
+                {rt::Arg::Buf(ck_.bcounts), rt::Arg::Val(chunks), rt::Arg::Val(E), rt::Arg::Buf(ck_.tiles),
+                 rt::Arg::Buf(ck_.ntiles), rt::Arg::Buf(ck_.bbase)},
+                error) &&
+         Launch("halo_moe_bucket_scatter", {chunks}, {1024},
+                {rt::Arg::Buf(ck_.ids), rt::Arg::Val(pairs), rt::Arg::Val(E), rt::Arg::Buf(ck_.bcounts),
+                 rt::Arg::Buf(ck_.bbase), rt::Arg::Buf(ck_.sorted), rt::Arg::Buf(ck_.pos)},
+                error);
+}
+
 bool FlashNextGpu::GroupedMoeFits(const model::LayerWeights& l) const {
   const auto& c = w_.config;
   const auto& gate = l.ffn_gate_exps;
@@ -586,24 +618,21 @@ bool FlashNextGpu::GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std
                 {rt::Arg::Buf(ck_.router), rt::Arg::Buf(ck_.ids), rt::Arg::Buf(ck_.wts), rt::Arg::Val(E),
                  rt::Arg::Val(used)},
                 error) &&
-         Launch("halo_moe_bucket", {1}, {1024},
-                {rt::Arg::Buf(ck_.ids), rt::Arg::Val(pairs), rt::Arg::Val(E), rt::Arg::Buf(ck_.sorted),
-                 rt::Arg::Buf(ck_.pos), rt::Arg::Buf(ck_.tiles), rt::Arg::Buf(ck_.ntiles)},
-                error) &&
+         Bucket(pairs, E, error) &&
          Launch("halo_f16_perm_rows", {Blocks(std::size_t{T} * H)}, {kBlock},
                 {rt::Arg::Buf(ck_.mixed), rt::Arg::Buf(ck_.x16), rt::Arg::Val(T * H)}, error) &&
-         Launch(gu.c_str(), {(ff + 127) / 128, max_tiles}, {256},
+         Launch(gu.c_str(), {(ff + kMoeBlockRows - 1) / kMoeBlockRows, max_tiles}, {256},
                 {rt::Arg::Buf(tg.buf), rt::Arg::Buf(tu.buf), rt::Arg::Val<std::uint64_t>(gate.RowBytes() * gate.rows),
                  rt::Arg::Val<std::uint64_t>(gate.RowBytes()), rt::Arg::Buf(ck_.x16), rt::Arg::Buf(ck_.sorted),
                  rt::Arg::Buf(ck_.tiles), rt::Arg::Buf(ck_.ntiles), rt::Arg::Buf(ck_.hp), rt::Arg::Val(ff),
                  rt::Arg::Val(H), rt::Arg::Val(used)},
                 error) &&
-         (td.qs ? Launch("halo_moe_down_grouped_q8r", {(H + 127) / 128, max_tiles}, {256},
+         (td.qs ? Launch("halo_moe_down_grouped_q8r", {(H + kMoeBlockRows - 1) / kMoeBlockRows, max_tiles}, {256},
                          {rt::Arg::Buf(td.qs), rt::Arg::Buf(td.d), rt::Arg::Val(td.qstride), rt::Arg::Buf(ck_.hp),
                           rt::Arg::Buf(ck_.tiles), rt::Arg::Buf(ck_.ntiles), rt::Arg::Buf(ck_.yp), rt::Arg::Val(H),
                           rt::Arg::Val(ff)},
                          error)
-                : Launch(dn.c_str(), {(H + 127) / 128, max_tiles}, {256},
+                : Launch(dn.c_str(), {(H + kMoeBlockRows - 1) / kMoeBlockRows, max_tiles}, {256},
                          {rt::Arg::Buf(td.buf), rt::Arg::Val<std::uint64_t>(down.RowBytes() * down.rows),
                           rt::Arg::Val<std::uint64_t>(down.RowBytes()), rt::Arg::Buf(ck_.hp), rt::Arg::Buf(ck_.tiles),
                           rt::Arg::Buf(ck_.ntiles), rt::Arg::Buf(ck_.yp), rt::Arg::Val(H), rt::Arg::Val(ff)},
@@ -685,6 +714,7 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
                              rt::Arg::Val<std::uint64_t>(w_.token_embd.RowBytes())};
     if (!dev_.Launch(emb.embed, {Blocks(H)}, {kBlock}, eargs, error)) return false;
   }
+  if (timing_) Stamp("token embedding (per token)");
   if (!Launch("halo_broadcast_rows", {Blocks(std::size_t{T} * D)}, {kBlock},
               {rt::Arg::Buf(ck_.res), rt::Arg::Buf(ck_.embd), rt::Arg::Val(c.hc_count), rt::Arg::Val(H),
                rt::Arg::Val(T)},
@@ -696,12 +726,30 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
                    rt::Arg::Val(c.hc_count), rt::Arg::Val(H), rt::Arg::Val(T)},
                   error);
   };
+  // The combine after a block and the next mixer's norm run as one pass
+  // (prefill_fused_combine_), except where PLE changes the residual between
+  // them; `normed` carries "the next mixer's norm is done".
+  const auto combine_norm = [&](const model::HcMixer& next) {
+    const bool h16 = F16Route(next.down);
+    return Launch("halo_hc_combine_norm_rows", {T * c.hc_count}, {kBlock},
+                  {rt::Arg::Buf(ck_.res), rt::Arg::Buf(ck_.block_out), rt::Arg::Buf(ck_.inject),
+                   rt::Arg::Buf(tensors_.at(next.norm.data).buf), rt::Arg::Buf(ck_.xn),
+                   h16 ? rt::Arg::Buf(ck_.xh) : rt::Arg::Val<std::uint64_t>(0), rt::Arg::Val(c.hc_count),
+                   rt::Arg::Val(H), rt::Arg::Val(c.rms_eps)},
+                  error);
+  };
+  const bool fuse = prefill_fused_combine_ && H <= 16 * kBlock;
+  bool normed = false;
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
     const auto& l = w_.layers[il];
     if (c.IsPleLayer(il) && !PleChunk(l, T, error)) return false;
-    if (!HcMixChunk(l.hc_attn, true, T, error)) return false;
+    if (!HcMixChunk(l.hc_attn, true, T, error, normed)) return false;
     if (l.linear ? !LinearChunk(l, linear_[il], T, error) : !AttentionChunk(l, attn_[il], T, error)) return false;
-    if (!combine() || !HcMixChunk(l.hc_ffn, true, T, error) || !MoeChunk(l, T, error) || !combine()) return false;
+    if (!(fuse ? combine_norm(l.hc_ffn) : combine()) || !HcMixChunk(l.hc_ffn, true, T, error, fuse) ||
+        !MoeChunk(l, T, error))
+      return false;
+    normed = fuse && il + 1 < c.num_layers && !c.IsPleLayer(il + 1);
+    if (!(normed ? combine_norm(w_.layers[il + 1].hc_attn) : combine())) return false;
   }
   // The last token's logits through the decode head.
   if (!logits.empty()) {

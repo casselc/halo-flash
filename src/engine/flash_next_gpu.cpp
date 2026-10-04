@@ -101,7 +101,63 @@ bool FlashNextGpu::Launch(const char* name, rt::Dim3 grid, rt::Dim3 block, std::
     return v ? "," + std::string(v) + "," : std::string();
   }();
   if (!skip.empty() && skip.find("," + std::string(name) + ",") != std::string::npos) return true;
-  return dev_.Launch(it->second, grid, block, std::span<const rt::Arg>(args.begin(), args.size()), error);
+  if (!dev_.Launch(it->second, grid, block, std::span<const rt::Arg>(args.begin(), args.size()), error)) return false;
+  if (timing_)
+    Stamp(std::string(name) + " [" + std::to_string(grid.x) + "x" + std::to_string(grid.y) + "x" +
+          std::to_string(grid.z) + "]");
+  return true;
+}
+
+void FlashNextGpu::Stamp(const std::string& key) {
+  if (!timing_ || stamp_keys_.size() >= stamp_cap_) return;
+  std::string e;
+  auto it = kernels_.find("halo_timestamp");
+  if (it == kernels_.end()) {
+    const auto id = dev_.Kernel("halo_timestamp", &e);
+    if (id < 0) return;
+    it = kernels_.emplace("halo_timestamp", id).first;
+  }
+  const rt::Arg a[] = {rt::Arg::Buf(stamps_), rt::Arg::Val(static_cast<std::uint32_t>(stamp_keys_.size()))};
+  if (dev_.Launch(it->second, {1}, {32}, a, &e)) stamp_keys_.push_back(key);
+}
+
+bool FlashNextGpu::StartKernelTiming(std::size_t capacity, std::string* error) {
+  if (!stamps_ || stamp_cap_ < capacity) {
+    if (stamps_) dev_.Free(stamps_);
+    stamps_ = dev_.Alloc(capacity * 8, error);
+    if (!stamps_) return false;
+    stamp_cap_ = capacity;
+  }
+  if (!dev_.Synchronize(error)) return false;
+  stamp_keys_.clear();
+  timing_ = true;
+  timing_start_ = std::chrono::steady_clock::now();
+  Stamp("(start)");
+  return true;
+}
+
+std::vector<FlashNextGpu::KernelTime> FlashNextGpu::StopKernelTiming(double* span_ms, double* ticks_per_ms,
+                                                                  std::string* error) {
+  std::vector<KernelTime> out;
+  timing_ = false;
+  if (!dev_.Synchronize(error)) return out;
+  const double host_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - timing_start_).count();
+  std::vector<std::uint64_t> t(stamp_keys_.size());
+  if (t.size() < 2 || !dev_.Download(stamps_, 0, t.data(), t.size() * 8, error)) return out;
+  double rate = ticks_per_ms && *ticks_per_ms > 0 ? *ticks_per_ms
+                                                  : static_cast<double>(t.back() - t.front()) / host_ms;
+  if (ticks_per_ms) *ticks_per_ms = rate;
+  if (span_ms) *span_ms = static_cast<double>(t.back() - t.front()) / rate;
+  std::unordered_map<std::string, std::size_t> at;
+  for (std::size_t i = 1; i < t.size(); ++i) {
+    auto [it, fresh] = at.emplace(stamp_keys_[i], out.size());
+    if (fresh) out.push_back({stamp_keys_[i], 0, 0});
+    out[it->second].ms += static_cast<double>(t[i] - t[i - 1]) / rate;
+    ++out[it->second].calls;
+  }
+  std::sort(out.begin(), out.end(), [](const KernelTime& a, const KernelTime& b) { return a.ms > b.ms; });
+  return out;
 }
 
 bool FlashNextGpu::MatVec(const model::TensorRef& t, std::uint64_t expert, const rt::Buffer& x, const rt::Buffer& y,
@@ -133,6 +189,7 @@ bool FlashNextGpu::MatVec(const model::TensorRef& t, std::uint64_t expert, const
     const rt::Arg args[] = {rt::Arg::Buf(d.buf, expert * t.RowBytes() * t.rows), rt::Arg::Buf(x, x_off), rt::Arg::Buf(y, y_off),
                             rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val<std::uint64_t>(t.RowBytes())};
     if (!dev_.Launch(d.matvec, {Blocks(rows, kBlock / 32)}, {kBlock}, args, error)) return false;
+    if (timing_) Stamp("matvec " + std::string(t.name));
   }
   // LoRA: y += (alpha / r) * B (A x), on dense projections, as the reference.
   if (auto it = lora_.find(t.data); it != lora_.end()) {
@@ -738,7 +795,7 @@ bool FlashNextGpu::Run(std::int32_t token, Head head, const SampleRequest* reque
   }
   if (!dev_.Upload(ple_emb_, 0, step_host_.data(), upload, error)) return false;
 
-  if (use_graphs_) {
+  if (use_graphs_ && !timing_) {  // kernel timing stamps eager launches only
     rt::Graph& g = graphs_[static_cast<int>(head)];
     if (!g) {
       if (!dev_.BeginCapture(error)) return false;

@@ -1152,6 +1152,8 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
 // |got - want| <= 1e-3 * sum |terms| per output. Also: bucketing is a
 // permutation grouped by expert in pair order, tiles cover each expert's
 // pairs exactly, and the row-wise router top-k equals the single-row kernel.
+// The per-pair down rows are fp16 too: the reference rounds each expert's
+// down output to fp16 before the weighted sum.
 TEST(GpuQuant, GroupedExpertsMatchCpuReference) {
   std::string error;
   // One row of Q4_K / Q5_K the way the grouped kernels dequantize it.
@@ -1281,6 +1283,32 @@ TEST(GpuQuant, GroupedExpertsMatchCpuReference) {
                   dev->Download(tb, 0, tiles.data(), tiles.size() * 4, &error) &&
                   dev->Download(nb, 0, ntiles.data(), 4, &error) && dev->Download(ob, 0, out.data(), out.size() * 4, &error))
           << error;
+      // The three-pass parallel bucketing gives the same output exactly.
+      {
+        const std::uint32_t chunks = u32((P + 1023) / 1024);
+        auto cb = dev->Alloc(std::size_t{chunks} * E * 4, &error), bb = dev->Alloc(E * 4, &error),
+             s2 = dev->Alloc(P * 4, &error), p2 = dev->Alloc(P * 4, &error), t2 = dev->Alloc(max_tiles * 12, &error),
+             n2 = dev->Alloc(4, &error);
+        ASSERT_TRUE(cb && bb && s2 && p2 && t2 && n2) << error;
+        launch("halo_moe_bucket_count", {chunks}, {1024},
+               {rt::Arg::Buf(ib), rt::Arg::Val(u32(P)), rt::Arg::Val(u32(E)), rt::Arg::Buf(cb)});
+        launch("halo_moe_bucket_scan", {1}, {1024},
+               {rt::Arg::Buf(cb), rt::Arg::Val(chunks), rt::Arg::Val(u32(E)), rt::Arg::Buf(t2), rt::Arg::Buf(n2),
+                rt::Arg::Buf(bb)});
+        launch("halo_moe_bucket_scatter", {chunks}, {1024},
+               {rt::Arg::Buf(ib), rt::Arg::Val(u32(P)), rt::Arg::Val(u32(E)), rt::Arg::Buf(cb), rt::Arg::Buf(bb),
+                rt::Arg::Buf(s2), rt::Arg::Buf(p2)});
+        std::vector<std::uint32_t> sorted2(P), pos2(P), tiles2(max_tiles * 3), ntiles2(1);
+        ASSERT_TRUE(dev->Download(s2, 0, sorted2.data(), P * 4, &error) && dev->Download(p2, 0, pos2.data(), P * 4, &error) &&
+                    dev->Download(t2, 0, tiles2.data(), tiles2.size() * 4, &error) &&
+                    dev->Download(n2, 0, ntiles2.data(), 4, &error))
+            << error;
+        for (auto* b : {&cb, &bb, &s2, &p2, &t2, &n2}) dev->Free(*b);
+        ASSERT_EQ(sorted2, sorted);
+        ASSERT_EQ(pos2, pos);
+        ASSERT_EQ(ntiles2[0], ntiles[0]);
+        ASSERT_TRUE(std::equal(tiles2.begin(), tiles2.begin() + 3 * ntiles[0], tiles.begin()));
+      }
       for (auto* b : {&gb, &ub, &db, &lb, &xb, &ib, &wb, &i1, &w1, &sb, &pb, &tb, &nb, &hb, &yb, &ob, &x16}) dev->Free(*b);
       ASSERT_EQ(ids, ids1);
       ASSERT_EQ(wts, wts1);
@@ -1333,7 +1361,7 @@ TEST(GpuQuant, GroupedExpertsMatchCpuReference) {
               y += double(f16(wd[j])) * h[j];
               m += std::fabs(double(f16(wd[j])) * h[j]);
             }
-            want[r] += wts[t * used + s] * y;
+            want[r] += wts[t * used + s] * f16(static_cast<float>(y));
             mag[r] += std::fabs(wts[t * used + s]) * m;
           }
         }
@@ -1342,21 +1370,25 @@ TEST(GpuQuant, GroupedExpertsMatchCpuReference) {
               << rt::BackendName(backend) << " t " << t << " r " << r << " H " << H << " ff " << ff << " E " << E
               << " used " << used << " T " << T << " q5k " << q5k << " q8_down " << q8_down << " repacked " << repacked;
       }
-    }, {.test_cases = 40});
+    }, {.test_cases = 40,
+        // Each case runs a large CPU reference; on a GPU shared with another job
+        // generation can exceed the 30 s budget without anything being wrong.
+        .suppress_health_check = {hegel::HealthCheck::TooSlow}});
   }
 }
 
 // P4: the tiled FP32 GEMM for F32 projections against double sums, with
 // the worst-case fp32 summation bound |err| <= cols * 2^-23 * sum |w x|,
 // over ragged rows and tokens.
-TEST(GpuQuant, TiledF32GemmMatchesDoubleSums) {
+TEST(GpuQuant, TiledF32GemmMatchesDoubleSums) {  // and the skinny kernel for <= 16 rows
   std::string error;
   for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
     auto dev = rt::Device::Create(backend, &error);
     if (!dev) continue;
     ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
     hegel::test([&](hegel::TestCase& tc) {
-      const auto rows = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 600}));
+      const auto rows = tc.draw(gs::booleans()) ? tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 16}))
+                                                : tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 600}));
       const auto cols = 16 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 80}));
       const auto T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 200}));
       std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
@@ -1370,9 +1402,13 @@ TEST(GpuQuant, TiledF32GemmMatchesDoubleSums) {
           << error;
       const rt::Arg a[] = {rt::Arg::Buf(wb), rt::Arg::Buf(xb), rt::Arg::Buf(yb), rt::Arg::Val(rows), rt::Arg::Val(cols),
                            rt::Arg::Val(T)};
-      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemm_f32_tiled", &error), {(T + 63) / 64, (rows + 63) / 64}, {256}, a,
-                              &error))
-          << error;
+      const bool skinny = rows <= 16 && tc.draw(gs::booleans());
+      if (skinny)
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemm_f32_skinny", &error), {(T + 7) / 8}, {256}, a, &error)) << error;
+      else
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemm_f32_tiled", &error), {(T + 63) / 64, (rows + 63) / 64}, {256}, a,
+                                &error))
+            << error;
       ASSERT_TRUE(dev->Download(yb, 0, y.data(), y.size() * 4, &error)) << error;
       for (auto* b : {&wb, &xb, &yb}) dev->Free(*b);
       for (std::uint32_t t = 0; t < T; ++t)
@@ -1402,7 +1438,8 @@ TEST(GpuQuant, Q8F16GemmMatchesDoubleSums) {
     if (!dev) continue;
     ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
     hegel::test([&](hegel::TestCase& tc) {
-      const auto rows = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 600}));
+      const auto rows = tc.draw(gs::booleans()) ? tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 16}))
+                                                : tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 600}));
       const int config = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 2}));  // large, small, tall
       const bool large = config == 0, tall = config == 2;
       const auto cols = (config == 1 ? 128 : 64) * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 12}));
@@ -1618,12 +1655,77 @@ TEST(GpuKernels, Fp16EmittingNormsMatchOriginals) {
       for (auto& o : owned) dev->Free(o);
       for (std::size_t i = 0; i < n; ++i) {
         ASSERT_EQ(std::bit_cast<std::uint32_t>(a[i]), std::bit_cast<std::uint32_t>(b[i])) << "rmsnorm fp32 " << i;
-        const auto ulp = [](_Float16 x, _Float16 y) {
-          return std::abs(static_cast<int>(std::bit_cast<std::int16_t>(x)) - static_cast<int>(std::bit_cast<std::int16_t>(y)));
+        const auto ulp = [](_Float16 x, _Float16 y) {  // 0 for equal values (+0 / -0)
+          return x == y ? 0
+                        : std::abs(static_cast<int>(std::bit_cast<std::int16_t>(x)) -
+                                   static_cast<int>(std::bit_cast<std::int16_t>(y)));
         };
         ASSERT_LE(ulp(ah[i], static_cast<_Float16>(a[i])), 1) << "rmsnorm fp16 " << i;
         ASSERT_LE(ulp(gh[i], static_cast<_Float16>(g[i])), 1) << "gated norm fp16 " << i << " mode " << mode;
       }
     }, {.test_cases = 30});
+  }
+}
+
+// P4: the combine fused with the next mixer's norm against the two kernels
+// (halo_hc_combine_rows, then halo_rmsnorm_rows_h): residual and normalized
+// rows bit for bit in fp32; the fp16 copy within one ulp (first asserted
+// exact: either kernel may round the final product straight to fp16).
+TEST(GpuKernels, CombineNormEqualsSeparateKernels) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      const auto h = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 128}));
+      const auto hc = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 4}));
+      const auto T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 20}));
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto vec = [&](std::size_t n, float amp) {
+        std::vector<float> v(n);
+        for (auto& x : v) { seed = seed * 1664525u + 1013904223u; x = amp * (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f); }
+        return v;
+      };
+      const std::size_t n = std::size_t{T} * hc * h;
+      const auto res = vec(n, 6.0f), out = vec(std::size_t{T} * h, 3.0f), inj = vec(std::size_t{T} * hc, 8.0f),
+                 w = vec(std::size_t{hc} * h, 2.0f);
+      std::vector<rt::Buffer> owned;
+      const auto up = [&](const void* p, std::size_t bytes) {
+        auto b = dev->Alloc(bytes, &error);
+        if (p) EXPECT_TRUE(dev->Upload(b, 0, p, bytes, &error));
+        owned.push_back(b);
+        return b;
+      };
+      auto r1 = up(res.data(), n * 4), r2 = up(res.data(), n * 4), ob = up(out.data(), out.size() * 4),
+           ib = up(inj.data(), inj.size() * 4), wb = up(w.data(), w.size() * 4), y1 = up(nullptr, n * 4),
+           y2 = up(nullptr, n * 4), h1 = up(nullptr, n * 2), h2 = up(nullptr, n * 2);
+      const auto launch = [&](const char* k, std::uint32_t grid, std::initializer_list<rt::Arg> a) {
+        ASSERT_TRUE(dev->Launch(dev->Kernel(k, &error), {grid}, {256}, std::span<const rt::Arg>(a.begin(), a.size()), &error)) << k;
+      };
+      launch("halo_hc_combine_rows", static_cast<std::uint32_t>((n + 255) / 256),
+             {rt::Arg::Buf(r1), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Val(hc), rt::Arg::Val(h), rt::Arg::Val(T)});
+      launch("halo_rmsnorm_rows_h", T * hc, {rt::Arg::Buf(r1), rt::Arg::Buf(wb), rt::Arg::Buf(y1), rt::Arg::Buf(h1),
+                                             rt::Arg::Val(h), rt::Arg::Val(1e-6f), rt::Arg::Val(h), rt::Arg::Val(hc)});
+      launch("halo_hc_combine_norm_rows", T * hc, {rt::Arg::Buf(r2), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Buf(wb),
+                                                   rt::Arg::Buf(y2), rt::Arg::Buf(h2), rt::Arg::Val(hc), rt::Arg::Val(h),
+                                                   rt::Arg::Val(1e-6f)});
+      std::vector<float> a1(n), a2(n), b1(n), b2(n);
+      std::vector<std::uint16_t> c1(n), c2(n);
+      ASSERT_TRUE(dev->Download(r1, 0, a1.data(), n * 4, &error) && dev->Download(r2, 0, a2.data(), n * 4, &error) &&
+                  dev->Download(y1, 0, b1.data(), n * 4, &error) && dev->Download(y2, 0, b2.data(), n * 4, &error) &&
+                  dev->Download(h1, 0, c1.data(), n * 2, &error) && dev->Download(h2, 0, c2.data(), n * 2, &error))
+          << error;
+      for (auto& o : owned) dev->Free(o);
+      for (std::size_t i = 0; i < n; ++i) {
+        ASSERT_EQ(std::bit_cast<std::uint32_t>(a1[i]), std::bit_cast<std::uint32_t>(a2[i])) << "residual " << i;
+        ASSERT_EQ(std::bit_cast<std::uint32_t>(b1[i]), std::bit_cast<std::uint32_t>(b2[i])) << "normalized " << i;
+        // Equal values (including +0 / -0) or adjacent fp16 codes.
+        const auto h1 = std::bit_cast<_Float16>(c1[i]), h2 = std::bit_cast<_Float16>(c2[i]);
+        ASSERT_TRUE(h1 == h2 || std::abs(static_cast<int>(std::bit_cast<std::int16_t>(c1[i])) -
+                                         static_cast<int>(std::bit_cast<std::int16_t>(c2[i]))) <= 1)
+            << "fp16 " << i << ": " << c1[i] << " vs " << c2[i] << ", fp32 " << b1[i] << " / " << b2[i];
+      }
+    }, {.test_cases = 40});
   }
 }

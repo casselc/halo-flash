@@ -84,6 +84,26 @@ set(HALO_HRX_ROOT "" CACHE PATH "hrx-system checkout built into build/cmake (emp
 if(HALO_GPU)
   find_program(HIPCC hipcc REQUIRED)
   set(HALO_GEN ${CMAKE_BINARY_DIR}/gen)
+  # One ROCm install for compiler, headers and runtime: the HIP runtime and
+  # headers are taken from the install hipcc belongs to, never from wherever
+  # the linker or the host compiler would find them first (mixing two ROCm
+  # versions builds and runs, and silently detaches profilers built for one).
+  get_filename_component(_halo_hipcc_real "${HIPCC}" REALPATH)
+  get_filename_component(HALO_ROCM_PREFIX "${_halo_hipcc_real}" DIRECTORY)
+  get_filename_component(HALO_ROCM_PREFIX "${HALO_ROCM_PREFIX}" DIRECTORY)
+  find_library(HALO_AMDHIP amdhip64 PATHS "${HALO_ROCM_PREFIX}/lib" "${HALO_ROCM_PREFIX}/lib/x86_64-linux-gnu"
+               NO_DEFAULT_PATH REQUIRED)
+  find_path(HALO_HIP_INCLUDE hip/hip_runtime.h PATHS "${HALO_ROCM_PREFIX}/include" NO_DEFAULT_PATH REQUIRED)
+  execute_process(COMMAND ${HIPCC} --version OUTPUT_VARIABLE _halo_hip_version ERROR_QUIET)
+  string(REGEX MATCH "HIP version: [^\n]*" HALO_HIP_VERSION "${_halo_hip_version}")
+  set(HALO_TOOLCHAIN_ID "$ENV{HALO_TOOLCHAIN}")
+  if(NOT HALO_TOOLCHAIN_ID)
+    set(HALO_TOOLCHAIN_ID "system")
+  endif()
+  message(STATUS "halo-flash ROCm: ${HALO_ROCM_PREFIX} (${HALO_HIP_VERSION}), runtime ${HALO_AMDHIP}, toolchain ${HALO_TOOLCHAIN_ID}")
+  file(WRITE ${HALO_GEN}/toolchain.h.in
+       "#pragma once\n#define HALO_TOOLCHAIN \"${HALO_TOOLCHAIN_ID}; ${HALO_HIP_VERSION}; hipcc ${_halo_hipcc_real}; runtime ${HALO_AMDHIP}\"\n")
+  configure_file(${HALO_GEN}/toolchain.h.in ${HALO_GEN}/halo_toolchain.h COPYONLY)
   add_custom_command(
     OUTPUT ${HALO_GEN}/core.hsaco
     COMMAND ${CMAKE_COMMAND} -E make_directory ${HALO_GEN}/kernels
@@ -108,7 +128,8 @@ if(HALO_GPU)
     ${HALO_GEN}/kernels/core_hsaco.cpp)
   target_include_directories(halo_gpu PUBLIC ${HALO_GEN})
   target_compile_definitions(halo_gpu PUBLIC __HIP_PLATFORM_AMD__ HALO_WITH_HIP=1)
-  target_link_libraries(halo_gpu PUBLIC halo_model amdhip64)
+  target_include_directories(halo_gpu PUBLIC ${HALO_HIP_INCLUDE})
+  target_link_libraries(halo_gpu PUBLIC halo_model ${HALO_AMDHIP})
   target_link_libraries(halo_decide PUBLIC halo_gpu)
   if(HALO_HRX_ROOT)
     target_sources(halo_gpu PRIVATE src/rt/hrx_device.cpp)
@@ -366,5 +387,22 @@ if(HALO_SCOPE)
         ENVIRONMENT "HALO_SCOPE_TEST_WRITER=thread;TSAN_OPTIONS=halt_on_error=1"
         PASS_REGULAR_EXPRESSION "WARNING: ThreadSanitizer: data race")
     endif()
+  endif()
+endif()
+
+# Kernel register/scratch budget: fails on a new spill or scratch use (and on
+# a stale allowlist entry). See tools/kernel_report.py.
+if(TARGET halo_gpu)
+  get_filename_component(_halo_hipcc_dir "${HIPCC}" DIRECTORY)
+  get_filename_component(_halo_hipcc_dir "${_halo_hipcc_dir}" REALPATH)
+  # The readelf of the LLVM that hipcc uses (distro: llvm-readelf-<major>).
+  find_program(HALO_LLVM_READELF NAMES llvm-readelf llvm-readelf-21 llvm-readelf-20 llvm-readelf-19
+               HINTS "${_halo_hipcc_dir}/../llvm/bin" "${_halo_hipcc_dir}/../lib/llvm/bin")
+  find_package(Python3 COMPONENTS Interpreter)
+  if(HALO_LLVM_READELF AND Python3_Interpreter_FOUND)
+    add_test(NAME kernel_resources
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/kernel_report.py
+                     --hsaco ${HALO_GEN}/core.hsaco --readelf ${HALO_LLVM_READELF}
+                     --check ${CMAKE_CURRENT_SOURCE_DIR}/tools/kernel_spill_allowlist.txt)
   endif()
 endif()

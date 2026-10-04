@@ -3119,6 +3119,44 @@ extern "C" __global__ void halo_rmsnorm_rows(const float* x, const float* w_all,
   for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) yv[i] = xv[i] * scale * w[i];
 }
 
+// halo_hc_combine_rows fused with the next mixer's grouped RMSNorm (and,
+// with y16, its fp16 copy): one pass over the residual instead of a write
+// and a re-read. Same arithmetic as the two kernels: each thread combines
+// and squares the values at i = threadIdx.x + k * blockDim.x, as the norm
+// kernel reads them. grid (T * hc), block 256; h <= 16 * 256.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_combine_norm_rows(float* res, const float* out, const float* inject, const float* w_all, float* y,
+                              _Float16* y16, std::uint32_t hc, std::uint32_t h, float eps) {
+  __shared__ float scratch[32];
+  const std::size_t v = blockIdx.x, t = v / hc, row = v * h;
+  const std::uint32_t st = static_cast<std::uint32_t>(v % hc);
+  const float a = 2.0f * Sigmoid(inject[t * hc + st] / static_cast<float>(hc));
+  const float* w = w_all + static_cast<std::size_t>(st) * h;
+  float vals[16];
+  float ss = 0.0f;
+#pragma unroll
+  for (std::uint32_t k = 0; k < 16; ++k) {
+    const std::uint32_t i = threadIdx.x + k * blockDim.x;
+    if (i < h) {
+      const float x = res[row + i] + out[t * h + i] * a;
+      res[row + i] = x;
+      vals[k] = x;
+      ss += x * x;
+    }
+  }
+  ss = BlockSum(ss, scratch);
+  const float scale = 1.0f / sqrtf(ss / static_cast<float>(h) + eps);
+#pragma unroll
+  for (std::uint32_t k = 0; k < 16; ++k) {
+    const std::uint32_t i = threadIdx.x + k * blockDim.x;
+    if (i < h) {
+      const float yv = vals[k] * scale * w[i];
+      y[row + i] = yv;
+      if (y16) y16[row + i] = static_cast<_Float16>(yv);
+    }
+  }
+}
+
 // halo_rmsnorm_rows that also writes an fp16 copy (the next GEMM's input on
 // the FP16 route), sparing a conversion pass.
 extern "C" __global__ void halo_rmsnorm_rows_h(const float* x, const float* w_all, float* y, _Float16* y16,
@@ -3271,6 +3309,78 @@ extern "C" __global__ void __launch_bounds__(1024)
       cnt[e] = c;
     }
   }
+}
+
+// The same bucketing in three parallel passes, for large chunks; output is
+// identical (pairs in pair order within an expert, same tiles).
+//   1. halo_moe_bucket_count: per chunk of 1024 pairs, per-expert counts
+//      [chunks][experts]. grid (chunks), block 1024
+//   2. halo_moe_bucket_scan: per expert, chunk offsets (exclusive scan over
+//      chunks) and expert offsets, tiles, ntiles. grid (1), block 1024
+//   3. halo_moe_bucket_scatter: each pair's rank among earlier pairs of its
+//      expert in its chunk (an LDS scan) gives its sorted position.
+//      grid (chunks), block 1024
+constexpr std::uint32_t kBucketChunk = 1024;
+extern "C" __global__ void __launch_bounds__(1024)
+    halo_moe_bucket_count(const std::uint32_t* ids, std::uint32_t pairs, std::uint32_t experts, std::uint32_t* counts) {
+  __shared__ std::uint32_t c[1024];
+  const std::uint32_t chunk = blockIdx.x, tid = threadIdx.x, p = chunk * kBucketChunk + tid;
+  for (std::uint32_t e = tid; e < experts; e += blockDim.x) c[e] = 0;
+  __syncthreads();
+  if (p < pairs) atomicAdd(&c[ids[p]], 1u);
+  __syncthreads();
+  for (std::uint32_t e = tid; e < experts; e += blockDim.x) counts[static_cast<std::size_t>(chunk) * experts + e] = c[e];
+}
+extern "C" __global__ void __launch_bounds__(1024)
+    halo_moe_bucket_scan(std::uint32_t* counts, std::uint32_t chunks, std::uint32_t experts, std::uint32_t* tiles,
+                         std::uint32_t* ntiles, std::uint32_t* base) {
+  __shared__ std::uint32_t total[1024], poff[1024], toff[1024];
+  const std::uint32_t tid = threadIdx.x;
+  for (std::uint32_t e = tid; e < experts; e += blockDim.x) {
+    std::uint32_t run = 0;
+    for (std::uint32_t ch = 0; ch < chunks; ++ch) {  // counts become exclusive chunk offsets
+      const std::uint32_t v = counts[static_cast<std::size_t>(ch) * experts + e];
+      counts[static_cast<std::size_t>(ch) * experts + e] = run;
+      run += v;
+    }
+    total[e] = run;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    std::uint32_t p = 0, t = 0;
+    for (std::uint32_t e = 0; e < experts; ++e) {
+      poff[e] = p;
+      toff[e] = t;
+      p += total[e];
+      t += (total[e] + kMoeTile - 1) / kMoeTile;
+    }
+    *ntiles = t;
+  }
+  __syncthreads();
+  for (std::uint32_t e = tid; e < experts; e += blockDim.x) {
+    base[e] = poff[e];
+    for (std::uint32_t i = 0; i * kMoeTile < total[e]; ++i) {
+      tiles[3 * (toff[e] + i)] = e;
+      tiles[3 * (toff[e] + i) + 1] = poff[e] + i * kMoeTile;
+      tiles[3 * (toff[e] + i) + 2] = min(kMoeTile, total[e] - i * kMoeTile);
+    }
+  }
+}
+extern "C" __global__ void __launch_bounds__(1024)
+    halo_moe_bucket_scatter(const std::uint32_t* ids, std::uint32_t pairs, std::uint32_t experts,
+                            const std::uint32_t* chunk_off, const std::uint32_t* base, std::uint32_t* sorted,
+                            std::uint32_t* pos) {
+  __shared__ std::uint32_t chunk_ids[kBucketChunk];
+  const std::uint32_t chunk = blockIdx.x, tid = threadIdx.x, p = chunk * kBucketChunk + tid;
+  const std::uint32_t e = p < pairs ? ids[p] : 0xFFFFFFFFu;
+  chunk_ids[tid] = e;
+  __syncthreads();
+  if (p >= pairs) return;
+  std::uint32_t rank = 0;
+  for (std::uint32_t i = 0; i < tid; ++i) rank += chunk_ids[i] == e;
+  const std::uint32_t at = base[e] + chunk_off[static_cast<std::size_t>(chunk) * experts + e] + rank;
+  sorted[at] = p;
+  pos[p] = at;
 }
 
 namespace {
@@ -3464,13 +3574,18 @@ __device__ inline halo_v16h LdsFrag(const _Float16* p) {
 
 // K staged 128 at a time for up to kMoeTile token rows.
 constexpr std::uint32_t kMoeKs = 128, kMoeRs = kMoeKs + 8, kMoeSub = kMoeTile / 16;
+// Row tiles per wave: a block covers 8 * 16 * kMoeRowTiles weight rows, so a
+// tile's activation rows are staged ceil(rows / that) times. 2 halves that
+// traffic but costs occupancy (160 -> 228 VGPRs in gate/up): measured +31 ms
+// per 2048-token prefill (within noise), so 1.
+constexpr std::uint32_t kMoeRowTiles = 1, kMoeBlockRows = 8 * 16 * kMoeRowTiles;
 static_assert(kMoeKs == 128, "the K-quant stage headers (KQuantHdr) cover 128 values");
 
 // gate/up: hp[pair][r] = silu(gate_e[r] . x_t) * (up_e[r] . x_t). Each wave
-// owns 16 rows; every weight fragment feeds the tile's 16-token sub-tiles.
-// x and hp are fp16 rows in kMoePerm order (halo_f16_perm_rows), so
-// staging is a plain copy.
-//   grid (ceil(ff / 128), max tiles), block 256; H % 256 == 0.
+// owns kMoeRowTiles x 16 rows; every weight fragment feeds the tile's
+// 16-token sub-tiles. x and hp are fp16 rows in kMoePerm order
+// (halo_f16_perm_rows), so staging is a plain copy.
+//   grid (ceil(ff / kMoeBlockRows), max tiles), block 256; H % 256 == 0.
 template <typename L>
 __device__ void MoeGateUp(const std::uint8_t* gate, const std::uint8_t* up, std::uint64_t expert_bytes,
                           std::uint64_t row_bytes, const _Float16* x, const std::uint32_t* sorted,
@@ -3483,11 +3598,17 @@ __device__ void MoeGateUp(const std::uint8_t* gate, const std::uint8_t* up, std:
   const std::uint32_t e = tiles[3 * tile], first = tiles[3 * tile + 1], n = tiles[3 * tile + 2];
   const std::uint32_t subs = (n + 15) / 16;  // block-uniform
   const std::uint32_t lane = threadIdx.x % 32, wave = threadIdx.x / 32;
-  const std::uint32_t r0 = blockIdx.x * 128 + wave * 16, row = min(r0 + lane % 16, ff - 1);
-  const std::uint8_t* g = gate + e * expert_bytes + row * row_bytes;
-  const std::uint8_t* u = up + e * expert_bytes + row * row_bytes;
+  const std::uint32_t r0 = blockIdx.x * kMoeBlockRows + wave * 16 * kMoeRowTiles;
+  const std::uint8_t* g[kMoeRowTiles];
+  const std::uint8_t* u[kMoeRowTiles];
+#pragma unroll
+  for (std::uint32_t rt = 0; rt < kMoeRowTiles; ++rt) {
+    const std::uint32_t row = min(r0 + rt * 16 + lane % 16, ff - 1);
+    g[rt] = gate + e * expert_bytes + row * row_bytes;
+    u[rt] = up + e * expert_bytes + row * row_bytes;
+  }
   for (std::uint32_t i = threadIdx.x; i < kMoeTile; i += blockDim.x) tok[i] = sorted[first + (i < n ? i : 0)] / k;
-  halo_v8f ag[kMoeSub] = {}, au[kMoeSub] = {};
+  halo_v8f ag[kMoeRowTiles][kMoeSub] = {}, au[kMoeRowTiles][kMoeSub] = {};
   for (std::uint32_t k0 = 0; k0 < H; k0 += kMoeKs) {
     __syncthreads();
     for (std::uint32_t i = threadIdx.x; i < subs * 16 * kMoeKs / 8; i += blockDim.x) {
@@ -3496,45 +3617,51 @@ __device__ void MoeGateUp(const std::uint8_t* gate, const std::uint8_t* up, std:
           *reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(tok[r]) * H + k0 + c);
     }
     __syncthreads();
-    const auto hg = Frag16<L>::LoadHdr(g, k0), hu = Frag16<L>::LoadHdr(u, k0);
 #pragma unroll
-    for (std::uint32_t kk = 0; kk < kMoeKs; kk += 16) {
-      const halo_v16h fg = Frag16<L>::GetH(g, k0 + kk, hg), fu = Frag16<L>::GetH(u, k0 + kk, hu);
+    for (std::uint32_t rt = 0; rt < kMoeRowTiles; ++rt) {
+      const auto hg = Frag16<L>::LoadHdr(g[rt], k0), hu = Frag16<L>::LoadHdr(u[rt], k0);
 #pragma unroll
-      for (std::uint32_t h = 0; h < kMoeSub; ++h) {
-        if (h >= subs) break;
-        const halo_v16h b = LdsFrag(&Bs[(h * 16 + lane % 16) * kMoeRs + kk]);
-        ag[h] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fg, b, ag[h]);
-        au[h] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fu, b, au[h]);
+      for (std::uint32_t kk = 0; kk < kMoeKs; kk += 16) {
+        const halo_v16h fg = Frag16<L>::GetH(g[rt], k0 + kk, hg), fu = Frag16<L>::GetH(u[rt], k0 + kk, hu);
+#pragma unroll
+        for (std::uint32_t h = 0; h < kMoeSub; ++h) {
+          if (h >= subs) break;
+          const halo_v16h b = LdsFrag(&Bs[(h * 16 + lane % 16) * kMoeRs + kk]);
+          ag[rt][h] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fg, b, ag[rt][h]);
+          au[rt][h] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fu, b, au[rt][h]);
+        }
       }
     }
   }
 #pragma unroll
-  for (std::uint32_t h = 0; h < kMoeSub; ++h) {
-    const std::uint32_t t = h * 16 + lane % 16;
-    if (t >= n) continue;
+  for (std::uint32_t rt = 0; rt < kMoeRowTiles; ++rt)
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      const std::uint32_t r = r0 + 2 * j + lane / 16;
-      if (r < ff) hp[static_cast<std::size_t>(first + t) * ff + MoePerm(r)] = static_cast<_Float16>(Silu(ag[h][j]) * au[h][j]);
+    for (std::uint32_t h = 0; h < kMoeSub; ++h) {
+      const std::uint32_t t = h * 16 + lane % 16;
+      if (t >= n) continue;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint32_t r = r0 + rt * 16 + 2 * j + lane / 16;
+        if (r < ff)
+          hp[static_cast<std::size_t>(first + t) * ff + MoePerm(r)] = static_cast<_Float16>(Silu(ag[rt][h][j]) * au[rt][h][j]);
+      }
     }
-  }
 }
 
 // down: yp[pair][r] = down_e[r] . hp[pair]; the tile's pairs are contiguous.
 // frag(e, row, k0) gives 16 weights of an output row of expert e.
-//   grid (ceil(H / 128), max tiles), block 256; ff % 16 == 0.
+//   grid (ceil(H / kMoeBlockRows), max tiles), block 256; ff % 16 == 0.
 template <typename F>
-__device__ void MoeDown(F frag, const _Float16* hp, const std::uint32_t* tiles, const std::uint32_t* ntiles, float* yp,
-                        std::uint32_t H, std::uint32_t ff) {
+__device__ void MoeDown(F frag, const _Float16* hp, const std::uint32_t* tiles, const std::uint32_t* ntiles,
+                        _Float16* yp, std::uint32_t H, std::uint32_t ff) {
   __shared__ __attribute__((aligned(16))) _Float16 Bs[kMoeTile * kMoeRs];
   const std::uint32_t tile = blockIdx.y;
   if (tile >= *ntiles) return;
   const std::uint32_t e = tiles[3 * tile], first = tiles[3 * tile + 1], n = tiles[3 * tile + 2];
   const std::uint32_t subs = (n + 15) / 16;
   const std::uint32_t lane = threadIdx.x % 32, wave = threadIdx.x / 32;
-  const std::uint32_t r0 = blockIdx.x * 128 + wave * 16, row = min(r0 + lane % 16, H - 1);
-  halo_v8f acc[kMoeSub] = {};
+  const std::uint32_t r0 = blockIdx.x * kMoeBlockRows + wave * 16 * kMoeRowTiles;
+  halo_v8f acc[kMoeRowTiles][kMoeSub] = {};
   for (std::uint32_t k0 = 0; k0 < ff; k0 += kMoeKs) {
     const std::uint32_t ks = min(kMoeKs, ff - k0);
     __syncthreads();
@@ -3546,24 +3673,30 @@ __device__ void MoeDown(F frag, const _Float16* hp, const std::uint32_t* tiles, 
     __syncthreads();
 #pragma unroll 4
     for (std::uint32_t kk = 0; kk < ks; kk += 16) {
-      const halo_v16h fw = frag(e, row, k0 + kk);
 #pragma unroll
-      for (std::uint32_t h = 0; h < kMoeSub; ++h) {
-        if (h >= subs) break;
-        acc[h] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fw, LdsFrag(&Bs[(h * 16 + lane % 16) * kMoeRs + kk]), acc[h]);
+      for (std::uint32_t rt = 0; rt < kMoeRowTiles; ++rt) {
+        const halo_v16h fw = frag(e, min(r0 + rt * 16 + lane % 16, H - 1), k0 + kk);
+#pragma unroll
+        for (std::uint32_t h = 0; h < kMoeSub; ++h) {
+          if (h >= subs) break;
+          acc[rt][h] =
+              __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fw, LdsFrag(&Bs[(h * 16 + lane % 16) * kMoeRs + kk]), acc[rt][h]);
+        }
       }
     }
   }
 #pragma unroll
-  for (std::uint32_t h = 0; h < kMoeSub; ++h) {
-    const std::uint32_t t = h * 16 + lane % 16;
-    if (t >= n) continue;
+  for (std::uint32_t rt = 0; rt < kMoeRowTiles; ++rt)
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      const std::uint32_t r = r0 + 2 * j + lane / 16;
-      if (r < H) yp[static_cast<std::size_t>(first + t) * H + r] = acc[h][j];
+    for (std::uint32_t h = 0; h < kMoeSub; ++h) {
+      const std::uint32_t t = h * 16 + lane % 16;
+      if (t >= n) continue;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint32_t r = r0 + rt * 16 + 2 * j + lane / 16;
+        if (r < H) yp[static_cast<std::size_t>(first + t) * H + r] = static_cast<_Float16>(acc[rt][h][j]);
+      }
     }
-  }
 }
 
 }  // namespace
@@ -3576,7 +3709,7 @@ __device__ void MoeDown(F frag, const _Float16* hp, const std::uint32_t* tiles, 
   }                                                                                                                   \
   extern "C" __global__ void __launch_bounds__(256) halo_moe_down_grouped_##SUFFIX(                                  \
       const std::uint8_t* down, std::uint64_t expert_bytes, std::uint64_t row_bytes, const _Float16* hp,              \
-      const std::uint32_t* tiles, const std::uint32_t* ntiles, float* yp, std::uint32_t H, std::uint32_t ff) {        \
+      const std::uint32_t* tiles, const std::uint32_t* ntiles, _Float16* yp, std::uint32_t H, std::uint32_t ff) {     \
     MoeDown([=](std::uint32_t e, std::uint32_t row, std::uint32_t k0) {                                               \
       return Frag16<L>::Get(down + e * expert_bytes + row * row_bytes, k0);                                           \
     }, hp, tiles, ntiles, yp, H, ff);                                                                                 \
@@ -3593,7 +3726,7 @@ HALO_MOE_GROUPED(f32, LoadF32)
 // per 32 values; experts rows * qstride and rows * cols / 32 apart).
 extern "C" __global__ void __launch_bounds__(256)
     halo_moe_down_grouped_q8r(const std::int8_t* qs, const std::uint16_t* d, std::uint32_t qstride, const _Float16* hp,
-                              const std::uint32_t* tiles, const std::uint32_t* ntiles, float* yp, std::uint32_t H,
+                              const std::uint32_t* tiles, const std::uint32_t* ntiles, _Float16* yp, std::uint32_t H,
                               std::uint32_t ff) {
   MoeDown([=](std::uint32_t e, std::uint32_t row, std::uint32_t k0) {
     const std::size_t r = static_cast<std::size_t>(e) * H + row;
@@ -3613,13 +3746,15 @@ extern "C" __global__ void halo_f16_perm_rows(const float* x, _Float16* y, std::
 
 // out[t][i] = sum_s w[t][s] * yp[pos[t * k + s]][i], slots in order.
 //   grid (ceil(n / 256), T), block 256
-extern "C" __global__ void halo_moe_combine_grouped(const float* yp, const std::uint32_t* pos, const float* w,
+// yp is fp16 (the down kernels' per-pair rows; halves their traffic), the
+// weighted sum fp32.
+extern "C" __global__ void halo_moe_combine_grouped(const _Float16* yp, const std::uint32_t* pos, const float* w,
                                                     float* out, std::uint32_t k, std::uint32_t n) {
   const std::uint32_t t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   float acc = 0.0f;
   for (std::uint32_t s = 0; s < k; ++s)
-    acc += w[t * k + s] * yp[static_cast<std::size_t>(pos[t * k + s]) * n + i];
+    acc += w[t * k + s] * static_cast<float>(yp[static_cast<std::size_t>(pos[t * k + s]) * n + i]);
   out[static_cast<std::size_t>(t) * n + i] = acc;
 }
 
@@ -4209,4 +4344,39 @@ extern "C" __global__ void __launch_bounds__(256)
         const std::size_t idx = (static_cast<std::size_t>(t0 + tq) * num_heads + g * G + h) * HD + d;
         out[idx] = acc[r][dt][j] / lrow[row] * Sigmoid(gate[idx]);
       }
+}
+
+// F32 GEMM for few rows (<= 16: the mixer's 4-row inject, the shared
+// expert's 1-row gate): one warp per token reads the token's row once,
+// coalesced, against every weight row (which stay in cache); lane sums
+// reduce across the warp. fp32 throughout.
+//   grid (ceil(T / 8)), block 256; rows <= 16.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_f32_skinny(const float* w, const float* x, float* y, std::uint32_t rows, std::uint32_t cols,
+                         std::uint32_t tokens) {
+  const std::uint32_t lane = threadIdx.x % 32, t = blockIdx.x * 8 + threadIdx.x / 32;
+  if (t >= tokens) return;
+  const float* xr = x + static_cast<std::size_t>(t) * cols;
+  float acc[16] = {};
+  for (std::uint32_t c = lane; c < cols; c += 32) {
+    const float xv = xr[c];
+#pragma unroll
+    for (std::uint32_t r = 0; r < 16; ++r)
+      if (r < rows) acc[r] = fmaf(w[static_cast<std::size_t>(r) * cols + c], xv, acc[r]);
+  }
+#pragma unroll
+  for (std::uint32_t r = 0; r < 16; ++r) {
+    if (r >= rows) break;
+    const float s = WarpSum(acc[r]);
+    if (lane == 0) y[static_cast<std::size_t>(t) * rows + r] = s;
+  }
+}
+
+// Profiling: the GPU's constant-rate counter into stamps[slot] (gfx11 reads
+// it with s_sendmsg_rtn MSG_RTN_GET_REALTIME, as HIP's wall_clock64 does).
+// Launched after each kernel while kernel timing is on; kernels on the stream
+// run in order, so consecutive stamps bracket each kernel without any host
+// synchronization. grid (1), block 32
+extern "C" __global__ void halo_timestamp(unsigned long long* stamps, std::uint32_t slot) {
+  if (threadIdx.x == 0) stamps[slot] = __builtin_amdgcn_s_sendmsg_rtnl(0x83);  // MSG_RTN_GET_REALTIME
 }

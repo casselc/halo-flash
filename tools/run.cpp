@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "halo_toolchain.h"
 #include "core/gguf.hpp"
 #include "core/sampling.hpp"
 #include "engine/flash_next_gpu.hpp"
@@ -124,6 +125,7 @@ int main(int argc, char** argv) {
   std::string model, prompt = "The capital of France is", device = "hip";
   int n = 16, prefill_bench = 0, reps = 3;
   std::string prefill_file, prefill_warm;
+  bool kernel_timing = false;  // --kernel-timing 1: sync-free per-kernel times of the last prefill rep
   bool eager = false, profile = false, device_sample = false;
   bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
   setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -143,6 +145,10 @@ int main(int argc, char** argv) {
     else if (a == "--prefill-file") prefill_file = argv[i + 1];
     else if (a == "--split-gdn") engine::FlashNextGpu::prefill_split_gdn_ = std::string(argv[i + 1]) == "1";
     else if (a == "--mq-attention") engine::FlashNextGpu::prefill_mq_attention_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--parallel-bucket") engine::FlashNextGpu::prefill_parallel_bucket_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--skinny-f32") engine::FlashNextGpu::prefill_skinny_f32_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--fused-combine") engine::FlashNextGpu::prefill_fused_combine_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--kernel-timing") kernel_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill-warm") prefill_warm = argv[i + 1];
     else if (a == "--reps") reps = std::max(1, std::atoi(argv[i + 1]));
@@ -170,6 +176,7 @@ int main(int argc, char** argv) {
   auto ngram = model::NgramTable::Open(reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset, t.rows,
                                        c.ple_head_dim, t.type, &error);
   if (!ngram) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+  std::printf("toolchain: %s\n", HALO_TOOLCHAIN);
   std::printf("model: %u layers, hidden %u, vocab %u, experts %u/%u, flash-next geometry %s\n", c.num_layers,
               c.hidden_size, c.vocab_size, c.num_experts_used, c.num_experts, c.IsFlashNextGeometry() ? "yes" : "no");
 
@@ -231,8 +238,20 @@ int main(int argc, char** argv) {
     if (profile) static_cast<Profiling*>(dev.get())->on = true;
     for (int r = 0; r < reps; ++r) {
       if (!gpu->Reset(&error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      const bool timed = kernel_timing && r + 1 == reps;
+      if (timed && !gpu->StartKernelTiming(1 << 20, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
       const auto st = std::chrono::steady_clock::now();
       if (!gpu->Prefill(toks, logits, &error)) return std::fprintf(stderr, "prefill: %s\n", error.c_str()), 1;
+      if (timed) {
+        double span = 0, rate = 0;
+        const auto times = gpu->StopKernelTiming(&span, &rate, &error);
+        double total = 0;
+        for (const auto& k : times) total += k.ms;
+        std::printf("kernel timing (last rep, sync-free): span %.1f ms, counter %.0f ticks/ms\n", span, rate);
+        for (const auto& k : times)
+          std::printf("  %-58s %9.2f ms %5.1f%% %7llu calls %9.1f us/call\n", k.key.c_str(), k.ms, 100 * k.ms / total,
+                      static_cast<unsigned long long>(k.calls), 1e3 * k.ms / k.calls);
+      }
       secs.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - st).count());
       std::printf("prefill %zu tokens: %.3f s (%.1f tok/s), argmax %u\n", toks.size(), secs.back(),
                   toks.size() / secs.back(), Argmax(logits).best);
