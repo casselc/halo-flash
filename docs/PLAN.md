@@ -689,6 +689,16 @@ The same operations are exposed as HTTP endpoints for out-of-process
 harnesses. Records go through the same rings and writer, with typed columns
 and payloads under the same capture policy.
 
+**Status (2026-10-04).** Implemented as `include/halo_scope.h` over
+`scope::Annotator`: steps become SPAN observations (tag `step:<kind>`),
+tool results TOOL observations carrying the engine's tool-call id, scores
+typed `llm_scores` facts (assert, supersede, retract), and trace context
+`llm_traces` facts that queries merge per field (latest non-empty value;
+tags accumulate). Output content follows the capture policy (off, digest,
+full). Tested with directed cases, a Hegel property (every OK return is
+exactly the rows written), concurrent threads under TSan, and a chDB round
+trip. HTTP endpoints for out-of-process harnesses come with the P7 server.
+
 Complete traces (generation, then tool call, tool result and the next
 generation) are what P11 turns into tool-calling training rows. Harness
 scores label them.

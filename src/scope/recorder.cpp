@@ -36,24 +36,12 @@ std::uint64_t ThreadCpuNs() {
   return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(ts.tv_nsec);
 }
 
-const char* StagingInsert(Table t) {
-  switch (t) {
-    case Table::kObservations: return "INSERT INTO halo_scope.llm_observations_in";
-    case Table::kPayloads: return "INSERT INTO halo_scope.llm_payloads_in";
-    default: return nullptr;
-  }
-}
-
-const char* Columns(Table t) {
-  return t == Table::kObservations ? kObservationColumns : kPayloadColumns;
-}
-
 }  // namespace
 
 bool ChdbSink::Write(Table table, std::string_view rows, std::size_t, std::string_view token, std::string* err) {
   // deduplicate_blocks_in_dependent_materialized_views: the Null staging
   // table keeps nothing, so deduplication has to happen at the MV target.
-  std::string ins = std::string(StagingInsert(table)) + " (" + Columns(table) + ")";
+  std::string ins = std::string("INSERT INTO ") + TableName(table) + "_in (" + TableColumns(table) + ")";
   if (dedup_token_)
     ins += " SETTINGS deduplicate_blocks_in_dependent_materialized_views = 1, insert_deduplication_token = " +
            SqlQuote(token);

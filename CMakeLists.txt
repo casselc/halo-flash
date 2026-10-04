@@ -248,8 +248,10 @@ if(HALO_SCOPE)
       src/scope/records.cpp
       src/scope/recorder.cpp
       src/scope/metadata.cpp
-      src/scope/wal.cpp)
-    target_include_directories(${name} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+      src/scope/wal.cpp
+      src/scope/annotate.cpp
+      src/scope/c_api.cpp)
+    target_include_directories(${name} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(${name} PUBLIC Threads::Threads ${CMAKE_DL_LIBS} SQLite::SQLite3)
     target_link_libraries(${name} PRIVATE BLAKE3::blake3)
     target_compile_definitions(${name} PRIVATE HALO_SCOPE_MUTANT=${mutant})
@@ -268,6 +270,7 @@ if(HALO_SCOPE)
       tests/scope/recorder_test.cpp
       tests/scope/metadata_test.cpp
       tests/scope/wal_test.cpp
+      tests/scope/annotate_test.cpp
       tests/scope/scope_main.cpp)
     target_link_libraries(scope_tests PRIVATE halo_scope)
 

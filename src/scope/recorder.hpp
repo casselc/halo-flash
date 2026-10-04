@@ -85,6 +85,16 @@ class Producer {
     EncodePayload(p, scratch_);
     return RecordRaw(Table::kPayloads, scratch_);
   }
+  bool Record(const Score& s) {
+    scratch_.clear();
+    EncodeScore(s, scratch_);
+    return RecordRaw(Table::kScores, scratch_);
+  }
+  bool Record(const TraceFact& t) {
+    scratch_.clear();
+    EncodeTraceFact(t, scratch_);
+    return RecordRaw(Table::kTraces, scratch_);
+  }
   /// One already-encoded staging row.
   bool RecordRaw(Table t, std::string_view row);
 

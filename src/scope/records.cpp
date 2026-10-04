@@ -26,6 +26,33 @@ const char* const kObservationColumns =
 
 const char* const kPayloadColumns = "project, hash, bytes, content";
 
+const char* const kScoreColumns =
+    "project, score_id, supersedes, kind, trace_id, observation_id, session_id, name, source, data_type, "
+    "value, string_value, comment, event_time";
+
+const char* const kTraceColumns =
+    "project, trace_id, name, user_id, session_id, tags, release, start_time, end_time, status_code, metadata";
+
+const char* TableName(Table t) {
+  switch (t) {
+    case Table::kObservations: return "halo_scope.llm_observations";
+    case Table::kPayloads: return "halo_scope.llm_payloads";
+    case Table::kScores: return "halo_scope.llm_scores";
+    case Table::kTraces: return "halo_scope.llm_traces";
+    default: return nullptr;
+  }
+}
+
+const char* TableColumns(Table t) {
+  switch (t) {
+    case Table::kObservations: return kObservationColumns;
+    case Table::kPayloads: return kPayloadColumns;
+    case Table::kScores: return kScoreColumns;
+    case Table::kTraces: return kTraceColumns;
+    default: return nullptr;
+  }
+}
+
 namespace {
 
 void StrArray(std::string& out, const std::vector<std::string>& v) {
@@ -189,6 +216,80 @@ Payload DecodePayload(rb::Reader& r) {
   p.bytes = r.Fixed<std::uint32_t>();
   p.content = r.Str();
   return p;
+}
+
+void EncodeScore(const Score& s, std::string& out) {
+  rb::Str(out, s.project);
+  rb::Str(out, s.score_id);
+  rb::Str(out, s.supersedes);
+  rb::Str(out, s.kind);
+  rb::Str(out, s.trace_id);
+  rb::Str(out, s.observation_id);
+  rb::Str(out, s.session_id);
+  rb::Str(out, s.name);
+  rb::Str(out, s.source);
+  rb::Str(out, s.data_type);
+  rb::Fixed<double>(out, s.value);
+  rb::Str(out, s.string_value);
+  rb::Str(out, s.comment);
+  rb::Fixed<std::int64_t>(out, s.event_ns);
+}
+
+Score DecodeScore(rb::Reader& r) {
+  Score s;
+  s.project = r.Str();
+  s.score_id = r.Str();
+  s.supersedes = r.Str();
+  s.kind = r.Str();
+  s.trace_id = r.Str();
+  s.observation_id = r.Str();
+  s.session_id = r.Str();
+  s.name = r.Str();
+  s.source = r.Str();
+  s.data_type = r.Str();
+  s.value = r.Fixed<double>();
+  s.string_value = r.Str();
+  s.comment = r.Str();
+  s.event_ns = r.Fixed<std::int64_t>();
+  return s;
+}
+
+void EncodeTraceFact(const TraceFact& t, std::string& out) {
+  rb::Str(out, t.project);
+  rb::Str(out, t.trace_id);
+  rb::Str(out, t.name);
+  rb::Str(out, t.user_id);
+  rb::Str(out, t.session_id);
+  StrArray(out, t.tags);
+  rb::Str(out, t.release);
+  rb::Fixed<std::int64_t>(out, t.start_ns);
+  rb::Fixed<std::int64_t>(out, t.end_ns);
+  rb::Str(out, t.status_code);
+  rb::Varint(out, t.metadata.size());  // Map = Array(Tuple(K, V))
+  for (const auto& [k, v] : t.metadata) {
+    rb::Str(out, k);
+    rb::Str(out, v);
+  }
+}
+
+TraceFact DecodeTraceFact(rb::Reader& r) {
+  TraceFact t;
+  t.project = r.Str();
+  t.trace_id = r.Str();
+  t.name = r.Str();
+  t.user_id = r.Str();
+  t.session_id = r.Str();
+  t.tags = ReadStrArray(r);
+  t.release = r.Str();
+  t.start_ns = r.Fixed<std::int64_t>();
+  t.end_ns = r.Fixed<std::int64_t>();
+  t.status_code = r.Str();
+  t.metadata.resize(r.Varint());
+  for (auto& [k, v] : t.metadata) {
+    k = r.Str();
+    v = r.Str();
+  }
+  return t;
 }
 
 }  // namespace halo::scope

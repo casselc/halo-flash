@@ -19,7 +19,7 @@
 namespace halo::scope {
 
 /// The tables a ring record can target.
-enum class Table : std::uint8_t { kObservations = 0, kPayloads = 1, kCount = 2 };
+enum class Table : std::uint8_t { kObservations = 0, kPayloads = 1, kScores = 2, kTraces = 3, kCount = 4 };
 
 /// One row of llm_observations: casselc/observability's typed llm_spans
 /// columns plus the engine-only columns of PLAN.md P12.
@@ -90,6 +90,46 @@ struct Payload {
   bool operator==(const Payload&) const = default;
 };
 
+/// One append-only score fact of llm_scores. `kind` is "assert" or
+/// "retract"; a correction is a later assert whose `supersedes` names the
+/// fact it replaces. Resolved at query time; nothing is updated in place.
+struct Score {
+  std::string project;
+  std::string score_id;
+  std::string supersedes;
+  std::string kind;
+  std::string trace_id;
+  std::string observation_id;
+  std::string session_id;
+  std::string name;
+  std::string source;     // harness, human, judge, rule, decider
+  std::string data_type;  // NUMERIC, CATEGORICAL, BOOLEAN
+  double value = 0;
+  std::string string_value;
+  std::string comment;
+  std::int64_t event_ns = 0;
+  bool operator==(const Score&) const = default;
+};
+
+/// One llm_traces fact. A trace may have several: the engine writes one when
+/// it opens the trace, and a harness adds context (session and user ids,
+/// tags, release, metadata) later. Queries merge a trace's facts, the latest
+/// non-empty value per field and per metadata key winning.
+struct TraceFact {
+  std::string project;
+  std::string trace_id;
+  std::string name;
+  std::string user_id;
+  std::string session_id;
+  std::vector<std::string> tags;
+  std::string release;
+  std::int64_t start_ns = 0;
+  std::int64_t end_ns = 0;
+  std::string status_code;
+  std::vector<std::pair<std::string, std::string>> metadata;
+  bool operator==(const TraceFact&) const = default;
+};
+
 /// The content address of a payload: BLAKE3, truncated to 128 bits.
 /// Unkeyed: one process owns the database, so there is no tenant or day
 /// to key by (the fleet design keyed per tenant and day).
@@ -99,10 +139,20 @@ void EncodeObservation(const Observation& o, std::string& out);
 Observation DecodeObservation(rb::Reader& r);
 void EncodePayload(const Payload& p, std::string& out);
 Payload DecodePayload(rb::Reader& r);
+void EncodeScore(const Score& s, std::string& out);
+Score DecodeScore(rb::Reader& r);
+void EncodeTraceFact(const TraceFact& t, std::string& out);
+TraceFact DecodeTraceFact(rb::Reader& r);
 
 /// Column lists in staging/typed order (comma-separated, for INSERT/SELECT).
 extern const char* const kObservationColumns;
 extern const char* const kPayloadColumns;
+extern const char* const kScoreColumns;
+extern const char* const kTraceColumns;
+/// "halo_scope.<table>", the typed table; its staging table adds "_in".
+const char* TableName(Table t);
+/// The staging columns of `t`.
+const char* TableColumns(Table t);
 
 }  // namespace halo::scope
 
