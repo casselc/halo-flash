@@ -34,6 +34,28 @@ The tests are mostly properties and state machines written with Hegel. When a
 property fails, Hegel shrinks it to a minimal counterexample and prints a
 replay seed. Commit each one as a regression test.
 
+## System One decisions (strands-decider)
+
+`/v1/systemone` decisions run strands-decider-2B-hobson-v19 on the CPU
+reference today. To build its artifacts from the Hugging Face checkpoints
+(`LLAMA_CPP` points at a llama.cpp checkout with qwen35 support), run:
+
+```sh
+python $LLAMA_CPP/convert_hf_to_gguf.py models/Qwen3.5-2B-Base --outtype bf16 \
+  --outfile models/Qwen3.5-2B-Base-BF16.gguf
+LLAMA_CPP=... python tools/convert_lora_gguf.py models/Qwen3.5-2B-Base \
+  models/strands-decider-2B-hobson-v19/lora models/strands-decider-lora-f32.gguf
+LLAMA_CPP=... python tools/convert_decider_head.py models/strands-decider-2B-hobson-v19 \
+  models/strands-decider-head.gguf
+LLAMA_CPP=... python tools/tokenizer_json_to_gguf.py \
+  models/strands-decider-2B-hobson-v19/tokenizer.json models/strands-decider-tokenizer.gguf
+HALO_DECIDER_MODELS_DIR=$PWD/models ./build/release/decide_tests --gtest_filter='StrandsDecider.*'
+```
+
+The checkpoint's `hobson_config.json` names the base revision it was trained
+on (`b1485b2`). Its `tokenizer.json` uses the older Qwen2 split regex, which
+the tokenizer supports as the `qwen2` pre-tokenizer.
+
 ## License
 
 MIT. Code adapted from gufo, llama.cpp and ds4 is listed in [NOTICE](NOTICE),

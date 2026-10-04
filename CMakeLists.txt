@@ -45,8 +45,9 @@ target_link_libraries(halo_text PUBLIC halo_core)
 # --- decide: System One decision API ---------------------------------------
 add_library(halo_decide STATIC
   src/decide/systemone.cpp
+  src/decide/decider.cpp
 )
-target_link_libraries(halo_decide PUBLIC halo_core halo_text)
+target_link_libraries(halo_decide PUBLIC halo_core halo_text halo_model)
 
 # --- model: config, weight binding, n-gram table, CPU reference -------------
 find_package(Threads REQUIRED)
@@ -60,6 +61,7 @@ add_library(halo_model STATIC
   src/model/qwen35.cpp
 )
 target_link_libraries(halo_model PUBLIC halo_core Threads::Threads)
+
 
 # --- tools ------------------------------------------------------------------
 add_executable(gguf_inspect tools/gguf_inspect.cpp)
@@ -101,7 +103,8 @@ if(HALO_BUILD_TESTS)
   halo_test(text_tests
     tests/text/tokenizer_test.cpp)
   halo_test(decide_tests
-    tests/decide/systemone_test.cpp)
+    tests/decide/systemone_test.cpp
+    tests/decide/decider_test.cpp)
   target_compile_definitions(decide_tests PRIVATE
     HALO_DECIDE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/decide/data")
   halo_test(model_tests

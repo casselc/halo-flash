@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <algorithm>
+#include <thread>
 #include <vector>
 
 #include "core/quant.hpp"
@@ -104,20 +106,28 @@ float DotRow(const TensorRef& t, std::uint64_t e, std::uint64_t row,
 
 void MatVec(const TensorRef& t, std::uint64_t e, std::span<const float> x,
             std::span<float> y) {
-  const auto rows = static_cast<std::int64_t>(t.rows);
-#pragma omp parallel
-  {
+  const auto rows = static_cast<std::size_t>(t.rows);
+  const auto work = [&](std::size_t begin, std::size_t end) {
     std::vector<float> w(t.cols);
-#pragma omp for schedule(static)
-    for (std::int64_t r = 0; r < rows; ++r) {
-      DequantizeRow(t, e, static_cast<std::uint64_t>(r), w.data());
+    for (std::size_t r = begin; r < end; ++r) {
+      DequantizeRow(t, e, r, w.data());
       double acc = 0.0;
-      for (std::size_t i = 0; i < t.cols; ++i) {
-        acc += static_cast<double>(w[i]) * x[i];
-      }
-      y[static_cast<std::size_t>(r)] = static_cast<float>(acc);
+      for (std::size_t i = 0; i < t.cols; ++i) acc += static_cast<double>(w[i]) * x[i];
+      y[r] = static_cast<float>(acc);
     }
+  };
+  // Large matrices are split across threads (std::thread, so the reference
+  // stays TSan-checkable); each row is computed identically either way.
+  const std::size_t threads =
+      t.rows * t.cols >= (1u << 20) ? std::max(1u, std::thread::hardware_concurrency()) : 1;
+  if (threads == 1 || rows < 2 * threads) {
+    work(0, rows);
+    return;
   }
+  std::vector<std::thread> pool;
+  const std::size_t chunk = (rows + threads - 1) / threads;
+  for (std::size_t b = 0; b < rows; b += chunk) pool.emplace_back(work, b, std::min(rows, b + chunk));
+  for (auto& th : pool) th.join();
 }
 
 void RmsNorm(std::span<float> x, const float* w, float eps) {

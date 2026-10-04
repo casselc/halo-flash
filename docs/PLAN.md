@@ -359,19 +359,240 @@ Copied MIT code keeps its notices in `NOTICE` and `licenses/`. The project is MI
   3. **`flash-pointer` decider.** A pointer head, with optional LoRA on Flash-Next's last k layers, reads the forked session's hidden states. The state is never re-prefilled, which makes this the cheapest decision path for a harness that already holds the conversation. It needs P11.
 - **Concurrency.** Decision forwards are scheduled like prefill chunks between LLM decode steps, with a per-request priority. A strands decider pinned to the NPU (N-lane candidate 1, below) would run fully in parallel.
 
-**P10: LoRA inference.** The primary target is Flash-Next; the decider's Qwen3.5 adapter comes second (user, 2026-10-03).
-- PEFT safetensors adapters (`adapter_config.json` and `adapter_model.safetensors`), mapped onto GGUF tensor names.
-- Unmerged low-rank side paths on dense projections: attention q/k/v/o, DeltaNet in_proj and out_proj, the shared expert, and optionally the router and experts.
-- Adapters are chosen per request or session, several stay resident, and requests in one batch may mix adapters (S-LoRA-style grouping).
-- An optional merge mode handles the single-adapter case.
-- Tests: logits with an adapter match HF plus PEFT on the tiny model, through the same converter pipeline as P1. Merged and unmerged results must agree.
+**P10: variants, first-class (supersedes "LoRA inference"; user, 2026-10-03).**
 
-**P11: LoRA and head training.**
-- **Stage 1: last-k-layer training.** The frozen trunk runs forward on the inference engine and caches the residual stream at layer L−k. Backward runs only through the last k layers, the head mixer and the pointer head or LM head. This covers the decider "adapt the final layers" path and output-side LoRA without full-depth backward kernels.
-- **Stage 2: full-depth LoRA**, including backward through chunked GDN, QSA attention and MoE routing, only if stage 1 is not enough.
-- Training uses AdamW with fp32 master weights for the adapters, gradient checkpointing, and resumable checkpoints. These are content-bound atomic checkpoints with durable progress, as for every long run.
-- Gradients are checked against PyTorch autograd on the HF tiny model, layer by layer, with tolerances fixed in advance.
-- Data: strands-decider's recipe (its public data inventory and generators) for decider heads. Any user dataset works for generic LoRA.
+Goal: train and load task-specific variants of a base model locally. Target
+uses are behavior and format, domain knowledge, and tool calling (for
+example, tuning tool use for the samizdat harness).
+
+A **variant** is a named, versioned bundle that the engine applies per
+session or per request, on top of an unchanged base. Any combination of
+these parts is allowed:
+
+| Part | What it changes | Runtime cost | Status |
+|---|---|---|---|
+| **LoRA / QLoRA deltas** on dense projections (attention, DeltaNet, shared expert, router) | behavior, format, tool use | a small low-rank matmul per adapted projection; several adapters resident, mixed in one batch | CPU reference with PEFT parity done (3088a3b); GPU next |
+| **Replacement experts (ESFT)**: retrained copies of the k experts per layer the task data routes to most | domain knowledge LoRA on attention cannot reach | none: the session's expert table points at its copies | planned |
+| **Task heads**: pointer or classifier readouts, plus an optional LoRA on the last k layers | decisions, routing, scoring (`/v1/systemone` over the live session) | negligible, reuses the session's hidden states | the strands head runs today on Qwen3.5 |
+| **State / prefix tuning**: a learned initial DeltaNet state plus a KV prefix for the attention layers | persona, standing instructions, house style | none: a snapshot restore through the prefix cache | planned |
+| **Small-model variant**: a fully fine-tuned Qwen3.5-2B or 9B used for the task instead of, or alongside, Flash-Next | narrow, high-volume tasks | a second resident model | the Qwen3.5 torso already runs (decider) |
+
+Engine requirements:
+- **Variant manifest.** A GGUF-family file per part, plus a manifest that
+  records the base model hash, part hashes, training provenance and an eval
+  summary. A variant whose base hash differs from the loaded base is refused.
+- **Selection per request.** A `variant` field on `/v1/completions`,
+  `/v1/chat/completions` and `/v1/systemone`, a C ABI equivalent, and the
+  OpenAI `model` alias `base:variant`.
+- **Batching.** Sessions with different variants batch together: LoRA uses
+  grouped low-rank matmuls; expert replacement is per-row expert indirection.
+- **Tests per part.** Parity with the PyTorch reference on the tiny models,
+  as done for LoRA. Merged and unmerged LoRA must agree. Expert-swap must be
+  exact. A state variant must equal re-prefilling its training prefix.
+
+**P11: training variants locally.**
+- **Shared machinery.**
+  - Frozen quantized base (QLoRA-style), FP32 master weights for trainable
+    parameters, AdamW, gradient checkpointing.
+  - Resumable content-bound checkpoints with durable progress, as for every
+    long run.
+  - Eval hooks into P12.
+- **Stage 1: last-k layers.** The frozen trunk runs forward on the inference
+  engine; backward covers only the last k layers plus heads or the LM head.
+  This covers task heads and output-side LoRA.
+- **Stage 2: full-depth backward kernels** for DeltaNet (chunked), QSA
+  attention, MoE (including router gradients for ESFT), hyper-connections
+  and PLE. Each is gradient-checked against PyTorch autograd on the tiny
+  model, layer by layer, with tolerances fixed in advance. This unlocks full
+  LoRA, ESFT and state/prefix tuning.
+- **Expert selection for ESFT.** Routing statistics over the task data choose
+  which experts to retrain, and are reported before training starts, so it
+  is clear whether the task concentrates on a manageable set.
+- **Data.**
+  - Behavior and domain: user datasets.
+  - Tool calling: harness traces (samizdat) converted to chat-template
+    training rows with the Qwen `<tool_call>` format, plus negative and
+    corrected examples.
+  - Decisions: strands-decider's recipe.
+- **Small-model path.** The same trainer works on Qwen3.5 (dense, so cheaper);
+  it is the recommended first target for narrow tasks.
+
+**P12: embedded LLM observability and evaluation ("halo-scope"; user, 2026-10-03).**
+
+Goal: the engine records its own LLM telemetry directly into embedded
+databases (no generic OTel pipeline). It serves log and trace search, a trace
+UI, and Langfuse-style prompt, dataset, experiment and judge features, which
+P11 training runs use.
+
+**Design sources.** The user's oscope (main: Jolt; spike/oscope-core: Rust,
+with a C ABI, an axum server, a vanilla-JS UI and a ratatui TUI), and the
+user's casselc/observability. Both are the user's own work, and the user
+permits copying from them (2026-10-03). Directly reusable pieces include the
+web UI's JS/CSS, the SQL DDL and the search-language design. Rust and Go code
+serves as a reference for the C++ port. NOTICE records the provenance of
+copied files.
+
+**Storage.**
+- **chDB (embedded ClickHouse) for append-only, high-volume data:**
+  - `llm_traces` (one row per request or session turn);
+  - `llm_observations`, typed rather than attribute maps;
+  - `llm_logs`;
+  - `llm_scores`;
+  - `engine_metrics`.
+- Every table is a MergeTree ordered for time and trace lookup, with a bloom
+  filter on trace id, a configurable TTL, and a Buffer table for live reads.
+- **Observation fields.** Type (generation, span, event or decision), model,
+  variant and adapter ids, prompt id and version, sampler parameters, exact
+  input/output/cached token counts, TTFT, per-token latency percentiles, MTP
+  acceptance, finish reason, tool calls, `/v1/systemone` answers, and cost
+  from a price table. Payloads follow a policy (off, digest or full), with
+  digest-only by default.
+- **Write path, following the oscope spike.** Per-thread lock-free rings feed
+  one writer thread. Batches of about 10k rows are RowBinary-encoded and sent
+  with `chdb_stream_insert`, never inline RowBinary (which misparses).
+  - A CRC-framed WAL makes writes crash-safe, and an insert dedup token avoids
+    duplicate replays.
+  - libchdb (about 566 MB) is loaded with `dlopen` as an optional component,
+    with its signal handlers disabled.
+  - Recording must never block or slow decode: when a ring is full the record
+    is dropped and counted.
+- **SQLite (WAL mode) for mutable metadata** where Langfuse would use a
+  document store:
+  - prompts, with versions and labels such as production and latest;
+  - datasets, items, experiments and runs (run items link traces to dataset
+    items);
+  - evaluators (LLM-as-judge templates, rule checks, decider questions);
+  - annotation queues and comments;
+  - saved searches and the price table;
+  - variant manifests (P10).
+- Migrations are ordered and checksummed in both stores.
+
+**API and UI** on the engine's HTTP server, plus C ABI calls for embedding
+harnesses:
+- **Search.** A Lucene-like query language, ported in spirit from oscope's
+  `query.rs`. Field filters on model, variant, session, status, duration,
+  tokens and tool. Values reach SQL only as escaped literals, and only an
+  allowlist of plans is accepted: no user SQL.
+  - Endpoints: histogram, facets, trace (waterfall with logs and token
+    timeline), sessions, and a services/RED view.
+- **Langfuse-style resources.**
+  - **Prompts:** CRUD with versioning, labels and template rendering.
+    Requests can reference `prompt: name@label`.
+  - **Datasets** and items.
+  - **Experiments.** Run a dataset against a variant and prompt version, as a
+    batch on the engine itself. Results and traces are linked.
+  - **Evaluators** produce scores:
+    - LLM-as-judge on local Flash-Next or a variant;
+    - `/v1/systemone` decisions with typed noul/choice/score outputs, which
+      suit judging;
+    - deterministic checks (tool-call validity, JSON schema, regex, exact
+      match).
+  - Scores attach to traces, observations, sessions and run items.
+  - Annotation queues for human scoring.
+- **Web UI.** Served by the engine. Views: search, trace waterfall, sessions,
+  prompts with diff, datasets, experiment comparison across variants, and
+  score dashboards.
+- **TUI.** A thin HTTP client over the same API, written in C++ with FTXUI,
+  following oscope's ratatui screens.
+
+**Schema decisions adopted from casselc/observability** (user pointer,
+2026-10-03). The repository is the user's own. The user permits copying its
+code into halo-flash; each copied file is recorded in NOTICE with its
+provenance.
+Its measured shape C, typed spans plus offloaded payloads, used half the
+storage and 40% less insert CPU than Langfuse's own tables, and searched
+faster.
+- **`llm_observations`** follows its typed `llm_spans`.
+  - Columns:
+    - identity and time: trace, span and parent ids, start and end times;
+    - classification: type, name, user and session ids, tags, status, level;
+    - model: provider and model;
+    - usage: input and output tokens, plus `usage_details
+      Map(LowCardinality(String), UInt64)` for input, output, cache_read and
+      reasoning;
+    - prompt and tools: prompt name and version, tool name;
+    - content references: `input_refs`, `output_refs`, `system_ref`, with byte
+      counts and a truncated flag.
+  - Engine-only additions: variant and adapter ids, completion start time
+    (TTFT), per-token latency percentiles, MTP acceptance, sampler
+    parameters, tool-call count and ids, prefix-cache hit tokens, and decision
+    answers.
+  - Sort key `(project, toStartOfMinute(start_time), xxHash32(trace_id),
+    span_id)`, with bloom filters on trace, session and user ids.
+- **Payloads are content-addressed** in `llm_payloads`. Keyed BLAKE3-128
+  hashes go in a ReplacingMergeTree with `ZSTD(3)` and a text index on
+  lowercased content. Agents resend the whole conversation every turn, so
+  deduplication by message shrinks storage about 6×. List pages never read
+  content.
+- **Scores are append-only facts** with `supersedes` and assert/retract,
+  resolved at query time. Nothing is ever updated in place.
+- **Cost is computed at query time** from bitemporal price facts in SQLite,
+  loaded into a dictionary, and kept separate from any provided cost.
+- **Write path.**
+  - RowBinary through `chdb_stream_insert_n` (length-delimited).
+  - A Null-engine staging table with plain types, plus a materialized view
+    into the typed table. chDB's stream insert cannot do `INSERT ... SELECT
+    FROM input()`, and parsing straight into LowCardinality types costs about
+    2×.
+  - Batches of 5k to 20k rows, or a Buffer table. Every chDB statement costs
+    about 1 to 1.5 ms of CPU, and every MergeTree part about 40 to 60 ms.
+  - `non_replicated_deduplication_window` on every materialized-view target,
+    so WAL replays stay exactly-once.
+- **One process owns the database.** chDB allows one data path per process,
+  and no other process can open it, so all reads go through the engine's API.
+  That matches halo-scope's design. On chDB 26.7, sessions are closed at
+  shutdown but the engine stays alive until process exit, because it cannot
+  shut down cleanly with MergeTree tables.
+- **`engine_metrics`** uses a series table plus points tables
+  (`DoubleDelta`/`Gorilla` codecs).
+- **Not adopted, because they serve multi-edge collection only:**
+  arrival-day/late-part partitioning, envelopes, attribute-items text
+  indexes, rollups, the semantic-convention mapping views, and S3 custody.
+  We write typed columns directly, so no mapping is needed.
+- **Langfuse reference:** its `research/langfuse.md` (the v4.46 data model,
+  and the Postgres-side entities SQLite replaces) is the checklist for
+  prompts, datasets, runs, evaluators, score configs and price matching.
+
+**Harness annotation ABI (user, 2026-10-03).** This is not a generic
+tracing API. An embedding harness (samizdat or similar) attaches its own
+steps to engine-owned traces through a few typed calls, so tool executions
+appear in the same waterfall as the generations that requested them:
+- **Steps:**
+  - `halo_scope_step_begin(trace, parent, kind, name)`, with kind one of tool,
+    retry, plan, memory or custom;
+  - `halo_scope_step_end(step, status, output)`.
+- **Tool results:** `halo_scope_tool_result(trace, tool_call_id, status,
+  output, latency)`. It links to the generation observation that emitted the
+  call, by the tool-call id the engine assigned when it parsed `<tool_call>`.
+- **Scores:** `halo_scope_score(target, name, value | category | bool, source,
+  comment)`, for harness-side outcomes such as task success, test results or
+  user feedback.
+- **Context:** `halo_scope_trace_meta(trace, key, value)` for session and user
+  ids, tags and release.
+
+The same operations are exposed as HTTP endpoints for out-of-process
+harnesses. Records go through the same rings and writer, with typed columns
+and payloads under the same capture policy.
+
+Complete traces (generation, then tool call, tool result and the next
+generation) are what P11 turns into tool-calling training rows. Harness
+scores label them.
+
+**Training integration (P11).** Every training run is an experiment: dataset
+version, base and variant hashes, checkpoints and eval scores per step. A
+variant is promoted to a "production" label only through an evaluator gate.
+The same records feed the variant manifest's eval summary.
+
+**Tests.**
+- Hegel state machines for the ring-to-writer pipeline: drops counted and
+  never silent, a WAL replay equal to the lost batch, no duplicate rows after
+  a crash at any point.
+- A crash test that kills the process during writes, then replays.
+- The search compiler is property-tested: generated queries never produce
+  unescaped SQL, and results equal a reference filter over generated rows.
+- An hours-long chDB soak test, given jolt-chdb's earlier thread-status
+  corruption report.
+- A UI end-to-end smoke test.
 
 **N-lane update.** The strands-decider torso becomes candidate 1 for the NPU, ahead of the prefill offload: a 2B dense, compute-bound forward that would otherwise compete with the LLM for the GPU. The go/no-go rule is unchanged, and it adds that LLM decode tok/s must not regress while decisions run.
 

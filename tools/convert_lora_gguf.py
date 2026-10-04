@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Converts a PEFT LoRA adapter for Qwen4Exp (Qwen3.8-Flash-Next) to a GGUF
-LoRA adapter in llama.cpp's layout (`<tensor>.lora_a` [in, r] and
+"""Converts a PEFT LoRA adapter for Qwen4Exp (Qwen3.8-Flash-Next) or Qwen3.5
+(e.g. strands-decider's torso adapter) to a GGUF LoRA adapter in llama.cpp's
+layout (`<tensor>.lora_a` [in, r] and
 `<tensor>.lora_b` [r, out] in GGUF dimension order, adapter.lora.alpha).
 
 llama.cpp's convert_lora_to_gguf.py cannot do this: the base converter
@@ -13,7 +14,8 @@ came from, and applies that row map to B and column map to A
 (W = s * B @ A, so row transforms act on B and column transforms on A).
 Non-separable transforms are rejected.
 
-Usage: LLAMA_CPP=<llama.cpp> convert_lora_qwen4exp.py <base-hf-dir> <peft-dir> <out.gguf>
+Usage: LLAMA_CPP=<llama.cpp> convert_lora_gguf.py <base-hf-dir> <peft-dir> <out.gguf>
+The base model's architecture (config.json) picks the converter class.
 """
 import json
 import os
@@ -27,7 +29,14 @@ sys.path[:0] = [llama, os.path.join(llama, "gguf-py")]
 import gguf  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
-from conversion import qwen4exp  # noqa: E402
+from conversion import qwen, qwen4exp  # noqa: E402
+
+CLASSES = {
+    "Qwen4ExpForConditionalGeneration": (qwen4exp.Qwen4ExpTextModel, "qwen4exp"),
+    "Qwen4ExpForCausalLM": (qwen4exp.Qwen4ExpTextModel, "qwen4exp"),
+    "Qwen3_5ForConditionalGeneration": (qwen.Qwen3_5TextModel, "qwen35"),
+    "Qwen3_5ForCausalLM": (qwen.Qwen3_5TextModel, "qwen35"),
+}
 from safetensors.torch import load_file  # noqa: E402
 
 
@@ -38,14 +47,15 @@ def main():
         raise SystemExit("rsLoRA/DoRA adapters are not supported")
     rank, alpha = int(cfg["r"]), float(cfg["lora_alpha"])
 
-    model = qwen4exp.Qwen4ExpTextModel(base_dir, gguf.LlamaFileType.ALL_F32, out,
-                                       eager=True, dry_run=True)
+    arch = json.load(open(base_dir / "config.json"))["architectures"][0]
+    cls, gguf_arch = CLASSES[arch]
+    model = cls(base_dir, gguf.LlamaFileType.ALL_F32, out, eager=True, dry_run=True)
     types = model.hparams.get("layer_types") or []
     model.hparams["layer_types"] = ["full_attention" if t == "indexed_attention" else t for t in types]
 
     state = load_file(peft_dir / "adapter_model.safetensors")
     modules = sorted({k.split(".lora_A.")[0] for k in state if ".lora_A." in k})
-    writer = gguf.GGUFWriter(out, "qwen4exp")
+    writer = gguf.GGUFWriter(out, gguf_arch)
     writer.add_string("general.type", "adapter")
     writer.add_string("adapter.type", "lora")
     writer.add_float32("adapter.lora.alpha", alpha)
@@ -56,7 +66,10 @@ def main():
         B = state[module + ".lora_B.weight"].double()   # [out, r]
         if A.shape[0] != rank or B.shape[1] != rank:
             raise SystemExit(f"{module}: rank mismatch")
-        hf_name = re.sub(r"^base_model\.model\.model\.", "model.", module) + ".weight"
+        # PEFT prefixes: base_model.model.model.layers... when attached to a
+        # *ForCausalLM, base_model.model.layers... when attached to the bare
+        # text model (strands-decider's torso).
+        hf_name = re.sub(r"^base_model\.model\.(model\.)?", "model.", module) + ".weight"
         m = re.search(r"\.layers\.(\d+)\.", hf_name)
         bid = int(m.group(1)) if m else None
         rows_n, cols_n = B.shape[0], A.shape[1]
