@@ -843,7 +843,13 @@ onto template turns as described above; a property checks that the same
 conversation sent through either API renders the identical Flash-Next
 prompt. Unsupported features (n > 1, images, hosted tools, item
 references, encrypted reasoning) fail with an error naming the parameter.
-The HTTP layer, streaming events and the response store come next.
+`src/server/openai_response` builds each API's output from the streaming
+parser's events: Chat chunks and completions, Responses events (numbered,
+every item added then done) and response objects, raw Completions text.
+Properties: streamed deltas concatenate to the final object, streaming and
+non-streaming builds agree, and a Responses output sent back as input items
+is the assistant turn Chat reports. The HTTP layer and the response store
+come next.
 
 **Context management and compaction (P6 with P12 evals).**
 1. **Truncation** (`truncation: "auto"`): drop the oldest items over budget.
