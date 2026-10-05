@@ -156,30 +156,24 @@ def timing(path):
     return out
 
 
-def first_dispatch(pmc_dir):
-    """Counters of each kernel's first prefill dispatch (later dispatches read 0 in the engine:
-    docs/HARDWARE.md), keyed (name, blocks)."""
+def per_call(pmc_dir):
+    """Mean counters per dispatch, keyed (name, blocks). Collect with tools/pmc.sh: without its keepalive,
+    instruction counters read 0 after any > ~70 ms GPU idle gap (docs/HARDWARE.md)."""
     passes = sorted(d for d in glob.glob(os.path.join(pmc_dir, "p*")) if os.path.isdir(d))
-    first = {}
+    sums, ids = collections.defaultdict(lambda: collections.defaultdict(float)), collections.defaultdict(set)
     for d in passes:
-        rows = list(csv.DictReader(open(os.path.join(d, "run_counter_collection.csv"))))
-        rows.sort(key=lambda r: int(r["Dispatch_Id"]))
-        seen = {}
-        for r in rows:
+        for r in csv.DictReader(open(os.path.join(d, "run_counter_collection.csv"))):
             key = (r["Kernel_Name"].split("(")[0], int(r["Grid_Size"]) // int(r["Workgroup_Size"]))
-            did = r["Dispatch_Id"]
-            if key not in seen:
-                seen[key] = did
-            if seen[key] == did:
-                first.setdefault(key, {})[r["Counter_Name"]] = float(r["Counter_Value"])
-    return first
+            sums[key][r["Counter_Name"]] += float(r["Counter_Value"])
+            ids[(key, r["Counter_Name"])].add(r["Dispatch_Id"])
+    return {k: {c: v / len(ids[(k, c)]) for c, v in cs.items()} for k, cs in sums.items()}
 
 
 def floors(pmc_dir, timing_path):
     """Per kernel: issue = (34 x WMMA + VALU + LDS) cycles over 80 SIMDs, WMMA from shapes and VALU / LDS from
-    first-dispatch counters (only where the first dispatch has this grid); memory = max(unique weight bytes at
+    per-call counters; memory = max(unique weight bytes at
     DRAM rate, L2-to-fabric bytes (counters x 2) at MALL rate for GEMMs, DRAM rate for streaming kernels). Floor = max(issue, memory)."""
-    tm, fd = timing(timing_path), first_dispatch(pmc_dir)
+    tm, fd = timing(timing_path), per_call(pmc_dir)
     rows = []
     for key, (ms, calls) in tm.items():
         c = fd.get(key, {})
