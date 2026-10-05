@@ -646,7 +646,9 @@ bool FlashNextGpu::MoeChunk(const model::LayerWeights& l, std::uint32_t T, std::
                             up.rows == gate.rows && up.cols == gate.cols && gate.cols % 256 == 0 && H <= 4096;
   const bool down_q5_1 = down.type == core::GgmlType::kQ5_1 && down.cols % 32 == 0 && ff <= 2048;
   const bool fast = gate_up_fast && (down_q5_1 || static_cast<bool>(dd.qs));
-  if (prefill_grouped_moe_ && GroupedMoeFits(l)) return GroupedMoe(l, T, error) && SharedExpertChunk(l, T, error);
+  if (prefill_grouped_moe_ && GroupedMoeFits(l))
+    return GroupedMoe(l, T, error, !prefill_fused_moe_combine_) &&
+           SharedExpertChunk(l, T, error, prefill_fused_moe_combine_);
   const char* gu = int8_act_moe_ ? "halo_moe_gate_up_q4_k_dot" : "halo_moe_gate_up_q4_k_s2";
   for (std::uint32_t t = 0; t < T; ++t) {
     const std::size_t ido = std::size_t{t} * used * 4, xo = std::size_t{t} * H * 4;
@@ -756,7 +758,7 @@ bool FlashNextGpu::GroupedMoeFits(const model::LayerWeights& l) const {
 
 // Routed experts grouped by expert (stage B): top-k for every token,
 // bucketing, gate/up with SwiGLU, down, weighted combine; five launches.
-bool FlashNextGpu::GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std::string* error) {
+bool FlashNextGpu::GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std::string* error, bool combine) {
   const auto& c = w_.config;
   const std::uint32_t H = c.hidden_size, used = c.num_experts_used, E = c.num_experts;
   const auto& gate = l.ffn_gate_exps;
@@ -791,13 +793,15 @@ bool FlashNextGpu::GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std
                           rt::Arg::Val<std::uint64_t>(down.RowBytes()), rt::Arg::Buf(ck_.hp), rt::Arg::Buf(ck_.tiles),
                           rt::Arg::Buf(ck_.ntiles), rt::Arg::Buf(ck_.yp), rt::Arg::Val(H), rt::Arg::Val(ff)},
                          error)) &&
-         Launch("halo_moe_combine_grouped", {Blocks(H), T}, {kBlock},
-                {rt::Arg::Buf(ck_.yp), rt::Arg::Buf(ck_.pos), rt::Arg::Buf(ck_.wts), rt::Arg::Buf(ck_.block_out),
-                 rt::Arg::Val(used), rt::Arg::Val(H)},
-                error);
+         (!combine ||  // else SharedExpertChunk combines (fused_combine)
+          Launch("halo_moe_combine_grouped", {Blocks(H), T}, {kBlock},
+                 {rt::Arg::Buf(ck_.yp), rt::Arg::Buf(ck_.pos), rt::Arg::Buf(ck_.wts), rt::Arg::Buf(ck_.block_out),
+                  rt::Arg::Val(used), rt::Arg::Val(H)},
+                 error));
 }
 
-bool FlashNextGpu::SharedExpertChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error) {
+bool FlashNextGpu::SharedExpertChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error,
+                                     bool fused_combine) {
   const auto& c = w_.config;
   const std::uint32_t H = c.hidden_size;
   const std::uint32_t sff = c.shared_expert_ff;
@@ -806,10 +810,16 @@ bool FlashNextGpu::SharedExpertChunk(const model::LayerWeights& l, std::uint32_t
          Launch("halo_silu_mul", {Blocks(std::size_t{T} * sff)}, {kBlock},
                 {rt::Arg::Buf(ck_.eg), rt::Arg::Buf(ck_.eu), rt::Arg::Val(T * sff)}, error) &&
          Gemm(l.shexp_down, ck_.eg, ck_.ed, T, error) && Gemm(l.shexp_gate_inp, ck_.mixed, ck_.sgate, T, error) &&
-         Launch("halo_axpy_sigmoid_rows", {Blocks(std::size_t{T} * H)}, {kBlock},
-                {rt::Arg::Buf(ck_.block_out), rt::Arg::Buf(ck_.ed), rt::Arg::Buf(ck_.sgate), rt::Arg::Val(H),
-                 rt::Arg::Val(T)},
-                error);
+         (fused_combine  // the routed experts' weighted sum and this expert in one pass
+              ? Launch("halo_moe_combine_shared", {Blocks(H), T}, {kBlock},
+                       {rt::Arg::Buf(ck_.yp), rt::Arg::Buf(ck_.pos), rt::Arg::Buf(ck_.wts), rt::Arg::Buf(ck_.ed),
+                        rt::Arg::Buf(ck_.sgate), rt::Arg::Buf(ck_.block_out),
+                        rt::Arg::Val(w_.config.num_experts_used), rt::Arg::Val(H)},
+                       error)
+              : Launch("halo_axpy_sigmoid_rows", {Blocks(std::size_t{T} * H)}, {kBlock},
+                       {rt::Arg::Buf(ck_.block_out), rt::Arg::Buf(ck_.ed), rt::Arg::Buf(ck_.sgate), rt::Arg::Val(H),
+                        rt::Arg::Val(T)},
+                       error));
 }
 
 bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error,

@@ -4042,6 +4042,22 @@ extern "C" __global__ void halo_moe_combine_grouped(const _Float16* yp, const st
   out[static_cast<std::size_t>(t) * n + i] = acc;
 }
 
+// halo_moe_combine_grouped and the shared expert's halo_axpy_sigmoid_rows in
+// one pass: out[t][i] = sum_s w * yp (slots in order) + sigmoid(g[t]) * x[t][i],
+// the same operations in the same order, without writing out and reading it
+// back in between. grid (ceil(n / 256), T), block 256
+extern "C" __global__ void halo_moe_combine_shared(const _Float16* yp, const std::uint32_t* pos, const float* w,
+                                                   const float* x, const float* g, float* out, std::uint32_t k,
+                                                   std::uint32_t n) {
+  const std::uint32_t t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float acc = 0.0f;
+  for (std::uint32_t s = 0; s < k; ++s)
+    acc += w[t * k + s] * static_cast<float>(yp[static_cast<std::size_t>(pos[t * k + s]) * n + i]);
+  acc += Sigmoid(g[t]) * x[static_cast<std::size_t>(t) * n + i];
+  out[static_cast<std::size_t>(t) * n + i] = acc;
+}
+
 // ---- P4: chunk attention on FP16 WMMA ---------------------------------------
 //
 // halo_attention_select_rows' result for head_dim 256 by tiles: one block
