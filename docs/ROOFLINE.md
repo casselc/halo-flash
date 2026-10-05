@@ -951,3 +951,8 @@ pattern the K-blocked fp16 copy exists to avoid. What remains open: a K-blocked 
 ([cols / 64][T][64] fp32, every residual kernel changed; makes the GEMM's and the mix epilogue's
 reads contiguous), or the numerics-changing options (mix reading the fp16 copy; an fp16/bf16 residual),
 which need a quality eval first.
+| `combine_norm` residual stores after BlockSum (bit-identical; GLM's review suggestion) | -3..-8 | study 1.29 -> 1.26 ms; engine -2.7 ms within noise (spread 7.5); trace: wave lifetime unchanged (the load wait moved from 1->2 to 2->3) | no |
+| Mix epilogue: row scales and gammas staged in LDS, the residual loads of each 16-token subtile issued as one batch (bit-identical; found with the span tracer: the epilogue was 89 of a wave's 118 us) | -35..-50 (epilogue to ~43 us) | engine kernel 121.5 -> 108.0 ms (-13.4, spread 3.7); end to end -16 ms (paired over 6 interleaved rounds: 5 faster, 1 tie); trace: epilogue 89 -> 74 us | yes |
+
+The study harness (`mixstudy`, after 96 MB of writes) said the opposite (1.10 -> 1.21 ms): its condition
+does not reproduce the engine's, as noted before; decide by the engine (A/B and in-engine traces).

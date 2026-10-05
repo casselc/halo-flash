@@ -5925,6 +5925,25 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
   HALO_SPAN(4);  // math done
   __syncthreads();
   float* slice = reinterpret_cast<float*>(smem) + wave * (TM * 16 * 16);
+  // kMix with rs: the tile's row scales (BN tokens x 4 streams) and gammas (4 streams x BM / 4 indices) go to
+  // LDS past the slices, so the mix loop keeps only its residual values in registers and issues them as one
+  // batch per 16-token subtile (one memory round, not one per iteration: 89 of a wave's 118 us were the
+  // epilogue's serialized rounds, docs/TRACING.md).
+  float* mix_rs = reinterpret_cast<float*>(smem) + kSlices / 2;
+  float* mix_nw = mix_rs + BN * 4;
+  if constexpr (kMix) {
+    static_assert(kStage >= kSlices + 2 * (BN * 4 + BM), "LDS for the mix scales and gammas");
+    if (rs) {
+      const std::uint32_t hh = rows / 4, i0 = r0 / 4;
+      for (std::uint32_t idx = tid; idx < BN * 4; idx += NT)
+        mix_rs[idx] = rs[static_cast<std::size_t>(min(t0 + idx / 4, tokens - 1)) * 4 + idx % 4];
+      for (std::uint32_t idx = tid; idx < BM; idx += NT) {
+        const std::uint32_t st = idx / (BM / 4), ii = idx % (BM / 4);
+        mix_nw[idx] = i0 + ii < hh ? nw[static_cast<std::size_t>(st) * hh + i0 + ii] : 0.0f;
+      }
+      __syncthreads();
+    }
+  }
 #pragma unroll
   for (std::uint32_t n = 0; n < TN; ++n) {
 #pragma unroll
@@ -5935,18 +5954,31 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
     __builtin_amdgcn_wave_barrier();
     if constexpr (kMix) {
       const std::uint32_t h = rows / 4;
-      for (std::uint32_t idx = lane; idx < 16 * TM * 4; idx += 32) {
-        const std::uint32_t tt = idx / (TM * 4), ii = idx % (TM * 4);
+      constexpr std::uint32_t kIt = 16 * TM * 4 / 32;
+      static_assert(16 * TM * 4 % 32 == 0, "whole iterations per lane");
+      float xv[kIt][4];
+#pragma unroll
+      for (std::uint32_t it = 0; it < kIt; ++it) {
+        const std::uint32_t idx = lane + 32 * it, tt = idx / (TM * 4), ii = idx % (TM * 4);
+        const std::uint32_t t = t0 + (wt * TN + n) * 16 + tt, i = (r0 + wr * TM * 16) / 4 + ii;
+        const bool ok = t < tokens && i < h;
+        const float* xr = xn + static_cast<std::size_t>(ok ? t : 0) * rows;
+#pragma unroll
+        for (std::uint32_t st = 0; st < 4; ++st) xv[it][st] = ok ? xr[st * h + i] : 0.0f;
+      }
+#pragma unroll
+      for (std::uint32_t it = 0; it < kIt; ++it) {
+        const std::uint32_t idx = lane + 32 * it, tt = idx / (TM * 4), ii = idx % (TM * 4);
         const std::uint32_t t = t0 + (wt * TN + n) * 16 + tt, i = (r0 + wr * TM * 16) / 4 + ii;
         if (t >= tokens || i >= h) continue;
-        const float* xr = xn + static_cast<std::size_t>(t) * rows;
         const float* g = slice + tt * (TM * 16) + ii * 4;
         float acc = 0.0f;
 #pragma unroll
         for (std::uint32_t st = 0; st < 4; ++st) {
           // With rs, xn is rebuilt from the residual as combine_norm computed it.
-          const float xv = rs ? xr[st * h + i] * rs[t * 4 + st] * nw[st * h + i] : xr[st * h + i];
-          acc += xv * Sigmoid(g[st]);
+          const float x = rs ? xv[it][st] * mix_rs[(t - t0) * 4 + st] * mix_nw[st * (BM / 4) + (i - r0 / 4)]
+                             : xv[it][st];
+          acc += x * Sigmoid(g[st]);
         }
         const float m = acc / 4.0f;
         y[static_cast<std::size_t>(t) * h + i] = m;

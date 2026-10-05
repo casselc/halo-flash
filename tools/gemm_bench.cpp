@@ -316,6 +316,16 @@ int main(int argc, char** argv) {
     std::vector<std::uint16_t> lo(std::size_t{T} * cols);
     for (auto& v : lo) v = static_cast<std::uint16_t>(0x3000 | (g() & 0x3FF));
     std::vector<float> res(std::size_t{T} * rows, 0.5f), rs(std::size_t{T} * 4, 1.0f), nw(rows, 1.0f);
+    // Optional 4th argument: write y and y16 to that file (random res, scales and gammas) for bitwise comparison
+    // between builds.
+    const char* dump = argc > 3 ? argv[3] : nullptr;
+    if (dump) {
+      std::mt19937 r(11);
+      std::uniform_real_distribution<float> u(-2.0f, 2.0f);
+      for (auto& v : res) v = u(r);
+      for (auto& v : rs) v = 0.25f + std::fabs(u(r));
+      for (auto& v : nw) v = u(r);
+    }
     auto wb = d->Alloc(w.size(), &e), qs = d->Alloc(std::size_t{rows} * cols, &e),
          db = d->Alloc(std::size_t{rows} * (cols / 32) * 2, &e), xb = d->Alloc(lo.size() * 2, &e),
          rb = d->Alloc(res.size() * 4, &e), rsb = d->Alloc(rs.size() * 4, &e), nwb = d->Alloc(nw.size() * 4, &e),
@@ -362,6 +372,16 @@ int main(int argc, char** argv) {
     const double own = timed([&](int) { (void)d->Fill(rb, 0x00, &e); });
     std::printf("mix 10240 x 320, T 2048: warm %.3f ms  cold %.3f  after 96 MB other writes %.3f  "
                 "after rewriting its own res (84 MB) %.3f\n", warm, cold, other, own);
+    if (dump) {
+      (void)d->Upload(rb, 0, res.data(), res.size() * 4, &e);  // the timed runs refilled res
+      (void)d->Launch(k, grid, {256}, a, &e);
+      std::vector<std::uint8_t> out(std::size_t{T} * h * 6);
+      (void)d->Download(yb, 0, out.data(), std::size_t{T} * h * 4, &e);
+      (void)d->Download(y16, 0, out.data() + std::size_t{T} * h * 4, std::size_t{T} * h * 2, &e);
+      std::FILE* f = std::fopen(dump, "wb");
+      std::fwrite(out.data(), 1, out.size(), f);
+      std::fclose(f);
+    }
     return 0;
   }
   if (argc > 1 && std::string(argv[1]) == "combinestudy") {
