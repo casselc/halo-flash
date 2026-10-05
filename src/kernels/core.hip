@@ -3676,15 +3676,17 @@ __device__ inline KQuantHdr LoadKQuantHdr(const std::uint8_t* b, std::uint32_t j
 // a multiple of 8, so the mask keeps exactly the four. One 24-bit multiply
 // and a mask instead of three shifts, four masks and three ors.
 __device__ inline std::uint32_t SpreadNibbleBits(std::uint32_t x) { return __umul24(x, 0x00204081u) & 0x01010101u; }
-template <>
-struct Frag16<LoadQ4_K> {
+// Q4_K fragments with super-blocks kSb bytes apart along a row: 144 row-major; 144 x kMoeBlockRows in the
+// K-blocked expert layout (halo_repack_rows_blocked: a block of 128 rows' super-block sb is contiguous).
+template <std::uint32_t kSb>
+struct Frag16Q4K {
   using Hdr = KQuantHdr;
   __device__ static Hdr LoadHdr(const std::uint8_t* row, std::uint32_t k0) {
-    return LoadKQuantHdr(row + (k0 / 256) * 144, (k0 % 256) / 32);
+    return LoadKQuantHdr(row + (k0 / 256) * kSb, (k0 % 256) / 32);
   }
   // k % kMoeKs selects the sub-block; constant once the stage loop unrolls.
   __device__ static halo_v16h GetH(const std::uint8_t* row, std::uint32_t k, const Hdr& hd) {
-    const std::uint8_t* b = row + (k / 256) * 144;
+    const std::uint8_t* b = row + (k / 256) * kSb;
     const std::uint32_t e = k % 256, chunk = e / 64, hi = (e % 64) / 32, l0 = e % 32, i = (k % 128) / 32;
     const uint4 q = *reinterpret_cast<const uint4*>(b + 16 + chunk * 32 + l0);
     const std::uint32_t w[4] = {q.x, q.y, q.z, q.w};
@@ -3702,7 +3704,7 @@ struct Frag16<LoadQ4_K> {
     uint4 q[4];
   };
   __device__ static Stage LoadStage(const std::uint8_t* row, std::uint32_t k0, std::uint32_t = 128) {
-    const std::uint8_t* qb = row + (k0 / 256) * 144 + 16 + ((k0 % 256) / 64) * 32;
+    const std::uint8_t* qb = row + (k0 / 256) * kSb + 16 + ((k0 % 256) / 64) * 32;
     Stage st;
 #pragma unroll
     for (int i = 0; i < 4; ++i) st.q[i] = *reinterpret_cast<const uint4*>(qb + 16 * i);
@@ -3722,7 +3724,7 @@ struct Frag16<LoadQ4_K> {
     return v;
   }
   __device__ static halo_v16h Get(const std::uint8_t* row, std::uint32_t k0) {
-    const std::uint8_t* b = row + (k0 / 256) * 144;
+    const std::uint8_t* b = row + (k0 / 256) * kSb;
     const std::uint32_t e = k0 % 256, chunk = e / 64, hi = (e % 64) / 32, l0 = e % 32;
     std::uint32_t sc, m;
     ScaleMinK4(2 * chunk + hi, b + 4, sc, m);
@@ -3737,6 +3739,11 @@ struct Frag16<LoadQ4_K> {
     return v;
   }
 };
+template <>
+struct Frag16<LoadQ4_K> : Frag16Q4K<144> {};
+struct LoadQ4_KB {};  // Q4_K experts in the K-blocked layout (MoeGateUp only)
+template <>
+struct Frag16<LoadQ4_KB> : Frag16Q4K<144 * 128> {};
 template <>
 struct Frag16<LoadQ5_K> {
   struct Stage {};
@@ -3912,8 +3919,12 @@ __device__ void MoeGateUp(const std::uint8_t* gate, const std::uint8_t* up, std:
 #pragma unroll
   for (std::uint32_t rt = 0; rt < kMoeRowTiles; ++rt) {
     const std::uint32_t row = min(r0 + rt * 16 + lane % 16, ff - 1);
-    g[rt] = gate + e * expert_bytes + row * row_bytes;
-    u[rt] = up + e * expert_bytes + row * row_bytes;
+    // K-blocked experts: rows grouped by kMoeBlockRows, each group's super-blocks contiguous (144-byte pieces).
+    const std::uint64_t at = std::is_same_v<L, LoadQ4_KB>
+                                 ? std::uint64_t{row / kMoeBlockRows} * kMoeBlockRows * row_bytes + (row % kMoeBlockRows) * 144u
+                                 : std::uint64_t{row} * row_bytes;
+    g[rt] = gate + e * expert_bytes + at;
+    u[rt] = up + e * expert_bytes + at;
   }
   for (std::uint32_t i = threadIdx.x; i < kMoeTile; i += blockDim.x) tok[i] = sorted[first + (i < n ? i : 0)] / k;
   halo_v8f ag[kMoeRowTiles][kMoeSub] = {}, au[kMoeRowTiles][kMoeSub] = {};
@@ -4105,6 +4116,32 @@ __device__ void MoeDown(SL load, SG get, const _Float16* hp, const std::uint32_t
 }
 
 }  // namespace
+// Q4_K gate/up experts in the K-blocked layout (see halo_repack_rows_blocked).
+extern "C" __global__ void __launch_bounds__(256) halo_moe_gate_up_grouped_q4_kb(
+    const std::uint8_t* gate, const std::uint8_t* up, std::uint64_t expert_bytes, std::uint64_t row_bytes,
+    const _Float16* x, const std::uint32_t* sorted, const std::uint32_t* tiles, const std::uint32_t* ntiles,
+    _Float16* hp, std::uint32_t ff, std::uint32_t H, std::uint32_t k) {
+  MoeGateUp<LoadQ4_KB>(gate, up, expert_bytes, row_bytes, x, sorted, tiles, ntiles, hp, ff, H, k);
+}
+
+// One-time K-blocked layout for quantized expert matrices: rows (all experts' rows in order, row_bytes each,
+// sb_bytes per super-block) grouped by kMoeBlockRows, and within a group super-block sb of every row
+// contiguous: dst[(R / 128) * 128 * row_bytes + sb * 128 * sb_bytes + (R % 128) * sb_bytes] = src[R * row_bytes +
+// sb * sb_bytes]. The same bytes: a grouped gate/up block's K stage then reads one contiguous run (DRAM row
+// locality: 240 vs 191 GB/s in halo_hwprobe sweep). rows % 128 == 0, sb_bytes % 16 == 0.
+//   grid (ceil(rows * row_bytes / 16 / 256)), block 256
+extern "C" __global__ void halo_repack_rows_blocked(const std::uint8_t* src, std::uint8_t* dst, std::uint32_t rows,
+                                                    std::uint32_t row_bytes, std::uint32_t sb_bytes) {
+  const std::uint64_t i = std::uint64_t{blockIdx.x} * blockDim.x + threadIdx.x;  // 16-byte piece
+  const std::uint32_t per_row = row_bytes / 16, per_sb = sb_bytes / 16;
+  if (i >= std::uint64_t{rows} * per_row) return;
+  const std::uint32_t R = static_cast<std::uint32_t>(i / per_row), p = static_cast<std::uint32_t>(i % per_row);
+  const std::uint32_t sb = p / per_sb, q = p % per_sb;
+  const std::uint64_t to = std::uint64_t{R / kMoeBlockRows} * kMoeBlockRows * row_bytes +
+                           std::uint64_t{sb} * kMoeBlockRows * sb_bytes + std::uint64_t{R % kMoeBlockRows} * sb_bytes + q * 16;
+  *reinterpret_cast<uint4*>(dst + to) = *reinterpret_cast<const uint4*>(src + std::uint64_t{R} * row_bytes + p * 16);
+}
+
 #define HALO_MOE_GROUPED(SUFFIX, L)                                                                                   \
   extern "C" __global__ void __launch_bounds__(256) halo_moe_gate_up_grouped_##SUFFIX(                               \
       const std::uint8_t* gate, const std::uint8_t* up, std::uint64_t expert_bytes, std::uint64_t row_bytes,          \

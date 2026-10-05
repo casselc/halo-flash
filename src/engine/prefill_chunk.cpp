@@ -786,7 +786,33 @@ bool FlashNextGpu::GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std
   const auto& tg = tensors_.at(gate.data);
   const auto& tu = tensors_.at(l.ffn_up_exps.data);
   const auto& td = tensors_.at(down.data);
-  const std::string gu = std::string("halo_moe_gate_up_grouped_") + GroupedSuffix(gate.type);
+  // Prototype (prefill_moe_blocked_): Q4_K gate/up repacked K-blocked on first use, via a temporary buffer.
+  const bool blocked = prefill_moe_blocked_ && gate.type == core::GgmlType::kQ4_K && ff % kMoeBlockRows == 0 &&
+                       H % 256 == 0;
+  if (blocked) {
+    for (const auto* t : {&gate, &l.ffn_up_exps}) {
+      if (moe_blocked_.contains(t->data)) continue;
+      const std::size_t bytes = t->SizeBytes();
+      if (!moe_blocked_tmp_ || moe_blocked_tmp_.bytes < bytes) {
+        if (moe_blocked_tmp_) dev_.Free(moe_blocked_tmp_);
+        moe_blocked_tmp_ = dev_.Alloc(bytes, error);
+        if (!moe_blocked_tmp_) return false;
+      }
+      const auto& dt = tensors_.at(t->data);
+      const auto rows = static_cast<std::uint32_t>(t->rows * t->experts);
+      const auto rb = static_cast<std::uint32_t>(t->RowBytes());
+      if (!Launch("halo_repack_rows_blocked", {static_cast<std::uint32_t>((bytes / 16 + 255) / 256)}, {256},
+                  {rt::Arg::Buf(dt.buf), rt::Arg::Buf(moe_blocked_tmp_), rt::Arg::Val(rows), rt::Arg::Val(rb),
+                   rt::Arg::Val(144u)},
+                  error) ||
+          !Launch("halo_copy", {4096}, {256},
+                  {rt::Arg::Buf(dt.buf), rt::Arg::Buf(moe_blocked_tmp_), rt::Arg::Val(static_cast<std::uint32_t>(bytes / 4))},
+                  error))
+        return false;
+      moe_blocked_.insert(t->data);
+    }
+  }
+  const std::string gu = std::string("halo_moe_gate_up_grouped_") + (blocked ? "q4_kb" : GroupedSuffix(gate.type));
   const std::string dn = std::string("halo_moe_down_grouped_") + GroupedSuffix(down.type);
   const std::uint32_t pairs = T * used, max_tiles = pairs / 64 + E + 1;
   return Launch("halo_router_topk_rows", {T}, {kBlock},

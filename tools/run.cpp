@@ -149,6 +149,7 @@ int main(int argc, char** argv) {
     else if (a == "--prefill-bench") prefill_bench = std::atoi(argv[i + 1]);
     else if (a == "--span-hsaco") span_hsaco = argv[i + 1];
     else if (a == "--logits-out") logits_out = argv[i + 1];
+    else if (a == "--moe-blocked") engine::FlashNextGpu::prefill_moe_blocked_ = std::string(argv[i + 1]) == "1";
     else if (a == "--span-kernel") engine::FlashNextGpu::span_kernel_ = argv[i + 1];
     else if (a == "--span-occurrence") engine::FlashNextGpu::span_occurrence_ = std::atoll(argv[i + 1]);
     else if (a == "--span-out") span_out = argv[i + 1];

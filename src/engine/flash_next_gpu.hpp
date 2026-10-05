@@ -17,6 +17,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "core/sampling.hpp"
@@ -105,6 +106,8 @@ class FlashNextGpu {
   static inline bool prefill_reg_gemm_ = true;  // banded GEMMs with weights in registers (halo_gemm_q8r_f16_lr8)
   static inline bool prefill_fused_moe_combine_ = true;  // routed combine + shared expert in one pass
   static inline bool prefill_ple_overlap_ = true;
+  /// Prototype: Q4_K gate/up experts repacked K-blocked on first prefill use (decode does not read that layout).
+  static inline bool prefill_moe_blocked_ = false;
   /// Span tracing (docs/TRACING.md): when set, the engine loads this code object (core_trace.hsaco) instead
   /// of the embedded one, and after SpanArm() brackets the span_occurrence_-th launch (from 0) of kernel
   /// span_kernel_ with halo_span_set(1) / halo_span_set(0).
@@ -300,6 +303,10 @@ class FlashNextGpu {
   bool SharedExpertChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error,
                          bool fused_combine = false);
   bool MoeChunk(const model::LayerWeights& l, std::uint32_t tokens, std::string* error);
+
+std::unordered_set<const void*> moe_blocked_;  // tensors repacked K-blocked (prefill_moe_blocked_)
+
+rt::Buffer moe_blocked_tmp_;
 
 std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: not armed
     rt::Device& dev_;

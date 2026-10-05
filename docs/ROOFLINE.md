@@ -972,3 +972,9 @@ generation (~4.8 waves/SIMD), each walking 128 chunk steps in series at ~16.5 us
 issues ~6.7 us of WMMA and ~6.3 us of VALU, so it runs at ~80% of issue. Its 6 spilled VGPRs are reloaded
 4 times a step from scratch (~0.3 us of 16.5, ~1.3 ms per prefill). No cheap lever: the remaining 20% is
 issue packing across the steps' phases.
+| MoE gate/up dequant ablated (study harness, fixed routing; wrong results, timing only) | upper bound of an exact VALU-cutting repack | 6.75 -> 7.45-7.79 ms (slower, at 6 vs 5 waves/SIMD): the dequant VALU is hidden under memory waits; repacking to cut VALU would not help | n/a |
+| Q4_K gate/up experts K-blocked (exact one-time repack; prototype `--moe-blocked 1`, decode not adapted) | -30..-47 (sweep: 191 -> 240 GB/s for one weight stream) | gate/up 248.1 -> 236.5 ms (-11.6, spreads 3.2/0.3); end to end -4.5 within noise; logits bit-identical | prototype only |
+
+The sweep probe over-predicted the repack ~3x: it models one weight stream; the kernel reads gate and up,
+16-byte headers and activations together. Integrating it means teaching the decode expert kernels the
+blocked layout (decode is weight-bandwidth-bound: risk) for ~12 ms of prefill.

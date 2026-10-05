@@ -701,6 +701,27 @@ int main(int argc, char** argv) {
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
     std::printf("moe layer (T %u, %u experts, top %u): %.2f ms; x48 layers = %.0f ms%s\n", T, E, k, ms, 48 * ms,
                 e.empty() ? "" : (" error: " + e).c_str());
+    // The grouped gate/up and down alone on the routing above (fixed: kernel-only changes compare like for like).
+    const auto time_one = [&](auto&& f) {
+      for (int i = 0; i < 3; ++i) f();
+      (void)d->Synchronize(&e);
+      const auto c0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < reps; ++i) f();
+      (void)d->Synchronize(&e);
+      return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count() / reps;
+    };
+    const double gu = time_one([&] {
+      L("halo_moe_gate_up_grouped_q4_k", {(ff + 127) / 128, max_tiles}, {256},
+        {rt::Arg::Buf(gb), rt::Arg::Buf(ub), rt::Arg::Val<std::uint64_t>(ff * gu_row), rt::Arg::Val<std::uint64_t>(gu_row),
+         rt::Arg::Buf(x16), rt::Arg::Buf(sb), rt::Arg::Buf(tb), rt::Arg::Buf(nb), rt::Arg::Buf(hb), rt::Arg::Val(ff),
+         rt::Arg::Val(H), rt::Arg::Val(k)});
+    });
+    const double dn = time_one([&] {
+      L("halo_moe_down_grouped_q5_1", {(H + 127) / 128, max_tiles}, {256},
+        {rt::Arg::Buf(db), rt::Arg::Val<std::uint64_t>(H * dn_row), rt::Arg::Val<std::uint64_t>(dn_row), rt::Arg::Buf(hb),
+         rt::Arg::Buf(tb), rt::Arg::Buf(nb), rt::Arg::Buf(yb), rt::Arg::Val(H), rt::Arg::Val(ff)});
+    });
+    std::printf("  gate/up (q4_k) alone %.3f ms, down (q5_1) alone %.3f ms\n", gu, dn);
     return 0;
   }
   if (argc > 1 && std::string(argv[1]) == "deltanet") {
