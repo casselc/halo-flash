@@ -64,6 +64,22 @@ LPDDR5X-8000 256-bit unified memory, 32 MB MALL. ROCm 7.2.3.
 - Writes are paid by the next kernels (their write-back drains during them); a microbenchmark's
   "after 96 MB of writes" condition does not reproduce the engine's cache state for large GEMMs.
 
+## Counters and toolchain (`tools/counter_check.py`, known-answer kernels in `halo_hwprobe counters`)
+
+Inline-asm kernels issue exact instruction counts (ISA checked: the compiler keeps them as written);
+the N = 20 minus N = 10 difference must match exactly. Results (7/7 pass):
+- `SQ_INSTS_VALU` and `SQ_INSTS_LDS` count exactly, per wave instruction; a branch taken by half
+  the waves counts only those waves; a block no lane takes is skipped and costs nothing.
+- **`SQ_INSTS_TEX_LOAD` does not count `global_load`: use `SQ_INSTS_FLAT`** (exact).
+- **WMMA is not counted in `SQ_INSTS_VALU`** and has no counter here: take WMMA counts from shapes.
+- **`GL2C_EA_RDREQ_*` bytes read half the true traffic** (x0.5 for every size from 1 MB to 256 MB):
+  multiply by 2. Every L2-to-fabric request is a full 128-byte line: request-size histograms do not
+  show segment sizes, and scattered 32-byte reads move 4x their useful bytes.
+- **L2 is invalidated between kernel launches**: re-reading 1 MB in the next launch misses entirely
+  (`GL2C_HIT` ~0), while re-reading it within one launch from other CUs hits in L2 (one pass of
+  fabric traffic). Data passes between kernels through the MALL (~800 GB/s) or DRAM, never L2;
+  only fusion reuses L2.
+
 ## Overheads (`halo_hwprobe sync`)
 
 - Barrier round (LDS write, barrier, LDS read): ~33-42 ns (100-120 cycles) for blocks of up to

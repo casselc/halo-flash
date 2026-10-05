@@ -478,6 +478,130 @@ void Sync() {
   CHECK(hipFree(out));
 }
 
+// ---- counters: known-answer kernels for validating hardware counters ---------
+// Each kernel issues an exact number of one instruction kind per wave through
+// inline asm (so the compiler cannot add, drop or fuse them); pairs of N cancel
+// the fixed prologue. tools/counter_check.py runs them under rocprofv3 and
+// checks SQ_INSTS_* and GL2C_* against these expectations, and checks the ISA.
+#define HALO_REP4(x) x x x x
+#define HALO_REP16(x) HALO_REP4(HALO_REP4(x))
+#define HALO_REP64(x) HALO_REP16(HALO_REP4(x))
+// kind 0: v_add_f32; 1: ds_load_b32; 2: global_load_b32; 3: WMMA f16
+template <int KIND, int REPS64>
+__global__ void __launch_bounds__(64) KnownKernel(float* g, float* out) {
+  __shared__ float s[256];
+  s[threadIdx.x] = 1.0f;
+  float a = threadIdx.x, b = 1.0f;
+  float* gp = g + threadIdx.x;
+  // The LDS byte offset of s[threadIdx.x]: s is this kernel's only LDS allocation, at offset 0
+  // (a generic pointer's value is a flat address, not an LDS offset).
+  const unsigned lds_addr = threadIdx.x * 4u;
+  __syncthreads();
+  for (int r = 0; r < REPS64; ++r) {
+    if constexpr (KIND == 0) {
+      asm volatile(HALO_REP64("v_add_f32 %0, %0, %1\n") : "+v"(a) : "v"(b));
+    } else if constexpr (KIND == 1) {
+      // Early-clobber outputs: otherwise the result may share the address register, and
+      // the first load overwrites the address (it faulted for global loads).
+      asm volatile(HALO_REP64("ds_load_b32 %0, %1\n") "s_waitcnt lgkmcnt(0)\n" : "=&v"(b) : "v"(lds_addr));
+    } else if constexpr (KIND == 2) {
+      asm volatile(HALO_REP64("global_load_b32 %0, %1, off\n") "s_waitcnt vmcnt(0)\n" : "=&v"(b) : "v"(gp));
+    } else {
+      v16h x = {};
+      v8f c = {};
+      for (int i = 0; i < 64; ++i) c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(x, x, c);
+      a += c[0];
+    }
+  }
+  if (a + b == 12345.f) out[0] = a;
+}
+// Exec mask all off for the asm block: are masked-off instructions counted?
+__global__ void __launch_bounds__(64) KnownMaskedKernel(float* out) {
+  float a = threadIdx.x, b = 1.0f;
+  if (threadIdx.x > 1000) {  // false for every lane: the block runs with exec = 0 or is skipped
+    for (int r = 0; r < 64; ++r) asm volatile(HALO_REP64("v_add_f32 %0, %0, %1\n") : "+v"(a) : "v"(b));
+  }
+  if (a == 12345.f) out[0] = a;
+}
+// Half the waves of each block take the branch.
+__global__ void __launch_bounds__(64) KnownHalfKernel(float* out) {
+  float a = threadIdx.x, b = 1.0f;
+  if (threadIdx.x >= 32) {
+    for (int r = 0; r < 64; ++r) asm volatile(HALO_REP64("v_add_f32 %0, %0, %1\n") : "+v"(a) : "v"(b));
+  }
+  if (a == 12345.f) out[0] = a;
+}
+// Exactly `bytes` read contiguously, once (cold if the buffer was evicted).
+__global__ void __launch_bounds__(256) KnownReadKernel(const float4* g, std::size_t n_f4, float* out) {
+  float acc = 0.0f;
+  for (std::size_t i = blockIdx.x * 256ull + threadIdx.x; i < n_f4; i += gridDim.x * 256ull) acc += g[i].x;
+  if (acc == 12345.f) out[0] = acc;
+}
+// Scattered 32-byte pieces: one float4 pair per 4 KB.
+__global__ void __launch_bounds__(256) KnownScatterKernel(const float4* g, std::size_t pieces, float* out) {
+  float acc = 0.0f;
+  for (std::size_t i = blockIdx.x * 256ull + threadIdx.x; i < pieces * 2; i += gridDim.x * 256ull)
+    acc += g[(i / 2) * 256 + i % 2].x;
+  if (acc == 12345.f) out[0] = acc;
+}
+
+// Reads a 1 MB range twice in one launch; the second pass of block b reads
+// what block (b + 80) % 160 read in the first (another CU), so a hit there is
+// an L2 hit. Tells "L2 invalidated between launches" from "hit counter broken".
+__global__ void __launch_bounds__(256) KnownReuseKernel(const float4* g, float* out) {
+  constexpr std::size_t kChunk = (1ull << 20) / 16 / 160;  // float4s per block
+  float acc = 0.0f;
+  for (int pass = 0; pass < 2; ++pass) {
+    const std::size_t b = pass == 0 ? blockIdx.x : (blockIdx.x + 80) % 160;
+    for (std::size_t i = threadIdx.x; i < kChunk; i += 256) acc += g[b * kChunk + i].x;
+    __syncthreads();
+    if (pass == 0) __threadfence();
+  }
+  if (acc == 12345.f) out[0] = acc;
+}
+
+void Counters() {
+  // Launch layout: 80 blocks x 64 threads = 160 waves for the instruction kernels.
+  float *g, *out;
+  const std::size_t gbytes = 512ull << 20;
+  CHECK(hipMalloc(&g, gbytes));
+  CHECK(hipMemset(g, 0, gbytes));
+  CHECK(hipMalloc(&out, 64));
+  int step = 0;
+  const auto sync = [&] {
+    const hipError_t e = hipDeviceSynchronize();
+    if (e != hipSuccess) {
+      std::fprintf(stderr, "counters: launch %d failed: %s\n", step, hipGetErrorString(e));
+      std::exit(1);
+    }
+    ++step;
+  };
+  hipLaunchKernelGGL((KnownKernel<0, 10>), 80, 64, 0, 0, g, out); sync();
+  hipLaunchKernelGGL((KnownKernel<0, 20>), 80, 64, 0, 0, g, out); sync();
+  hipLaunchKernelGGL((KnownKernel<1, 10>), 80, 64, 0, 0, g, out); sync();
+  hipLaunchKernelGGL((KnownKernel<1, 20>), 80, 64, 0, 0, g, out); sync();
+  hipLaunchKernelGGL((KnownKernel<2, 10>), 80, 64, 0, 0, g, out); sync();
+  hipLaunchKernelGGL((KnownKernel<2, 20>), 80, 64, 0, 0, g, out); sync();
+  hipLaunchKernelGGL((KnownKernel<3, 10>), 80, 64, 0, 0, g, out); sync();
+  hipLaunchKernelGGL((KnownKernel<3, 20>), 80, 64, 0, 0, g, out); sync();
+  hipLaunchKernelGGL(KnownMaskedKernel, 80, 64, 0, 0, out); sync();
+  hipLaunchKernelGGL(KnownHalfKernel, 80, 64, 0, 0, out); sync();
+  // Bytes: evict with a 256 MB read of another range, then 64 MB cold, then the same 4 MB twice (warm).
+  const std::size_t evict = 256ull << 20, cold = 64ull << 20, warm = 4ull << 20;
+  hipLaunchKernelGGL(KnownReadKernel, 1280, 256, 0, 0, reinterpret_cast<const float4*>(g) + (cold / 16), evict / 16, out); sync();
+  hipLaunchKernelGGL(KnownReadKernel, 1280, 256, 0, 0, reinterpret_cast<const float4*>(g), cold / 16, out); sync();
+  hipLaunchKernelGGL(KnownReadKernel, 160, 256, 0, 0, reinterpret_cast<const float4*>(g), warm / 16, out); sync();
+  hipLaunchKernelGGL(KnownReadKernel, 160, 256, 0, 0, reinterpret_cast<const float4*>(g), warm / 16, out); sync();
+  hipLaunchKernelGGL(KnownScatterKernel, 1280, 256, 0, 0, reinterpret_cast<const float4*>(g) + (cold / 16), 65536, out); sync();
+  // 1 MB twice: the second read should hit in L2 if L2 holds 1 MB.
+  hipLaunchKernelGGL(KnownReadKernel, 160, 256, 0, 0, reinterpret_cast<const float4*>(g), (1ull << 20) / 16, out); sync();
+  hipLaunchKernelGGL(KnownReadKernel, 160, 256, 0, 0, reinterpret_cast<const float4*>(g), (1ull << 20) / 16, out); sync();
+  hipLaunchKernelGGL(KnownReuseKernel, 160, 256, 0, 0, reinterpret_cast<const float4*>(g) + (8ull << 20) / 16, out); sync();
+  std::printf("counters: known-answer kernels launched (run under rocprofv3; see tools/counter_check.py)\n");
+  CHECK(hipFree(g));
+  CHECK(hipFree(out));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -488,8 +612,9 @@ int main(int argc, char** argv) {
   else if (cmd == "lds") Lds();
   else if (cmd == "latency") Latency();
   else if (cmd == "sync") Sync();
+  else if (cmd == "counters") Counters();
   else {
-    std::fprintf(stderr, "usage: halo_hwprobe clock|dram|wmma|lds|latency|sync\n");
+    std::fprintf(stderr, "usage: halo_hwprobe clock|dram|wmma|lds|latency|sync|counters\n");
     return 2;
   }
   return 0;
