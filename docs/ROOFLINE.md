@@ -662,8 +662,19 @@ before that chunk's device work. Overlapping it with the previous chunk saves ~0
 - Traces: the scan is LDS-bound (54%: every lane re-reads the chunk's K and Q), its staging is
   unprefetched, and SIMDs are idle 2.5x as long as busy at 96 blocks. The prep's 6144 small
   blocks are load-latency bound.
-- Next design: WMMA for K S0 / Q S0 / K^T Delta (bf16 hi/lo for the state), the prep fused into
-  the scan, value columns split over more blocks.
+- WMMA redesign (e95425e, same branch): every product on bf16 WMMA with the hi/lo split; the
+  state in accumulator tiles, which double as B operands after one lane ^ 16 exchange; 4 waves
+  per block (2 column groups x 2 key halves). Correct within relative L2 1e-4, both controls
+  caught.
+  - 9.39 ms per layer, against the split kernel's 8.18 (pinned, 2K).
+  - Trace: WMMA 0.6% of cycles, barrier 43%, chunk staging loads 29%, at 256 VGPRs and 4 waves
+    per SIMD.
+  - Batching the staging loads made it worse (10.08 ms, 32 spills): the register budget leaves
+    no room to prefetch.
+- What it would take: larger chunks (C = 64) so each barrier and staging round trip covers 4x the
+  math; the state in LDS instead of registers (a head's 128 x 128 fp32 is 64 KB, so per key half
+  or in bf16 hi/lo); and a prep pass that computes T and the QK masks ahead of the scan. Halogen's
+  scan runs at 254 VGPRs and 61.9 KB LDS with 128 threads: the same corner, with bigger chunks.
 
 **4l. Routed experts: ablations (2026-10-04, `halo_gemm_bench moe`, one layer, pinned).** Base
 13.83 ms per layer (x48 = 664 ms). Each probe removes one cost with wrong numerics:
