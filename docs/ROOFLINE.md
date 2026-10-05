@@ -978,3 +978,17 @@ issue packing across the steps' phases.
 The sweep probe over-predicted the repack ~3x: it models one weight stream; the kernel reads gate and up,
 16-byte headers and activations together. Integrating it means teaching the decode expert kernels the
 blocked layout (decode is weight-bandwidth-bound: risk) for ~12 ms of prefill.
+| Mix epilogue reads combine_norm's fp16 `xh` (retried after 881b573 made the epilogue batch its loads: the rounds model then called it DRAM-bound, so half the bytes should have helped) | -15..-30 | mix 107.6 -> 117.8 ms (slower), end to end +6.1; logits drift max 0.32 of 16.8 (argmax same) | no; quality eval not run (no speed gain) |
+
+Both byte halving (fp16) and request coalescing (128-byte) now failed on the mix epilogue after its loads were
+batched: neither bytes nor request count is its limiter, so the rounds model's "DRAM-bound" reading is wrong
+for it. Remaining suspects: the 31 MB of `mixed` stores and the write-back of combine_norm's 126 MB (see the
+2026-10-04 probes above); an ATT trace of the current epilogue is the next step if it is revisited.
+
+Dense GEMM redesign (speculation from GPT-6.1-sol and GLM 5.3, 2026-10-05, not built): both propose the same
+discriminating probe first: the `_l` kernel with pre-dequantized fp16 weights (exact: the same fp16 values,
+2x the bytes, ~1.4 GB more for these shapes) or with dequantization bypassed, and read stage time from the span
+trace (4.0 -> ~3.3 us would mean serial dequant is the ceiling). Then: GLM ranks warp-specialized producer waves
+(KS 32 two-deep ring) and a persistent 40-block grid; sol ranks balanced stream-K / persistent scheduling for the
+tail and doubts warp specialization on this hardware (VALU and WMMA serialize per SIMD). Both: skip split-K
+(fp32 partial traffic), int8 W8A8 changes numerics.
