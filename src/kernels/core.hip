@@ -866,6 +866,59 @@ extern "C" __global__ void halo_qsa_select_rows(const float* score, std::uint32_
   QsaSelect(score + t * score_stride, visible + t * visible_stride, params + t * 16, k, ratio);
 }
 
+// P4: the union of 4 consecutive tokens' QSA selections, for attention that
+// shares K/V reads between them (halo_attention_wmma_qsel). Token q selects
+// its k chosen blocks (all complete blocks when under budget) and its
+// incomplete tail block; the union, in ascending block order, goes to
+// ublk[group][*] with umask's bit q set where token q selected the block.
+// Token q sees position p exactly when bit q is set for p / ratio and
+// p < n_kv(q): the same set halo_qsa_select_rows lists.
+//   grid (ceil(T / 4)), block 1024; max_blocks >= every n_kv / ratio + 1
+//   (4 bitmaps of max_blocks bits in LDS); max_u >= 4 k + 4.
+extern "C" __global__ void __launch_bounds__(1024)
+    halo_qsa_union4(const std::uint32_t* visible, const std::uint32_t* params, std::uint32_t k, std::uint32_t ratio,
+                    std::uint32_t visible_stride, std::uint32_t max_blocks, std::uint32_t tokens, std::uint32_t* ublk,
+                    std::uint8_t* umask, std::uint32_t* ucount, std::uint32_t max_u) {
+  constexpr std::uint32_t QT = 4, kMaxWords = 65537 / 32 + 1;  // 262144-token context
+  __shared__ std::uint32_t bits[QT][kMaxWords];
+  __shared__ std::uint32_t buf[1024];
+  const std::uint32_t grp = blockIdx.x, t0 = grp * QT, words = (max_blocks + 31) / 32;
+  for (std::uint32_t i = threadIdx.x; i < QT * words; i += blockDim.x) bits[i / words][i % words] = 0;
+  __syncthreads();
+  std::uint32_t last = 0;  // highest block any token sees
+  for (std::uint32_t q = 0; q < QT && t0 + q < tokens; ++q) {
+    const std::uint32_t* pp = params + static_cast<std::size_t>(t0 + q) * 16;
+    const std::uint32_t n = pp[kHaloComplete], n_kv = pp[kHaloNkv];
+    const std::uint32_t* vis = visible + static_cast<std::size_t>(t0 + q) * visible_stride;
+    if (k >= n) {
+      for (std::uint32_t b = threadIdx.x; b < n; b += blockDim.x) atomicOr(&bits[q][b / 32], 1u << (b % 32));
+    } else {
+      for (std::uint32_t i = threadIdx.x; i < k; i += blockDim.x) {
+        const std::uint32_t b = vis[i * ratio] / ratio;
+        atomicOr(&bits[q][b / 32], 1u << (b % 32));
+      }
+    }
+    if (threadIdx.x == 0 && n_kv > n * ratio) atomicOr(&bits[q][n / 32], 1u << (n % 32));
+    last = max(last, (n_kv + ratio - 1) / ratio);
+  }
+  __syncthreads();
+  std::uint32_t written = 0;
+  for (std::uint32_t base = 0; base < last; base += blockDim.x) {
+    const std::uint32_t b = base + threadIdx.x;
+    std::uint32_t m = 0;
+    if (b < last)
+      for (std::uint32_t q = 0; q < QT; ++q) m |= ((bits[q][b / 32] >> (b % 32)) & 1u) << q;
+    std::uint32_t kept;
+    const std::uint32_t at = written + BlockScan(m != 0, buf, &kept);
+    if (m != 0 && at < max_u) {
+      ublk[static_cast<std::size_t>(grp) * max_u + at] = b;
+      umask[static_cast<std::size_t>(grp) * max_u + at] = static_cast<std::uint8_t>(m);
+    }
+    written += kept;
+  }
+  if (threadIdx.x == 0) ucount[grp] = min(written, max_u);
+}
+
 // ---- Device-side sampling (core/sampling semantics) --------------------------
 
 #include "kernels/sample_params.h"
@@ -4649,6 +4702,147 @@ extern "C" __global__ void __launch_bounds__(256)
       for (int j = 0; j < 8; ++j) {
         const std::uint32_t r = rt * 16 + 2 * j + lane / 16, tq = r / G;
         const bool ok = r < rows && kj < nkv[min(tq, QT - 1)];
+        Ss[r * KC + kt * 16 + lane % 16] = ok ? s[j] * scale : -INFINITY;
+      }
+    }
+    __syncthreads();
+    // Online softmax: 4 threads per row (192 of 256), 8 keys each.
+    if (tid < MR * 4) {
+      const std::uint32_t row = tid / 4, part = tid % 4;
+      float mx = -INFINITY;
+      if (row < rows)
+        for (std::uint32_t c = part * 8; c < part * 8 + 8; ++c) mx = fmaxf(mx, Ss[row * KC + c]);
+      for (int o = 2; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 32));
+      const float m_old = mrow[row], m_new = fmaxf(m_old, mx);
+      float sum = 0.0f;
+      for (std::uint32_t c = part * 8; c < part * 8 + 8; ++c) {
+        const float p = row < rows && m_new != -INFINITY ? expf(Ss[row * KC + c] - m_new) : 0.0f;
+        Ps[row * PR + c] = static_cast<_Float16>(p);
+        sum += p;
+      }
+      for (int o = 2; o > 0; o >>= 1) sum += __shfl_xor(sum, o, 32);
+      if (part == 0) {
+        const float a = m_old == -INFINITY ? 0.0f : expf(m_old - m_new);
+        alpha[row] = a;
+        lrow[row] = lrow[row] * a + sum;
+        mrow[row] = m_new;
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (std::uint32_t r = 0; r < 3; ++r) {  // fully unrolled: acc stays in registers
+      if (r >= rtiles) break;
+#pragma unroll
+      for (int dt = 0; dt < 2; ++dt)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[r][dt][j] *= alpha[r * 16 + 2 * j + lane / 16];
+      for (std::uint32_t kk = 0; kk < KC; kk += 16) {
+        const halo_v16h a = LdsFrag(&Ps[(r * 16 + lane % 16) * PR + kk]);
+#pragma unroll
+        for (int dt = 0; dt < 2; ++dt) {
+          const std::uint32_t d = (wave * 2 + dt) * 16 + lane % 16;
+          halo_v16h b;
+#pragma unroll
+          for (int i = 0; i < 16; ++i) b[i] = Vs[(kk + i) * VR + d];
+          acc[r][dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[r][dt]);
+        }
+      }
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (std::uint32_t r = 0; r < 3; ++r)
+#pragma unroll
+    for (int dt = 0; dt < 2; ++dt)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint32_t row = r * 16 + 2 * j + lane / 16, tq = row / G, h = row % G;
+        if (r >= rtiles || row >= rows || t0 + tq >= tokens) continue;
+        const std::uint32_t d = (wave * 2 + dt) * 16 + lane % 16;
+        const std::size_t idx = (static_cast<std::size_t>(t0 + tq) * num_heads + g * G + h) * HD + d;
+        out[idx] = acc[r][dt][j] / lrow[row] * Sigmoid(gate[idx]);
+      }
+}
+
+// halo_attention_wmma_mq's structure for QSA-selected keys: the 4 tokens of
+// a group walk the union of their selections (halo_qsa_union4), so each K
+// fragment and V chunk is read once for all of them (neighbouring tokens
+// share ~60-70% of their selections: the union is ~1.6x one set instead of
+// 4x). A token's scores outside its own selection are masked.
+//   grid (num_kv_heads, ceil(T / 4)), block 256; head_dim 256, G <= 12.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_attention_wmma_qsel(const float* q, const float* kc, const float* vc, const float* gate, float* out,
+                             const std::uint32_t* params, const std::uint32_t* ublk, const std::uint8_t* umask,
+                             const std::uint32_t* ucount, std::uint32_t max_u, std::uint32_t ratio,
+                             std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t tokens) {
+  constexpr std::uint32_t HD = 256, QT = 4, KC = 32, QR = HD + 8, VR = HD + 8, PR = KC + 8, MR = 48;
+  __shared__ __attribute__((aligned(16))) _Float16 Qs[MR * QR];
+  __shared__ __attribute__((aligned(16))) _Float16 Vs[KC * VR];
+  __shared__ __attribute__((aligned(16))) _Float16 Ps[MR * PR];
+  __shared__ float Ss[MR * KC];
+  __shared__ float mrow[MR], lrow[MR], alpha[MR];
+  __shared__ std::uint32_t nkv[QT];
+  const std::uint32_t g = blockIdx.x, t0 = blockIdx.y * QT, G = num_heads / num_kv_heads;
+  const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const std::uint32_t rows = QT * G, rtiles = (rows + 15) / 16;
+  const float scale = 1.0f / sqrtf(static_cast<float>(HD));
+  if (tid < QT) nkv[tid] = t0 + tid < tokens ? params[static_cast<std::size_t>(t0 + tid) * 16 + kHaloNkv] : 0;
+  const std::uint32_t* ub = ublk + static_cast<std::size_t>(blockIdx.y) * max_u;
+  const std::uint8_t* um = umask + static_cast<std::size_t>(blockIdx.y) * max_u;
+  // Key j of the union: position ub[j / ratio] * ratio + j % ratio.
+  const auto pos_of = [&](std::uint32_t j) { return ub[j / ratio] * ratio + j % ratio; };
+  for (std::uint32_t i = tid; i < MR * HD; i += blockDim.x) {
+    const std::uint32_t r = i / HD, d = i % HD, tq = r / G, h = r % G;
+    const bool live = r < rows && t0 + tq < tokens;
+    Qs[r * QR + d] = static_cast<_Float16>(live ? q[(static_cast<std::size_t>(t0 + tq) * num_heads + g * G + h) * HD + d] : 0.0f);
+  }
+  if (tid < MR) {
+    mrow[tid] = -INFINITY;
+    lrow[tid] = 0.0f;
+  }
+  __syncthreads();
+  // The union's keys; token q sees key j when its bit is set and the
+  // position is before its own causal limit.
+  const std::uint32_t n = ucount[blockIdx.y] * ratio;
+  // P . V work: wave owns dim tiles 2 * (wave % 8) .. + 1 for every row tile.
+  halo_v8f acc[3][2] = {};
+  for (std::uint32_t c0 = 0; c0 < n; c0 += KC) {
+    __syncthreads();  // previous chunk's Vs / Ps reads done
+    for (std::uint32_t i = tid; i < KC * HD / 4; i += blockDim.x) {
+      const std::uint32_t j = i / (HD / 4), d = (i % (HD / 4)) * 4;
+      float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      if (c0 + j < n) v = *reinterpret_cast<const float4*>(vc + (static_cast<std::size_t>(pos_of(c0 + j)) * num_kv_heads + g) * HD + d);
+      _Float16* dst = Vs + j * VR + d;
+      dst[0] = static_cast<_Float16>(v.x);
+      dst[1] = static_cast<_Float16>(v.y);
+      dst[2] = static_cast<_Float16>(v.z);
+      dst[3] = static_cast<_Float16>(v.w);
+    }
+    // Scores: wave -> (row tile wave / 2, key tile wave % 2), up to 6 waves.
+    const std::uint32_t rt = wave / 2, kt = wave % 2;
+    if (rt < rtiles) {
+      const std::uint32_t kj = c0 + kt * 16 + lane % 16;
+      const std::uint32_t kp = pos_of(min(kj, n - 1)), km = um[min(kj, n - 1) / ratio];
+      const float* krow = kc + (static_cast<std::size_t>(kp) * num_kv_heads + g) * HD;
+      halo_v8f s = {};
+      for (std::uint32_t k0 = 0; k0 < HD; k0 += 16) {
+        const halo_v16h a = LdsFrag(&Qs[(rt * 16 + lane % 16) * QR + k0]);
+        halo_v16h b;
+#pragma unroll
+        for (int i = 0; i < 16; i += 4) {
+          const float4 v = *reinterpret_cast<const float4*>(krow + k0 + i);
+          b[i] = static_cast<_Float16>(v.x);
+          b[i + 1] = static_cast<_Float16>(v.y);
+          b[i + 2] = static_cast<_Float16>(v.z);
+          b[i + 3] = static_cast<_Float16>(v.w);
+        }
+        s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, s);
+      }
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint32_t r = rt * 16 + 2 * j + lane / 16, tq = r / G;
+        const std::uint32_t qq = min(tq, QT - 1);
+        const bool ok = r < rows && kj < n && ((km >> qq) & 1u) && kp < nkv[qq];
         Ss[r * KC + kt * 16 + lane % 16] = ok ? s[j] * scale : -INFINITY;
       }
     }

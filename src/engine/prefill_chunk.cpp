@@ -97,6 +97,12 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   k.bscores = f(sub * (max_context_ / c.compress_ratio + 1));
   k.vis = f(sub * AttnVisibleStride());
   k.ascores = f(sub * c.num_heads * AttnVisibleStride());
+  {
+    const std::size_t groups = (sub + 3) / 4, max_u = 4ull * (c.indexer_top_k / c.compress_ratio) + 4;
+    k.ublk = f(groups * max_u);
+    k.umask = f((groups * max_u + 3) / 4);  // bytes
+    k.ucount = f(groups);
+  }
   k.params_offset = (T * c.PleEmbeddingDim() * 4 + 63) / 64 * 64;
   ck_host_.assign(k.params_offset + T * 64, 0);
   k.host = dev_.Alloc(ck_host_.size(), error);
@@ -105,7 +111,7 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
                         &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg, &k.q, &k.gate_a, &k.k, &k.v, &k.ctx,
                         &k.iq, &k.ik, &k.router, &k.ids, &k.wts, &k.eg, &k.eu, &k.ed, &k.sgate, &k.host,
                         &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16, &k.bcounts, &k.bbase, &k.pa, &k.pb, &k.ipart, &k.rscale, &k.xh, &k.mh,
-                        &k.bscores, &k.vis, &k.ascores})
+                        &k.bscores, &k.vis, &k.ascores, &k.ublk, &k.umask, &k.ucount})
     if (!*b) return false;
   // Index-major copies of the mixers' up projections (fused GEMM + mix).
   if (c.hc_count == 4)
@@ -489,6 +495,9 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
                    rt::Arg::Val(nkv), rt::Arg::Val(T)},
                   error) &&
            Gemm(l.attn_out, ck_.ctx, ck_.block_out, T, error);
+  // 4 tokens at a time over the union of their selections (shared K/V).
+  const std::uint32_t max_u = 4 * budget + 4;
+  const bool qsel = wmma && prefill_qsel_attention_ && 4 * G <= 48 && max_blocks <= 65537;
   for (std::uint32_t t0 = 0; t0 < T; t0 += kAttnSub) {
     const std::uint32_t n = std::min(kAttnSub, T - t0);
     const rt::Arg params = rt::Arg::Buf(ck_.host, ck_.params_offset + std::size_t{t0} * 64);
@@ -500,7 +509,19 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
                 {rt::Arg::Buf(ck_.bscores), rt::Arg::Buf(ck_.vis), params, rt::Arg::Val(budget), rt::Arg::Val(ratio),
                  rt::Arg::Val(max_blocks), rt::Arg::Val(vstride)},
                 error) ||
-        !(wmma ? Launch("halo_attention_wmma_rows", {nkv, n}, {128},
+        !(qsel ? Launch("halo_qsa_union4", {(n + 3) / 4}, {1024},
+                        {rt::Arg::Buf(ck_.vis), params, rt::Arg::Val(budget), rt::Arg::Val(ratio), rt::Arg::Val(vstride),
+                         rt::Arg::Val(max_blocks), rt::Arg::Val(n), rt::Arg::Buf(ck_.ublk), rt::Arg::Buf(ck_.umask),
+                         rt::Arg::Buf(ck_.ucount), rt::Arg::Val(max_u)},
+                        error) &&
+                     Launch("halo_attention_wmma_qsel", {nkv, (n + 3) / 4}, {256},
+                            {rt::Arg::Buf(ck_.q, std::size_t{t0} * qdim * 4), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v),
+                             rt::Arg::Buf(ck_.gate_a, std::size_t{t0} * qdim * 4),
+                             rt::Arg::Buf(ck_.ctx, std::size_t{t0} * qdim * 4), params, rt::Arg::Buf(ck_.ublk),
+                             rt::Arg::Buf(ck_.umask), rt::Arg::Buf(ck_.ucount), rt::Arg::Val(max_u),
+                             rt::Arg::Val(ratio), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(n)},
+                            error)
+         : wmma ? Launch("halo_attention_wmma_rows", {nkv, n}, {128},
                         {rt::Arg::Buf(ck_.q, std::size_t{t0} * qdim * 4), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v),
                          rt::Arg::Buf(ck_.gate_a, std::size_t{t0} * qdim * 4), rt::Arg::Buf(ck_.vis),
                          rt::Arg::Buf(ck_.ctx, std::size_t{t0} * qdim * 4), params, rt::Arg::Val(nh),

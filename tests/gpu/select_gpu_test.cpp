@@ -225,6 +225,106 @@ TEST(GpuSelect, WmmaChunkAttentionMatchesSelectKernel) {
   }
 }
 
+// P4: QSA-selected chunk attention, 4 tokens per block over the union of
+// their selections (halo_qsa_union4 + halo_attention_wmma_qsel), against the
+// decode kernel's arithmetic over each token's own list
+// (halo_attention_select_rows). Lists in halo_qsa_select_rows' format:
+// k selected complete blocks in block order, expanded to `ratio`
+// positions, then the incomplete tail; every complete block when under
+// budget. Consecutive tokens at pos0 + t, budgets from 1 block, tokens on
+// both sides of the budget, ragged 4-token groups. Bound fixed in advance
+// as for the other WMMA attention kernels: relative L2 < 5e-3 per token.
+TEST(GpuSelect, QsaUnionAttentionMatchesSelectKernel) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      constexpr std::uint32_t hd = 256, ratio = 4;
+      const std::uint32_t nkv = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 2}));
+      const std::uint32_t G = tc.draw(gs::sampled_from(std::vector<std::uint32_t>{1, 2, 12}));
+      const std::uint32_t nh = nkv * G;
+      const std::uint32_t T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 13}));
+      const std::uint32_t k = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 40}));
+      const std::uint32_t pos0 = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = 700}));
+      const std::uint32_t ctx = pos0 + T, max_blocks = ctx / ratio + 1, vstride = ctx, max_u = 4 * k + 4;
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return static_cast<float>(seed >> 8) / 16777216.0f - 0.5f; };
+      const float amp = tc.draw(gs::sampled_from(std::vector<float>{0.5f, 2.0f, 8.0f}));
+      std::vector<float> q(std::size_t{T} * nh * hd), gate(q.size()), kc(std::size_t{ctx} * nkv * hd), vc(kc.size());
+      for (auto& x : q) x = amp * rnd();
+      for (auto& x : gate) x = 4 * rnd();
+      for (auto& x : kc) x = amp * rnd();
+      for (auto& x : vc) x = rnd();
+      std::vector<std::uint32_t> visible(std::size_t{T} * vstride, 0), params(std::size_t{T} * 16, 0);
+      for (std::uint32_t t = 0; t < T; ++t) {
+        const std::uint32_t n_kv = pos0 + t + 1, n = n_kv / ratio;
+        std::uint32_t* vis = visible.data() + std::size_t{t} * vstride;
+        std::uint32_t w = 0;
+        if (k >= n) {
+          for (std::uint32_t p = 0; p < n_kv; ++p) vis[w++] = p;
+        } else {
+          std::vector<std::uint32_t> blocks(n);
+          for (std::uint32_t b = 0; b < n; ++b) blocks[b] = b;
+          for (std::uint32_t i = 0; i < k; ++i) {  // partial Fisher-Yates
+            seed = seed * 1664525u + 1013904223u;
+            std::swap(blocks[i], blocks[i + (seed >> 8) % (n - i)]);
+          }
+          std::sort(blocks.begin(), blocks.begin() + k);
+          for (std::uint32_t i = 0; i < k; ++i)
+            for (std::uint32_t r = 0; r < ratio; ++r) vis[w++] = blocks[i] * ratio + r;
+          for (std::uint32_t p = n * ratio; p < n_kv; ++p) vis[w++] = p;
+        }
+        params[t * 16 + kHaloNkv] = n_kv;
+        params[t * 16 + kHaloComplete] = n;
+        params[t * 16 + kHaloNVisible] = w;
+      }
+      const std::uint32_t groups = (T + 3) / 4;
+      auto qb = dev->Alloc(q.size() * 4, &error), gb = dev->Alloc(gate.size() * 4, &error),
+           kb = dev->Alloc(kc.size() * 4, &error), vb = dev->Alloc(vc.size() * 4, &error),
+           sb = dev->Alloc(visible.size() * 4, &error), pb = dev->Alloc(params.size() * 4, &error),
+           o1 = dev->Alloc(q.size() * 4, &error), o2 = dev->Alloc(q.size() * 4, &error),
+           sc = dev->Alloc(std::size_t{T} * nh * vstride * 4, &error), ub = dev->Alloc(std::size_t{groups} * max_u * 4, &error),
+           mb = dev->Alloc(std::size_t{groups} * max_u, &error), cb = dev->Alloc(groups * 4, &error);
+      ASSERT_TRUE(qb && gb && kb && vb && sb && pb && o1 && o2 && sc && ub && mb && cb) << error;
+      ASSERT_TRUE(dev->Upload(qb, 0, q.data(), q.size() * 4, &error) &&
+                  dev->Upload(gb, 0, gate.data(), gate.size() * 4, &error) &&
+                  dev->Upload(kb, 0, kc.data(), kc.size() * 4, &error) && dev->Upload(vb, 0, vc.data(), vc.size() * 4, &error) &&
+                  dev->Upload(sb, 0, visible.data(), visible.size() * 4, &error) &&
+                  dev->Upload(pb, 0, params.data(), params.size() * 4, &error))
+          << error;
+      const rt::Arg ra[] = {rt::Arg::Buf(qb), rt::Arg::Buf(kb), rt::Arg::Buf(vb), rt::Arg::Buf(gb), rt::Arg::Buf(sb),
+                            rt::Arg::Buf(o1), rt::Arg::Buf(sc), rt::Arg::Buf(pb), rt::Arg::Val(nh), rt::Arg::Val(nkv),
+                            rt::Arg::Val(hd), rt::Arg::Val(vstride)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_attention_select_rows", &error), {nh, T}, {256}, ra, &error)) << error;
+      const rt::Arg ua[] = {rt::Arg::Buf(sb), rt::Arg::Buf(pb), rt::Arg::Val(k), rt::Arg::Val(ratio), rt::Arg::Val(vstride),
+                            rt::Arg::Val(max_blocks), rt::Arg::Val(T), rt::Arg::Buf(ub), rt::Arg::Buf(mb), rt::Arg::Buf(cb),
+                            rt::Arg::Val(max_u)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_qsa_union4", &error), {groups}, {1024}, ua, &error)) << error;
+      const rt::Arg wa[] = {rt::Arg::Buf(qb), rt::Arg::Buf(kb), rt::Arg::Buf(vb), rt::Arg::Buf(gb), rt::Arg::Buf(o2),
+                            rt::Arg::Buf(pb), rt::Arg::Buf(ub), rt::Arg::Buf(mb), rt::Arg::Buf(cb), rt::Arg::Val(max_u),
+                            rt::Arg::Val(ratio), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(T)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_attention_wmma_qsel", &error), {nkv, groups}, {256}, wa, &error)) << error;
+      std::vector<float> want(q.size()), got(q.size());
+      ASSERT_TRUE(dev->Download(o1, 0, want.data(), want.size() * 4, &error) &&
+                  dev->Download(o2, 0, got.data(), got.size() * 4, &error))
+          << error;
+      for (auto* b : {&qb, &gb, &kb, &vb, &sb, &pb, &o1, &o2, &sc, &ub, &mb, &cb}) dev->Free(*b);
+      for (std::uint32_t t = 0; t < T; ++t) {
+        double d = 0, m = 0;
+        for (std::size_t i = std::size_t{t} * nh * hd; i < std::size_t{t + 1} * nh * hd; ++i) {
+          ASSERT_TRUE(std::isfinite(got[i])) << i;
+          d += double(got[i] - want[i]) * (got[i] - want[i]);
+          m += double(want[i]) * want[i];
+        }
+        ASSERT_LT(std::sqrt(d / m), 5e-3) << rt::BackendName(backend) << " t " << t << " pos0 " << pos0 << " k " << k
+                                          << " G " << G << " nkv " << nkv << " T " << T;
+      }
+    }, {.test_cases = 40});
+  }
+}
+
 // P4: dense chunk attention, 4 query tokens per block sharing K/V
 // (halo_attention_wmma_mq), against the decode kernel's arithmetic
 // (halo_attention_select_rows) on dense causal inputs: token t of a chunk at
