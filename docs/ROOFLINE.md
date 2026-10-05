@@ -653,6 +653,22 @@ most of the distance to halogen's 1,584 tok/s on an 8K-token prompt.
 Also: the n-gram read for each chunk (~115 ms of random tokens, not resident) runs serially
 before that chunk's device work. Overlapping it with the previous chunk saves ~0.35-0.45 s at 8K.
 
+**4k. Mixer down GEMM `_m`, closed for now (2026-10-04, `halo_gemm_bench study`, pinned).**
+
+| Variant (320 x 10240, T 2048) | warm | cold | after 96 MB of writes |
+|---|---:|---:|---:|
+| `_m` (320 x 64 tiles, 32 blocks) | 0.74 ms | 0.77 | 1.34 |
+| 32-token tiles (64 blocks, all CUs) | 0.85-0.90 | 0.91-0.93 | 1.53-1.55 |
+| two stages in flight (LDS-only barriers, clamped refills) | 0.77 | 0.79 | 1.35 |
+| no dequant at all (probe, wrong numerics) | 0.67 | 0.73 | 1.42 |
+| int8 WMMA path (`wmma_t`, without quantize) | 1.36 | - | - |
+
+Split K (4-20) was worse still (4f). Like for like, `_m` is within ~13% of hipBLASLt (0.64 ms
+warm). Its in-engine 1.02 ms is mostly combine_norm's ~126 MB of writes draining during it
+(4f). Levers that remain are outside the kernel: fewer bytes written before it (kernel A
+removed xh but broke even, branch `proto/kernel-a`), or ordering independent compute-bound work
+in between.
+
 **4g. Bytes audit (2026-10-04).** Per 2048-token prefill, analytic from tensor shapes. rocprofv3
 7.2.3's FETCH_SIZE/WRITE_SIZE read 0 for every prefill dispatch (with or without graphs) while
 counting the load-time repack, so they could not be used. Writes are weighted like reads (4f),
