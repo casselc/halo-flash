@@ -15,6 +15,10 @@
 //                             gate/up, down, combine (for profilers: small memory)
 //   halo_gemm_bench model     every Flash-Next dense int8 GEMM shape at T = 2048,
 //                             weighted by its count per 2048-token prefill
+//   halo_gemm_bench study [rows cols tokens]
+//                             FP16-route GEMM variants (Q8_0 weights) on one shape,
+//                             default the mixer's down projection 320 x 10240 at
+//                             T = 2048: 20 warm-up then 50 timed launches each
 
 #include <algorithm>
 #include <chrono>
@@ -33,6 +37,93 @@ using namespace halo;
 
 int main(int argc, char** argv) {
   std::string e;
+  if (argc > 1 && std::string(argv[1]) == "study") {
+    auto d = rt::Device::Create(rt::Backend::kHip, &e);
+    if (!d || !d->LoadModule(kernels::CoreHsaco(), &e)) return std::printf("%s\n", e.c_str()), 1;
+    const std::uint32_t rows = argc > 2 ? std::atoi(argv[2]) : 320, cols = argc > 3 ? std::atoi(argv[3]) : 10240,
+                        T = argc > 4 ? std::atoi(argv[4]) : 2048;
+    const std::size_t row_bytes = cols / 32 * 34;
+    std::vector<std::uint8_t> w(std::size_t{rows} * row_bytes);
+    std::mt19937 g(5);
+    for (auto& b : w) b = static_cast<std::uint8_t>(g());
+    for (std::size_t r = 0; r < rows; ++r)
+      for (std::size_t b = 0; b < cols / 32; ++b) {
+        const std::uint16_t hv = 0x2000 | (g() & 0x3FF);
+        std::memcpy(w.data() + r * row_bytes + b * 34, &hv, 2);
+      }
+    std::vector<std::uint16_t> xh(std::size_t{T} * cols);
+    for (auto& v : xh) v = static_cast<std::uint16_t>(0x3000 | (g() & 0x3FF));
+    auto wb = d->Alloc(w.size(), &e), qs = d->Alloc(std::size_t{rows} * cols, &e),
+         db = d->Alloc(std::size_t{rows} * (cols / 32) * 2, &e), xb = d->Alloc(xh.size() * 2, &e),
+         yb = d->Alloc(std::size_t{32} * T * rows * 4, &e);  // room for split-K partials
+    (void)d->Upload(wb, 0, w.data(), w.size(), &e);
+    (void)d->Upload(xb, 0, xh.data(), xh.size() * 2, &e);
+    const rt::Arg ra[] = {rt::Arg::Buf(wb), rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                          rt::Arg::Val(cols)};
+    (void)d->Launch(d->Kernel("halo_repack_q8_0", &e), {4096}, {256}, ra, &e);
+    struct V {
+      const char* kernel;
+      std::uint32_t bm, bn, splits;
+    };
+    const V variants[] = {
+        {"halo_gemm_q8r_f16_m", 320, 64, 1},
+        {"halo_gemm_q8r_f16_l", 256, 128, 1},
+        {"halo_gemm_q8r_f16_s", 64, 128, 1},
+    };
+    std::printf("shape %u x %u, T %u (%.1f GFLOP)\n", rows, cols, T, 2.0 * rows * cols * T / 1e9);
+    const auto kf = d->Kernel("halo_bench_read", &e);
+    auto fb = d->Alloc(96ull << 20, &e), fo = d->Alloc(64, &e);
+    {
+      std::vector<float> fill((96ull << 20) / 4, 1.0f);
+      (void)d->Upload(fb, 0, fill.data(), fill.size() * 4, &e);
+    }
+    const rt::Arg fa[] = {rt::Arg::Buf(fb), rt::Arg::Val(std::uint64_t{(96ull << 20) / 16}), rt::Arg::Val(std::uint32_t{1}),
+                          rt::Arg::Buf(fo)};
+    for (const auto& v : variants) {
+      const auto k = d->Kernel(v.kernel, &e);
+      if (!k) {
+        std::printf("%-28s missing\n", v.kernel);
+        continue;
+      }
+      const rt::Arg a[] = {rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Buf(xb), rt::Arg::Buf(yb), rt::Arg::Val(rows),
+                           rt::Arg::Val(cols), rt::Arg::Val(cols), rt::Arg::Val(T)};
+      const rt::Dim3 grid{(T + v.bn - 1) / v.bn, (rows + v.bm - 1) / v.bm, v.splits};
+      for (int r = 0; r < 20; ++r) (void)d->Launch(k, grid, {256}, a, &e);
+      (void)d->Synchronize(&e);
+      const int reps = 50;
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < reps; ++r) (void)d->Launch(k, grid, {256}, a, &e);
+      (void)d->Synchronize(&e);
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+      // Cold: a 96 MB read between launches evicts the last-level cache (as
+      // the engine's preceding kernels do); each launch timed on its own.
+      double cold = 0;
+      for (int r = 0; r < 20; ++r) {
+        (void)d->Launch(kf, {1280}, {256}, fa, &e);
+        (void)d->Synchronize(&e);
+        const auto c0 = std::chrono::steady_clock::now();
+        (void)d->Launch(k, grid, {256}, a, &e);
+        (void)d->Synchronize(&e);
+        cold += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+      }
+      cold /= 20;
+      // Dirty: 96 MB written just before (as combine_norm writes res and xh):
+      // the write-back of dirty lines overlaps the kernel.
+      double dirty = 0;
+      for (int r = 0; r < 20; ++r) {
+        (void)d->Fill(fb, static_cast<std::uint8_t>(r), &e);
+        (void)d->Synchronize(&e);
+        const auto c0 = std::chrono::steady_clock::now();
+        (void)d->Launch(k, grid, {256}, a, &e);
+        (void)d->Synchronize(&e);
+        dirty += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+      }
+      dirty /= 20;
+      std::printf("%-28s grid %4ux%ux%u  warm %7.3f ms (%5.1f TFLOP/s)  cold %7.3f ms  after-writes %7.3f ms\n",
+                  v.kernel, grid.x, grid.y, grid.z, ms, 2.0 * rows * cols * T / ms / 1e9, cold, dirty);
+    }
+    return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "peak") {
     // Register-only WMMA throughput: the ceiling the GEMMs are measured against.
     auto d = rt::Device::Create(rt::Backend::kHip, &e);

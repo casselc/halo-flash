@@ -598,6 +598,28 @@ tiles re-read xh once per row tile (5x, ~210 MB), and the cost grew with the spl
 library's split without its tile economics does not work; next is a microbenchmark study of
 `_m` tile shapes with a trace, not more in-engine guesses.
 
+**4f. GEMM-core latency study: the in-engine gap is write-back, not the GEMM** (2026-10-04,
+`halo_gemm_bench study`, pinned). `_m` on its real shape (320 x 10240, 2048 tokens):
+
+| Condition | `_m` per call |
+|---|---:|
+| warm (repeated launches) | 0.729 ms |
+| cold (96 MB read in between) | 0.768 ms |
+| **right after a 96 MB write** | **1.359 ms** |
+| in-engine (after combine_norm's ~126 MB of writes; rocprofv3 and our timestamps agree) | 1.02-1.05 ms |
+
+hipBLASLt's 0.638 ms was measured warm, so like for like our core is about 12% behind, not
+1.6x. Dirty lines drain to DRAM during the next kernel, which pays for its predecessor's
+writes. So:
+- per-kernel attribution in the engine charges write-back to the following kernel;
+- removing writes anywhere speeds up whatever runs next (R2a's 84 MB also took 10 ms off
+  `_m`);
+- the lever is total bytes moved, writes included (section 1.2), more than per-kernel latency.
+
+The same probably holds for the other "slow" kernels that follow heavy writers (`mix` after
+the down GEMM and SiLU, the experts after the router and bucketing). Check in the harness before
+optimizing any of them alone.
+
 **4e. Router on bf16 WMMA, hi/lo split (781449a).** -7.4 ms (router 1.30 -> 1.02 ms per call,
 pinned) against a predicted -35..-40; quality unchanged within noise. The trace shows 59% of
 cycles in one `vmcnt(0)` per K stage at ~330 GB/s from cache, so it is not bandwidth-bound.
