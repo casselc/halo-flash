@@ -918,3 +918,16 @@ The router probe repeated the high-occupancy mistake above: at 10 waves/SIMD its
 4. Dense GEMMs: gufo fuses the DeltaNet qkv and z projections (one 16384-row GEMM, ~21 ms).
 Rules learned tonight: check occupancy before trusting a stall share; run a multi-chunk prompt
 for any host or control-flow change; keep kernel variants compile-time.
+
+**2026-10-05 day, on main:**
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| Mix GEMM with row tiles fastest (`halo_gemm_q8r_f16_mixt`, f4d8504, bit-identical) | -30..-40 | mix 140.9 -> 116.3 ms, device -22.5 | yes |
+| Same order for the `_l` GEMMs (study mode) | — | 10240x2560 equal, 2560x6144 +0.3 ms worse, 6144x2560 -0.1 ms | no |
+
+The mix probe sequence that found it: `halo_gemm_bench mixstudy` showed the kernel as slow warm
+(1.41 ms) as in-engine (write-back refuted); ablations put ~1 ms in the epilogue alone (~117 GB/s);
+a GPT-6.1 review of the code and numbers ranked DRAM locality of the dispatch order first. With
+token tiles fastest, resident blocks read 256-byte pieces of many tokens' 40 KB rows. The `_l`
+GEMMs depend more on sharing weight rows across token tiles than on output-write locality.
