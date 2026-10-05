@@ -609,8 +609,19 @@ every token. Then the serial n-gram read per chunk (4h).
 - Indexer scores as a bf16x3 WMMA GEMM: 1605 -> ~24 ms (-1.52 s); 8K prefill 697 -> 869 tok/s on
   random tokens.
 
-What remains in attention: `qsel` at ~500 ms. The trace shows 43% barrier and 25% K gathers;
-K staging through LDS would help. Then the serial n-gram read per chunk.
+What remains in attention: `qsel` at ~500 ms. The trace shows 43% barrier and 25% K gathers.
+
+**K staged through LDS, measured, not kept:** 4835 -> 4810 us per call (-0.5%; predicted -20 to
+-35%). The redundant per-lane K fetches it removed were cache hits. The cost is the one exposed
+K round trip per chunk, and hiding it needs K prefetched in registers like V: 32 more VGPRs of
+fp32 on top of 253.
+
+**The lever is an fp16 copy of the K/V cache.** The prefill attention kernels already round K/V
+to fp16, so prefill results would be bit-identical. It would halve the gather bytes and the
+prefetch registers, so both K and V fit in flight. The cost is ~24.6 KB more per cached token:
+~6.4 GB at a 262K context, ~200 MB at 8K. That needs a decision on memory.
+
+Then the serial n-gram read per chunk.
 
 **4h. Chunk size and long prompts (2026-10-04, pinned, pseudo-random tokens, n-gram not
 resident).** For an 8192-token prompt:
