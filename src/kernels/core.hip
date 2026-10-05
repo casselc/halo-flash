@@ -5914,6 +5914,148 @@ extern "C" __global__ void __launch_bounds__(256)
                         std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
   GemmQ8rF16<256, 128, 8, 1, 64>(qs, d, x, y, rows, cols, qstride, tokens);
 }
+// GemmQ8rF16's large tile with the weights kept out of LDS: each wave loads
+// its own rows' int8 codes and scales straight into registers (one K stage
+// ahead) and dequantizes them there, so LDS holds only the activation stage
+// (~18 KB instead of 55). The dequantized fp16 values and the WMMA order are
+// GemmQ8rF16's, so the results are the same bits. (Trace of GemmQ8rF16 at
+// 4 waves/SIMD: 44% of cycles waiting on LDS, 25% VALU, WMMA 4%.)
+//   grid (ceil(T / BN), rows / BM, banded by RG), block 256; cols % KS == 0
+namespace {
+// 16 int8 codes (natural order) and an fp16 scale -> 16 fp16 values, as
+// GemmQ8rF16's staging computes them: (fp16(1152 + q) - 1152) * scale.
+__device__ inline halo_v16h DequantI8x16(const halo_v4i& w, _Float16 sc) {
+  const halo_h2 s2 = {sc, sc}, bias = {1152, 1152};
+  halo_v16h v;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const std::uint32_t u = static_cast<std::uint32_t>(w[j]) ^ 0x80808080u;
+    const halo_h2 p0 = (AsH2(__builtin_amdgcn_perm(0x64646464u, u, 0x05010400u)) - bias) * s2;  // bytes 0, 1
+    const halo_h2 p1 = (AsH2(__builtin_amdgcn_perm(0x64646464u, u, 0x05030402u)) - bias) * s2;  // bytes 2, 3
+    v[4 * j] = p0.x;
+    v[4 * j + 1] = p0.y;
+    v[4 * j + 2] = p1.x;
+    v[4 * j + 3] = p1.y;
+  }
+  return v;
+}
+}  // namespace
+template <std::uint32_t RG>
+__device__ void GemmQ8rF16Reg(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
+                              std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
+  constexpr std::uint32_t BM = 256, BN = 128, KS = 64, RS = KS + 8, NT = 256, TM = 2, TN = 8, KK = KS / 16;
+  constexpr std::uint32_t BPR = KS / 8, BP = BN * BPR / NT;  // activation pieces (8 halves) per thread
+  constexpr std::uint32_t kSlices = 8 * TM * 16 * 16 * 2;
+  __shared__ __attribute__((aligned(16))) _Float16 smem[BN * RS > kSlices ? BN * RS : kSlices];
+  _Float16* Bs = smem;
+  const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  std::uint32_t rt = blockIdx.y, tt = blockIdx.x;
+  if constexpr (RG > 1) {
+    const std::uint32_t lin = blockIdx.y * gridDim.x + blockIdx.x, band = RG * gridDim.x;
+    rt = (lin / band) * RG + lin % RG;
+    tt = (lin % band) / RG;
+  }
+  const std::uint32_t r0 = rt * BM, t0 = tt * BN, nblk = cols / 32;
+  // This lane's weight rows: row tile m of the wave, row lane % 16.
+  const std::int8_t* wrow[TM];
+  const std::uint16_t* drow[TM];
+#pragma unroll
+  for (std::uint32_t m = 0; m < TM; ++m) {
+    const std::size_t r = min(r0 + wave * TM * 16 + m * 16 + lane % 16, rows - 1);
+    wrow[m] = qs + r * qstride;
+    drow[m] = d + r * nblk;
+  }
+  halo_v4i ra[TM][KK];
+  std::uint16_t rd[TM][KS / 32];
+  halo_v4i rb[BP];
+  const auto load = [&](std::uint32_t k0) {
+#pragma unroll
+    for (std::uint32_t m = 0; m < TM; ++m) {
+#pragma unroll
+      for (std::uint32_t kk = 0; kk < KK; ++kk) ra[m][kk] = *reinterpret_cast<const halo_v4i*>(wrow[m] + k0 + kk * 16);
+#pragma unroll
+      for (std::uint32_t b = 0; b < KS / 32; ++b) rd[m][b] = drow[m][k0 / 32 + b];
+    }
+#pragma unroll
+    for (std::uint32_t p = 0; p < BP; ++p) {
+      const std::uint32_t i = tid + p * NT, tok = i / BPR, part = i % BPR;
+      rb[p] = *reinterpret_cast<const halo_v4i*>(x + static_cast<std::size_t>(min(t0 + tok, tokens - 1)) * cols + k0 + part * 8);
+    }
+  };
+  halo_v8f acc[TM][TN] = {};
+  load(0);
+  for (std::uint32_t k0 = 0; k0 < cols; k0 += KS) {
+    __syncthreads();  // the previous stage's fragment reads are done
+#pragma unroll
+    for (std::uint32_t p = 0; p < BP; ++p) {
+      const std::uint32_t i = tid + p * NT, tok = i / BPR, part = i % BPR;
+      *reinterpret_cast<halo_v4i*>(Bs + tok * RS + part * 8) = rb[p];
+    }
+    halo_v4i ca[TM][KK];
+    std::uint16_t cd[TM][KS / 32];
+#pragma unroll
+    for (std::uint32_t m = 0; m < TM; ++m) {
+#pragma unroll
+      for (std::uint32_t kk = 0; kk < KK; ++kk) ca[m][kk] = ra[m][kk];
+#pragma unroll
+      for (std::uint32_t b = 0; b < KS / 32; ++b) cd[m][b] = rd[m][b];
+    }
+    __syncthreads();
+    load(min(k0 + KS, cols - KS));  // next stage (the last reloads itself), in flight during the math
+#pragma unroll
+    for (std::uint32_t kk = 0; kk < KK; ++kk) {
+      halo_v16h a[TM];
+#pragma unroll
+      for (std::uint32_t m = 0; m < TM; ++m) a[m] = DequantI8x16(ca[m][kk], AsH2(cd[m][kk / 2]).x);
+#pragma unroll
+      for (std::uint32_t n = 0; n < TN; ++n) {
+        const halo_v16h b = LdsFrag(&Bs[(n * 16 + lane % 16) * RS + kk * 16]);
+#pragma unroll
+        for (std::uint32_t m = 0; m < TM; ++m) acc[m][n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[m], b, acc[m][n]);
+      }
+    }
+  }
+  // Epilogue as GemmQ8rF16's (WM = 8, WN = 1).
+  __syncthreads();
+  float* slice = reinterpret_cast<float*>(smem) + wave * (TM * 16 * 16);
+#pragma unroll
+  for (std::uint32_t n = 0; n < TN; ++n) {
+#pragma unroll
+    for (std::uint32_t m = 0; m < TM; ++m)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) slice[(lane % 16) * (TM * 16) + m * 16 + 2 * j + lane / 16] = acc[m][n][j];
+    __builtin_amdgcn_s_waitcnt(0);
+    __builtin_amdgcn_wave_barrier();
+    for (std::uint32_t idx = lane; idx < 16 * TM * 16; idx += 32) {
+      const std::uint32_t ti = idx / (TM * 16), rr = idx % (TM * 16);
+      const std::uint32_t t = t0 + n * 16 + ti, r = r0 + wave * TM * 16 + rr;
+      if (t < tokens && r < rows) y[static_cast<std::size_t>(t) * rows + r] = slice[ti * (TM * 16) + rr];
+    }
+    __builtin_amdgcn_wave_barrier();
+  }
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_q8r_f16_lr8(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y, std::uint32_t rows,
+                          std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
+  GemmQ8rF16Reg<8>(qs, d, x, y, rows, cols, qstride, tokens);
+}
+
+// Study variants of the large tile (halo_gemm_bench study).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_q8r_f16_lk32(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y, std::uint32_t rows,
+                           std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
+  GemmQ8rF16<256, 128, 8, 1, 32, false, false, 8>(qs, d, x, y, rows, cols, qstride, tokens);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_q8r_f16_lw42(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y, std::uint32_t rows,
+                           std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
+  GemmQ8rF16<256, 128, 4, 2, 64, false, false, 8>(qs, d, x, y, rows, cols, qstride, tokens);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_q8r_f16_lw42k32(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
+                              std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
+  GemmQ8rF16<256, 128, 4, 2, 32, false, false, 8>(qs, d, x, y, rows, cols, qstride, tokens);
+}
 // halo_gemm_q8r_f16_l walked in bands of 8 row tiles (every token tile of
 // a band before the next): the band's weights (~5 MB) stay in the
 // last-level cache while the token tiles pass. Study at 2048 tokens, after

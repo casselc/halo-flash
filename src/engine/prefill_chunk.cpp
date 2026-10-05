@@ -192,7 +192,7 @@ bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt
     const bool banded = !tall && !small && prefill_banded_gemm_ && (rows / 256) % 8 == 0 && rows % 256 == 0;
     return Launch(tall    ? "halo_gemm_q8r_f16_m"
                   : small ? "halo_gemm_q8r_f16_s"
-                  : banded ? "halo_gemm_q8r_f16_lg8"
+                  : banded ? (prefill_reg_gemm_ ? "halo_gemm_q8r_f16_lr8" : "halo_gemm_q8r_f16_lg8")
                            : "halo_gemm_q8r_f16_l",
                   {(T + bn - 1) / bn, (rows + bm - 1) / bm}, {256},
                   {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(x16 ? *x16 : ck_.xh), rt::Arg::Buf(y),
