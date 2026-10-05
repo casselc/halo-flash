@@ -4666,6 +4666,246 @@ extern "C" __global__ void __launch_bounds__(256)
   for (std::uint32_t i = 0; i < 32; ++i) S[(i0 + i) * d] = s[i];
 }
 
+// ---- P4: chunked gated DeltaNet on WMMA ---------------------------------------
+// The chunked form of halo_gdn_chunk_scan (see there) with every product on
+// bf16 WMMA, operands split hi/lo (three WMMAs per product, ~2^-15 relative):
+// per 16-token chunk K S0 and Q S0 (16 x 128 . 128 x cols), A = K K^T and
+// Q K^T (16 x 16), Delta = T RHS with T = (I + A)^-1, O = e^G Q S0 + QK Delta,
+// S += Kw^T Delta. The state stays in fp32 accumulator tiles (keys x the
+// wave's 16 value columns) and doubles as the B operand of K S0 / Q S0: in
+// the 16 x 16 accumulator layout lane l holds column l % 16, rows 2 j + l / 16,
+// so one exchange with lane l ^ 16 gives the 16 rows a B fragment needs.
+//   grid (4, heads), block 128: 4 waves = 2 column groups x 2 key halves, 32 columns.
+namespace {
+__device__ inline void SplitFrag16(const float (&f)[16], halo_v16s& hi, halo_v16s& lo) {
+#pragma unroll
+  for (int e = 0; e < 16; ++e) {
+    short h, l;
+    SplitBf16(f[e], h, l);
+    hi[e] = h;
+    lo[e] = l;
+  }
+}
+__device__ inline halo_v8f Wmma3(const halo_v16s& ah, const halo_v16s& al, const halo_v16s& bh, const halo_v16s& bl,
+                                 halo_v8f c) {
+  c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al, bh, c);
+  c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ah, bl, c);
+  return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ah, bh, c);
+}
+// Accumulator layout -> the 16 K-values of this lane's column (B operand),
+// split straight into bf16 hi/lo (no fp32 staging array: register pressure).
+__device__ inline void AccToBSplit(const halo_v8f& c, halo_v16s& hi, halo_v16s& lo) {
+  const bool upper = (threadIdx.x % 32) >= 16;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const float own = c[j], other = __shfl_xor(c[j], 16, 32);
+    short h0, l0, h1, l1;
+    SplitBf16(upper ? other : own, h0, l0);
+    SplitBf16(upper ? own : other, h1, l1);
+    hi[2 * j] = h0;
+    lo[2 * j] = l0;
+    hi[2 * j + 1] = h1;
+    lo[2 * j + 1] = l1;
+  }
+}
+// 16 consecutive floats (16-byte aligned) -> bf16 hi/lo.
+__device__ inline void RowSplit(const float* p, halo_v16s& hi, halo_v16s& lo) {
+#pragma unroll
+  for (int e = 0; e < 16; e += 4) {
+    const float4 x = *reinterpret_cast<const float4*>(p + e);
+    const float f[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      short h, l;
+      SplitBf16(f[i], h, l);
+      hi[e + i] = h;
+      lo[e + i] = l;
+    }
+  }
+}
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(128)
+    halo_gdn_chunk_wmma(const float* q, const float* k, const float* v, const float* alpha, const float* beta,
+                        const float* a, const float* dt, float* state, float* out, std::uint32_t num_k_heads,
+                        std::uint32_t tokens, std::uint32_t qk_stride, std::uint32_t v_stride, std::uint32_t o_stride) {
+  constexpr std::uint32_t d = 128, C = 16, KR = d + 4, NC = 32;  // value columns per block
+  __shared__ __attribute__((aligned(16))) float ks[C][KR], qs[C][KR];
+  __shared__ float vs[C][NC];
+  __shared__ float part[4][2][8][32];  // per wave: its K S0 and Q S0 partials (accumulator layout)
+  __shared__ float Tm[C][C + 1], QKm[C][C + 1], Am[C][C + 1];
+  __shared__ float G[C], bs[C];
+  const std::uint32_t h = blockIdx.y, heads = gridDim.y, tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  // Wave = (column group cg, key half kh2): columns cg * 16 .. + 15 of the
+  // block's 32, keys kh2 * 64 .. + 63 of the state (4 tiles of 16 keys).
+  const std::uint32_t cg = wave % 2, kh2 = wave / 2;
+  const std::uint32_t kh = h % num_k_heads, c0 = blockIdx.x * NC + cg * 16;  // this wave's first column
+  const std::uint32_t col = c0 + lane % 16, hi = lane / 16;
+  float* S = state + static_cast<std::size_t>(h) * d * d;
+  // State tiles: acc[kt] holds keys (kh2 * 4 + kt) * 16 + 2 j + hi of column `col`.
+  halo_v8f acc[4];
+#pragma unroll
+  for (int kt = 0; kt < 4; ++kt)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[kt][j] = S[((kh2 * 4 + kt) * 16 + 2 * j + hi) * d + col];
+  const float ah = a[h], dth = dt[h], inv_sqrt_d = 1.0f / sqrtf(static_cast<float>(d));
+  const std::uint32_t nchunks = (tokens + C - 1) / C;
+  for (std::uint32_t ch = 0; ch < nchunks; ++ch) {
+    const std::uint32_t t0 = ch * C, n = min(C, tokens - t0);
+    __syncthreads();  // the previous chunk's LDS reads are done
+    for (std::uint32_t x = tid; x < C * d / 4; x += blockDim.x) {
+      const std::uint32_t tt = x / (d / 4), i = (x % (d / 4)) * 4;
+      float4 kk = make_float4(0.0f, 0.0f, 0.0f, 0.0f), qq = kk;
+      if (tt < n) {
+        const std::size_t row = static_cast<std::size_t>(t0 + tt) * qk_stride + kh * d + i;
+        kk = *reinterpret_cast<const float4*>(k + row);
+        qq = *reinterpret_cast<const float4*>(q + row);
+      }
+      *reinterpret_cast<float4*>(&ks[tt][i]) = kk;
+      *reinterpret_cast<float4*>(&qs[tt][i]) = qq;
+    }
+    for (std::uint32_t x = tid; x < C * NC; x += blockDim.x) {
+      const std::uint32_t tt = x / NC, cc = x % NC;
+      vs[tt][cc] = tt < n ? v[static_cast<std::size_t>(t0 + tt) * v_stride + h * d + blockIdx.x * NC + cc] : 0.0f;
+    }
+    if (tid < 32) {  // cumulative log decays and gates; padding tokens: no decay, no gate
+      const float lg = tid < n ? ah * Softplus(alpha[static_cast<std::size_t>(t0 + tid) * heads + h] + dth) : 0.0f;
+      float gsum = lg;
+      for (int o = 1; o < 32; o <<= 1) {
+        const float up = __shfl_up(gsum, o, 32);
+        if (tid >= static_cast<std::uint32_t>(o)) gsum += up;
+      }
+      if (tid < C) {
+        G[tid] = gsum;
+        bs[tid] = tid < n ? Sigmoid(beta[static_cast<std::size_t>(t0 + tid) * heads + h]) : 0.0f;
+      }
+    }
+    __syncthreads();
+    // Waves 0 and 1: K K^T and Q K^T (16 x 16, K = 128) for A and the masked QK.
+    if (wave < 2) {
+      const float(&L)[C][KR] = wave == 0 ? ks : qs;
+      halo_v8f m = {};
+      for (std::uint32_t k0 = 0; k0 < d; k0 += 16) {
+        halo_v16s ahh, all, bhh, bll;
+        RowSplit(&L[lane % 16][k0], ahh, all);
+        RowSplit(&ks[lane % 16][k0], bhh, bll);
+        m = Wmma3(ahh, all, bhh, bll, m);
+      }
+      // m[j]: row t = 2 j + hi, column s = lane % 16.
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint32_t t = 2 * j + hi, sx = lane % 16;
+        const float dec = expf(G[t] - G[sx]);
+        if (wave == 0)
+          Am[t][sx] = sx < t ? bs[t] * m[j] * dec : 0.0f;
+        else
+          QKm[t][sx] = sx <= t ? m[j] * dec : 0.0f;
+      }
+    }
+    // Every wave: its key half's part of K S0 and Q S0 for its 16 columns.
+    {
+      halo_v8f pk = {}, pq = {};
+#pragma unroll
+      for (int kt = 0; kt < 4; ++kt) {
+        const std::uint32_t key0 = (kh2 * 4 + kt) * 16;
+        halo_v16s bhh, bll, xh, xl;
+        AccToBSplit(acc[kt], bhh, bll);  // S0 rows key0 .. + 15 of this column
+        RowSplit(&ks[lane % 16][key0], xh, xl);
+        pk = Wmma3(xh, xl, bhh, bll, pk);
+        RowSplit(&qs[lane % 16][key0], xh, xl);
+        pq = Wmma3(xh, xl, bhh, bll, pq);
+      }
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        part[wave][0][j][lane] = pk[j];
+        part[wave][1][j][lane] = pq[j];
+      }
+    }
+    __syncthreads();  // Am, QKm and the partials written
+    // Full sums, low key half first (the same order in both waves of a group).
+    halo_v8f kd, qd;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      kd[j] = part[cg][0][j][lane] + part[cg + 2][0][j][lane];
+      qd[j] = part[cg][1][j][lane] + part[cg + 2][1][j][lane];
+    }
+    if (tid < C) {  // T = (I + A)^-1 by forward substitution; lane = column
+      const std::uint32_t sx = tid;
+      float tcol[C];
+#pragma unroll
+      for (std::uint32_t t = 0; t < C; ++t) {
+        float r = t == sx ? 1.0f : 0.0f;
+#pragma unroll
+        for (std::uint32_t u = 0; u < t; ++u) r -= Am[t][u] * tcol[u];
+        tcol[t] = r;
+      }
+#pragma unroll
+      for (std::uint32_t t = 0; t < C; ++t) Tm[t][sx] = tcol[t];
+    }
+    __syncthreads();
+    // RHS = b (V - e^G (K S0)) in accumulator layout: rows tokens 2 j + hi.
+    halo_v8f rhs;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const std::uint32_t t = 2 * j + hi;
+      rhs[j] = bs[t] * (vs[t][cg * 16 + lane % 16] - expf(G[t]) * kd[j]);
+    }
+    // Delta = T RHS: A operand T (row t = lane % 16), B operand RHS.
+    halo_v16s rhh, rll, thh, tll;
+    AccToBSplit(rhs, rhh, rll);
+    {
+      float ft[16];
+#pragma unroll
+      for (int e = 0; e < 16; ++e) ft[e] = Tm[lane % 16][e];
+      SplitFrag16(ft, thh, tll);
+    }
+    halo_v8f dl = {};
+    dl = Wmma3(thh, tll, rhh, rll, dl);
+    halo_v16s dhh, dll;
+    AccToBSplit(dl, dhh, dll);  // Delta's 16 tokens of this column
+    // Outputs: e^G (Q S0) + QK Delta.
+    halo_v16s qkh, qkl;
+    {
+      float fqk[16];
+#pragma unroll
+      for (int e = 0; e < 16; ++e) fqk[e] = QKm[lane % 16][e];
+      SplitFrag16(fqk, qkh, qkl);
+    }
+    halo_v8f o = {};
+    o = Wmma3(qkh, qkl, dhh, dll, o);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const std::uint32_t t = 2 * j + hi;
+      if (kh2 == 0 && t < n)
+        out[static_cast<std::size_t>(t0 + t) * o_stride + h * d + col] = (expf(G[t]) * qd[j] + o[j]) * inv_sqrt_d;
+    }
+    // State: S = e^G_n S0 + Kw^T Delta, Kw[t][i] = e^(G_n - G_t) k_t[i].
+    const float gn = G[n - 1], en = expf(gn);
+    float wt[16];
+#pragma unroll
+    for (int e = 0; e < 16; ++e) wt[e] = static_cast<std::uint32_t>(e) < n ? expf(gn - G[e]) : 0.0f;
+#pragma unroll
+    for (int kt = 0; kt < 4; ++kt) {
+      const std::uint32_t key0 = (kh2 * 4 + kt) * 16;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[kt][j] *= en;
+      halo_v16s ahh, all;  // A operand: key key0 + lane % 16, the chunk's 16 tokens
+#pragma unroll
+      for (int e = 0; e < 16; ++e) {
+        short hh, ll;
+        SplitBf16(ks[e][key0 + lane % 16] * wt[e], hh, ll);
+        ahh[e] = hh;
+        all[e] = ll;
+      }
+      acc[kt] = Wmma3(ahh, all, dhh, dll, acc[kt]);
+    }
+  }
+#pragma unroll
+  for (int kt = 0; kt < 4; ++kt)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) S[((kh2 * 4 + kt) * 16 + 2 * j + hi) * d + col] = acc[kt][j];
+}
+
 // ---- P4: dense GEMM over repacked Q8_0 on FP16 WMMA ---------------------------
 //
 // y[t][r] = sum_c W[r][c] x[t][c]: W repacked Q8_0 (int8 rows qstride apart,

@@ -1155,6 +1155,24 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
                 rt::Arg::Val(vd)});
         close(get(out4, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "chunked output");
         close(get(gs4, gst.size()), get(gs5, gst.size()), "chunked recurrent state");
+        // The WMMA chunked kernel: every product bf16 hi/lo split (~2^-15
+        // relative per product), so its bound is 1e-4 (fixed in advance).
+        auto gs6 = up(gst), out6 = zeros(std::size_t{T} * vd);
+        launch("halo_gdn_chunk_wmma", {4, nv}, {128},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(conv2, 2ull * kd * 4), rt::Arg::Buf(alb),
+                rt::Arg::Buf(beb), rt::Arg::Buf(ab), rt::Arg::Buf(dtb), rt::Arg::Buf(gs6), rt::Arg::Buf(out6),
+                rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)});
+        const auto close4 = [&](const std::vector<float>& x, const std::vector<float>& y, const char* what) {
+          double dd = 0, m = 0;
+          for (std::size_t i = 0; i < x.size(); ++i) {
+            ASSERT_TRUE(std::isfinite(x[i])) << what << "[" << i << "]";
+            dd += double(x[i] - y[i]) * (x[i] - y[i]);
+            m += double(y[i]) * y[i];
+          }
+          ASSERT_LT(std::sqrt(dd / std::max(m, 1e-30)), 1e-4) << rt::BackendName(backend) << " " << what << " T " << T;
+        };
+        close4(get(out6, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "wmma chunked output");
+        close4(get(gs6, gst.size()), get(gs5, gst.size()), "wmma chunked recurrent state");
       }
       same(get(out2, std::size_t{T} * vd), get(out1, std::size_t{T} * vd), "output");
       same(get(cs2, cst.size()), get(cs1, cst.size()), "conv state");

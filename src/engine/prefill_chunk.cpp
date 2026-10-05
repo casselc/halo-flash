@@ -344,18 +344,13 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
               ? (prefill_gdn_chunked_ && c.ssm_head_dim == 128
                      // 16-token chunks: the chunks' A / QK in parallel, then a
                      // scan over chunks instead of over tokens.
-                     ? Launch("halo_gdn_chunk_prep", {(T + 15) / 16, c.ssm_num_v_heads}, {256},
-                              {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull), rt::Arg::Buf(ck_.alpha),
-                               rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
-                               rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(ck_.gdnprep),
-                               rt::Arg::Val(c.ssm_num_k_heads), rt::Arg::Val(T), rt::Arg::Val(ch)},
-                              error) &&
-                           Launch("halo_gdn_chunk_scan", {2, c.ssm_num_v_heads}, {256},
-                                  {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull),
-                                   rt::Arg::Buf(ck_.conv, 2ull * kd * 4), rt::Arg::Buf(ck_.gdnprep),
-                                   rt::Arg::Buf(s.state), rt::Arg::Buf(ck_.gdn), rt::Arg::Val(c.ssm_num_k_heads),
-                                   rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)},
-                                  error)
+                     ? Launch("halo_gdn_chunk_wmma", {4, c.ssm_num_v_heads}, {128},
+                              {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull),
+                               rt::Arg::Buf(ck_.conv, 2ull * kd * 4), rt::Arg::Buf(ck_.alpha), rt::Arg::Buf(ck_.beta),
+                               rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf), rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf),
+                               rt::Arg::Buf(s.state), rt::Arg::Buf(ck_.gdn), rt::Arg::Val(c.ssm_num_k_heads),
+                               rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)},
+                              error)
                      : Launch("halo_gdn_prefill_split", {2, c.ssm_num_v_heads}, {256},
                        {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull), rt::Arg::Buf(ck_.conv, 2ull * kd * 4),
                         rt::Arg::Buf(ck_.alpha), rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
