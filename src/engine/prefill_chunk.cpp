@@ -365,7 +365,7 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
                                rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(ck_.gdnprep),
                                rt::Arg::Val(c.ssm_num_v_heads), rt::Arg::Val(T), rt::Arg::Val(ch)},
                               error) &&
-                           Launch(prefill_gdn_c16_bf16_ ? "halo_gdn_c16_scan" : "halo_gdn_c16_scan3", {2, c.ssm_num_v_heads}, {128},
+                           Launch(prefill_gdn_c16_bf16_ ? "halo_gdn_c16_scan" : prefill_gdn_c16_u3_ ? "halo_gdn_c16_scan3u" : "halo_gdn_c16_scan3", {2, c.ssm_num_v_heads}, {128},
                                   {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull),
                                    rt::Arg::Buf(ck_.conv, 2ull * kd * 4), rt::Arg::Buf(ck_.gdnprep),
                                    rt::Arg::Buf(s.state), rt::Arg::Buf(ck_.gdn), rt::Arg::Val(c.ssm_num_k_heads),

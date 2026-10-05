@@ -5275,11 +5275,11 @@ HALO_GDN_C16_SCAN(halo_gdn_c16_scan_ks3, true)
 // by every wave. The update folds the decay weights into Delta,
 // S = e^G_n S0 + K^T (w Delta), so its A operand is K's hi / mid gathered
 // as they are. ~24 KB of LDS: every block of a layer still resident.
-//   grid (2, heads), block 128
-extern "C" __global__ void __launch_bounds__(128)
-    halo_gdn_c16_scan3(const float* q, const float* k, const float* v, const float* prep, float* state, float* out,
-                       std::uint32_t num_k_heads, std::uint32_t tokens, std::uint32_t qk_stride, std::uint32_t v_stride,
-                       std::uint32_t o_stride) {
+// U3: the update's K three-way too (hi / mid / lo against w Delta's hi / lo).
+template <bool U3>
+__device__ void GdnC16Scan3(const float* q, const float* k, const float* v, const float* prep, float* state,
+                            float* out, std::uint32_t num_k_heads, std::uint32_t tokens, std::uint32_t qk_stride,
+                            std::uint32_t v_stride, std::uint32_t o_stride) {
   constexpr std::uint32_t d = 128, C = 16, KR = d + 8, NT = 128, KP = C * d / 4 / NT, PP = kGdnP16 / 4;
   __shared__ __attribute__((aligned(16))) short kh[C][KR], km[C][KR], kl[C][KR], qh[C][KR], ql[C][KR];
   __shared__ __attribute__((aligned(16))) float P[kGdnP16];
@@ -5396,6 +5396,13 @@ extern "C" __global__ void __launch_bounds__(128)
         ah[e] = kh[e][kt * 16 + lane % 16];
         am[e] = km[e][kt * 16 + lane % 16];
       }
+      if constexpr (U3) {
+        halo_v16s al;
+#pragma unroll
+        for (int e = 0; e < 16; ++e) al[e] = kl[e][kt * 16 + lane % 16];
+        acc[kt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al, dh, acc[kt]);
+        acc[kt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(am, dlo, acc[kt]);
+      }
       acc[kt] = Wmma3(ah, am, dh, dlo, acc[kt]);
       __builtin_amdgcn_sched_barrier(0);
     }
@@ -5407,6 +5414,18 @@ extern "C" __global__ void __launch_bounds__(128)
 #pragma unroll
     for (int j = 0; j < 8; ++j) (S + (kt * 16 + 2 * j) * d)[so] = acc[kt][j];
 }
+
+#define HALO_GDN_C16_SCAN3(NAME, U3)                                                                             \
+  extern "C" __global__ void __launch_bounds__(128)                                                              \
+      NAME(const float* q, const float* k, const float* v, const float* prep, float* state, float* out,          \
+           std::uint32_t num_k_heads, std::uint32_t tokens, std::uint32_t qk_stride, std::uint32_t v_stride,      \
+           std::uint32_t o_stride) {                                                                             \
+    GdnC16Scan3<U3>(q, k, v, prep, state, out, num_k_heads, tokens, qk_stride, v_stride, o_stride);              \
+  }
+//   grid (2, heads), block 128
+HALO_GDN_C16_SCAN3(halo_gdn_c16_scan3, false)
+HALO_GDN_C16_SCAN3(halo_gdn_c16_scan3u, true)
+#undef HALO_GDN_C16_SCAN3
 
 // ---- Study: structural floor of a chunked DeltaNet scan ---------------------
 // The loads, LDS staging, barriers and state traffic of a chunked scan with

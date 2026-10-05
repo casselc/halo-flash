@@ -173,6 +173,8 @@ int main(int argc, char** argv) {
       time("halo_gdn_c16_scan_ks3", [&] { (void)d->Launch(k3, {2, heads}, {128}, ca, &e); });
       const auto k4 = d->Kernel("halo_gdn_c16_scan3", &e);
       time("halo_gdn_c16_scan3", [&] { (void)d->Launch(k4, {2, heads}, {128}, ca, &e); });
+      const auto k5 = d->Kernel("halo_gdn_c16_scan3u", &e);
+      time("halo_gdn_c16_scan3u", [&] { (void)d->Launch(k5, {2, heads}, {128}, ca, &e); });
       time("halo_gdn_c16 prep + scan", [&] {
         (void)d->Launch(kp, {T / 16, kheads}, {256}, pa, &e);
         (void)d->Launch(kc, {2, heads}, {128}, ca, &e);

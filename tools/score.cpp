@@ -80,6 +80,7 @@ int main(int argc, char** argv) {
       engine::FlashNextGpu::prefill_gdn_chunked_ = std::string(argv[i + 1]) != "0";
       engine::FlashNextGpu::prefill_gdn_chunk_fp32_ = std::string(argv[i + 1]) == "fp32";
       engine::FlashNextGpu::prefill_gdn_c16_bf16_ = std::string(argv[i + 1]) == "bf16";
+      engine::FlashNextGpu::prefill_gdn_c16_u3_ = std::string(argv[i + 1]) != "u2";
     }
     else if (a == "--start") start = std::atoi(argv[i + 1]);
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";

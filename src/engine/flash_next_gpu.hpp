@@ -104,6 +104,7 @@ class FlashNextGpu {
   static inline bool prefill_gdn_chunked_ = true;
   static inline bool prefill_gdn_chunk_fp32_ = false;  // study: the fp32 chunked kernels instead of c16
   static inline bool prefill_gdn_c16_bf16_ = false;    // study: the two-way bf16 scan (fails the long-set gate)
+  static inline bool prefill_gdn_c16_u3_ = true;       // scan3u (update's K three-way); false: scan3, +0.0013 NLL
   /// Read the next prefill chunk's n-gram rows on a host thread while the
   /// current chunk runs on the device.
   static inline bool prefill_ngram_prefetch_ = true;

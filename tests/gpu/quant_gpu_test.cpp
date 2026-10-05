@@ -1192,6 +1192,13 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
                 rt::Arg::Val(vd)});
         close4(get(out8, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "c16 scan3 output");
         close4(get(gs8, gst.size()), get(gs5, gst.size()), "c16 scan3 recurrent state");
+        auto gs9 = up(gst), out9 = zeros(std::size_t{T} * vd);
+        launch("halo_gdn_c16_scan3u", {2, nv}, {128},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(conv2, 2ull * kd * 4), rt::Arg::Buf(prep7),
+                rt::Arg::Buf(gs9), rt::Arg::Buf(out9), rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch),
+                rt::Arg::Val(vd)});
+        close4(get(out9, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "c16 scan3u output");
+        close4(get(gs9, gst.size()), get(gs5, gst.size()), "c16 scan3u recurrent state");
       }
       same(get(out2, std::size_t{T} * vd), get(out1, std::size_t{T} * vd), "output");
       same(get(cs2, cst.size()), get(cs1, cst.size()), "conv state");
