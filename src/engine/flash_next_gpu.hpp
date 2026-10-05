@@ -100,6 +100,7 @@ class FlashNextGpu {
   // combine_norm skips the fp32 xn the mixer's mix epilogue would re-read;
   // the epilogue rebuilds it from res (same arithmetic, bit-identical).
   static inline bool prefill_mix_rebuild_ = true;
+  static inline bool prefill_banded_gemm_ = true;  // large dense GEMMs in bands of 8 row tiles
   static inline bool prefill_fused_moe_combine_ = true;  // routed combine + shared expert in one pass
   static inline bool prefill_ple_overlap_ = true;  // read the n-gram rows while the layers before the PLE run
   /// DeltaNet over 16-token chunks (prep + scan) instead of token by token.

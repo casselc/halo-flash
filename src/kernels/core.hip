@@ -5771,7 +5771,7 @@ HALO_GDN_SKEL(halo_gdnskel_c64_n32_pf_seq, 64, 32, 256, 4, true, true)
 // With rs and nw, xn is the residual and xn[t][s h + i] is rebuilt as
 // (res * rs[t * 4 + s]) * nw[s h + i] (combine_norm's arithmetic).
 template <std::uint32_t BM, std::uint32_t BN, std::uint32_t WM, std::uint32_t WN, std::uint32_t KS, bool kMix = false,
-          bool kRowsFast = false>
+          bool kRowsFast = false, std::uint32_t RG = 1>
 __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
                            std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens,
                            const float* xn = nullptr, _Float16* y16 = nullptr, const float* rs = nullptr,
@@ -5790,7 +5790,15 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
   _Float16* Bs = smem + BM * RS;
   const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
   // kRowsFast: row tiles vary fastest in dispatch order (grid (row tiles, token tiles)).
-  const std::uint32_t r0 = (kRowsFast ? blockIdx.x : blockIdx.y) * BM, t0 = (kRowsFast ? blockIdx.y : blockIdx.x) * BN;
+  // RG > 1: grid (token tiles, row tiles) walked in bands of RG row tiles,
+  // every token tile of a band before the next band (RG divides the row tiles).
+  std::uint32_t rt = kRowsFast ? blockIdx.x : blockIdx.y, tt = kRowsFast ? blockIdx.y : blockIdx.x;
+  if constexpr (RG > 1) {
+    const std::uint32_t lin = blockIdx.y * gridDim.x + blockIdx.x, band = RG * gridDim.x;
+    rt = (lin / band) * RG + lin % RG;
+    tt = (lin % band) / RG;
+  }
+  const std::uint32_t r0 = rt * BM, t0 = tt * BN;
   const std::uint32_t wr = wave % WM, wt = wave / WM;
   const std::uint32_t nblk = cols / 32;
   // Native vectors, not HIP's int4/uint4: those are structs, and LLVM's
@@ -5905,6 +5913,17 @@ extern "C" __global__ void __launch_bounds__(256)
     halo_gemm_q8r_f16_l(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y, std::uint32_t rows,
                         std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
   GemmQ8rF16<256, 128, 8, 1, 64>(qs, d, x, y, rows, cols, qstride, tokens);
+}
+// halo_gemm_q8r_f16_l walked in bands of 8 row tiles (every token tile of
+// a band before the next): the band's weights (~5 MB) stay in the
+// last-level cache while the token tiles pass. Study at 2048 tokens, after
+// 96 MB of writes: 10240 x 2560 3.95 -> 3.60 ms, 6144 x 2560 2.42 -> 2.24,
+// 12288 x 2560 4.68 -> 4.39. Same tiles, same arithmetic.
+//   grid (ceil(T / 128), rows / 256), rows / 256 % 8 == 0
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_q8r_f16_lg8(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y, std::uint32_t rows,
+                          std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
+  GemmQ8rF16<256, 128, 8, 1, 64, false, false, 8>(qs, d, x, y, rows, cols, qstride, tokens);
 }
 extern "C" __global__ void __launch_bounds__(256)
     halo_gemm_q8r_f16_s(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y, std::uint32_t rows,

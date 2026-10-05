@@ -236,6 +236,7 @@ int main(int argc, char** argv) {
     const V variants[] = {
         {"halo_gemm_q8r_f16_m", 320, 64, 1},
         {"halo_gemm_q8r_f16_l", 256, 128, 1},
+        {"halo_gemm_q8r_f16_lg8", 256, 128, 1},
         {"halo_gemm_q8r_f16_s", 64, 128, 1},
     };
     std::printf("shape %u x %u, T %u (%.1f GFLOP)\n", rows, cols, T, 2.0 * rows * cols * T / 1e9);

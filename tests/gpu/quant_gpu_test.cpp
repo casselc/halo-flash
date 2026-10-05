@@ -1560,6 +1560,50 @@ TEST(GpuQuant, Bf16x3GemmMatchesDoubleSums) {
 // double sums of the same fp16 operands: fp16(d * q) is exact in the
 // kernel's arithmetic, so only fp32 summation order differs. Bound fixed
 // in advance: cols * 2^-23 * sum |w x|. Ragged rows and tokens.
+// The banded dispatch order (halo_gemm_q8r_f16_lg8) computes the same tiles
+// with the same arithmetic as halo_gemm_q8r_f16_l: bit-identical, for 8 and
+// 16 row tiles and ragged token counts.
+TEST(GpuQuant, BandedQ8F16GemmIsBitIdentical) {
+  std::string error;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &error);
+  if (!dev) GTEST_SKIP() << error;
+  ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+  for (const std::uint32_t rows : {2048u, 4096u})
+    for (const std::uint32_t T : {1u, 130u, 300u}) {
+      const std::uint32_t cols = 256, row_bytes = cols / 32 * 34;
+      std::vector<std::uint8_t> w(std::size_t{rows} * row_bytes);
+      std::uint32_t seed = rows * 7 + T;
+      for (auto& b : w) b = static_cast<std::uint8_t>((seed = seed * 1664525u + 1013904223u) >> 24);
+      for (std::size_t r = 0; r < rows; ++r)
+        for (std::size_t b = 0; b < cols / 32; ++b) {
+          const std::uint16_t h = 0x2000 | (r * 7 + b) % 1024;
+          std::memcpy(w.data() + r * row_bytes + b * 34, &h, 2);
+        }
+      std::vector<_Float16> x(std::size_t{T} * cols);
+      for (std::size_t i = 0; i < x.size(); ++i) x[i] = static_cast<_Float16>(std::sin(0.37 * i));
+      auto wb = dev->Alloc(w.size(), &error), qs = dev->Alloc(std::size_t{rows} * cols, &error),
+           db = dev->Alloc(std::size_t{rows} * (cols / 32) * 2, &error), xb = dev->Alloc(x.size() * 2, &error),
+           y1 = dev->Alloc(std::size_t{T} * rows * 4, &error), y2 = dev->Alloc(std::size_t{T} * rows * 4, &error);
+      ASSERT_TRUE(wb && qs && db && xb && y1 && y2 && dev->Upload(wb, 0, w.data(), w.size(), &error) &&
+                  dev->Upload(xb, 0, x.data(), x.size() * 2, &error))
+          << error;
+      const rt::Arg ra[] = {rt::Arg::Buf(wb), rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                            rt::Arg::Val(cols)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_repack_q8_0", &error), {4096}, {256}, ra, &error)) << error;
+      for (const auto& [k, y] : {std::pair{"halo_gemm_q8r_f16_l", &y1}, std::pair{"halo_gemm_q8r_f16_lg8", &y2}}) {
+        const rt::Arg ga[] = {rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Buf(xb), rt::Arg::Buf(*y), rt::Arg::Val(rows),
+                              rt::Arg::Val(cols), rt::Arg::Val(cols), rt::Arg::Val(T)};
+        ASSERT_TRUE(dev->Launch(dev->Kernel(k, &error), {(T + 127) / 128, rows / 256}, {256}, ga, &error)) << error;
+      }
+      std::vector<float> a(std::size_t{T} * rows), b(a.size());
+      ASSERT_TRUE(dev->Download(y1, 0, a.data(), a.size() * 4, &error) && dev->Download(y2, 0, b.data(), b.size() * 4, &error))
+          << error;
+      for (auto* buf : {&wb, &qs, &db, &xb, &y1, &y2}) dev->Free(*buf);
+      for (std::size_t i = 0; i < a.size(); ++i)
+        ASSERT_EQ(std::bit_cast<std::uint32_t>(a[i]), std::bit_cast<std::uint32_t>(b[i])) << "rows " << rows << " T " << T << " i " << i;
+    }
+}
+
 TEST(GpuQuant, Q8F16GemmMatchesDoubleSums) {
   std::string error;
   const auto f16 = [](float v) { return static_cast<float>(static_cast<_Float16>(v)); };
