@@ -653,6 +653,18 @@ most of the distance to halogen's 1,584 tok/s on an 8K-token prompt.
 Also: the n-gram read for each chunk (~115 ms of random tokens, not resident) runs serially
 before that chunk's device work. Overlapping it with the previous chunk saves ~0.35-0.45 s at 8K.
 
+**4m. Chunked gated DeltaNet, first prototype (branch `proto/gdn-chunked`, 47199e4).**
+- The chunked form (cumulative log decays G, strictly lower A = b (k.k) e^(G_t-G_s),
+  (I + A) Delta = bV - b e^G K S0, outputs and end state from S0 and Delta) was verified exact
+  against stepping (5.6e-16, double).
+- The fp32 per-lane kernels (16-token chunks) pass the property test, but run at 16.9 ms (scan)
+  + 2.6 ms (prep) per layer, against the split kernel's 8.1 ms.
+- Traces: the scan is LDS-bound (54%: every lane re-reads the chunk's K and Q), its staging is
+  unprefetched, and SIMDs are idle 2.5x as long as busy at 96 blocks. The prep's 6144 small
+  blocks are load-latency bound.
+- Next design: WMMA for K S0 / Q S0 / K^T Delta (bf16 hi/lo for the state), the prep fused into
+  the scan, value columns split over more blocks.
+
 **4l. Routed experts: ablations (2026-10-04, `halo_gemm_bench moe`, one layer, pinned).** Base
 13.83 ms per layer (x48 = 664 ms). Each probe removes one cost with wrong numerics:
 
