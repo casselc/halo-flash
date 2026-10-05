@@ -3570,6 +3570,11 @@ __device__ inline KQuantHdr LoadKQuantHdr(const std::uint8_t* b, std::uint32_t j
   }
   return r;
 }
+// Bit b of a 4-bit x to bit 8 b (bit 0 of byte b): x * (1 + 2^7 + 2^14 + 2^21)
+// puts bit b at 8 b, and every cross term (bit b at b + 7 c, c != b) misses
+// a multiple of 8, so the mask keeps exactly the four. One 24-bit multiply
+// and a mask instead of three shifts, four masks and three ors.
+__device__ inline std::uint32_t SpreadNibbleBits(std::uint32_t x) { return __umul24(x, 0x00204081u) & 0x01010101u; }
 template <>
 struct Frag16<LoadQ4_K> {
   using Hdr = KQuantHdr;
@@ -3687,8 +3692,8 @@ struct Frag16<LoadQ5_1> {
     const std::uint8_t* b = row + (k0 / 32) * 24;
     Stage st;
 #pragma unroll
-    for (std::uint32_t i = 0; i < 12; ++i)
-      st.r[i] = (i / 3) * 32 < kn ? *reinterpret_cast<const uint2*>(b + 8 * i) : make_uint2(0, 0);
+    for (std::uint32_t i = 0; i < 12; ++i)  // unconditional (clamped to the last live block): a conditional load waits
+      st.r[i] = *reinterpret_cast<const uint2*>(b + 8 * min(i, 3 * ((kn + 31) / 32) - 1));
     return st;
   }
   template <typename H>
@@ -3704,7 +3709,7 @@ struct Frag16<LoadQ5_1> {
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const std::uint32_t x = (qh >> (4 * j)) & 0xFu;
-      const std::uint32_t bits = (x & 1u) | ((x & 2u) << 7) | ((x & 4u) << 14) | ((x & 8u) << 21);
+      const std::uint32_t bits = SpreadNibbleBits(x);
       Unpack4(v, j, ((w[j] >> (j0 ? 4 : 0)) & 0x0F0F0F0Fu) | (bits << 4), halo_h2{1024, 1024}, halo_h2{d, d},
               halo_h2{m, m});
     }
@@ -3725,7 +3730,7 @@ struct Frag16<LoadQ5_1> {
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const std::uint32_t x = (qh >> (4 * j)) & 0xFu;
-      const std::uint32_t bits = (x & 1u) | ((x & 2u) << 7) | ((x & 4u) << 14) | ((x & 8u) << 21);
+      const std::uint32_t bits = SpreadNibbleBits(x);
       Unpack4(v, j, ((w[j] >> (j0 ? 4 : 0)) & 0x0F0F0F0Fu) | (bits << 4), halo_h2{1024, 1024}, halo_h2{d, d},
               halo_h2{m, m});
     }
@@ -3904,22 +3909,49 @@ __device__ void MoeDown(SL load, SG get, const _Float16* hp, const std::uint32_t
   const std::uint32_t r0 = blockIdx.x * kMoeBlockRows + wave * 16 * kMoeRowTiles;
   halo_v8f acc[kMoeRowTiles][kMoeSub] = {};
   const std::uint32_t row = min(r0 + lane % 16, H - 1);
+  // Software pipeline as in MoeGateUp: the next stage's weights and
+  // activation pieces load into registers while this stage is multiplied
+  // out. (Thread trace of the synchronous form: 28% of cycles in vmcnt(0),
+  // 16% at barriers, WMMA 2.6%.) Pieces are unconditional: rows past n
+  // repeat the tile's first pair, columns past the stage are clamped; neither
+  // is read by the math.
+  constexpr std::uint32_t kXp = kMoeTile * (kMoeKs / 8) / 256;
+  static_assert(kXp == 4, "four activation pieces per thread per stage");
+  uint4 xr0, xr1, xr2, xr3;
+  const auto x_at = [&](std::uint32_t p, std::uint32_t k0) {
+    const std::uint32_t i = threadIdx.x + p * 256, r = i / (kMoeKs / 8), c = min((i % (kMoeKs / 8)) * 8, ff - k0 - 8);
+    return *reinterpret_cast<const uint4*>(hp + static_cast<std::size_t>(first + (r < n ? r : 0)) * ff + k0 + c);
+  };
+  const auto bs_at = [&](std::uint32_t p) {
+    const std::uint32_t i = threadIdx.x + p * 256, r = i / (kMoeKs / 8), c = (i % (kMoeKs / 8)) * 8;
+    return reinterpret_cast<uint4*>(Bs + r * kMoeRs + c);
+  };
+#define HALO_MOE_LOAD_HP(K0) \
+  xr0 = x_at(0, (K0));       \
+  xr1 = x_at(1, (K0));       \
+  xr2 = x_at(2, (K0));       \
+  xr3 = x_at(3, (K0));
+  auto st = load(e, row, 0, min(kMoeKs, ff));
+  HALO_MOE_LOAD_HP(0)
   for (std::uint32_t k0 = 0; k0 < ff; k0 += kMoeKs) {
     const std::uint32_t ks = min(kMoeKs, ff - k0);
-    const auto st = load(e, row, k0, ks);  // in flight during the staging below
+    __syncthreads();  // the previous stage's LDS reads are done
+    *bs_at(0) = xr0;
+    *bs_at(1) = xr1;
+    *bs_at(2) = xr2;
+    *bs_at(3) = xr3;
     __syncthreads();
-    for (std::uint32_t i = threadIdx.x; i < subs * 16 * ks / 8; i += blockDim.x) {
-      const std::uint32_t r = i / (ks / 8), c = (i % (ks / 8)) * 8;
-      *reinterpret_cast<uint4*>(Bs + r * kMoeRs + c) =
-          *reinterpret_cast<const uint4*>(hp + static_cast<std::size_t>(first + (r < n ? r : 0)) * ff + k0 + c);
+    const auto cur = st;
+    if (k0 + kMoeKs < ff) {  // next stage, in flight during the math below
+      st = load(e, row, k0 + kMoeKs, min(kMoeKs, ff - k0 - kMoeKs));
+      HALO_MOE_LOAD_HP(k0 + kMoeKs)
     }
-    __syncthreads();
 #pragma unroll
     for (std::uint32_t kk = 0; kk < kMoeKs; kk += 16) {  // fully unrolled: the stage stays in registers
       if (kk >= ks) break;
 #pragma unroll
       for (std::uint32_t rt = 0; rt < kMoeRowTiles; ++rt) {
-        const halo_v16h fw = get(st, e, row, k0, kk);
+        const halo_v16h fw = get(cur, e, row, k0, kk);
 #pragma unroll
         for (std::uint32_t h = 0; h < kMoeSub; ++h) {
           if (h >= subs) break;
@@ -3929,6 +3961,7 @@ __device__ void MoeDown(SL load, SG get, const _Float16* hp, const std::uint32_t
       }
     }
   }
+#undef HALO_MOE_LOAD_HP
 #pragma unroll
   for (std::uint32_t rt = 0; rt < kMoeRowTiles; ++rt)
 #pragma unroll
