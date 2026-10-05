@@ -621,6 +621,10 @@ to fp16, so prefill results would be bit-identical. It would halve the gather by
 prefetch registers, so both K and V fit in flight. The cost is ~24.6 KB more per cached token:
 ~6.4 GB at a 262K context, ~200 MB at 8K. That needs a decision on memory.
 
+**fp16 K/V copy (fb4a7b5):** attention 608 -> 449 ms per 8K prefill (-188 ms in total, pinned),
+bit-identical results, ~24.6 KB more memory per cached token. It also fixed out-of-bounds K/V
+reads in the union kernels (tail-block slots past the causal end).
+
 Then the serial n-gram read per chunk.
 
 **4h. Chunk size and long prompts (2026-10-04, pinned, pseudo-random tokens, n-gram not
