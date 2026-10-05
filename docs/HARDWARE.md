@@ -56,6 +56,9 @@ LPDDR5X-8000 256-bit unified memory, 32 MB MALL. ROCm 7.2.3.
   segments scattered across concurrent blocks collapse DRAM bandwidth up to 20x. Random 4 KB
   pages read 512 bytes at a time: ~34 GB/s flat, whatever the loads in flight (1-8 per lane) or
   waves (1-16 per SIMD): parallelism does not fix locality.
+- Inside the MALL the order does not matter: the same sweep over a 15 MB footprint reads ~800 GB/s
+  for both orders (64 B segments and up; ~400-470 at 32 B). The collapse above is DRAM row (page)
+  locality, not cache or translation. MALL-resident working sets (<= ~32 MB) stream at ~800 GB/s.
 - Dependent-load latency by footprint: 16 KB 39 ns, 256 KB 62, 2 MB 92, 8 MB 134, 24 MB 180,
   64 MB 256, 256 MB 295 ns (L1 / L2 / MALL / DRAM).
 - Writes are paid by the next kernels (their write-back drains during them); a microbenchmark's
@@ -89,8 +92,8 @@ prefill (predicted -40 to -50), the norm kernel writing it +10.6, net -31.7 ms.
 
 ## Open questions (from a GPT-6.1 review of the probes, 2026-10-05)
 
-- Same-rows vs different-rows bandwidth: count unique vs requested bytes and transactions to tell
-  DRAM row locality from cache or translation reuse.
+- Same-rows vs different-rows bandwidth: answered, DRAM row locality (the same pattern inside the
+  MALL shows no order effect).
 - Random 4 KB pages at a flat ~34 GB/s for every loads-in-flight / occupancy setting: verify in the
   ISA that the sweep really varied outstanding loads; vary page size and locality.
 - Pointer-chase knees are effective latencies, not cache sizes (translation, associativity and

@@ -2,7 +2,7 @@
 // performance work relies on. Standalone HIP; each subcommand prints one table.
 //
 //   halo_hwprobe clock           shader clock (in-kernel counters) vs load
-//   halo_hwprobe dram            bandwidth vs segment size, dispatch order, read/write
+//   halo_hwprobe dram [MB]       bandwidth vs segment size, dispatch order, read/write
 //   halo_hwprobe wmma            f16 / bf16 / iu8 WMMA rate, chain latency, VALU overlap
 //
 // Clock truth comes from inside kernels: SHADER_CYCLES (20 bits, wraps every
@@ -96,8 +96,10 @@ __global__ void __launch_bounds__(256)
   if (acc == 12345.f) sink[0] = acc;
 }
 
-void Dram() {
-  const std::uint32_t row_bytes = 40960, rows = 12288;  // 480 MB: past the 32 MB MALL
+void Dram(std::uint32_t mb) {
+  // Default 480 MB: past the 32 MB MALL. A footprint inside the MALL (e.g. 16)
+  // tells DRAM row locality from cache / translation effects.
+  const std::uint32_t row_bytes = 40960, rows = std::max<std::uint32_t>(128, (mb << 20) / row_bytes / 128 * 128);
   const std::size_t bytes = std::size_t{row_bytes} * rows;
   float4 *a, *b;
   float* sink;
@@ -109,7 +111,7 @@ void Dram() {
   hipEvent_t e0, e1;
   CHECK(hipEventCreate(&e0));
   CHECK(hipEventCreate(&e1));
-  std::printf("DRAM: 480 MB as rows of 40 KB; a block takes `seg` bytes from each of 128 rows (256 threads, 16-byte accesses)\n");
+  std::printf("memory: %zu MB as rows of 40 KB; a block takes `seg` bytes from each of 128 rows (256 threads, 16-byte accesses)\n", bytes >> 20);
   std::printf("  %6s  %-9s  %8s  %8s  %8s\n", "seg B", "order", "read", "write", "copy");
   for (const std::uint32_t seg : {32u, 64u, 128u, 256u, 512u, 1024u, 4096u, 40960u}) {
     const std::uint32_t seg_f4 = seg / 16, trows = seg == 40960 ? 4 : 128, cols = row_bytes / seg, groups = rows / trows;
@@ -481,7 +483,7 @@ void Sync() {
 int main(int argc, char** argv) {
   const std::string cmd = argc > 1 ? argv[1] : "";
   if (cmd == "clock") Clock();
-  else if (cmd == "dram") Dram();
+  else if (cmd == "dram") Dram(argc > 2 ? static_cast<std::uint32_t>(std::atoi(argv[2])) : 480);
   else if (cmd == "wmma") Wmma();
   else if (cmd == "lds") Lds();
   else if (cmd == "latency") Latency();
