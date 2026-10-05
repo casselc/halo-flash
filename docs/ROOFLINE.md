@@ -851,3 +851,19 @@ prefetch) measured -9.6 ms (noise; predicted -30..-45): `qsel_h` 75.4 vs `mq` 87
 32 rows a block (16 queries x 2 heads), 16-key tiles, 8 waves = S tiles x head-dim halves,
 K/V prefetched into registers, V transposed in LDS. Next: a kernel whose waves each own their
 rows and softmax, so only K/V staging needs a block barrier.
+
+**Later the same night (main line of the branch, each A/B 3 rounds x 3 reps, pinned):**
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| n-gram rows read while layer 0 runs (PLE is layer 1; 41-110 ms host read) (0647d6b) | -35..-40 wall | **-42 ms wall** (1.733 -> 1.691 s) | yes |
+| token embedding in one launch instead of T | (the 45 ms stamp was the read above) | neutral | yes (0647d6b) |
+| MoE down: stage pipeline + multiply bit spread for Q5_1 (9343638) | -40..-55 | down 224 -> 207 ms | yes |
+| `Unpack4` via byte permutes | -25..-40 | not built: its element order already avoids the interleave | — |
+| W8A8 for the mixer down (`_m`): tall `GemmQ8rWmma<5,2,4,2>` | -35..-60 | microbench 976 us vs fp16 725 us | no |
+
+The down pipeline missed its prediction for a reason worth keeping: the trace showed 28% of
+wave cycles in `vmcnt(0)`, but at 12 waves/SIMD other waves covered most of it; the kernel is
+VALU-bound (40%) on dequant. A wave-level stall share says little at high occupancy.
+The int8 GEMM template is staging-limited (~20 of 56 TOPS); W8A8 needs a better int8 kernel
+first (gufo's runs the same shape in 0.50 ms in-engine).
