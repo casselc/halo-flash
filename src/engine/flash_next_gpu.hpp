@@ -129,6 +129,7 @@ class FlashNextGpu {
   /// While every token sees every earlier position (under the QSA budget),
   /// 4 tokens per attention block share K/V and QSA selection is skipped.
   static inline bool prefill_mq_attention_ = true;
+  static inline bool prefill_fa_attention_ = true;  // dense causal: halo_attention_fa (needs the fp16 K/V copy)
   /// DeltaNet recurrence with each state column over 4 lanes (2 blocks per
   /// head), its inputs staged and prefetched per 8 tokens, and a separate
   /// gated norm; exact mode keeps the fused kernel, bit-identical to

@@ -459,11 +459,36 @@ TEST(GpuSelect, MultiTokenDenseAttentionMatchesSelectKernel) {
       const rt::Arg ma[] = {rt::Arg::Buf(qb), rt::Arg::Buf(kb), rt::Arg::Buf(vb), rt::Arg::Buf(gb), rt::Arg::Buf(o2),
                             rt::Arg::Buf(pb), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(T)};
       ASSERT_TRUE(dev->Launch(dev->Kernel("halo_attention_wmma_mq", &error), {nkv, (T + 3) / 4}, {256}, ma, &error)) << error;
-      std::vector<float> want(q.size()), got(q.size());
-      ASSERT_TRUE(dev->Download(o1, 0, want.data(), want.size() * 4, &error) &&
-                  dev->Download(o2, 0, got.data(), got.size() * 4, &error))
+      // halo_attention_fa reads the fp16 K/V copy (halo_f16_rows), as prefill keeps it.
+      auto k16 = dev->Alloc(k.size() * 2, &error), v16 = dev->Alloc(v.size() * 2, &error), o3 = dev->Alloc(q.size() * 4, &error);
+      ASSERT_TRUE(k16 && v16 && o3) << error;
+      for (const auto& [src, dst] : {std::pair{&kb, &k16}, std::pair{&vb, &v16}}) {
+        const rt::Arg ha[] = {rt::Arg::Buf(*src), rt::Arg::Buf(*dst), rt::Arg::Val(static_cast<std::uint32_t>(k.size()))};
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_f16_rows", &error), {static_cast<std::uint32_t>((k.size() + 255) / 256)},
+                                {256}, ha, &error))
+            << error;
+      }
+      const rt::Arg fa[] = {rt::Arg::Buf(qb), rt::Arg::Buf(k16), rt::Arg::Buf(v16), rt::Arg::Buf(gb), rt::Arg::Buf(o3),
+                            rt::Arg::Buf(pb), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(T)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_attention_fa", &error), {(T + 15) / 16, nkv * ((G + 3) / 4)}, {256}, fa,
+                              &error))
           << error;
-      for (auto* b : {&qb, &gb, &kb, &vb, &sb, &pb, &o1, &o2, &sc}) dev->Free(*b);
+      std::vector<float> want(q.size()), got(q.size()), got_fa(q.size());
+      ASSERT_TRUE(dev->Download(o1, 0, want.data(), want.size() * 4, &error) &&
+                  dev->Download(o2, 0, got.data(), got.size() * 4, &error) &&
+                  dev->Download(o3, 0, got_fa.data(), got_fa.size() * 4, &error))
+          << error;
+      for (auto* b : {&qb, &gb, &kb, &vb, &sb, &pb, &o1, &o2, &sc, &k16, &v16, &o3}) dev->Free(*b);
+      for (std::uint32_t t = 0; t < T; ++t) {  // the flash kernel, same bound
+        double d = 0, m = 0;
+        for (std::size_t i = std::size_t{t} * nh * hd; i < std::size_t{t + 1} * nh * hd; ++i) {
+          ASSERT_TRUE(std::isfinite(got_fa[i])) << "fa " << i;
+          d += double(got_fa[i] - want[i]) * (got_fa[i] - want[i]);
+          m += double(want[i]) * want[i];
+        }
+        ASSERT_LT(std::sqrt(d / m), 5e-3) << rt::BackendName(backend) << " fa t " << t << " T " << T << " pos0 " << pos0
+                                          << " G " << G << " nkv " << nkv;
+      }
       for (std::uint32_t t = 0; t < T; ++t) {
         double d = 0, m = 0;
         for (std::size_t i = std::size_t{t} * nh * hd; i < std::size_t{t + 1} * nh * hd; ++i) {

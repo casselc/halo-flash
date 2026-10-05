@@ -532,6 +532,30 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   // selected nothing away yet): 4 tokens per block share K/V, and the QSA
   // scores and selection are not needed.
   const std::uint32_t G = nh / nkv;
+  // The fp16 K/V copy: convert what is not current yet (this chunk, and
+  // anything decode wrote since); the flash and QSA kernels read it.
+  const auto kv16_current = [&] {
+    if (s.valid16 >= pos0 + T) return true;
+    const std::size_t lo = std::size_t{s.valid16} * kvdim, nv = std::size_t{pos0 + T - s.valid16} * kvdim;
+    for (const auto& [f, h] : {std::pair{&s.k, &s.k16}, std::pair{&s.v, &s.v16}})
+      if (!Launch("halo_f16_rows", {static_cast<std::uint32_t>((nv + 255) / 256)}, {kBlock},
+                  {rt::Arg::Buf(*f, lo * 4), rt::Arg::Buf(*h, lo * 2), rt::Arg::Val(static_cast<std::uint32_t>(nv))},
+                  error))
+        return false;
+    s.valid16 = pos0 + T;
+    return true;
+  };
+  // Dense causal, flash style: 16 tokens x 4 heads a block, each wave its
+  // own rows and softmax (halo_attention_fa).
+  if (wmma && prefill_mq_attention_ && prefill_fa_attention_ && prefill_kv16_ && s.k16 &&
+      (pos0 + T) / ratio <= budget)
+    return kv16_current() &&
+           Launch("halo_attention_fa", {(T + 15) / 16, nkv * ((G + 3) / 4)}, {256},
+                  {rt::Arg::Buf(ck_.q), rt::Arg::Buf(s.k16), rt::Arg::Buf(s.v16), rt::Arg::Buf(ck_.gate_a),
+                   rt::Arg::Buf(ck_.ctx), rt::Arg::Buf(ck_.host, ck_.params_offset), rt::Arg::Val(nh),
+                   rt::Arg::Val(nkv), rt::Arg::Val(T)},
+                  error) &&
+           Gemm(l.attn_out, ck_.ctx, ck_.block_out, T, error);
   if (wmma && prefill_mq_attention_ && (pos0 + T) / ratio <= budget && 4 * G <= 48)
     return Launch("halo_attention_wmma_mq", {nkv, (T + 3) / 4}, {256},
                   {rt::Arg::Buf(ck_.q), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v), rt::Arg::Buf(ck_.gate_a),
@@ -546,15 +570,7 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   // The fp16 K/V copy: convert what is not current yet (this chunk, and
   // anything decode wrote since), then the union attention reads it.
   const bool kv16 = qsel && prefill_kv16_ && s.k16;
-  if (kv16 && s.valid16 < pos0 + T) {
-    const std::size_t lo = std::size_t{s.valid16} * kvdim, nv = std::size_t{pos0 + T - s.valid16} * kvdim;
-    for (const auto& [f, h] : {std::pair{&s.k, &s.k16}, std::pair{&s.v, &s.v16}})
-      if (!Launch("halo_f16_rows", {static_cast<std::uint32_t>((nv + 255) / 256)}, {kBlock},
-                  {rt::Arg::Buf(*f, lo * 4), rt::Arg::Buf(*h, lo * 2), rt::Arg::Val(static_cast<std::uint32_t>(nv))},
-                  error))
-        return false;
-    s.valid16 = pos0 + T;
-  }
+  if (kv16 && !kv16_current()) return false;
   for (std::uint32_t t0 = 0; t0 < T; t0 += kAttnSub) {
     const std::uint32_t n = std::min(kAttnSub, T - t0);
     const rt::Arg params = rt::Arg::Buf(ck_.host, ck_.params_offset + std::size_t{t0} * 64);
@@ -847,7 +863,9 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
       return false;
     }
     deferred_read_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    return dev_.Upload(ck_.host, 0, ple_emb.data(), ple_emb.size_bytes(), error);
+    if (!dev_.Upload(ck_.host, 0, ple_emb.data(), ple_emb.size_bytes(), error)) return false;
+    if (after_prep) after_prep(history);
+    return true;
   };
   for (std::uint32_t t = 0; t < T; ++t) {
     const std::uint32_t pos = position_ + t, n_kv = pos + 1, complete = n_kv / ratio;
@@ -866,7 +884,9 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
                    : dev_.Upload(ck_.host, 0, ck_host_.data(), ck_.params_offset + std::size_t{T} * 64, error)))
     return false;
   const auto t_upload = std::chrono::steady_clock::now();
-  if (after_prep) after_prep(history);
+  // after_prep may start the next chunk's n-gram prefetch; the table serves
+  // one read at a time, so with the read deferred it starts after that read.
+  if (after_prep && !defer_read) after_prep(history);
 
   const std::uint32_t H = c.hidden_size, D = c.HcDim();
   const auto& emb = tensors_.at(w_.token_embd.data);
