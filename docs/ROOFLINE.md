@@ -598,6 +598,17 @@ tiles re-read xh once per row tile (5x, ~210 MB), and the cost grew with the spl
 library's split without its tile economics does not work; next is a microbenchmark study of
 `_m` tile shapes with a trace, not more in-engine guesses.
 
+**4e. Router on bf16 WMMA, hi/lo split (781449a).** -7.4 ms (router 1.30 -> 1.02 ms per call,
+pinned) against a predicted -35..-40; quality unchanged within noise. The trace shows 59% of
+cycles in one `vmcnt(0)` per K stage at ~330 GB/s from cache, so it is not bandwidth-bound.
+An LDS-only barrier with a clamped refill changed nothing (1005 vs 1012 us), as for `_m`: with
+one stage in flight, the data is needed at the next store anyway. The levers left are fewer
+bytes per product and fewer re-reads:
+- split W once at load into stored bf16 hi/lo (the same 4 bytes per element, no per-block
+  split VALU);
+- tiles of 128 tokens, halving the W re-reads;
+- 2 WMMAs per product (x in bf16 hi only), if the quality gate allows it.
+
 **4b. Router F32 GEMM (`f32_tiled [32x8]`, 512 x 2560 x 2048 per layer).** DONE, partly. A
 trace first: 52% of cycles in `s_waitcnt vmcnt`, 33% at barriers, ~4% in FMAs. With a 32-wide K
 step and a one-stage register prefetch it measured **-36.5 ms** against a predicted -65 to -85:
