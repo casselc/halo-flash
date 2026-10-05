@@ -874,3 +874,11 @@ async prefetch, which after_prep starts); fixed in 0cdb694, found by the long qu
 or control-flow changes to prefill need a multi-chunk run before they are committed.
 First version of the attention kernel: 95 ms, 40% of cycles in `ds_store_b16` (a wave's
 transposed V stores 640 bytes apart); one key per lane fixed it.
+| Router weights split to bf16 once (`halo_gemm_f32_bf16x3w`, bit-identical) | -12..-20 | -1.9 (49.2 -> 47.3) | no (252 MB for 2 ms) |
+
+**Night total, wall clock** (`halo_run --prefill-bench`, default clock, `prose_long.txt`, same
+argmax): 2048 tokens 1.896 -> 1.651 s (1080 -> 1240 tok/s, +15%); 6940 tokens 6.82 -> 5.98 s
+(1017 -> 1160 tok/s, +14%). Over the 8K prefill the kernel sums fell 972 ms (DeltaNet -698,
+host n-gram read -262, MoE down -58, first-chunk attention -42). gufo pp2048: 1599 tok/s.
+The router probe repeated the high-occupancy mistake above: at 10 waves/SIMD its trace's
+26% `vmcnt` and 24% split VALU were covered by other waves.
