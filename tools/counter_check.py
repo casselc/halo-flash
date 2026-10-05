@@ -23,6 +23,7 @@ PASSES = [
     ["SQ_INSTS_FLAT", "SQ_INSTS_TEX_LOAD", "SQ_INSTS_TEX_STORE", "SQ_INSTS_SMEM"],
     ["GL2C_EA_RDREQ_32B", "GL2C_EA_RDREQ_64B", "GL2C_EA_RDREQ_96B", "GL2C_EA_RDREQ_128B"],
     ["GL2C_MC_RDREQ", "GL2C_HIT", "GL2C_MISS", "GL2C_EA_WRREQ_64B"],
+    ["SQ_INSTS", "SQ_INSTS_WAVE32", "SQ_INSTS_WAVE32_VALU"],
 ]
 WAVES = 80 * 2  # 80 blocks x 64 threads
 
@@ -84,6 +85,9 @@ def main():
     print("\nfindings (no fixed expectation):")
     print(f"  WMMA in SQ_INSTS_VALU: delta {delta(6, 'SQ_INSTS_VALU'):.0f} for {need} WMMAs "
           f"({'counted' if abs(delta(6, 'SQ_INSTS_VALU') - need) < 0.01 * need else 'NOT counted: take WMMA counts from shapes'})")
+    for nm, i in [("v_add_f32", 0), ("ds_load_b32", 2), ("global_load_b32", 4), ("WMMA", 6)]:
+        print(f"  SQ_INSTS delta for {need} {nm}: {delta(i, 'SQ_INSTS'):.0f} (SQ_INSTS reads 0: unusable); "
+              f"SQ_INSTS_WAVE32_VALU {delta(i, 'SQ_INSTS_WAVE32_VALU'):.0f}")
     print(f"  TEX_LOAD delta for global_load_b32: {delta(4, 'SQ_INSTS_TEX_LOAD'):.0f} (FLAT: {delta(4, 'SQ_INSTS_FLAT'):.0f})")
     print(f"  SQ_WAVES per instruction kernel: {k[0].get('SQ_WAVES', 0):.0f} (launched {WAVES})")
     print(f"  masked-off asm block (64 x 64 v_add_f32 under a never-taken branch): VALU {k[8].get('SQ_INSTS_VALU', 0):.0f}"

@@ -6052,22 +6052,6 @@ extern "C" __global__ void __launch_bounds__(256)
   GemmQ8rF16Reg<8>(qs, d, x, y, rows, cols, qstride, tokens);
 }
 
-// Study variants of the large tile (halo_gemm_bench study).
-extern "C" __global__ void __launch_bounds__(256)
-    halo_gemm_q8r_f16_lk32(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y, std::uint32_t rows,
-                           std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
-  GemmQ8rF16<256, 128, 8, 1, 32, false, false, 8>(qs, d, x, y, rows, cols, qstride, tokens);
-}
-extern "C" __global__ void __launch_bounds__(256)
-    halo_gemm_q8r_f16_lw42(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y, std::uint32_t rows,
-                           std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
-  GemmQ8rF16<256, 128, 4, 2, 64, false, false, 8>(qs, d, x, y, rows, cols, qstride, tokens);
-}
-extern "C" __global__ void __launch_bounds__(256)
-    halo_gemm_q8r_f16_lw42k32(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
-                              std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
-  GemmQ8rF16<256, 128, 4, 2, 32, false, false, 8>(qs, d, x, y, rows, cols, qstride, tokens);
-}
 // halo_gemm_q8r_f16_l walked in bands of 8 row tiles (every token tile of
 // a band before the next): the band's weights (~5 MB) stay in the
 // last-level cache while the token tiles pass. Study at 2048 tokens, after

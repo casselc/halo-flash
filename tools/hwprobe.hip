@@ -10,6 +10,10 @@
 // requested level, not the delivered clock.
 #include <hip/hip_runtime.h>
 
+#include <atomic>
+#include <thread>
+#include <fcntl.h>
+#include <unistd.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -613,6 +617,45 @@ int main(int argc, char** argv) {
   else if (cmd == "latency") Latency();
   else if (cmd == "sync") Sync();
   else if (cmd == "counters") Counters();
+  else if (cmd == "counters-repeat") {  // the same known kernel N times: do counters hold up over many dispatches?
+    const int n = argc > 2 ? std::atoi(argv[2]) : 2000;
+    float *g, *out;
+    CHECK(hipMalloc(&g, 1 << 20));
+    CHECK(hipMalloc(&out, 64));
+    // Optional third argument: a 1 MB host-to-device copy (and a sync) halfway, as the engine does.
+    const bool copy = argc > 3 && std::string(argv[3]) == "copy";
+    // "threads FILE": 16 host threads doing 4 KB O_DIRECT preads of FILE from halfway on, as the
+    // engine's n-gram table reader does.
+    const bool io = argc > 4 && std::string(argv[3]) == "threads";
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> pool;
+    std::vector<char> host(1 << 20, 1);
+    for (int i = 0; i < n; ++i) {
+      if (io && i == n / 2)
+        for (int t = 0; t < 16; ++t)
+          pool.emplace_back([&, t] {
+            const int fd = ::open(argv[4], O_RDONLY | O_DIRECT);
+            void* buf = nullptr;
+            if (fd < 0 || posix_memalign(&buf, 4096, 4096) != 0) return;
+            std::uint64_t x = 1234567 + t;
+            while (!stop.load()) {
+              x = x * 6364136223846793005ull + 1;
+              (void)!::pread(fd, buf, 4096, static_cast<off_t>((x >> 20) % (1ull << 18)) * 4096);
+            }
+            std::free(buf);
+            ::close(fd);
+          });
+      if (copy && i == n / 2) {
+        CHECK(hipMemcpyAsync(g, host.data(), host.size(), hipMemcpyHostToDevice, 0));
+        CHECK(hipDeviceSynchronize());
+      }
+      hipLaunchKernelGGL((KnownKernel<0, 10>), 80, 64, 0, 0, g, out);
+    }
+    CHECK(hipDeviceSynchronize());
+    stop = true;
+    for (auto& t : pool) t.join();
+    std::printf("counters-repeat: %d launches of KnownKernel<0, 10> (102400 + overhead VALU each)\n", n);
+  }
   else {
     std::fprintf(stderr, "usage: halo_hwprobe clock|dram|wmma|lds|latency|sync|counters\n");
     return 2;

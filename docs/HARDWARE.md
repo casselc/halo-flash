@@ -80,6 +80,16 @@ the N = 20 minus N = 10 difference must match exactly. Results (7/7 pass):
   fabric traffic). Data passes between kernels through the MALL (~800 GB/s) or DRAM, never L2;
   only fusion reuses L2.
 
+**Open defect (2026-10-05): in the engine, instruction counters read 0 after each kernel's first
+dispatch.** Profiling a 2048-token prefill, `SQ_INSTS_VALU` / `LDS` / `SALU` / `FLAT` are non-zero
+only for the first dispatch of each kernel (`halo_hc_combine_norm_rows`: 1 of 94; also with only
+that kernel instrumented, and for a single chosen later dispatch), while `SQ_WAVES` stays right.
+Not reproduced outside the engine, so far ruled out: dispatch count (2000 repeats exact), a
+mid-run host-to-device copy, 16 host threads doing O_DIRECT reads, module-loaded kernels
+(`hipModuleLaunchKernel`), a non-blocking stream, a kernel ending in `s_sendmsg
+MSG_DEALLOC_VGPRS` before others, graphs (prefill runs eager). Until found: use first-dispatch
+counters for instruction mix (after checking them against analytic counts) and timestamps for time.
+
 ## Overheads (`halo_hwprobe sync`)
 
 - Barrier round (LDS write, barrier, LDS read): ~33-42 ns (100-120 cycles) for blocks of up to
