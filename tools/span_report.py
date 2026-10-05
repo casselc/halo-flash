@@ -18,6 +18,7 @@ import sys
 TAGS = {1: "span_control", 2: "hc_combine_norm_rows", 3: "GemmQ8rF16"}
 RT_HZ = 100e6
 WRAP = 1 << 20  # SHADER_CYCLES width
+ANCHOR = 255  # anchor records: realtime and cycles read together
 
 
 def load(path):
@@ -38,13 +39,14 @@ def timelines(recs):
     wave: its first cycles reading is unwrapped against the nearest anchor (within half a wrap, ~180 us),
     later readings cumulatively."""
     waves = collections.defaultdict(list)
+    anchors = collections.defaultdict(dict)  # tag -> {block: (rt, cycles)}: anchor records (event 255)
     for rt, cy, block, wave, event, tag, valid in recs:
-        if valid:
+        if not valid:
+            continue
+        if event == ANCHOR:
+            anchors[tag][block] = (rt, cy & (WRAP - 1))
+        else:
             waves[(tag, block, wave)].append((event, rt, cy & (WRAP - 1), cy >> 20))
-    anchors = collections.defaultdict(dict)  # tag -> {block: (rt, cycles)}
-    for (tag, block, wave), ev in waves.items():
-        if wave == 0 and ev[0][1]:
-            anchors[tag][block] = (ev[0][1], ev[0][2])
     clock, placed = {}, {}
     for tag, an in anchors.items():
         blocks = sorted(an)
@@ -115,6 +117,18 @@ def main():
                 d_cy.append(t[5] - t[4])
         print(f"control 4 -> 5: realtime p50 {pct(d_rt, .5) * 1e6:.3f} us, cycle-derived p50 {pct(d_cy, .5) * 1e6:.3f} us "
               f"({(pct(d_cy, .5) / pct(d_rt, .5) - 1) * 100:+.2f}%), {len(d_rt)} waves")
+        # Stall check: wave 0 parked at s_barrier across 6 -> 7 (the others run a loop).
+        rt67 = {}
+        for r, cy, block, wave, event, tag, valid in recs:
+            if valid and tag == 1 and event in (6, 7):
+                rt67[(block, wave, event)] = r
+        for label, sel in (("wave 0 (parked at the barrier)", lambda w: w == 0), ("waves 1-7 (running)", lambda w: w > 0)):
+            dr = [(rt67[(b, w, 7)] - rt67[(b, w, 6)]) / RT_HZ for (b, w, e) in rt67 if e == 6 and sel(w) and (b, w, 7) in rt67]
+            dc = [dict(ev)[7] - dict(ev)[6] for (tg, b, w), ev in tl.items()
+                  if tg == 1 and sel(w) and 6 in dict(ev) and 7 in dict(ev)]
+            if dr and dc:
+                print(f"control 6 -> 7, {label}: realtime p50 {pct(dr, .5) * 1e6:.3f} us, cycle-derived "
+                      f"{pct(dc, .5) * 1e6:.3f} us ({(pct(dc, .5) / pct(dr, .5) - 1) * 100:+.2f}%)")
     by_tag = collections.defaultdict(dict)
     for (tag, block, wave), ev in tl.items():
         by_tag[tag][(block, wave)] = ev
@@ -157,6 +171,12 @@ def main():
         print(f"  WGPs used {len(busy)}; busy share min {busy[0][0] * 100:.0f}% median "
               f"{busy[len(busy) // 2][0] * 100:.0f}% max {busy[-1][0] * 100:.0f}%; waves per WGP "
               f"{min(b[2] for b in busy)}..{max(b[2] for b in busy)}")
+        # Coverage and placement checks: sampled waves per SE/WGP, waves placed before their block's anchor.
+        cover = collections.Counter((where[(tag, b, w)]["se"], where[(tag, b, w)]["sa"], where[(tag, b, w)]["wgp"])
+                                    for (b, w) in ws)
+        print(f"  coverage: {len(cover)} WGPs (SE, SA, WGP); waves per slot {min(cover.values())}..{max(cover.values())}")
+        early = sum(1 for (b, w), ev in ws.items() if w > 0 and (b, 0) in ws and ev[0][1] < ws[(b, 0)][0][1] - 2e-6)
+        print(f"  placement: {early} waves start > 2 us before their block's wave 0 (expect 0)")
         trans = collections.defaultdict(list)
         for ev in ws.values():
             for (e0, s0), (e1, s1) in zip(ev, ev[1:]):

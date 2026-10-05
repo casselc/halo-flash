@@ -37,6 +37,22 @@ cheaply, rebuild the timeline, and explain each difference.
 | Plain stores of trace records | A barrier's release fence (`s_waitcnt_vscnt 0`) then waits for the trace stores: GEMM +37% | Records stored through inline asm, which the compiler's wait insertion does not track |
 | Is SHADER_CYCLES one GPU-wide counter? | Yes. The anchors' (cycles − realtime × clock) agree across all 20 WGPs to within about 100 cycles | Real time from anchors only. Each wave is placed against the anchor of the nearest earlier block index; nearest-in-cycles picks the wrong 20-bit wrap |
 
+Review fixes (GPT-6.1-sol and GLM 5.3 reviewed the first version):
+- **Wave 0 started late.** It started 3-4 µs after the other waves in every block. Wave 0 evaluated
+  the anchor condition, a vector load of the sampling setting waited on under a saturated DRAM
+  queue, before its first stamp.
+
+  Fix: the start stamp is the first instruction; the sampling settings are read as scalar loads in
+  uniform control flow; an anchor is its own record (event 255) with the realtime and cycle reads
+  back to back.
+
+  Check in `span_report.py`: no wave may start more than 2 µs before its block's wave 0 (0 now).
+- **Sampling aliasing.** Use a stride coprime with the 20 WGPs (7 or 11). The report prints
+  coverage over (SE, SA, WGP); stride 7 covers all 20.
+- **Stalls.** The cycle counter keeps counting while a wave is parked at `s_barrier`: control
+  events 6 -> 7 (wave 0 waits while waves 1-7 run a loop). Cycle-derived 11.75 µs vs realtime
+  11.88 µs (-1.1%).
+
 Positive control (`halo_span_control`, `span_report.py --control`): a loop bracketed by both
 clocks. The cycle-derived duration matches the realtime one within 1.1% (9.73 vs 9.84 µs), which
 is about the realtime message's latency.
@@ -47,6 +63,9 @@ Overhead at T 2048, pinned, plain vs traced code object, three runs each:
 |---|---|---|---|
 | `combine_norm` (6 events per wave, 20 µs waves) | +6.6..7.6% | +0.5..2.7% | +1.5..2.4% |
 | `combine_norm` + down GEMM (`_mb`, 3 events per stage) | +5.2..6.9% | +0.7..2.5% | −0.1..+0.7% |
+
+After the review fixes, every 7th block (three runs each): `combine_norm` +1.0..2.8%,
+`combine_norm` + down GEMM −0.7..+1.5%.
 
 The events also change the generated code: about +0.5% even when no block stores. Use sampling
 (8 to 32) for kernels with many short waves, and report the overhead with every trace. A full

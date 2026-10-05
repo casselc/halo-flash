@@ -410,7 +410,7 @@ int main(int argc, char** argv) {
   }
   if (argc > 4 && std::string(argv[1]) == "trace") {
     // Span traces (src/kernels/span_trace.h) of the HC mixer's kernels at prefill shape:
-    //   halo_gemm_bench trace CORE_TRACE_HSACO CASE OUT.bin [SAMPLE]   CASE: control | combine | combine+mb
+    //   halo_gemm_bench trace CORE_TRACE_HSACO CASE OUT.bin [SAMPLE [OFFSET]]   CASE: control | combine | combine+mb
     //   SAMPLE: only every SAMPLE-th block records (default 1: all)
     // Runs the case warm (5 runs), resets the record count, runs it once, writes the records for
     // tools/span_report.py. Then times the case with the plain and the traced code object (20 runs each,
@@ -427,6 +427,7 @@ int main(int argc, char** argv) {
     }
     const std::string which = argv[3];
     const std::uint32_t sample = argc > 5 ? static_cast<std::uint32_t>(std::atoi(argv[5])) : 1;  // trace every Nth block
+    const std::uint32_t offset = argc > 6 ? static_cast<std::uint32_t>(std::atoi(argv[6])) : 0;  // ... starting here
     auto dt = rt::Device::Create(rt::Backend::kHip, &e), dp = rt::Device::Create(rt::Backend::kHip, &e);
     if (!dt || !dp || !dt->LoadModule(traced, &e) || !dp->LoadModule(kernels::CoreHsaco(), &e))
       return std::printf("%s\n", e.c_str()), 1;
@@ -477,7 +478,8 @@ int main(int argc, char** argv) {
       return c;
     };
     Case ct = setup(dt.get()), cp = setup(dp.get());
-    if (!dt->WriteGlobal("halo_span_sample", &sample, 4, &e)) return std::printf("%s\n", e.c_str()), 1;
+    if (!dt->WriteGlobal("halo_span_sample", &sample, 4, &e) || !dt->WriteGlobal("halo_span_offset", &offset, 4, &e))
+      return std::printf("%s\n", e.c_str()), 1;
     const auto run = [&](Case& c) {
       const rt::Arg null = rt::Arg::Val<std::uint64_t>(0);
       auto& b = c.b;

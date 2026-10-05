@@ -3262,7 +3262,7 @@ extern "C" __global__ void __launch_bounds__(256)
   __shared__ float scratch[32];
   const std::size_t v = blockIdx.x, t = v / hc, row = v * h;
   const std::uint32_t st = static_cast<std::uint32_t>(v % hc);
-  HALO_SPAN_BEGIN(kSpanCombineNorm, 8);
+  HALO_SPAN_BEGIN(kSpanCombineNorm, 8);  // 6 events + an anchor
   const float a = 2.0f * Sigmoid(inject[t * hc + st] / static_cast<float>(hc));
   const float* w = w_all + static_cast<std::size_t>(st) * h;
   // All of a thread's loads are issued before any is used. Combined with the
@@ -6164,7 +6164,7 @@ extern "C" __global__ void __launch_bounds__(256)
 // Events 4 and 5 bracket the loop again with the realtime clock as well: the cycle-derived and the
 // realtime durations of 4 -> 5 must agree (tools/span_report.py --control).
 extern "C" __global__ void halo_span_control(float* out, std::uint32_t iters) {
-  HALO_SPAN_BEGIN(kSpanControl, 8);
+  HALO_SPAN_BEGIN(kSpanControl, 10);
   __builtin_amdgcn_s_sleep(10);
   HALO_SPAN(1);
   float a = threadIdx.x;
@@ -6175,6 +6175,13 @@ extern "C" __global__ void halo_span_control(float* out, std::uint32_t iters) {
   HALO_SPAN_RT(4);
   for (std::uint32_t i = 0; i < iters; ++i) a = a * 1.0001f + 0.5f;
   HALO_SPAN_RT(5);
+  // A stall: wave 0 waits at the barrier while the others run the loop. Its 6 -> 7 is time parked at
+  // s_barrier; the cycle counter must keep counting through it (realtime vs cycles agree).
+  HALO_SPAN_RT(6);
+  if (threadIdx.x >= 32)
+    for (std::uint32_t i = 0; i < iters; ++i) a = a * 1.0001f + 0.5f;
+  __syncthreads();
+  HALO_SPAN_RT(7);
   if (a == 12345.f) out[0] = a;
 }
 #endif

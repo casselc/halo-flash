@@ -33,7 +33,7 @@ enum HaloSpanTag : std::uint8_t {
 #ifdef HALO_TRACE
 
 struct HaloSpan {
-  std::uint32_t realtime;  // 100 MHz; event 0 of wave 0 of every 64th block only (an anchor), else 0
+  std::uint32_t realtime;  // 100 MHz; anchor records (event 255) and HALO_SPAN_RT only, else 0
   std::uint32_t cycles;    // SHADER_CYCLES in bits 0-19; where the wave ran in bits 20-31 (see below)
   std::uint32_t block;     // linear block index
   std::uint8_t wave, event, tag, valid;
@@ -50,6 +50,7 @@ __device__ HaloSpan halo_spans[kHaloSpanCap];
 // Blocks with block % halo_span_sample == 0 record (host-set, default every block); the others run the
 // same code without storing, so sampling lowers the overhead the traced blocks see from their neighbours.
 __device__ std::uint32_t halo_span_sample = 1;
+__device__ std::uint32_t halo_span_offset = 0;  // records blocks with block % sample == offset
 
 struct HaloSpanState {
   std::uint32_t base, n, max, hw;
@@ -57,8 +58,9 @@ struct HaloSpanState {
   std::uint8_t wave, tag;
 };
 
-__device__ inline void HaloSpanWrite(HaloSpanState& s, std::uint32_t event, std::uint32_t realtime = 0) {
-  const std::uint32_t cy = static_cast<std::uint32_t>(clock64()) & 0xFFFFFu;
+constexpr std::uint32_t kHaloSpanAnchor = 255;  // event id of an anchor record (realtime + cycles read together)
+
+__device__ inline void HaloSpanStore(HaloSpanState& s, std::uint32_t event, std::uint32_t realtime, std::uint32_t cy) {
   if (s.n < s.max && (threadIdx.x % 32) == 0) {
     // Stored through inline asm: the compiler's wait insertion does not track it, so a barrier's release
     // fence (s_waitcnt_vscnt 0 before s_barrier) does not wait for trace records to reach memory. With a
@@ -71,7 +73,17 @@ __device__ inline void HaloSpanWrite(HaloSpanState& s, std::uint32_t event, std:
   ++s.n;
 }
 
+__device__ inline void HaloSpanWrite(HaloSpanState& s, std::uint32_t event, std::uint32_t realtime = 0) {
+  HaloSpanStore(s, event, realtime, static_cast<std::uint32_t>(clock64()) & 0xFFFFFu);
+}
+
 __device__ inline HaloSpanState HaloSpanBegin(std::uint32_t tag, std::uint32_t max_events) {
+  // The start stamp comes first: the slot and sampling arithmetic below loads globals (a memory round trip,
+  // ~3-4 us under a saturated DRAM queue), which made wave 0, the one that also checks for an anchor, start late.
+  const std::uint32_t cy0 = static_cast<std::uint32_t>(clock64()) & 0xFFFFFu;
+  // Read in uniform control flow so they are scalar loads (inside the lane-0 branch they became vector loads
+  // waited on at once: ~1 us per wave).
+  const std::uint32_t sample = halo_span_sample, offset = halo_span_offset;
   HaloSpanState s;
   const std::uint32_t tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
   const std::uint32_t wpb = (blockDim.x * blockDim.y * blockDim.z + 31) / 32;
@@ -81,22 +93,26 @@ __device__ inline HaloSpanState HaloSpanBegin(std::uint32_t tag, std::uint32_t m
   s.n = 0;
   const std::uint64_t slot = (std::uint64_t{s.block} * wpb + s.wave) * max_events;
   s.base = (tag % 4) * kHaloSpanRegion + static_cast<std::uint32_t>(slot);
-  s.max = slot + max_events <= kHaloSpanRegion && s.block % halo_span_sample == 0 ? max_events : 0;
+  s.max = slot + max_events <= kHaloSpanRegion && s.block % sample == offset ? max_events : 0;
   // HW_ID1 (gfx11): SIMD_ID 9:8, WGP_ID 13:10, SA_ID 16, SE_ID 20:18 -> bits 20-31 as
   // SIMD 2 bits, WGP 4, SA 1, SE 3.
   std::uint32_t hw;
   asm volatile("s_getreg_b32 %0, hwreg(HW_REG_HW_ID1)" : "=s"(hw));
   s.hw = (((hw >> 8) & 3u) | (((hw >> 10) & 15u) << 2) | (((hw >> 16) & 1u) << 6) | (((hw >> 18) & 7u) << 7)) << 20;
-  // SHADER_CYCLES is one counter across the GPU (anchors agree to ~100 cycles), so only every 64th block
-  // reads the realtime clock (a ~0.6 us message): enough anchors to unwrap the 20-bit cycles.
-  HaloSpanWrite(s, 0,
-                s.wave == 0 && s.block % (64 * halo_span_sample) == 0 ? static_cast<std::uint32_t>(wall_clock64()) : 0u);
+  HaloSpanStore(s, 0, 0, cy0);
+  // SHADER_CYCLES is one counter across the GPU (anchors agree to ~100 cycles), so only wave 0 of every 64th
+  // traced block reads the realtime clock (a ~0.6 us message) into an anchor record, with the cycles read
+  // right after it: enough anchors to unwrap the 20-bit cycles and place every wave.
+  if (s.wave == 0 && s.max && s.block % (64 * sample) == offset) {
+    const std::uint32_t rt = static_cast<std::uint32_t>(wall_clock64());
+    HaloSpanStore(s, kHaloSpanAnchor, rt, static_cast<std::uint32_t>(clock64()) & 0xFFFFFu);
+  }
   return s;
 }
 
 #define HALO_SPAN_BEGIN(tag, max_events) HaloSpanState halo_span_ = HaloSpanBegin((tag), (max_events))
 #define HALO_SPAN(event) HaloSpanWrite(halo_span_, (event))
-// Also records the realtime clock (a ~0.6 us message): for checking cycle-derived times.
+// Also records the realtime clock (a ~0.6 us message), read just before the cycles: for checking times.
 #define HALO_SPAN_RT(event) HaloSpanWrite(halo_span_, (event), static_cast<std::uint32_t>(wall_clock64()))
 
 #else
