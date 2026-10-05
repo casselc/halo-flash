@@ -598,6 +598,23 @@ tiles re-read xh once per row tile (5x, ~210 MB), and the cost grew with the spl
 library's split without its tile economics does not work; next is a microbenchmark study of
 `_m` tile shapes with a trace, not more in-engine guesses.
 
+**4g. Bytes audit (2026-10-04).** Per 2048-token prefill, analytic from tensor shapes. rocprofv3
+7.2.3's FETCH_SIZE/WRITE_SIZE read 0 for every prefill dispatch (with or without graphs) while
+counting the load-time repack, so they could not be used. Writes are weighted like reads (4f),
+at ~200 GB/s.
+
+| Area | Traffic | Cost | Avoidable | Potential |
+|---|---:|---:|---|---:|
+| Routed expert weights (all 512 experts stream every chunk) | ~75 GB | ~375 ms | none at T = 2048; amortized only by larger chunks | - |
+| Mixers (96 half-layers): res r/w, out, xh, mix re-read, mixed | ~37 GB | ~185 ms | xh round trip, 84 MB per call | ~40 ms (kernel A broke even) |
+| DeltaNet (36): qkv 84, conv r/w 168, recurrence 84 + 50, z 50 + 50, gdn 50, xh 25 + 25, out 21 MB per layer | ~24 GB | ~120 ms | qkv, conv, z, gdn stored fp16: ~270 MB per layer | **~45-50 ms** |
+| Expert outputs `yp` fp16 write + combine read, 210 MB per layer | ~10 GB | ~50 ms | fused accumulation | ~40 ms, unproven |
+| Attention (12): qg 100, split, norms, RoPE, ctx, f16 | ~9 GB | ~45 ms | epilogue fusion | ~30 ms |
+
+Order: DeltaNet fp16 intermediates first (mechanical; the quality gate decides), then the
+attention epilogues. Halogen's 32K-token chunks amortize the ~75 GB of expert weights over 16x
+the tokens; for long prompts, the chunk size is the lever (memory, not code).
+
 **4f. GEMM-core latency study: the in-engine gap is write-back, not the GEMM** (2026-10-04,
 `halo_gemm_bench study`, pinned). `_m` on its real shape (320 x 10240, 2048 tokens):
 
