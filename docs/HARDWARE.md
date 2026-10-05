@@ -59,6 +59,10 @@ LPDDR5X-8000 256-bit unified memory, 32 MB MALL. ROCm 7.2.3.
 - Inside the MALL the order does not matter: the same sweep over a 15 MB footprint reads ~800 GB/s
   for both orders (64 B segments and up; ~400-470 at 32 B). The collapse above is DRAM row (page)
   locality, not cache or translation. MALL-resident working sets (<= ~32 MB) stream at ~800 GB/s.
+- The hyper-connection residual's traffic (`halo_hwprobe stream`, 4 x 2048 x 2560 fp32 = 80 MiB):
+  read 243 GB/s (0.345 ms), in-place `res += 1` 213 GB/s (0.79 ms), the combine's pattern
+  (res += out in place, out shared by 4 streams, plus a half-size fp16 copy: 220 MB) 204 GB/s
+  (1.13 ms). The engine's combine + norm kernel moves the same bytes in 1.66 ms.
 - Dependent-load latency by footprint: 16 KB 39 ns, 256 KB 62, 2 MB 92, 8 MB 134, 24 MB 180,
   64 MB 256, 256 MB 295 ns (L1 / L2 / MALL / DRAM).
 - Writes are paid by the next kernels (their write-back drains during them); a microbenchmark's
@@ -75,6 +79,11 @@ the N = 20 minus N = 10 difference must match exactly. Results (7/7 pass):
 - **`GL2C_EA_RDREQ_*` bytes read half the true traffic** (x0.5 for every size from 1 MB to 256 MB):
   multiply by 2. Every L2-to-fabric request is a full 128-byte line: request-size histograms do not
   show segment sizes, and scattered 32-byte reads move 4x their useful bytes.
+- **`GL2C_EA_WRREQ_64B` counts writes exactly (x1, not x2)**: 64 MB written reads 1,024,000 x 64 B
+  (true 1,048,576), 4 MB reads 40,960 (65,536): the difference, ~1.5 MB, is still dirty in L2 when
+  the kernel ends and is written back later. Writing half of each 128-byte line counts only the
+  written halves (no write amplification for 64-byte pieces). `GL2C_MC_WRREQ` is half of it.
+  `GL2C_EA_WRREQ` reads 0.
 - **L2 is invalidated between kernel launches**: re-reading 1 MB in the next launch misses entirely
   (`GL2C_HIT` ~0), while re-reading it within one launch from other CUs hits in L2 (one pass of
   fabric traffic). Data passes between kernels through the MALL (~800 GB/s) or DRAM, never L2;

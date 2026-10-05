@@ -24,6 +24,7 @@ PASSES = [
     ["GL2C_EA_RDREQ_32B", "GL2C_EA_RDREQ_64B", "GL2C_EA_RDREQ_96B", "GL2C_EA_RDREQ_128B"],
     ["GL2C_MC_RDREQ", "GL2C_HIT", "GL2C_MISS", "GL2C_EA_WRREQ_64B"],
     ["SQ_INSTS", "SQ_INSTS_WAVE32", "SQ_INSTS_WAVE32_VALU"],
+    ["GL2C_EA_WRREQ", "GL2C_EA_WRREQ_64B", "GL2C_MC_WRREQ"],
 ]
 WAVES = 80 * 2  # 80 blocks x 64 threads
 
@@ -106,6 +107,13 @@ def main():
     print("  EA read bytes / true bytes (useful bytes for the scatter): " + ", ".join(
         f"{sum(k[10 + j].get(f'GL2C_EA_RDREQ_{s}B', 0) * s for s in (32, 64, 96, 128)) / 2**20 / t:.2f}"
         for j, t in enumerate(true)))
+    for j, (lab, mb) in enumerate([("write 64 MB", 64), ("write 4 MB", 4), ("write half of each line, 64 MB", 32),
+                                   ("write 32 MB, 4 B per lane", 32), ("write 32 MB, 2 B per lane", 32),
+                                   ("read-modify-write 32 MB in place", 32)]):
+        x = k[18 + j]
+        print(f"  {lab:32} EA_WRREQ {x.get('GL2C_EA_WRREQ', 0):10.0f}  EA_WRREQ_64B {x.get('GL2C_EA_WRREQ_64B', 0):10.0f}"
+              f"  MC_WRREQ {x.get('GL2C_MC_WRREQ', 0):10.0f}  (true {mb} MB = {mb * 2**20 / 64:.0f} x 64 B)"
+              f"  EA read {sum(x.get(f'GL2C_EA_RDREQ_{s}B', 0) * s for s in (32, 64, 96, 128)) / 2**20:6.1f} MB")
     print(f"\n{len(rows) - fails}/{len(rows)} checks passed")
     sys.exit(1 if fails else 0)
 

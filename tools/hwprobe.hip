@@ -1,6 +1,7 @@
 // halo_hwprobe: measured facts about the GPU (gfx1151 Strix Halo) that the
 // performance work relies on. Standalone HIP; each subcommand prints one table.
 //
+//   halo_hwprobe stream          the hyper-connection residual's DRAM traffic patterns
 //   halo_hwprobe clock           shader clock (in-kernel counters) vs load
 //   halo_hwprobe dram [MB]       bandwidth vs segment size, dispatch order, read/write
 //   halo_hwprobe wmma            f16 / bf16 / iu8 WMMA rate, chain latency, VALU overlap
@@ -147,6 +148,76 @@ void Dram(std::uint32_t mb) {
   }
   CHECK(hipFree(a));
   CHECK(hipFree(b));
+}
+
+// ---- stream: the hyper-connection residual's traffic ---------------------------
+// res is 4 streams x T x h fp32 (84 MB at T = 2048, h = 2560), past the MALL.
+// Modes, grid-stride with 16-byte accesses: 0 read res; 1 res += 1 in place;
+// 2 the combine's pattern: res[t][s] += out[t] (out shared by the 4 streams)
+// in place, plus a half-size fp16 copy written.
+template <int MODE>
+__global__ void __launch_bounds__(256) StreamKernel(float4* res, const float4* out, uint2* y16, std::size_t n_f4,
+                                                    std::uint32_t h_f4, float* sink) {
+  float acc = 0.0f;
+  for (std::size_t i = blockIdx.x * 256ull + threadIdx.x; i < n_f4; i += gridDim.x * 256ull) {
+    float4 v = res[i];
+    if constexpr (MODE == 0) {
+      acc += v.x;
+    } else {
+      if constexpr (MODE == 2) {
+        const float4 o = out[(i / (4ull * h_f4)) * h_f4 + i % h_f4];
+        v.x += o.x, v.y += o.y, v.z += o.z, v.w += o.w;
+        const _Float16 hv[4] = {_Float16(v.x), _Float16(v.y), _Float16(v.z), _Float16(v.w)};
+        y16[i] = *reinterpret_cast<const uint2*>(hv);
+      } else {
+        v.x += 1.0f;
+      }
+      res[i] = v;
+    }
+  }
+  if (acc == 12345.f) sink[0] = acc;
+}
+
+void Stream() {
+  const std::uint32_t T = 2048, h = 2560;
+  const std::size_t n = std::size_t{4} * T * h;  // floats
+  float4 *res, *out;
+  uint2* y16;
+  float* sink;
+  CHECK(hipMalloc(&res, n * 4));
+  CHECK(hipMalloc(&out, n));
+  CHECK(hipMalloc(&y16, n * 2));
+  CHECK(hipMalloc(&sink, 64));
+  CHECK(hipMemset(res, 0, n * 4));
+  CHECK(hipMemset(out, 0, n));
+  hipEvent_t e0, e1;
+  CHECK(hipEventCreate(&e0));
+  CHECK(hipEventCreate(&e1));
+  std::printf("stream: residual 4 x %u x %u fp32 (%zu MB)\n", T, h, (n * 4) >> 20);
+  const char* names[] = {"read res", "res += 1 in place", "combine: res += out, fp16 copy"};
+  const double moved[] = {n * 4.0, n * 8.0, n * 8.0 + n + n * 2.0};
+  for (int mode = 0; mode < 3; ++mode) {
+    for (const std::uint32_t blocks : {1280u, 8192u}) {
+      const auto run = [&] {
+        if (mode == 0) hipLaunchKernelGGL(StreamKernel<0>, blocks, 256, 0, 0, res, out, y16, n / 4, h / 4, sink);
+        else if (mode == 1) hipLaunchKernelGGL(StreamKernel<1>, blocks, 256, 0, 0, res, out, y16, n / 4, h / 4, sink);
+        else hipLaunchKernelGGL(StreamKernel<2>, blocks, 256, 0, 0, res, out, y16, n / 4, h / 4, sink);
+      };
+      for (int w = 0; w < 3; ++w) run();
+      CHECK(hipDeviceSynchronize());
+      CHECK(hipEventRecord(e0));
+      for (int r = 0; r < 10; ++r) run();
+      CHECK(hipEventRecord(e1));
+      CHECK(hipEventSynchronize(e1));
+      float ms;
+      CHECK(hipEventElapsedTime(&ms, e0, e1));
+      std::printf("  %-32s %5u blocks  %7.3f ms  %6.1f GB/s (bytes moved %zu MB)\n", names[mode], blocks, ms / 10,
+                  moved[mode] / (ms / 10 * 1e-3) / 1e9, static_cast<std::size_t>(moved[mode]) >> 20);
+    }
+  }
+  CHECK(hipFree(res));
+  CHECK(hipFree(out));
+  CHECK(hipFree(y16));
 }
 
 // ---- wmma --------------------------------------------------------------------
@@ -564,6 +635,22 @@ __global__ void __launch_bounds__(256) KnownReuseKernel(const float4* g, float* 
   if (acc == 12345.f) out[0] = acc;
 }
 
+// Exactly n_f4 float4s written contiguously; with `half` only the first 64 bytes of every 128-byte line.
+__global__ void __launch_bounds__(256) KnownWriteKernel(float4* g, std::size_t n_f4, int half) {
+  for (std::size_t i = blockIdx.x * 256ull + threadIdx.x; i < n_f4; i += gridDim.x * 256ull)
+    if (!half || i % 8 < 4) g[i] = make_float4(1.0f, 2.0f, 3.0f, float(i));
+}
+
+// 32 MB written as one 4-byte or 2-byte value per lane (a wave stores 128 or 64 contiguous bytes), and
+// 32 MB read, modified and written back in place (the residual update's pattern).
+template <typename E>
+__global__ void __launch_bounds__(256) KnownNarrowWriteKernel(E* g, std::size_t n) {
+  for (std::size_t i = blockIdx.x * 256ull + threadIdx.x; i < n; i += gridDim.x * 256ull) g[i] = E(i & 7);
+}
+__global__ void __launch_bounds__(256) KnownRmwKernel(float* g, std::size_t n) {
+  for (std::size_t i = blockIdx.x * 256ull + threadIdx.x; i < n; i += gridDim.x * 256ull) g[i] = g[i] * 0.5f + 1.0f;
+}
+
 void Counters() {
   // Launch layout: 80 blocks x 64 threads = 160 waves for the instruction kernels.
   float *g, *out;
@@ -601,6 +688,14 @@ void Counters() {
   hipLaunchKernelGGL(KnownReadKernel, 160, 256, 0, 0, reinterpret_cast<const float4*>(g), (1ull << 20) / 16, out); sync();
   hipLaunchKernelGGL(KnownReadKernel, 160, 256, 0, 0, reinterpret_cast<const float4*>(g), (1ull << 20) / 16, out); sync();
   hipLaunchKernelGGL(KnownReuseKernel, 160, 256, 0, 0, reinterpret_cast<const float4*>(g) + (8ull << 20) / 16, out); sync();
+  // Writes: 64 MB, 4 MB, and 64 MB of lines of which only half (64 B of each 128) is written.
+  hipLaunchKernelGGL(KnownWriteKernel, 1280, 256, 0, 0, reinterpret_cast<float4*>(g) + (cold / 16), cold / 16, 0); sync();
+  hipLaunchKernelGGL(KnownWriteKernel, 160, 256, 0, 0, reinterpret_cast<float4*>(g) + (cold / 16), warm / 16, 0); sync();
+  hipLaunchKernelGGL(KnownWriteKernel, 1280, 256, 0, 0, reinterpret_cast<float4*>(g) + (cold / 16), cold / 16, 1); sync();
+  const std::size_t mid = 32ull << 20;
+  hipLaunchKernelGGL(KnownNarrowWriteKernel<float>, 1280, 256, 0, 0, reinterpret_cast<float*>(g) + (cold / 4), mid / 4); sync();
+  hipLaunchKernelGGL(KnownNarrowWriteKernel<_Float16>, 1280, 256, 0, 0, reinterpret_cast<_Float16*>(g) + (cold / 2), mid / 2); sync();
+  hipLaunchKernelGGL(KnownRmwKernel, 1280, 256, 0, 0, reinterpret_cast<float*>(g) + (cold / 4), mid / 4); sync();
   std::printf("counters: known-answer kernels launched (run under rocprofv3; see tools/counter_check.py)\n");
   CHECK(hipFree(g));
   CHECK(hipFree(out));
@@ -617,6 +712,7 @@ int main(int argc, char** argv) {
   else if (cmd == "latency") Latency();
   else if (cmd == "sync") Sync();
   else if (cmd == "counters") Counters();
+  else if (cmd == "stream") Stream();
   else if (cmd == "counters-repeat") {  // the same known kernel N times: do counters hold up over many dispatches?
     const int n = argc > 2 ? std::atoi(argv[2]) : 2000;
     float *g, *out;
