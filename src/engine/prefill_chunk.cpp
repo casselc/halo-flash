@@ -752,7 +752,9 @@ bool FlashNextGpu::SharedExpertChunk(const model::LayerWeights& l, std::uint32_t
                 error);
 }
 
-bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error) {
+bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error,
+                                const std::vector<float>* pre_emb,
+                                const std::function<void(const model::NgramHistory&)>& after_prep) {
   const auto& c = w_.config;
   const auto T = static_cast<std::uint32_t>(tokens.size());
   if (T == 0) return true;
@@ -779,7 +781,9 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
     model::HashNgramRows(c, history, tokens, rows);
     t_hash = std::chrono::steady_clock::now();
     const std::span<float> emb(reinterpret_cast<float*>(ck_host_.data()), std::size_t{T} * c.PleEmbeddingDim());
-    if (!ngram_ || !ngram_->Read(rows, emb)) {
+    if (pre_emb && pre_emb->size() == emb.size()) {
+      std::memcpy(emb.data(), pre_emb->data(), emb.size_bytes());
+    } else if (!ngram_ || !ngram_->Read(rows, emb)) {
       if (error) *error = "n-gram table read failed";
       return false;
     }
@@ -799,6 +803,7 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
   const auto t_prep = std::chrono::steady_clock::now();
   if (!dev_.Upload(ck_.host, 0, ck_host_.data(), ck_.params_offset + std::size_t{T} * 64, error)) return false;
   const auto t_upload = std::chrono::steady_clock::now();
+  if (after_prep) after_prep(history);
 
   const std::uint32_t H = c.hidden_size, D = c.HcDim();
   const auto& emb = tensors_.at(w_.token_embd.data);

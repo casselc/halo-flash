@@ -1,3 +1,4 @@
+#include <future>
 #include "engine/flash_next_gpu.hpp"
 
 #include <algorithm>
@@ -919,9 +920,32 @@ bool FlashNextGpu::Prefill(std::span<const std::int32_t> tokens, std::span<float
   }
   if (!AllocChunk(error)) return false;
   const std::size_t chunk = std::max<std::uint32_t>(1, std::min(prefill_chunk_, ck_.cap));
+  // The next chunk's n-gram rows are read on a host thread while this chunk
+  // runs on the device. One read is in flight at a time: the prefetch starts
+  // after this chunk's own read, and the next chunk then skips its read.
+  const auto& c = w_.config;
+  std::future<std::vector<float>> next;
   for (std::size_t i = 0; i < tokens.size(); i += chunk) {
     const std::size_t n = std::min(chunk, tokens.size() - i);
-    if (!PrefillChunk(tokens.subspan(i, n), i + n == tokens.size() ? logits : std::span<float>{}, error)) return false;
+    std::vector<float> pre;
+    if (next.valid()) pre = next.get();  // empty when the prefetch failed: the chunk reads itself
+    const std::size_t i2 = i + n, n2 = std::min(chunk, tokens.size() - std::min(i2, tokens.size()));
+    const auto prefetch = [&](const model::NgramHistory& after) {
+      if (!prefill_ngram_prefetch_ || n2 == 0 || c.ple_layer < 0 || !ngram_) return;
+      next = std::async(std::launch::async, [this, &c, hist = model::NgramHistory(after), toks = tokens.subspan(i2, n2)]() mutable {
+        std::vector<std::uint32_t> rows(toks.size() * c.ple_heads);
+        model::HashNgramRows(c, hist, toks, rows);
+        std::vector<float> emb(toks.size() * c.PleEmbeddingDim());
+        if (!ngram_->Read(rows, emb)) emb.clear();
+        return emb;
+      });
+    };
+    const bool ok = PrefillChunk(tokens.subspan(i, n), i + n == tokens.size() ? logits : std::span<float>{}, error,
+                                 pre.empty() ? nullptr : &pre, prefetch);
+    if (!ok) {
+      if (next.valid()) next.wait();  // never leave a read running past the call
+      return false;
+    }
   }
   return true;
 }

@@ -9,6 +9,7 @@
 // reference's tie rules (equal scores keep the lower index), so a step
 // needs no host round trip except the n-gram rows and the final logits.
 
+#include <functional>
 #include <chrono>
 #include <cstdint>
 #include <initializer_list>
@@ -99,6 +100,9 @@ class FlashNextGpu {
   // combine_norm skips the fp32 xn the mixer's mix epilogue would re-read;
   // the epilogue rebuilds it from res (same arithmetic, bit-identical).
   static inline bool prefill_mix_rebuild_ = true;
+  /// Read the next prefill chunk's n-gram rows on a host thread while the
+  /// current chunk runs on the device.
+  static inline bool prefill_ngram_prefetch_ = true;
   /// The chunked QSA attention reads an fp16 copy of the K/V cache (same
   /// results; ~24.6 KB more per cached token).
   static inline bool prefill_kv16_ = true;
@@ -245,7 +249,13 @@ class FlashNextGpu {
   std::vector<std::uint8_t> ck_host_;
   bool ChunkSupported() const;
   bool AllocChunk(std::string* error);
-  bool PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error);
+  // pre_emb: this chunk's n-gram rows already read (by the previous chunk's
+  // prefetch); after_prep(history) runs once the chunk's host data is
+  // uploaded, with the n-gram history after its tokens (for the next
+  // chunk's prefetch, overlapping this chunk's device work).
+  bool PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error,
+                    const std::vector<float>* pre_emb = nullptr,
+                    const std::function<void(const model::NgramHistory&)>& after_prep = {});
   /// y[T][rows] = W x[T][cols]: int8 GEMM for repacked Q8 (x quantized here),
   /// BF16 / F32 GEMMs, else the decode GEMV per token.
   /// x16: x already converted to fp16 rows (shared by several GEMMs), or null.
