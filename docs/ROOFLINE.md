@@ -625,7 +625,11 @@ prefetch registers, so both K and V fit in flight. The cost is ~24.6 KB more per
 bit-identical results, ~24.6 KB more memory per cached token. It also fixed out-of-bounds K/V
 reads in the union kernels (tail-block slots past the causal end).
 
-Then the serial n-gram read per chunk.
+**N-gram prefetch (21a0490):** the next chunk's rows are read during this chunk's device work.
+Host prep 115 -> 1.3 ms on later chunks; 8K prefill 8.40 -> 8.08 s.
+
+**State (2026-10-04, default clock, n-gram from /data, not resident):** pp2048 1081 tok/s; an
+8K-token prefill 1014 tok/s (from ~632 before the long-prompt work).
 
 **4h. Chunk size and long prompts (2026-10-04, pinned, pseudo-random tokens, n-gram not
 resident).** For an 8192-token prompt:
