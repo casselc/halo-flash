@@ -4806,18 +4806,39 @@ extern "C" __global__ void __launch_bounds__(256)
   const std::uint32_t n = ucount[blockIdx.y] * ratio;
   // P . V work: wave owns dim tiles 2 * (wave % 8) .. + 1 for every row tile.
   halo_v8f acc[3][2] = {};
-  for (std::uint32_t c0 = 0; c0 < n; c0 += KC) {
-    __syncthreads();  // previous chunk's Vs / Ps reads done
-    for (std::uint32_t i = tid; i < KC * HD / 4; i += blockDim.x) {
-      const std::uint32_t j = i / (HD / 4), d = (i % (HD / 4)) * 4;
-      float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-      if (c0 + j < n) v = *reinterpret_cast<const float4*>(vc + (static_cast<std::size_t>(pos_of(c0 + j)) * num_kv_heads + g) * HD + d);
-      _Float16* dst = Vs + j * VR + d;
-      dst[0] = static_cast<_Float16>(v.x);
-      dst[1] = static_cast<_Float16>(v.y);
-      dst[2] = static_cast<_Float16>(v.z);
-      dst[3] = static_cast<_Float16>(v.w);
+  // Only LDS is shared between the waves: LDS-only barriers keep the next
+  // chunk's V rows (prefetched into registers, unconditionally: clamped to
+  // the last key) in flight while this chunk is scored and multiplied (a
+  // trace of the synchronous version: 51% of cycles waiting on gathers).
+  const auto barrier = [] {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+  };
+  constexpr std::uint32_t VP = KC * HD / 4 / 256;  // float4 of V per thread per chunk
+  float4 rv[VP];
+  const auto load_v = [&](std::uint32_t c) {
+#pragma unroll
+    for (std::uint32_t p = 0; p < VP; ++p) {
+      const std::uint32_t i = tid + p * 256, j = i / (HD / 4), d = (i % (HD / 4)) * 4;
+      rv[p] = *reinterpret_cast<const float4*>(
+          vc + (static_cast<std::size_t>(pos_of(min(c + j, n - 1))) * num_kv_heads + g) * HD + d);
     }
+  };
+  if (n > 0) load_v(0);
+  for (std::uint32_t c0 = 0; c0 < n; c0 += KC) {
+    barrier();  // previous chunk's Vs / Ps reads done
+#pragma unroll
+    for (std::uint32_t p = 0; p < VP; ++p) {
+      const std::uint32_t i = tid + p * 256, j = i / (HD / 4), d = (i % (HD / 4)) * 4;
+      const bool live = c0 + j < n;
+      _Float16* dst = Vs + j * VR + d;
+      dst[0] = static_cast<_Float16>(live ? rv[p].x : 0.0f);
+      dst[1] = static_cast<_Float16>(live ? rv[p].y : 0.0f);
+      dst[2] = static_cast<_Float16>(live ? rv[p].z : 0.0f);
+      dst[3] = static_cast<_Float16>(live ? rv[p].w : 0.0f);
+    }
+    load_v(min(c0 + KC, n - 1));  // next chunk, in flight during the work below
     // Scores: wave -> (row tile wave / 2, key tile wave % 2), up to 6 waves.
     const std::uint32_t rt = wave / 2, kt = wave % 2;
     if (rt < rtiles) {
@@ -4846,7 +4867,7 @@ extern "C" __global__ void __launch_bounds__(256)
         Ss[r * KC + kt * 16 + lane % 16] = ok ? s[j] * scale : -INFINITY;
       }
     }
-    __syncthreads();
+    barrier();
     // Online softmax: 4 threads per row (192 of 256), 8 keys each.
     if (tid < MR * 4) {
       const std::uint32_t row = tid / 4, part = tid % 4;
@@ -4869,7 +4890,7 @@ extern "C" __global__ void __launch_bounds__(256)
         mrow[row] = m_new;
       }
     }
-    __syncthreads();
+    barrier();
 #pragma unroll
     for (std::uint32_t r = 0; r < 3; ++r) {  // fully unrolled: acc stays in registers
       if (r >= rtiles) break;
