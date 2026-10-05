@@ -867,3 +867,10 @@ wave cycles in `vmcnt(0)`, but at 12 waves/SIMD other waves covered most of it; 
 VALU-bound (40%) on dequant. A wave-level stall share says little at high occupancy.
 The int8 GEMM template is staging-limited (~20 of 56 TOPS); W8A8 needs a better int8 kernel
 first (gufo's runs the same shape in 0.50 ms in-engine).
+| Flash-style dense attention `halo_attention_fa` (0cdb694) | -25..-45 | **-31.8** (attention 86.6 -> 47.0 ms; gufo 49) | yes |
+
+0647d6b broke every multi-chunk prompt (the deferred n-gram read collided with the next chunk's
+async prefetch, which after_prep starts); fixed in 0cdb694, found by the long quality set. Host
+or control-flow changes to prefill need a multi-chunk run before they are committed.
+First version of the attention kernel: 95 ms, 40% of cycles in `ds_store_b16` (a wave's
+transposed V stores 640 bytes apart); one key per lane fixed it.
