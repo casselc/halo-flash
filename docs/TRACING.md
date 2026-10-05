@@ -105,3 +105,19 @@ trace (every block) distorted the GEMM's barrier waits about 8× (0.46 vs 0.06 �
   - The store phase is 0.25 µs and the barrier 0.06 µs.
   - Prologue 7.7 µs, epilogue 7.6 µs.
   - 32 blocks on 20 WGPs leave some WGPs with one block, some with two.
+
+## Readings in the engine (2026-10-05, T 2048, pinned)
+
+- **Mix GEMM (`mixt`): the epilogue was 89 of a wave's 118 µs.** Batching its residual loads per
+  subtile cut that to 74 (kept: -13.4 ms kernel, -16 ms end to end). What remains fits the rounds
+  model as DRAM-bound. Coalescing the loads to 128 bytes changed nothing (70 µs), which rules out
+  request rate.
+- **MoE down (Q5_1): 4.19 ms a call against a ~2.6-3.0 ms floor for its 629 MB of weights.**
+  - ~640 waves resident (cap 720); waves live 35 µs (p50): math stages 18.6, output stores 8.6
+    (p90 18.9), first-stage loads 6.1. This fits 123 generations × 35 µs ~ 4.35 ms.
+  - ATT on the same dispatch: VALU 30% (dequantization), barriers 21%, memory ~23% (issue stalls on
+    a full memory queue, store stalls, vmcnt), WMMA 3%.
+  - The grid sized for 833 tiles is not a cost: empty blocks take ~2 ns each (`halo_hwprobe empty`).
+- **Tracer bug the MoE trace exposed:** slots were indexed by block, so a 16,660-block grid
+  overflowed the region and every occurrence looked like 285 tiles. Slots now count sampled blocks,
+  and dropped waves are counted and reported.
