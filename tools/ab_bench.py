@@ -11,8 +11,10 @@ both arms' spreads.
 
 Guards: --build runs `cmake --build` first and refuses to measure if it
 fails (a failed build would otherwise leave a stale binary); the GPU clock
-is pinned to profile_peak through the sudoers rule for the measurement and
-always set back to auto; a run starts only if MemAvailable covers its need;
+is pinned for the measurement (manual level, overdrive minimum shader clock
+2900 MHz, top fabric clock: tools/gpu_clock.sh pin) and always set back to
+auto; profile_peak delivered only ~2.5 GHz under load and made prefill ~10%
+slower than auto, the overdrive pin ~0.5% faster with a 1 ms spread; a run starts only if MemAvailable covers its need;
 results are written to --out after every run.
 
 Attribution: unless --no-kernels, each run adds one more rep with
@@ -41,16 +43,27 @@ import time
 # Through the DRM class link, which survives PCI bus renumbering (adding an
 # NVMe moved the GPU from c6:00.0 to c7:00.0). The sudoers rule must name
 # this exact path.
-CLOCK = "/sys/class/drm/card0/device/power_dpm_force_performance_level"
+DEV = "/sys/class/drm/card0/device"
+CLOCK = DEV + "/power_dpm_force_performance_level"
 
 
-def set_clock(level):
+def write_sysfs(path, value):
     try:
-        subprocess.run(["sudo", "-n", "tee", CLOCK], input=level + "\n", text=True, check=True,
+        subprocess.run(["sudo", "-n", "tee", path], input=value + "\n", text=True, check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
+
+
+def set_clock(level):
+    """'pin': manual level, overdrive minimum sclk 2900 MHz, top fclk; 'auto': undo."""
+    if level == "pin":
+        return (write_sysfs(CLOCK, "manual") and write_sysfs(DEV + "/pp_od_clk_voltage", "s 0 2900")
+                and write_sysfs(DEV + "/pp_od_clk_voltage", "c") and write_sysfs(DEV + "/pp_dpm_fclk", "7"))
+    write_sysfs(DEV + "/pp_od_clk_voltage", "r")
+    write_sysfs(DEV + "/pp_od_clk_voltage", "c")
+    return write_sysfs(CLOCK, "auto")
 
 
 def mem_available_gb():
@@ -125,7 +138,7 @@ def main():
     need = args.need_gb if args.need_gb is not None else 90.0 + (30.0 if args.resident else 0.0)
 
     env = dict(os.environ, HALO_PREFILL_TIMING="1")
-    pinned = not args.no_pin and set_clock("profile_peak")
+    pinned = not args.no_pin and set_clock("pin")
     if not args.no_pin and not pinned:
         print(f"warning: could not pin the GPU clock ({CLOCK}); measuring at auto", file=sys.stderr, flush=True)
 
@@ -136,7 +149,7 @@ def main():
 
     signal.signal(signal.SIGINT, restore)
     signal.signal(signal.SIGTERM, restore)
-    results = {"arms": {n: {"command": c, "runs": []} for n, c in arms}, "clock": "profile_peak" if pinned else "auto",
+    results = {"arms": {n: {"command": c, "runs": []} for n, c in arms}, "clock": "od2900" if pinned else "auto",
                "tokens": args.tokens, "reps": args.reps, "resident": args.resident, "started": time.time()}
     try:
         for rnd in range(args.rounds):

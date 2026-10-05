@@ -110,6 +110,14 @@ if(HALO_GPU)
   #   -DHALO_HSACO_COMPILER=<clang> "-DHALO_HSACO_FLAGS=--hip-path=<hip>;--rocm-device-lib-path=<bitcode>"
   set(HALO_HSACO_COMPILER "${HIPCC}" CACHE FILEPATH "Compiler for the GPU kernels (HSACO)")
   set(HALO_HSACO_FLAGS "" CACHE STRING "Extra flags for HALO_HSACO_COMPILER (a CMake list)")
+  # Hardware probes (standalone HIP program, docs/HARDWARE.md).
+  add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/halo_hwprobe
+    COMMAND ${HIPCC} -O3 -std=c++20 --offload-arch=gfx1151 ${CMAKE_CURRENT_SOURCE_DIR}/tools/hwprobe.hip
+            -o ${CMAKE_BINARY_DIR}/halo_hwprobe
+    DEPENDS tools/hwprobe.hip
+    COMMENT "Building halo_hwprobe")
+  add_custom_target(hwprobe ALL DEPENDS ${CMAKE_BINARY_DIR}/halo_hwprobe)
   add_custom_command(
     OUTPUT ${HALO_GEN}/core.hsaco
     COMMAND ${CMAKE_COMMAND} -E make_directory ${HALO_GEN}/kernels
