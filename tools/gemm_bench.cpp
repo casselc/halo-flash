@@ -37,6 +37,44 @@ using namespace halo;
 
 int main(int argc, char** argv) {
   std::string e;
+  if (argc > 1 && std::string(argv[1]) == "gdnskel") {
+    // Structural floor of chunked DeltaNet scans (no math) at one layer's real
+    // shape: 2048 tokens, 48 v-heads, 16 k-heads, conv rows of 10240.
+    auto d = rt::Device::Create(rt::Backend::kHip, &e);
+    if (!d || !d->LoadModule(kernels::CoreHsaco(), &e)) return std::printf("%s\n", e.c_str()), 1;
+    const std::uint32_t T = 2048, heads = 48, kheads = 16, stride = 10240;
+    auto conv = d->Alloc(std::size_t{T} * stride * 4, &e), al = d->Alloc(std::size_t{T} * heads * 4, &e),
+         st = d->Alloc(std::size_t{heads} * 128 * 128 * 4, &e), out = d->Alloc(64, &e);
+    {
+      std::vector<float> f(std::size_t{T} * stride, 0.01f);
+      (void)d->Upload(conv, 0, f.data(), f.size() * 4, &e);
+    }
+    struct V {
+      const char* k;
+      std::uint32_t nc, nt;
+    };
+    const V vs[] = {{"halo_gdnskel_c16_n32", 32, 128},        {"halo_gdnskel_c16_n32_pf", 32, 128},
+                    {"halo_gdnskel_c16_n64_pf", 64, 256},     {"halo_gdnskel_c32_n32", 32, 128},
+                    {"halo_gdnskel_c32_n32_pf", 32, 128},     {"halo_gdnskel_c32_n64_pf_seq", 64, 256},
+                    {"halo_gdnskel_c16_n64_pf_nost", 64, 256}, {"halo_gdnskel_c32_n64_pf_seq_nost", 64, 256},
+                    {"halo_gdnskel_c64_n32_seq", 32, 256},    {"halo_gdnskel_c64_n32_pf_seq", 32, 256}};
+    std::printf("structural floor per layer (2048 tokens, no math); the split kernel takes 8.2 ms in-engine\n");
+    for (const auto& v : vs) {
+      const auto k = d->Kernel(v.k, &e);
+      const rt::Arg a[] = {rt::Arg::Buf(conv), rt::Arg::Buf(conv, 2048ull * 4), rt::Arg::Buf(conv, 4096ull * 4),
+                           rt::Arg::Buf(al), rt::Arg::Buf(st), rt::Arg::Buf(out), rt::Arg::Val(kheads), rt::Arg::Val(T),
+                           rt::Arg::Val(stride), rt::Arg::Val(stride)};
+      const rt::Dim3 grid{128 / v.nc, heads};
+      for (int r = 0; r < 3; ++r) (void)d->Launch(k, grid, {v.nt}, a, &e);
+      (void)d->Synchronize(&e);
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < 10; ++r) (void)d->Launch(k, grid, {v.nt}, a, &e);
+      (void)d->Synchronize(&e);
+      std::printf("%-28s grid %ux%u  %7.3f ms\n", v.k, grid.x, grid.y,
+                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 10);
+    }
+    return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "study") {
     auto d = rt::Device::Create(rt::Backend::kHip, &e);
     if (!d || !d->LoadModule(kernels::CoreHsaco(), &e)) return std::printf("%s\n", e.c_str()), 1;

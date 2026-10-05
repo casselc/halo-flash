@@ -4497,6 +4497,7 @@ extern "C" __global__ void __launch_bounds__(256)
   for (std::uint32_t i = 0; i < 32; ++i) S[(i0 + i) * d] = s[i];
 }
 
+<<<<<<< Updated upstream
 // ---- P4: chunked gated DeltaNet ---------------------------------------------
 //
 // halo_gdn_prefill_split's recurrence per v-head (S key x value, decay
@@ -4905,6 +4906,108 @@ extern "C" __global__ void __launch_bounds__(128)
 #pragma unroll
     for (int j = 0; j < 8; ++j) S[((kh2 * 4 + kt) * 16 + 2 * j + hi) * d + col] = acc[kt][j];
 }
+=======
+// ---- Study: structural floor of a chunked DeltaNet scan ---------------------
+// The loads, LDS staging, barriers and state traffic of a chunked scan with
+// no math: per chunk of C tokens, K and Q (C x 128 fp32) and the block's NC
+// value columns of V into LDS, the block's 128 x NC fp32 state slice read
+// and written once in LDS, NB barriers. PF prefetches the next chunk's K/Q/V
+// into registers during the chunk. A checksum keeps the work live.
+//   grid (128 / NC, heads), block NT
+template <std::uint32_t C, std::uint32_t NC, std::uint32_t NT, std::uint32_t NB, bool PF, bool SEQ, bool ST = true>
+__device__ void GdnSkeleton(const float* q, const float* k, const float* v, const float* alpha, float* state,
+                            float* out, std::uint32_t num_k_heads, std::uint32_t tokens, std::uint32_t qk_stride,
+                            std::uint32_t v_stride) {
+  constexpr std::uint32_t d = 128, KR = d + 4, KP = C * d / 4 / NT, VP = (C * NC + NT - 1) / NT;
+  static_assert(C * d / 4 % NT == 0, "whole float4 per thread");
+  // SEQ: Q is staged into K's buffer once K is used (two more barriers).
+  __shared__ __attribute__((aligned(16))) float ks[C][KR], qx[SEQ ? 1 : C][KR];
+  float(*qs)[KR] = SEQ ? ks : qx;
+  __shared__ float vs[C * NC];
+  __shared__ float st[d * NC];
+  __shared__ float gs[C];
+  const std::uint32_t h = blockIdx.y, heads = gridDim.y, tid = threadIdx.x, kh = h % num_k_heads;
+  float* S = state + static_cast<std::size_t>(h) * d * d + blockIdx.x * NC;
+  for (std::uint32_t x = tid; x < d * NC; x += NT) st[x] = S[(x / NC) * d + x % NC];
+  float4 rk[KP], rq[KP];
+  float rv[VP];
+  const auto load = [&](std::uint32_t t0) {
+    const std::uint32_t n = min(C, tokens - t0);
+#pragma unroll
+    for (std::uint32_t p = 0; p < KP; ++p) {
+      const std::uint32_t x = tid + p * NT, tt = x / (d / 4), i = (x % (d / 4)) * 4;
+      const std::size_t row = static_cast<std::size_t>(t0 + min(tt, n - 1)) * qk_stride + kh * d + i;
+      rk[p] = *reinterpret_cast<const float4*>(k + row);
+      rq[p] = *reinterpret_cast<const float4*>(q + row);
+    }
+#pragma unroll
+    for (std::uint32_t p = 0; p < VP; ++p) {
+      const std::uint32_t x = min(tid + p * NT, C * NC - 1), tt = x / NC, cc = x % NC;
+      rv[p] = v[static_cast<std::size_t>(t0 + min(tt, n - 1)) * v_stride + h * d + blockIdx.x * NC + cc];
+    }
+  };
+  float sum = 0.0f;
+  load(0);
+  for (std::uint32_t t0 = 0; t0 < tokens; t0 += C) {
+    __syncthreads();
+#pragma unroll
+    for (std::uint32_t p = 0; p < KP; ++p) {
+      const std::uint32_t x = tid + p * NT, tt = x / (d / 4), i = (x % (d / 4)) * 4;
+      *reinterpret_cast<float4*>(&ks[tt][i]) = rk[p];
+      if constexpr (!SEQ) *reinterpret_cast<float4*>(&qs[tt][i]) = rq[p];
+    }
+#pragma unroll
+    for (std::uint32_t p = 0; p < VP; ++p)
+      if (tid + p * NT < C * NC) vs[tid + p * NT] = rv[p];
+    if (tid < C) gs[tid] = alpha[static_cast<std::size_t>(min(t0 + tid, tokens - 1)) * heads + h];
+    if constexpr (PF) {
+      if (t0 + C < tokens) load(t0 + C);
+    }
+    __syncthreads();
+    // The state slice read and written once (the update), and a touch of
+    // the staged chunk so nothing is dead.
+    if constexpr (ST)
+      for (std::uint32_t x = tid; x < d * NC; x += NT) st[x] = st[x] * 0.999f + ks[x % C][x / NC] * vs[x % (C * NC)];
+    else
+      sum += vs[tid % (C * NC)];
+    if constexpr (SEQ) {
+      __syncthreads();
+#pragma unroll
+      for (std::uint32_t p = 0; p < KP; ++p) {
+        const std::uint32_t x = tid + p * NT, tt = x / (d / 4), i = (x % (d / 4)) * 4;
+        *reinterpret_cast<float4*>(&qs[tt][i]) = rq[p];
+      }
+      __syncthreads();
+    }
+    sum += qs[tid % C][tid % d] + gs[tid % C];
+#pragma unroll
+    for (std::uint32_t b = 2; b < NB; ++b) __syncthreads();
+    if constexpr (!PF) {
+      if (t0 + C < tokens) load(t0 + C);
+    }
+  }
+  __syncthreads();
+  for (std::uint32_t x = tid; x < d * NC; x += NT) S[(x / NC) * d + x % NC] = st[x];
+  if (sum == 12345.678f) out[0] = sum;
+}
+#define HALO_GDN_SKEL(NAME, C, NC, NT, NB, PF, SEQ, ...)                                                                   \
+  extern "C" __global__ void __launch_bounds__(NT)                                                               \
+      NAME(const float* q, const float* k, const float* v, const float* alpha, float* state, float* out,         \
+           std::uint32_t num_k_heads, std::uint32_t tokens, std::uint32_t qk_stride, std::uint32_t v_stride) {   \
+    GdnSkeleton<C, NC, NT, NB, PF, SEQ __VA_OPT__(,) __VA_ARGS__>(q, k, v, alpha, state, out, num_k_heads, tokens, qk_stride, v_stride);       \
+  }
+HALO_GDN_SKEL(halo_gdnskel_c16_n32, 16, 32, 128, 4, false, false)
+HALO_GDN_SKEL(halo_gdnskel_c16_n32_pf, 16, 32, 128, 4, true, false)
+HALO_GDN_SKEL(halo_gdnskel_c16_n64_pf, 16, 64, 256, 4, true, false)
+HALO_GDN_SKEL(halo_gdnskel_c32_n32, 32, 32, 128, 4, false, false)
+HALO_GDN_SKEL(halo_gdnskel_c32_n32_pf, 32, 32, 128, 4, true, false)
+HALO_GDN_SKEL(halo_gdnskel_c32_n64_pf_seq, 32, 64, 256, 4, true, true)
+HALO_GDN_SKEL(halo_gdnskel_c16_n64_pf_nost, 16, 64, 256, 4, true, false, false)
+HALO_GDN_SKEL(halo_gdnskel_c32_n64_pf_seq_nost, 32, 64, 256, 4, true, true, false)
+HALO_GDN_SKEL(halo_gdnskel_c64_n32_seq, 64, 32, 256, 4, false, true)
+HALO_GDN_SKEL(halo_gdnskel_c64_n32_pf_seq, 64, 32, 256, 4, true, true)
+#undef HALO_GDN_SKEL
+>>>>>>> Stashed changes
 
 // ---- P4: dense GEMM over repacked Q8_0 on FP16 WMMA ---------------------------
 //
