@@ -341,11 +341,17 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
   return MixedHalf(T, error) && Gemm(l.ssm_qkv, ck_.mixed, ck_.qkv, T, error, MixedH()) &&
          Gemm(l.ssm_gate, ck_.mixed, ck_.z, T, error, MixedH()) &&
          Gemm(l.ssm_alpha, ck_.mixed, ck_.alpha, T, error) && Gemm(l.ssm_beta, ck_.mixed, ck_.beta, T, error) &&
-         Launch("halo_conv_l2norm_prefill", {ch / 128, T}, {128},
-                {rt::Arg::Buf(ck_.qkv), rt::Arg::Buf(s.conv), rt::Arg::Buf(tensors_.at(l.ssm_conv1d.data).buf),
-                 rt::Arg::Buf(ck_.conv), rt::Arg::Val(ch), rt::Arg::Val(c.ssm_conv_kernel), rt::Arg::Val(2 * kd),
-                 rt::Arg::Val(c.rms_eps)},
-                error) &&
+         (c.ssm_conv_kernel == 4  // 8 tokens a block, the same bits
+              ? Launch("halo_conv_l2norm_prefill8", {ch / 128, (T + 7) / 8}, {128},
+                       {rt::Arg::Buf(ck_.qkv), rt::Arg::Buf(s.conv), rt::Arg::Buf(tensors_.at(l.ssm_conv1d.data).buf),
+                        rt::Arg::Buf(ck_.conv), rt::Arg::Val(ch), rt::Arg::Val(T), rt::Arg::Val(2 * kd),
+                        rt::Arg::Val(c.rms_eps)},
+                       error)
+              : Launch("halo_conv_l2norm_prefill", {ch / 128, T}, {128},
+                       {rt::Arg::Buf(ck_.qkv), rt::Arg::Buf(s.conv), rt::Arg::Buf(tensors_.at(l.ssm_conv1d.data).buf),
+                        rt::Arg::Buf(ck_.conv), rt::Arg::Val(ch), rt::Arg::Val(c.ssm_conv_kernel), rt::Arg::Val(2 * kd),
+                        rt::Arg::Val(c.rms_eps)},
+                       error)) &&
          Launch("halo_conv_state_advance", {Blocks(ch)}, {kBlock},
                 {rt::Arg::Buf(ck_.qkv), rt::Arg::Buf(s.conv), rt::Arg::Val(ch), rt::Arg::Val(c.ssm_conv_kernel),
                  rt::Arg::Val(T)},

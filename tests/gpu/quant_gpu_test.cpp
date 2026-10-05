@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 #include "core/quant.hpp"
@@ -1097,6 +1098,13 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
       launch("halo_conv_l2norm_prefill", {ch / d, T}, {d}, {rt::Arg::Buf(inb), rt::Arg::Buf(cs2), rt::Arg::Buf(cwb),
                                                            rt::Arg::Buf(conv2), rt::Arg::Val(ch), rt::Arg::Val(kern),
                                                            rt::Arg::Val(2 * kd), rt::Arg::Val(1e-6f)});
+      std::optional<rt::Buffer> conv8;
+      if (kern == 4) {  // the 8-token form, before the state advances (it reads the old state)
+        conv8 = zeros(std::size_t{T} * ch);
+        launch("halo_conv_l2norm_prefill8", {ch / d, (T + 7) / 8}, {d},
+               {rt::Arg::Buf(inb), rt::Arg::Buf(cs2), rt::Arg::Buf(cwb), rt::Arg::Buf(*conv8), rt::Arg::Val(ch),
+                rt::Arg::Val(T), rt::Arg::Val(2 * kd), rt::Arg::Val(1e-6f)});
+      }
       launch("halo_conv_state_advance", {(ch + 255) / 256}, {256},
              {rt::Arg::Buf(inb), rt::Arg::Buf(cs2), rt::Arg::Val(ch), rt::Arg::Val(kern), rt::Arg::Val(T)});
       launch("halo_gdn_prefill_d128_norm", {nv}, {d},
@@ -1209,6 +1217,7 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
           same(get(prep2, std::size_t{nv} * nch * 576), get(prep7, std::size_t{nv} * nch * 576), "prep2");
         }
       }
+      if (conv8) same(get(*conv8, std::size_t{T} * ch), get(conv2, std::size_t{T} * ch), "conv8");
       same(get(out2, std::size_t{T} * vd), get(out1, std::size_t{T} * vd), "output");
       same(get(cs2, cst.size()), get(cs1, cst.size()), "conv state");
       same(get(gs2, gst.size()), get(gs1, gst.size()), "recurrent state");

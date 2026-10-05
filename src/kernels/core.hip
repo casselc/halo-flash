@@ -2858,6 +2858,61 @@ extern "C" __global__ void halo_conv_l2norm_prefill(const float* in, const float
   if (ch < channels) out[static_cast<std::size_t>(t) * channels + ch] = v;
 }
 
+// halo_conv_l2norm_prefill for kern == 4 with 8 tokens a block: the conv
+// window slides through registers, and the 8 tokens' L2 sums share one
+// barrier. Same arithmetic in the same order, so the same bits: the terms as
+// above; each token's sum of squares as BlockSum forms it (warp sums, then
+// the 4 partials summed by WarpSum, here by every warp alike). The one-token
+// form ran 163,840 blocks of 4 loads each per 2048 tokens: 1.28 ms against
+// ~0.7 ms of traffic.
+//   grid (ceil(channels / 128), ceil(T / 8)), block 128; kern == 4
+extern "C" __global__ void __launch_bounds__(128)
+    halo_conv_l2norm_prefill8(const float* in, const float* state, const float* w, float* out,
+                              std::uint32_t channels, std::uint32_t tokens, std::uint32_t l2_channels, float eps) {
+  constexpr std::uint32_t TT = 8, kern = 4;
+  __shared__ float part[TT][4];
+  const std::uint32_t ch = blockIdx.x * blockDim.x + threadIdx.x, t0 = blockIdx.y * TT;
+  const std::uint32_t lane = threadIdx.x % kWarp, warp = threadIdx.x / kWarp;
+  const bool live = ch < channels;
+  const std::uint32_t c = live ? ch : 0;
+  // x[j] = input t0 - 3 + j (j < TT + 3), from the chunk or the conv state.
+  float x[TT + kern - 1];
+#pragma unroll
+  for (std::uint32_t j = 0; j < TT + kern - 1; ++j) {
+    const std::int64_t i = static_cast<std::int64_t>(t0) - static_cast<std::int64_t>(kern - 1) + j;
+    x[j] = i >= static_cast<std::int64_t>(tokens) ? 0.0f
+           : i >= 0 ? in[static_cast<std::size_t>(i) * channels + c]
+                    : state[static_cast<std::size_t>(i + kern - 1) * channels + c];
+  }
+  const float w0 = w[c * kern], w1 = w[c * kern + 1], w2 = w[c * kern + 2], w3 = w[c * kern + 3];
+  float v[TT];
+#pragma unroll
+  for (std::uint32_t t = 0; t < TT; ++t) {
+    float acc = w3 * x[t + 3];
+    acc += w0 * x[t];
+    acc += w1 * x[t + 1];
+    acc += w2 * x[t + 2];
+    v[t] = live ? Silu(acc) : 0.0f;
+  }
+  if (blockIdx.x * blockDim.x < l2_channels) {  // block-uniform
+#pragma unroll
+    for (std::uint32_t t = 0; t < TT; ++t) {
+      const float ws = WarpSum(v[t] * v[t]);
+      if (lane == 0) part[t][warp] = ws;
+    }
+    __syncthreads();
+#pragma unroll
+    for (std::uint32_t t = 0; t < TT; ++t) {
+      const float ss = WarpSum(lane < 4 ? part[t][lane] : 0.0f);
+      v[t] *= 1.0f / sqrtf(ss + eps);
+    }
+  }
+  if (!live) return;
+#pragma unroll
+  for (std::uint32_t t = 0; t < TT; ++t)
+    if (t0 + t < tokens) out[static_cast<std::size_t>(t0 + t) * channels + ch] = v[t];
+}
+
 // The conv state after a chunk of T inputs: the last kern - 1 inputs, the
 // older ones from the previous state when T < kern - 1.
 //   grid (ceil(channels / 256)), block 256
