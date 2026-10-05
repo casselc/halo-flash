@@ -1425,6 +1425,53 @@ TEST(GpuQuant, TiledF32GemmMatchesDoubleSums) {  // and the skinny kernel for <=
   }
 }
 
+// P4: the FP32 GEMM on bf16 WMMA with hi/lo splitting (the router), against
+// double sums. Bound fixed in advance from the split: each product within
+// (2^-16 + 2 * 2^-17 + 2^-18) of |w x| (the dropped lo*lo, and lo rounded
+// to bf16 on both operands), plus fp32 accumulation cols * 2^-23: so
+// (2^-15 + cols * 2^-23) * sum |w x|. Ragged rows and tokens; cols % 32 == 0.
+TEST(GpuQuant, Bf16x3GemmMatchesDoubleSums) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      const auto rows = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 600}));
+      const auto cols = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 100}));
+      const auto T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 200}));
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return static_cast<float>(seed >> 8) / 16777216.0f - 0.5f; };
+      // Values over many binades, as router weights and activations are.
+      const auto wide = [&] { return rnd() * std::ldexp(1.0f, static_cast<int>(rnd() * 16)); };
+      std::vector<float> w(std::size_t{rows} * cols), x(std::size_t{T} * cols), y(std::size_t{T} * rows);
+      for (auto& v : w) v = wide();
+      for (auto& v : x) v = wide();
+      auto wb = dev->Alloc(w.size() * 4, &error), xb = dev->Alloc(x.size() * 4, &error), yb = dev->Alloc(y.size() * 4, &error);
+      ASSERT_TRUE(wb && xb && yb && dev->Upload(wb, 0, w.data(), w.size() * 4, &error) &&
+                  dev->Upload(xb, 0, x.data(), x.size() * 4, &error))
+          << error;
+      const rt::Arg a[] = {rt::Arg::Buf(wb), rt::Arg::Buf(xb), rt::Arg::Buf(yb), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                           rt::Arg::Val(T)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemm_f32_bf16x3", &error), {(T + 63) / 64, (rows + 63) / 64}, {256}, a,
+                              &error))
+          << error;
+      ASSERT_TRUE(dev->Download(yb, 0, y.data(), y.size() * 4, &error)) << error;
+      for (auto* b : {&wb, &xb, &yb}) dev->Free(*b);
+      for (std::uint32_t t = 0; t < T; ++t)
+        for (std::uint32_t r = 0; r < rows; ++r) {
+          double want = 0, mag = 0;
+          for (std::uint32_t c = 0; c < cols; ++c) {
+            want += double(w[std::size_t{r} * cols + c]) * x[std::size_t{t} * cols + c];
+            mag += std::fabs(double(w[std::size_t{r} * cols + c]) * x[std::size_t{t} * cols + c]);
+          }
+          ASSERT_NEAR(y[std::size_t{t} * rows + r], want, (0x1p-15 + cols * 0x1p-23) * mag + 1e-30)
+              << rt::BackendName(backend) << " t " << t << " r " << r << " rows " << rows << " cols " << cols << " T " << T;
+        }
+    }, {.test_cases = 40});
+  }
+}
+
 // P4: the FP16-route dense GEMM (Q8_0 dequantized to fp16 while staging,
 // fp16 activations, fp32 accumulation), both tile configurations, against
 // double sums of the same fp16 operands: fp16(d * q) is exact in the

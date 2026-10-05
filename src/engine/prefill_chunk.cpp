@@ -525,7 +525,18 @@ bool FlashNextGpu::MoeChunk(const model::LayerWeights& l, std::uint32_t T, std::
   const auto& down = l.ffn_down_exps;
   const auto& dd = tensors_.at(down.data);
   const auto ff = static_cast<std::uint32_t>(gate.rows);
-  if (!Gemm(l.router, ck_.mixed, ck_.router, T, error)) return false;
+  // The router on bf16 WMMA with hi/lo splitting (~2^-15 per product)
+  // instead of the fp32 VALU GEMM.
+  const auto& rt_ = tensors_.at(l.router.data);
+  const auto rrows = static_cast<std::uint32_t>(l.router.rows), rcols = static_cast<std::uint32_t>(l.router.cols);
+  const bool bx3 = prefill_router_bf16x3_ && !prefill_exact_projections_ && !lora_.contains(l.router.data) &&
+                   l.router.type == core::GgmlType::kF32 && rcols % 32 == 0;
+  if (!(bx3 ? Launch("halo_gemm_f32_bf16x3", {(T + 63) / 64, (rrows + 63) / 64}, {256},
+                     {rt::Arg::Buf(rt_.buf), rt::Arg::Buf(ck_.mixed), rt::Arg::Buf(ck_.router), rt::Arg::Val(rrows),
+                      rt::Arg::Val(rcols), rt::Arg::Val(T)},
+                     error)
+            : Gemm(l.router, ck_.mixed, ck_.router, T, error)))
+    return false;
   const bool gate_up_fast = fused_moe_ && gate.type == core::GgmlType::kQ4_K && up.type == gate.type &&
                             up.rows == gate.rows && up.cols == gate.cols && gate.cols % 256 == 0 && H <= 4096;
   const bool down_q5_1 = down.type == core::GgmlType::kQ5_1 && down.cols % 32 == 0 && ff <= 2048;

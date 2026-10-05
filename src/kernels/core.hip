@@ -4149,6 +4149,104 @@ extern "C" __global__ void __launch_bounds__(256)
   }
 }
 
+// ---- P4: FP32 GEMM on bf16 WMMA with hi/lo splitting (the router) -----------
+// y[t][r] = sum_k W[r][k] x[t][k] for fp32 W and x. Each operand is split
+// while staging into bf16 halves, v = hi + lo (hi = bf16(v), lo = bf16(v -
+// hi)), and each product taken as hi*hi + hi*lo + lo*hi with fp32
+// accumulation: about 2^-15 relative per product (the dropped lo*lo and the
+// rounding of lo), against fp32 FMA's 2^-24, at WMMA rate instead of VALU
+// (halo_gemm_f32_tiled: 1.28 ms for the 512 x 2560 router at 2048 tokens).
+//   grid (ceil(T / 64), ceil(rows / 64)), block 256; cols % 32 == 0.
+typedef short halo_v16s __attribute__((ext_vector_type(16)));
+__device__ inline void SplitBf16(float v, short& hi, short& lo) {
+  const auto rne = [](float f) {
+    const std::uint32_t u = __float_as_uint(f);
+    return static_cast<std::uint32_t>((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+  };
+  const std::uint32_t h = rne(v);
+  hi = static_cast<short>(h);
+  lo = static_cast<short>(rne(v - __uint_as_float(h << 16)));
+}
+__device__ inline halo_v16s LdsFragS(const short* p) {
+  typedef short v8s __attribute__((ext_vector_type(8)));
+  const v8s a = *reinterpret_cast<const v8s*>(p), b = *reinterpret_cast<const v8s*>(p + 8);
+  halo_v16s r;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    r[e] = a[e];
+    r[e + 8] = b[e];
+  }
+  return r;
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_f32_bf16x3(const float* w, const float* x, float* y, std::uint32_t rows, std::uint32_t cols,
+                         std::uint32_t tokens) {
+  constexpr std::uint32_t BM = 64, BN = 64, KS = 32, RS = KS + 8, WM = 4, WN = 2, TN = BN / WN / 16;
+  __shared__ __attribute__((aligned(16))) short Ah[BM * RS], Al[BM * RS], Bh[BN * RS], Bl[BN * RS];
+  const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32, wr = wave % WM, wt = wave / WM;
+  const std::uint32_t r0 = blockIdx.y * BM, t0 = blockIdx.x * BN;
+  // Staging: 64 x 32 floats per operand = 512 float4, two per thread.
+  const float* wp[2];
+  const float* xp[2];
+  std::uint32_t srow[2], sk[2];
+#pragma unroll
+  for (int q = 0; q < 2; ++q) {
+    const std::uint32_t i = tid + q * 256;
+    srow[q] = i / 8;
+    sk[q] = (i % 8) * 4;
+    wp[q] = w + static_cast<std::size_t>(min(r0 + srow[q], rows - 1)) * cols + sk[q];
+    xp[q] = x + static_cast<std::size_t>(min(t0 + srow[q], tokens - 1)) * cols + sk[q];
+  }
+  float4 ra[2], rb[2];
+  const auto load = [&](std::uint32_t k0) {
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+      ra[q] = *reinterpret_cast<const float4*>(wp[q] + k0);
+      rb[q] = *reinterpret_cast<const float4*>(xp[q] + k0);
+    }
+  };
+  const auto put = [&](short* hi, short* lo, std::uint32_t row, std::uint32_t k, const float4& v) {
+    const float f[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int e = 0; e < 4; ++e) SplitBf16(f[e], hi[row * RS + k + e], lo[row * RS + k + e]);
+  };
+  halo_v8f acc[TN] = {};
+  load(0);
+  for (std::uint32_t k0 = 0; k0 < cols; k0 += KS) {
+    __syncthreads();  // the previous stage's fragment reads are done
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+      put(Ah, Al, srow[q], sk[q], ra[q]);
+      put(Bh, Bl, srow[q], sk[q], rb[q]);
+    }
+    __syncthreads();
+    if (k0 + KS < cols) load(k0 + KS);  // in flight during the math below
+#pragma unroll
+    for (std::uint32_t kk = 0; kk < KS; kk += 16) {
+      const std::uint32_t ar = (wr * 16 + lane % 16) * RS + kk;
+      const halo_v16s ah = LdsFragS(Ah + ar), al = LdsFragS(Al + ar);
+#pragma unroll
+      for (std::uint32_t n = 0; n < TN; ++n) {
+        const std::uint32_t br = ((wt * TN + n) * 16 + lane % 16) * RS + kk;
+        const halo_v16s bh = LdsFragS(Bh + br), bl = LdsFragS(Bl + br);
+        acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al, bh, acc[n]);
+        acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ah, bl, acc[n]);
+        acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ah, bh, acc[n]);
+      }
+    }
+  }
+#pragma unroll
+  for (std::uint32_t n = 0; n < TN; ++n) {
+    const std::uint32_t t = t0 + (wt * TN + n) * 16 + lane % 16;
+    if (t >= tokens) continue;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const std::uint32_t r = r0 + wr * 16 + 2 * j + lane / 16;
+      if (r < rows) y[static_cast<std::size_t>(t) * rows + r] = acc[n][j];
+    }
+  }
+}
+
 // Lane exchange within aligned groups of 4 lanes by DPP quad permutes:
 // QuadXor1 reads lane ^ 1, QuadXor2 lane ^ 2 (quad_perm [1,0,3,2], [2,3,0,1]).
 __device__ inline float QuadXor1(float v) {

@@ -99,6 +99,9 @@ class FlashNextGpu {
   // combine_norm skips the fp32 xn the mixer's mix epilogue would re-read;
   // the epilogue rebuilds it from res (same arithmetic, bit-identical).
   static inline bool prefill_mix_rebuild_ = true;
+  /// The router GEMM on bf16 WMMA with hi/lo-split operands (~2^-15 per
+  /// product) instead of fp32 VALU.
+  static inline bool prefill_router_bf16x3_ = true;
   /// Attention of a chunk's tokens in batched launches (same arithmetic as
   /// stepping) instead of token by token.
   static inline bool prefill_batched_attention_ = true;
