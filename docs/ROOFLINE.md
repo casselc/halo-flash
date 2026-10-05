@@ -591,6 +591,13 @@ trace):
 - tiles of 96 x 96 to 128 x 96 with 128 threads, and two stages of global prefetch (`PGR2`);
 - roughly 25-way split K, so thousands of short-K workgroups rather than our 32 long ones.
 
+First attempt at that shape, not kept (pinned, in-engine): 64 x 64 tiles with split K over
+`gridDim.z` (`halo_gemm_q8r_f16_k`), partials summed in the SiLU pass. Per call: 2.58 ms at 4
+splits, 3.51 at 8, 3.92 at 16, 4.28 at 20, against 1.05 for the single 320-row tile. Small row
+tiles re-read xh once per row tile (5x, ~210 MB), and the cost grew with the split. Copying the
+library's split without its tile economics does not work; next is a microbenchmark study of
+`_m` tile shapes with a trace, not more in-engine guesses.
+
 **4b. Router F32 GEMM (`f32_tiled [32x8]`, 512 x 2560 x 2048 per layer).** DONE, partly. A
 trace first: 52% of cycles in `s_waitcnt vmcnt`, 33% at barriers, ~4% in FMAs. With a 32-wide K
 step and a one-stage register prefetch it measured **-36.5 ms** against a predicted -65 to -85:
