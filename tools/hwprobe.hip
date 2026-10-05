@@ -1,6 +1,7 @@
 // halo_hwprobe: measured facts about the GPU (gfx1151 Strix Halo) that the
 // performance work relies on. Standalone HIP; each subcommand prints one table.
 //
+//   halo_hwprobe keepalive [ms] [s] an empty marker every ms: keeps rocprofv3 instruction counters armed
 //   halo_hwprobe stream          the hyper-connection residual's DRAM traffic patterns
 //   halo_hwprobe clock           shader clock (in-kernel counters) vs load
 //   halo_hwprobe dram [MB]       bandwidth vs segment size, dispatch order, read/write
@@ -178,6 +179,39 @@ __global__ void __launch_bounds__(256) StreamKernel(float4* res, const float4* o
   if (acc == 12345.f) sink[0] = acc;
 }
 
+// The fused mixer's memory side: block b owns tokens [b TT, b TT + TT) (all 4 streams). Pass A: res += out in
+// place; pass B: re-read the tile (the down GEMM's xn); pass C: re-read it again and write mixed (fp32 + fp16, h
+// per token). `passes` 1 runs A only, 3 all.
+__global__ void __launch_bounds__(1024) StreamTileKernel(float4* res, const float4* out, float4* mixed, uint2* mixed16,
+                                                         std::uint32_t tt, std::uint32_t h_f4, int passes, float* sink) {
+  const std::size_t t0 = std::size_t{blockIdx.x} * tt, tile = std::size_t{tt} * 4 * h_f4;
+  float4* r = res + t0 * 4 * h_f4;
+  float acc = 0.0f;
+  for (std::size_t i = threadIdx.x; i < tile; i += blockDim.x) {
+    float4 v = r[i];
+    const float4 o = out[(t0 + i / (4 * h_f4)) * h_f4 + i % h_f4];
+    v.x += o.x, v.y += o.y, v.z += o.z, v.w += o.w;
+    r[i] = v;
+  }
+  if (passes > 1) {
+    __syncthreads();
+    for (std::size_t i = threadIdx.x; i < tile; i += blockDim.x) acc += r[i].x;
+    __syncthreads();
+    for (std::size_t i = threadIdx.x; i < std::size_t{tt} * h_f4; i += blockDim.x) {
+      const std::size_t t = i / h_f4, c = i % h_f4;
+      float4 m = {acc, 0, 0, 0};
+      for (std::uint32_t st = 0; st < 4; ++st) {
+        const float4 v = r[(t * 4 + st) * h_f4 + c];
+        m.x += v.x, m.y += v.y, m.z += v.z, m.w += v.w;
+      }
+      mixed[(t0 + t) * h_f4 + c] = m;
+      const _Float16 hv[4] = {_Float16(m.x), _Float16(m.y), _Float16(m.z), _Float16(m.w)};
+      mixed16[(t0 + t) * h_f4 + c] = *reinterpret_cast<const uint2*>(hv);
+    }
+  }
+  if (acc == 12345.f) sink[0] = acc;
+}
+
 void Stream() {
   const std::uint32_t T = 2048, h = 2560;
   const std::size_t n = std::size_t{4} * T * h;  // floats
@@ -215,6 +249,28 @@ void Stream() {
                   moved[mode] / (ms / 10 * 1e-3) / 1e9, static_cast<std::size_t>(moved[mode]) >> 20);
     }
   }
+  // Token tiles (the fused mixer's memory side).
+  float4* mixed;
+  CHECK(hipMalloc(&mixed, n));
+  for (const int passes : {1, 3})
+    for (const std::uint32_t tt : {8u, 16u, 32u, 64u})
+      for (const std::uint32_t threads : {256u, 1024u}) {
+        const auto run = [&] {
+          hipLaunchKernelGGL(StreamTileKernel, T / tt, threads, 0, 0, res, out, mixed, y16, tt, h / 4, passes, sink);
+        };
+        for (int w = 0; w < 3; ++w) run();
+        CHECK(hipDeviceSynchronize());
+        CHECK(hipEventRecord(e0));
+        for (int r = 0; r < 10; ++r) run();
+        CHECK(hipEventRecord(e1));
+        CHECK(hipEventSynchronize(e1));
+        float ms;
+        CHECK(hipEventElapsedTime(&ms, e0, e1));
+        const double dram = n * 8.0 + n + (passes > 1 ? n * 1.5 / 4 * 4 / 4 * 1.0 : 0.0);  // res rw, out, mixed
+        std::printf("  tiles of %2u tokens x %4u threads (%4u blocks), %s  %7.3f ms  (%.0f GB/s of unique bytes)\n", tt,
+                    threads, T / tt, passes > 1 ? "A+B+C" : "A    ", ms / 10, dram / (ms / 10 * 1e-3) / 1e9);
+      }
+  CHECK(hipFree(mixed));
   CHECK(hipFree(res));
   CHECK(hipFree(out));
   CHECK(hipFree(y16));
@@ -713,6 +769,20 @@ int main(int argc, char** argv) {
   else if (cmd == "sync") Sync();
   else if (cmd == "counters") Counters();
   else if (cmd == "stream") Stream();
+  else if (cmd == "keepalive") {  // keepalive [period_ms] [seconds]: see tools/pmc.sh
+    const int period = argc > 2 ? std::atoi(argv[2]) : 10;
+    const double secs = argc > 3 ? std::atof(argv[3]) : 3600.0;
+    hipStream_t st;
+    hipEvent_t ev;
+    CHECK(hipStreamCreateWithFlags(&st, hipStreamNonBlocking));
+    CHECK(hipEventCreate(&ev));
+    const auto t0 = std::chrono::steady_clock::now();
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < secs) {
+      CHECK(hipEventRecord(ev, st));  // a marker: no waves, so no counter is disturbed
+      CHECK(hipStreamSynchronize(st));
+      std::this_thread::sleep_for(std::chrono::milliseconds(period));
+    }
+  }
   else if (cmd == "counters-repeat") {  // the same known kernel N times: do counters hold up over many dispatches?
     const int n = argc > 2 ? std::atoi(argv[2]) : 2000;
     float *g, *out;

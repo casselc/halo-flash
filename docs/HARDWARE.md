@@ -89,15 +89,16 @@ the N = 20 minus N = 10 difference must match exactly. Results (7/7 pass):
   fabric traffic). Data passes between kernels through the MALL (~800 GB/s) or DRAM, never L2;
   only fusion reuses L2.
 
-**Open defect (2026-10-05): in the engine, instruction counters read 0 after each kernel's first
-dispatch.** Profiling a 2048-token prefill, `SQ_INSTS_VALU` / `LDS` / `SALU` / `FLAT` are non-zero
-only for the first dispatch of each kernel (`halo_hc_combine_norm_rows`: 1 of 94; also with only
-that kernel instrumented, and for a single chosen later dispatch), while `SQ_WAVES` stays right.
-Not reproduced outside the engine, so far ruled out: dispatch count (2000 repeats exact), a
-mid-run host-to-device copy, 16 host threads doing O_DIRECT reads, module-loaded kernels
-(`hipModuleLaunchKernel`), a non-blocking stream, a kernel ending in `s_sendmsg
-MSG_DEALLOC_VGPRS` before others, graphs (prefill runs eager). Until found: use first-dispatch
-counters for instruction mix (after checking them against analytic counts) and timestamps for time.
+**Instruction counters switch off after the GPU idles (cause found 2026-10-05).** Under rocprofv3
+`--pmc`, if the GPU is idle for more than ~60-70 ms (50 ms is fine), `SQ_INSTS_VALU` / `LDS` / `SALU`
+/ `FLAT` read 0 on every later dispatch while `SQ_WAVES` keeps counting, until any process (even an
+unprofiled one) creates a GPU queue. A 2048-token prefill has two 70-80 ms host gaps, which looked like
+"only each kernel's first dispatch counts"; shorter prefills have none and count correctly. Likely the
+idle power-down (GFXOFF, 100 ms delay) losing perfmon state; this kernel (7.0, KFD 1.22) lacks the
+profiler-lock ioctl that rocprofiler-sdk's DKMS path uses. **Workaround: `tools/pmc.sh`** (rocprofv3
+with `halo_hwprobe keepalive` submitting an empty marker every 10 ms): all 2899 dispatches of a 2048-token
+prefill count, the 621 dispatches that counted before are bit-identical, and the known-answer checks pass
+with it running. A 1000 ms keepalive period does not help (negative control).
 
 ## Overheads (`halo_hwprobe sync`)
 
