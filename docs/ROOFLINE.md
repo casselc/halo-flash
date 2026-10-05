@@ -882,3 +882,16 @@ argmax): 2048 tokens 1.896 -> 1.651 s (1080 -> 1240 tok/s, +15%); 6940 tokens 6.
 host n-gram read -262, MoE down -58, first-chunk attention -42). gufo pp2048: 1599 tok/s.
 The router probe repeated the high-occupancy mistake above: at 10 waves/SIMD its trace's
 26% `vmcnt` and 24% split VALU were covered by other waves.
+| Routed combine + shared-expert add in one pass (f4ab695, bit-identical) | -10..-15 | kernels -10, device -5.2 (noise) | yes |
+
+**Queue after this night, ranked by measured gap to gufo (2K, per prefill):**
+1. HC mixers (~150 ms): the mix epilogue's ~0.7 ms/call of loads did not respond to bytes,
+   batching or access width; test the write-back hypothesis directly (e.g. a probe kernel that
+   only reads `res` right after combine_norm vs after an unrelated kernel), then decide whether
+   combine_norm should write less (int8 / fp16 streams, as gufo does).
+2. Mixer down `_m` (~50 ms): needs an int8 GEMM faster than the fp16 one (ours is
+   staging-limited at ~20 of 56 TOPS); gufo's W8A8 runs the shape in 0.50 ms.
+3. MoE gate/up (~24 ms) and down (~10 ms left): VALU-bound on dequant at high occupancy.
+4. Dense GEMMs: gufo fuses the DeltaNet qkv and z projections (one 16384-row GEMM, ~21 ms).
+Rules learned tonight: check occupancy before trusting a stall share; run a multi-chunk prompt
+for any host or control-flow change; keep kernel variants compile-time.
