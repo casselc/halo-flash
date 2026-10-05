@@ -177,8 +177,13 @@ bool FlashNextGpu::F16Route(const model::TensorRef& t) const {
          cols % (small ? 128 : 64) == 0 && d.qstride % 16 == 0;
 }
 
+bool FlashNextGpu::BlockedXh(const model::HcMixer& m) const {
+  const auto rows = static_cast<std::uint32_t>(m.down.rows), cols = static_cast<std::uint32_t>(m.down.cols);
+  return prefill_blocked_xh_ && F16Route(m.down) && rows <= 320 && cols >= 4096 && cols % 64 == 0;
+}
+
 bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::Buffer& y, std::uint32_t T,
-                        std::string* error, const rt::Buffer* x16) {
+                        std::string* error, const rt::Buffer* x16, bool x16_blocked) {
   const auto& d = tensors_.at(t.data);
   const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
   const bool per_token = prefill_exact_projections_ || lora_.contains(t.data);
@@ -190,7 +195,7 @@ bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt
     if (!x16 && !Half(x, ck_.xh, T * cols, error)) return false;
     // Large tiles walk in bands of 8 row tiles when they divide evenly.
     const bool banded = !tall && !small && prefill_banded_gemm_ && (rows / 256) % 8 == 0 && rows % 256 == 0;
-    return Launch(tall    ? "halo_gemm_q8r_f16_m"
+    return Launch(tall    ? (x16 && x16_blocked ? "halo_gemm_q8r_f16_mb" : "halo_gemm_q8r_f16_m")
                   : small ? "halo_gemm_q8r_f16_s"
                   : banded ? (prefill_reg_gemm_ ? "halo_gemm_q8r_f16_lr8" : "halo_gemm_q8r_f16_lg8")
                            : "halo_gemm_q8r_f16_l",
@@ -248,13 +253,13 @@ bool FlashNextGpu::HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_
                     rt::Arg::Buf(ck_.xh), rt::Arg::Val(H), rt::Arg::Val(c.rms_eps), rt::Arg::Val(H),
                     rt::Arg::Val(c.hc_count),
                     fused_inject ? rt::Arg::Buf(tensors_.at(m.inject.data).buf) : rt::Arg::Val<std::uint64_t>(0),
-                    rt::Arg::Buf(ck_.ipart), rt::Arg::Val(irows)},
+                    rt::Arg::Buf(ck_.ipart), rt::Arg::Val(irows), rt::Arg::Val(BlockedXh(m) ? T : 0u)},
                    error)
           : Launch("halo_rmsnorm_rows", {T * c.hc_count}, {kBlock},
                    {rt::Arg::Buf(ck_.res), rt::Arg::Buf(tensors_.at(m.norm.data).buf), rt::Arg::Buf(ck_.xn),
                     rt::Arg::Val(H), rt::Arg::Val(c.rms_eps), rt::Arg::Val(H), rt::Arg::Val(c.hc_count)},
                    error));
-  return norm_ok && Gemm(m.down, ck_.xn, ck_.lo, T, error, h16 ? &ck_.xh : nullptr) &&
+  return norm_ok && Gemm(m.down, ck_.xn, ck_.lo, T, error, h16 ? &ck_.xh : nullptr, h16 && BlockedXh(m)) &&
          Launch("halo_scale_silu", {Blocks(std::size_t{T} * low)}, {kBlock},
                 {rt::Arg::Buf(ck_.lo), rt::Arg::Val(1.0F / static_cast<float>(c.hc_count)), rt::Arg::Val(T * low)},
                 error) &&
@@ -948,7 +953,8 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
                    rt::Arg::Val(H), rt::Arg::Val(c.rms_eps),
                    FuseInject(next) ? rt::Arg::Buf(tensors_.at(next.inject.data).buf) : rt::Arg::Val<std::uint64_t>(0),
                    rt::Arg::Buf(ck_.ipart), rt::Arg::Val(static_cast<std::uint32_t>(next.inject.rows)),
-                   xn_skipped_ ? rt::Arg::Buf(ck_.rscale) : rt::Arg::Val<std::uint64_t>(0)},
+                   xn_skipped_ ? rt::Arg::Buf(ck_.rscale) : rt::Arg::Val<std::uint64_t>(0),
+                   rt::Arg::Val(h16 && BlockedXh(next) ? T : 0u)},
                   error);
   };
   const bool fuse = prefill_fused_combine_ && H <= 16 * kBlock;

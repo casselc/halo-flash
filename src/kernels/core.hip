@@ -3233,6 +3233,15 @@ extern "C" __global__ void halo_rmsnorm_rows(const float* x, const float* w_all,
   for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) yv[i] = xv[i] * scale * w[i];
 }
 
+// The mixer's fp16 streams in K-blocked layout [cols / 64][T][64]: the down
+// projection (halo_gemm_q8r_f16_mb) then reads each 64-value K stage of its
+// tokens as one contiguous run. Row-major, a stage was 128-byte pieces of 64
+// different 20 KB rows, the access pattern DRAM serves at ~20-30 GB/s
+// (docs/HARDWARE.md).
+__device__ inline std::size_t XhBlocked(std::uint32_t t, std::uint32_t c, std::uint32_t tokens) {
+  return (static_cast<std::size_t>(c / 64) * tokens + t) * 64 + c % 64;
+}
+
 // halo_hc_combine_rows fused with the next mixer's grouped RMSNorm (and,
 // with y16, its fp16 copy): one pass over the residual instead of a write
 // and a re-read. Same arithmetic as the two kernels: each thread combines
@@ -3248,7 +3257,7 @@ extern "C" __global__ void halo_rmsnorm_rows(const float* x, const float* w_all,
 extern "C" __global__ void __launch_bounds__(256)
     halo_hc_combine_norm_rows(float* res, const float* out, const float* inject, const float* w_all, float* y,
                               _Float16* y16, std::uint32_t hc, std::uint32_t h, float eps, const float* iw,
-                              float* ipart, std::uint32_t irows, float* rscale) {
+                              float* ipart, std::uint32_t irows, float* rscale, std::uint32_t y16_tokens) {
   __shared__ float scratch[32];
   const std::size_t v = blockIdx.x, t = v / hc, row = v * h;
   const std::uint32_t st = static_cast<std::uint32_t>(v % hc);
@@ -3285,7 +3294,7 @@ extern "C" __global__ void __launch_bounds__(256)
     if (i < h) {
       const float yv = vals[k] * scale * w[i];
       if (y) y[row + i] = yv;
-      if (y16) y16[row + i] = static_cast<_Float16>(yv);
+      if (y16) y16[y16_tokens ? XhBlocked(t, st * h + i, y16_tokens) : row + i] = static_cast<_Float16>(yv);
       if (iw) {
 #pragma unroll
         for (std::uint32_t r = 0; r < 8; ++r)
@@ -3322,7 +3331,7 @@ extern "C" __global__ void halo_inject_reduce(const float* ipart, float* inject,
 extern "C" __global__ void halo_rmsnorm_rows_h(const float* x, const float* w_all, float* y, _Float16* y16,
                                                std::uint32_t d, float eps, std::uint32_t w_stride,
                                                std::uint32_t w_period, const float* iw, float* ipart,
-                                               std::uint32_t irows) {
+                                               std::uint32_t irows, std::uint32_t y16_tokens) {
   __shared__ float scratch[32];
   const std::size_t row = static_cast<std::size_t>(blockIdx.x) * d;
   const std::uint32_t st = blockIdx.x % w_period;
@@ -3335,7 +3344,7 @@ extern "C" __global__ void halo_rmsnorm_rows_h(const float* x, const float* w_al
   for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) {
     const float v = x[row + i] * scale * w[i];
     y[row + i] = v;
-    y16[row + i] = static_cast<_Float16>(v);
+    y16[y16_tokens ? XhBlocked(blockIdx.x / w_period, st * d + i, y16_tokens) : row + i] = static_cast<_Float16>(v);
     if (iw) {
 #pragma unroll
       for (std::uint32_t r = 0; r < 8; ++r)
@@ -5771,7 +5780,7 @@ HALO_GDN_SKEL(halo_gdnskel_c64_n32_pf_seq, 64, 32, 256, 4, true, true)
 // With rs and nw, xn is the residual and xn[t][s h + i] is rebuilt as
 // (res * rs[t * 4 + s]) * nw[s h + i] (combine_norm's arithmetic).
 template <std::uint32_t BM, std::uint32_t BN, std::uint32_t WM, std::uint32_t WN, std::uint32_t KS, bool kMix = false,
-          bool kRowsFast = false, std::uint32_t RG = 1>
+          bool kRowsFast = false, std::uint32_t RG = 1, bool kBlockedX = false>
 __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
                            std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens,
                            const float* xn = nullptr, _Float16* y16 = nullptr, const float* rs = nullptr,
@@ -5818,7 +5827,10 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
 #pragma unroll
     for (std::uint32_t p = 0; p < BP; ++p) {
       const std::uint32_t i = tid + p * NT, tok = i / BPR, part = i % BPR;  // part: 8 values
-      rb[p] = *reinterpret_cast<const halo_v4i*>(x + static_cast<std::size_t>(min(t0 + tok, tokens - 1)) * cols + k0 + part * 8);
+      // kBlockedX: x stored [cols / KS][tokens][KS], a stage's tokens contiguous.
+      rb[p] = *reinterpret_cast<const halo_v4i*>(
+          x + (kBlockedX ? (static_cast<std::size_t>(k0 / KS) * tokens + min(t0 + tok, tokens - 1)) * KS + part * 8
+                         : static_cast<std::size_t>(min(t0 + tok, tokens - 1)) * cols + k0 + part * 8));
     }
   };
   const auto store = [&] {
@@ -6109,6 +6121,13 @@ extern "C" __global__ void __launch_bounds__(256)
     halo_gemm_q8r_f16_m(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y, std::uint32_t rows,
                         std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
   GemmQ8rF16<320, 64, 4, 2, 64>(qs, d, x, y, rows, cols, qstride, tokens);
+}
+
+// halo_gemm_q8r_f16_m reading x in K-blocked layout [cols / 64][T][64] (XhBlocked).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_q8r_f16_mb(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y, std::uint32_t rows,
+                         std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
+  GemmQ8rF16<320, 64, 4, 2, 64, false, false, 1, true>(qs, d, x, y, rows, cols, qstride, tokens);
 }
 
 // fp32 -> fp16 rows (n values). grid (ceil(n / 256))

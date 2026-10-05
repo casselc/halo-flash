@@ -100,6 +100,7 @@ class FlashNextGpu {
   // combine_norm skips the fp32 xn the mixer's mix epilogue would re-read;
   // the epilogue rebuilds it from res (same arithmetic, bit-identical).
   static inline bool prefill_mix_rebuild_ = true;
+  static inline bool prefill_blocked_xh_ = true;  // the mixers' fp16 streams K-blocked for the down GEMM
   static inline bool prefill_banded_gemm_ = true;  // large dense GEMMs in bands of 8 row tiles
   static inline bool prefill_reg_gemm_ = true;  // banded GEMMs with weights in registers (halo_gemm_q8r_f16_lr8)
   static inline bool prefill_fused_moe_combine_ = true;  // routed combine + shared expert in one pass
@@ -271,13 +272,14 @@ class FlashNextGpu {
   /// BF16 / F32 GEMMs, else the decode GEMV per token.
   /// x16: x already converted to fp16 rows (shared by several GEMMs), or null.
   bool Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::Buffer& y, std::uint32_t tokens,
-            std::string* error, const rt::Buffer* x16 = nullptr);
+            std::string* error, const rt::Buffer* x16 = nullptr, bool x16_blocked = false);
   bool HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_t tokens, std::string* error, bool normed = false);
   bool PleChunk(const model::LayerWeights& l, std::uint32_t tokens, std::string* error);
   bool LinearChunk(const model::LayerWeights& l, LinearState& s, std::uint32_t tokens, std::string* error);
   bool AttentionBatched(const model::LayerWeights& l, AttnState& s, std::uint32_t T, std::string* error);
   bool AttentionChunk(const model::LayerWeights& l, AttnState& s, std::uint32_t tokens, std::string* error);
   bool F16Route(const model::TensorRef& t) const;
+  bool BlockedXh(const model::HcMixer& m) const;
   bool FuseInject(const model::HcMixer& m) const;
   bool MixFused(const model::HcMixer& m) const;
   bool MixUp(const model::HcMixer& m, std::uint32_t T, std::string* error);

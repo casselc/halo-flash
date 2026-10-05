@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <optional>
+#include <tuple>
 #include <vector>
 
 #include "core/quant.hpp"
@@ -1563,6 +1564,52 @@ TEST(GpuQuant, Bf16x3GemmMatchesDoubleSums) {
 // The banded dispatch order (halo_gemm_q8r_f16_lg8) computes the same tiles
 // with the same arithmetic as halo_gemm_q8r_f16_l: bit-identical, for 8 and
 // 16 row tiles and ragged token counts.
+// The mixer down GEMM reading K-blocked activations (halo_gemm_q8r_f16_mb,
+// x stored [cols / 64][T][64]) equals halo_gemm_q8r_f16_m on the row-major
+// copy bit for bit: same values, same order.
+TEST(GpuQuant, BlockedActivationTallGemmIsBitIdentical) {
+  std::string error;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &error);
+  if (!dev) GTEST_SKIP() << error;
+  ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+  for (const std::uint32_t T : {1u, 70u, 200u}) {
+    const std::uint32_t rows = 320, cols = 1024, row_bytes = cols / 32 * 34;
+    std::vector<std::uint8_t> w(std::size_t{rows} * row_bytes);
+    std::uint32_t seed = T * 31 + 7;
+    for (auto& b : w) b = static_cast<std::uint8_t>((seed = seed * 1664525u + 1013904223u) >> 24);
+    for (std::size_t r = 0; r < rows; ++r)
+      for (std::size_t b = 0; b < cols / 32; ++b) {
+        const std::uint16_t h = 0x2000 | (r * 5 + b) % 1024;
+        std::memcpy(w.data() + r * row_bytes + b * 34, &h, 2);
+      }
+    std::vector<_Float16> x(std::size_t{T} * cols), xb(x.size());
+    for (std::size_t i = 0; i < x.size(); ++i) x[i] = static_cast<_Float16>(std::sin(0.13 * i));
+    for (std::uint32_t t = 0; t < T; ++t)
+      for (std::uint32_t c = 0; c < cols; ++c) xb[(std::size_t{c / 64} * T + t) * 64 + c % 64] = x[std::size_t{t} * cols + c];
+    auto wb = dev->Alloc(w.size(), &error), qs = dev->Alloc(std::size_t{rows} * cols, &error),
+         db = dev->Alloc(std::size_t{rows} * (cols / 32) * 2, &error), x1 = dev->Alloc(x.size() * 2, &error),
+         x2 = dev->Alloc(x.size() * 2, &error), y1 = dev->Alloc(std::size_t{T} * rows * 4, &error),
+         y2 = dev->Alloc(std::size_t{T} * rows * 4, &error);
+    ASSERT_TRUE(wb && qs && db && x1 && x2 && y1 && y2 && dev->Upload(wb, 0, w.data(), w.size(), &error) &&
+                dev->Upload(x1, 0, x.data(), x.size() * 2, &error) && dev->Upload(x2, 0, xb.data(), xb.size() * 2, &error))
+        << error;
+    const rt::Arg ra[] = {rt::Arg::Buf(wb), rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                          rt::Arg::Val(cols)};
+    ASSERT_TRUE(dev->Launch(dev->Kernel("halo_repack_q8_0", &error), {4096}, {256}, ra, &error)) << error;
+    for (const auto& [k, xx, y] : {std::tuple{"halo_gemm_q8r_f16_m", &x1, &y1}, std::tuple{"halo_gemm_q8r_f16_mb", &x2, &y2}}) {
+      const rt::Arg ga[] = {rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Buf(*xx), rt::Arg::Buf(*y), rt::Arg::Val(rows),
+                            rt::Arg::Val(cols), rt::Arg::Val(cols), rt::Arg::Val(T)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel(k, &error), {(T + 63) / 64, 1}, {256}, ga, &error)) << error;
+    }
+    std::vector<float> a(std::size_t{T} * rows), b(a.size());
+    ASSERT_TRUE(dev->Download(y1, 0, a.data(), a.size() * 4, &error) && dev->Download(y2, 0, b.data(), b.size() * 4, &error))
+        << error;
+    for (auto* buf : {&wb, &qs, &db, &x1, &x2, &y1, &y2}) dev->Free(*buf);
+    for (std::size_t i = 0; i < a.size(); ++i)
+      ASSERT_EQ(std::bit_cast<std::uint32_t>(a[i]), std::bit_cast<std::uint32_t>(b[i])) << "T " << T << " i " << i;
+  }
+}
+
 TEST(GpuQuant, BandedQ8F16GemmIsBitIdentical) {
   std::string error;
   auto dev = rt::Device::Create(rt::Backend::kHip, &error);
@@ -1851,7 +1898,7 @@ TEST(GpuKernels, Fp16EmittingNormsMatchOriginals) {
       launch("halo_rmsnorm_rows_h", rows, {rt::Arg::Buf(xb), rt::Arg::Buf(wb), rt::Arg::Buf(y2), rt::Arg::Buf(h2),
                                            rt::Arg::Val(d), rt::Arg::Val(1e-6f), rt::Arg::Val(d), rt::Arg::Val(period),
                                            rt::Arg::Val<std::uint64_t>(0), rt::Arg::Val<std::uint64_t>(0),
-                                           rt::Arg::Val(0u)});
+                                           rt::Arg::Val(0u), rt::Arg::Val(0u)});
       // Gated norm: the original in place on g1 (a copy of x), the fp16 variant from x.
       launch("halo_gated_norm_h", rows, {rt::Arg::Buf(xb), rt::Arg::Buf(wb), rt::Arg::Buf(zb), rt::Arg::Buf(h3),
                                          rt::Arg::Val(d), rt::Arg::Val(1e-6f), rt::Arg::Val(mode)});
@@ -1924,18 +1971,30 @@ TEST(GpuKernels, CombineNormEqualsSeparateKernels) {
              {rt::Arg::Buf(r1), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Val(hc), rt::Arg::Val(h), rt::Arg::Val(T)});
       launch("halo_rmsnorm_rows_h", T * hc, {rt::Arg::Buf(r1), rt::Arg::Buf(wb), rt::Arg::Buf(y1), rt::Arg::Buf(h1),
                                              rt::Arg::Val(h), rt::Arg::Val(1e-6f), rt::Arg::Val(h), rt::Arg::Val(hc),
-                                             rt::Arg::Buf(iwb), rt::Arg::Buf(p1), rt::Arg::Val(irows)});
+                                             rt::Arg::Buf(iwb), rt::Arg::Buf(p1), rt::Arg::Val(irows), rt::Arg::Val(0u)});
       launch("halo_hc_combine_norm_rows", T * hc, {rt::Arg::Buf(r2), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Buf(wb),
                                                    rt::Arg::Buf(y2), rt::Arg::Buf(h2), rt::Arg::Val(hc), rt::Arg::Val(h),
                                                    rt::Arg::Val(1e-6f), rt::Arg::Buf(iwb), rt::Arg::Buf(p2),
-                                                   rt::Arg::Val(irows), rt::Arg::Val<std::uint64_t>(0)});
+                                                   rt::Arg::Val(irows), rt::Arg::Val<std::uint64_t>(0), rt::Arg::Val(0u)});
       // The same with xn skipped: per-row scales instead, everything else unchanged.
       auto r3 = up(res.data(), n * 4), h3 = up(nullptr, n * 2), p3 = up(nullptr, std::size_t{T} * hc * irows * 4),
            sb = up(nullptr, std::size_t{T} * hc * 4);
       launch("halo_hc_combine_norm_rows", T * hc, {rt::Arg::Buf(r3), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Buf(wb),
                                                    rt::Arg::Val<std::uint64_t>(0), rt::Arg::Buf(h3), rt::Arg::Val(hc),
                                                    rt::Arg::Val(h), rt::Arg::Val(1e-6f), rt::Arg::Buf(iwb),
-                                                   rt::Arg::Buf(p3), rt::Arg::Val(irows), rt::Arg::Buf(sb)});
+                                                   rt::Arg::Buf(p3), rt::Arg::Val(irows), rt::Arg::Buf(sb), rt::Arg::Val(0u)});
+      // The fp16 streams K-blocked ([cols / 64][T][64], when cols % 64 == 0): the same values, permuted.
+      std::optional<std::vector<_Float16>> blocked;
+      if ((hc * h) % 64 == 0) {
+        auto r4 = up(res.data(), n * 4), h4 = up(nullptr, n * 2), p4 = up(nullptr, std::size_t{T} * hc * irows * 4),
+             sb4 = up(nullptr, std::size_t{T} * hc * 4);
+        launch("halo_hc_combine_norm_rows", T * hc, {rt::Arg::Buf(r4), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Buf(wb),
+                                                     rt::Arg::Val<std::uint64_t>(0), rt::Arg::Buf(h4), rt::Arg::Val(hc),
+                                                     rt::Arg::Val(h), rt::Arg::Val(1e-6f), rt::Arg::Buf(iwb),
+                                                     rt::Arg::Buf(p4), rt::Arg::Val(irows), rt::Arg::Buf(sb4), rt::Arg::Val(T)});
+        blocked.emplace(n);
+        ASSERT_TRUE(dev->Download(h4, 0, blocked->data(), n * 2, &error)) << error;
+      }
       launch("halo_inject_reduce", (T * irows + 255) / 256,
              {rt::Arg::Buf(p1), rt::Arg::Buf(j1), rt::Arg::Val(hc), rt::Arg::Val(irows), rt::Arg::Val(T)});
       launch("halo_inject_reduce", (T * irows + 255) / 256,
@@ -1980,6 +2039,11 @@ TEST(GpuKernels, CombineNormEqualsSeparateKernels) {
       }
       for (std::size_t i = 0; i < q2.size(); ++i)
         ASSERT_EQ(std::bit_cast<std::uint32_t>(q3[i]), std::bit_cast<std::uint32_t>(q2[i])) << "skipped-xn inject " << i;
+      if (blocked)
+        for (std::size_t i = 0; i < n; ++i) {  // element (t, c) of the row-major streams sits at XhBlocked(t, c)
+          const std::size_t t = i / (hc * h), cc = i % (hc * h), at = ((cc / 64) * T + t) * 64 + cc % 64;
+          ASSERT_EQ(std::bit_cast<std::uint16_t>((*blocked)[at]), c3[i]) << "blocked fp16 " << i;
+        }
       for (auto& o : owned) dev->Free(o);
       for (std::size_t i = 0; i < n; ++i) {
         ASSERT_EQ(std::bit_cast<std::uint32_t>(a1[i]), std::bit_cast<std::uint32_t>(a2[i])) << "residual " << i;
