@@ -4497,6 +4497,175 @@ extern "C" __global__ void __launch_bounds__(256)
   for (std::uint32_t i = 0; i < 32; ++i) S[(i0 + i) * d] = s[i];
 }
 
+// ---- P4: chunked gated DeltaNet ---------------------------------------------
+//
+// halo_gdn_prefill_split's recurrence per v-head (S key x value, decay
+// g = exp(a softplus(alpha + dt)), b = sigmoid(beta), delta = b (v - g S^T k),
+// S = g S + k delta^T, o = S^T q / sqrt d) over chunks of C tokens. With
+// G_t the cumulative log decay within a chunk and S0 its starting state:
+//   (I + A) Delta = diag(b) V - diag(b e^G) K S0,  A[t][s] = b_t (k_t.k_s) e^(G_t - G_s), s < t
+//   o_t = (e^G_t q_t^T S0 + sum_{s<=t} (q_t.k_s) e^(G_t - G_s) delta_s) / sqrt d
+//   S_C = e^G_C S0 + sum_s e^(G_C - G_s) k_s delta_s^T
+// (verified exact against stepping in double precision). The prep kernel
+// computes each chunk's A and masked QK in parallel; the scan walks the
+// chunks of a head in order, once per chunk instead of once per token.
+constexpr std::uint32_t kGdnChunk = 16;  // 16: ~23 KB LDS in the scan, all 96 blocks resident
+// Per (chunk, v-head): G [C], b [C], A [C][C] (strictly lower), QK [C][C]
+// (lower incl. diagonal, decay applied); prep layout [head][chunk][kGdnPrep].
+constexpr std::uint32_t kGdnPrep = 2 * kGdnChunk + 2 * kGdnChunk * kGdnChunk;
+//   grid (ceil(T / C), heads), block 256
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gdn_chunk_prep(const float* q, const float* k, const float* alpha, const float* beta, const float* a,
+                        const float* dt, float* prep, std::uint32_t num_k_heads, std::uint32_t tokens,
+                        std::uint32_t qk_stride) {
+  constexpr std::uint32_t d = 128, C = kGdnChunk;
+  __shared__ __attribute__((aligned(16))) float ks[C][d + 4], qs[C][d + 4];
+  __shared__ float G[C], bs[C];
+  const std::uint32_t c = blockIdx.x, h = blockIdx.y, heads = gridDim.y, tid = threadIdx.x;
+  const std::uint32_t t0 = c * C, n = min(C, tokens - t0), kh = h % num_k_heads;
+  for (std::uint32_t x = tid; x < C * d / 4; x += blockDim.x) {
+    const std::uint32_t tt = x / (d / 4), i = (x % (d / 4)) * 4;
+    const std::size_t row = static_cast<std::size_t>(t0 + min(tt, n - 1)) * qk_stride + kh * d + i;
+    *reinterpret_cast<float4*>(&ks[tt][i]) = *reinterpret_cast<const float4*>(k + row);
+    *reinterpret_cast<float4*>(&qs[tt][i]) = *reinterpret_cast<const float4*>(q + row);
+  }
+  if (tid < 32) {
+    const std::uint32_t tt = tid;
+    const float lg = tt < n && tt < C ? a[h] * Softplus(alpha[static_cast<std::size_t>(t0 + tt) * heads + h] + dt[h]) : 0.0f;
+    float g = lg;  // inclusive prefix sum over the chunk's 32 lanes
+    for (int o = 1; o < 32; o <<= 1) {
+      const float up = __shfl_up(g, o, 32);
+      if (tt >= static_cast<std::uint32_t>(o)) g += up;
+    }
+    if (tt < C) {
+      G[tt] = g;
+      bs[tt] = tt < n ? Sigmoid(beta[static_cast<std::size_t>(t0 + tt) * heads + h]) : 0.0f;
+    }
+  }
+  __syncthreads();
+  float* out = prep + (static_cast<std::size_t>(h) * gridDim.x + c) * kGdnPrep;
+  if (tid < C) {
+    out[tid] = G[tid];
+    out[C + tid] = bs[tid];
+  }
+  float* A = out + 2 * C;
+  float* QK = A + C * C;
+  for (std::uint32_t x = tid; x < 2 * C * C; x += blockDim.x) {
+    const std::uint32_t which = x / (C * C), t = (x % (C * C)) / C, sidx = x % C;
+    const bool live = t < n && sidx < n && (which == 0 ? sidx < t : sidx <= t);
+    float v = 0.0f;
+    if (live) {
+      const float* a0 = which == 0 ? ks[t] : qs[t];
+      float acc = 0.0f;
+#pragma unroll 8
+      for (std::uint32_t i = 0; i < d; i += 4) {
+        const float4 x4 = *reinterpret_cast<const float4*>(a0 + i), y4 = *reinterpret_cast<const float4*>(&ks[sidx][i]);
+        acc += x4.x * y4.x + x4.y * y4.y + x4.z * y4.z + x4.w * y4.w;
+      }
+      v = acc * expf(G[t] - G[sidx]) * (which == 0 ? bs[t] : 1.0f);
+    }
+    (which == 0 ? A : QK)[t * C + sidx] = v;
+  }
+}
+
+// The chunk scan: state columns spread over 4 lanes of 32 keys as in
+// halo_gdn_prefill_split (grid (2, heads), block 256: 64 columns a block).
+// Per chunk, every token's S0^T k and S0^T q are independent dot products;
+// the deltas follow by forward substitution; the state updates once.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gdn_chunk_scan(const float* q, const float* k, const float* v, const float* prep, float* state, float* out,
+                        std::uint32_t num_k_heads, std::uint32_t tokens, std::uint32_t qk_stride, std::uint32_t v_stride,
+                        std::uint32_t o_stride) {
+  constexpr std::uint32_t d = 128, C = kGdnChunk;
+  __shared__ __attribute__((aligned(16))) float ks[C][d + 4], qs[C][d + 4];
+  __shared__ float vs[C][64];
+  __shared__ float P[kGdnPrep];
+  const std::uint32_t h = blockIdx.y, tid = threadIdx.x;
+  const std::uint32_t j = blockIdx.x * 64 + tid / 4, part = tid % 4, i0 = part * 32;
+  const std::uint32_t kh = h % num_k_heads, nchunks = (tokens + C - 1) / C;
+  float* S = state + static_cast<std::size_t>(h) * d * d + j;  // S[i][j] at S[i * d]
+  float s[32];
+#pragma unroll
+  for (std::uint32_t i = 0; i < 32; ++i) s[i] = S[(i0 + i) * d];
+  const float inv_sqrt_d = 1.0f / sqrtf(static_cast<float>(d));
+  for (std::uint32_t c = 0; c < nchunks; ++c) {
+    const std::uint32_t t0 = c * C, n = min(C, tokens - t0);
+    __syncthreads();  // the previous chunk's LDS reads are done
+    for (std::uint32_t x = tid; x < C * d / 4; x += blockDim.x) {
+      const std::uint32_t tt = x / (d / 4), i = (x % (d / 4)) * 4;
+      const std::size_t row = static_cast<std::size_t>(t0 + min(tt, n - 1)) * qk_stride + kh * d + i;
+      *reinterpret_cast<float4*>(&ks[tt][i]) = *reinterpret_cast<const float4*>(k + row);
+      *reinterpret_cast<float4*>(&qs[tt][i]) = *reinterpret_cast<const float4*>(q + row);
+    }
+    for (std::uint32_t x = tid; x < C * 64; x += blockDim.x) {
+      const std::uint32_t tt = x / 64, cc = x % 64;
+      vs[tt][cc] = v[static_cast<std::size_t>(t0 + min(tt, n - 1)) * v_stride + h * d + blockIdx.x * 64 + cc];
+    }
+    const float* pp = prep + (static_cast<std::size_t>(h) * nchunks + c) * kGdnPrep;
+    for (std::uint32_t x = tid; x < kGdnPrep; x += blockDim.x) P[x] = pp[x];
+    __syncthreads();
+    const float* G = P;
+    const float* bs = P + C;
+    const float* A = P + 2 * C;
+    const float* QK = A + C * C;
+    // S0^T k_t and S0^T q_t for every token: partial over this lane's keys,
+    // then summed over the column's 4 lanes.
+    float kd[C], qd[C];
+#pragma unroll
+    for (std::uint32_t t = 0; t < C; ++t) {
+      float pk = 0.0f, pq = 0.0f;
+#pragma unroll
+      for (std::uint32_t i = 0; i < 32; i += 4) {
+        const float4 k4 = *reinterpret_cast<const float4*>(&ks[t][i0 + i]);
+        const float4 q4 = *reinterpret_cast<const float4*>(&qs[t][i0 + i]);
+        pk += s[i] * k4.x + s[i + 1] * k4.y + s[i + 2] * k4.z + s[i + 3] * k4.w;
+        pq += s[i] * q4.x + s[i + 1] * q4.y + s[i + 2] * q4.z + s[i + 3] * q4.w;
+      }
+      pk += QuadXor1(pk);
+      pq += QuadXor1(pq);
+      pk += QuadXor2(pk);
+      pq += QuadXor2(pq);
+      kd[t] = pk;
+      qd[t] = pq;
+    }
+    // Deltas by forward substitution (every lane of the column alike).
+    float dl[C];
+#pragma unroll
+    for (std::uint32_t t = 0; t < C; ++t) {
+      float r = bs[t] * (vs[t][tid / 4] - expf(G[t]) * kd[t]);
+#pragma unroll
+      for (std::uint32_t u = 0; u < t; ++u) r -= A[t * C + u] * dl[u];
+      dl[t] = t < n ? r : 0.0f;
+    }
+    // Outputs.
+    if (part == 0) {
+#pragma unroll
+      for (std::uint32_t t = 0; t < C; ++t) {
+        if (t >= n) break;
+        float o = expf(G[t]) * qd[t];
+#pragma unroll
+        for (std::uint32_t u = 0; u <= t; ++u) o += QK[t * C + u] * dl[u];
+        out[static_cast<std::size_t>(t0 + t) * o_stride + h * d + j] = o * inv_sqrt_d;
+      }
+    }
+    // State: S = e^G_n S0 + sum_t e^(G_n - G_t) k_t delta_t^T.
+    const float gn = G[n - 1];
+    float w[C];
+#pragma unroll
+    for (std::uint32_t t = 0; t < C; ++t) w[t] = t < n ? expf(gn - G[t]) * dl[t] : 0.0f;
+    const float en = expf(gn);
+#pragma unroll
+    for (std::uint32_t i = 0; i < 32; ++i) {
+      float acc = en * s[i];
+#pragma unroll
+      for (std::uint32_t t = 0; t < C; ++t) acc += ks[t][i0 + i] * w[t];
+      s[i] = acc;
+    }
+  }
+#pragma unroll
+  for (std::uint32_t i = 0; i < 32; ++i) S[(i0 + i) * d] = s[i];
+}
+
 // ---- P4: dense GEMM over repacked Q8_0 on FP16 WMMA ---------------------------
 //
 // y[t][r] = sum_c W[r][c] x[t][c]: W repacked Q8_0 (int8 rows qstride apart,

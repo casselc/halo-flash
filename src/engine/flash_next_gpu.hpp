@@ -100,6 +100,8 @@ class FlashNextGpu {
   // combine_norm skips the fp32 xn the mixer's mix epilogue would re-read;
   // the epilogue rebuilds it from res (same arithmetic, bit-identical).
   static inline bool prefill_mix_rebuild_ = true;
+  /// DeltaNet over 16-token chunks (prep + scan) instead of token by token.
+  static inline bool prefill_gdn_chunked_ = true;
   /// Read the next prefill chunk's n-gram rows on a host thread while the
   /// current chunk runs on the device.
   static inline bool prefill_ngram_prefetch_ = true;
@@ -239,6 +241,7 @@ class FlashNextGpu {
     rt::Buffer xh, mh;  // fp16 activations: per GEMM, and the shared `mixed`  // grouped experts (hp, x16 fp16)
     rt::Buffer bscores, vis, ascores;                // batched attention, kAttnSub tokens at a time
     rt::Buffer ublk, umask, ucount;                  // QSA unions of 4 tokens (halo_qsa_union4)
+    rt::Buffer gdnprep;                              // chunked DeltaNet: per (head, 16-token chunk) G, b, A, QK
     std::size_t params_offset = 0;  // in `host`: per-token step params after the n-gram rows
     std::uint32_t cap = 0;  // tokens the buffers hold
   };

@@ -1049,7 +1049,7 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
       const std::uint32_t nk = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 2}));
       const std::uint32_t nv = nk * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 3}));
       const std::uint32_t kern = tc.draw(gs::sampled_from(std::vector<std::uint32_t>{2, 4}));
-      const std::uint32_t T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 24}));
+      const std::uint32_t T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 40}));
       const std::uint32_t mode = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = 1}));
       const std::uint32_t kd = nk * d, vd = nv * d, ch = 2 * kd + vd;
       std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
@@ -1135,6 +1135,27 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
       };
       close(get(out3, std::size_t{T} * vd), get(out2, std::size_t{T} * vd), "output");
       close(get(gs3, gst.size()), get(gs2, gst.size()), "recurrent state");
+      // The chunked form (halo_gdn_chunk_prep + halo_gdn_chunk_scan, 16-token
+      // chunks) against the split kernel, before the gated norm: same bound.
+      {
+        constexpr std::uint32_t C = 16, kPrep = 2 * C + 2 * C * C;
+        const std::uint32_t nch = (T + C - 1) / C;
+        auto gs4 = up(gst), out4 = zeros(std::size_t{T} * vd), out5 = zeros(std::size_t{T} * vd), gs5 = up(gst),
+             prep = zeros(std::size_t{nv} * nch * kPrep);
+        launch("halo_gdn_prefill_split", {2, nv}, {256},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(conv2, 2ull * kd * 4), rt::Arg::Buf(alb),
+                rt::Arg::Buf(beb), rt::Arg::Buf(ab), rt::Arg::Buf(dtb), rt::Arg::Buf(gs5), rt::Arg::Buf(out5),
+                rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)});
+        launch("halo_gdn_chunk_prep", {nch, nv}, {256},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(alb), rt::Arg::Buf(beb), rt::Arg::Buf(ab),
+                rt::Arg::Buf(dtb), rt::Arg::Buf(prep), rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch)});
+        launch("halo_gdn_chunk_scan", {2, nv}, {256},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(conv2, 2ull * kd * 4), rt::Arg::Buf(prep),
+                rt::Arg::Buf(gs4), rt::Arg::Buf(out4), rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch),
+                rt::Arg::Val(vd)});
+        close(get(out4, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "chunked output");
+        close(get(gs4, gst.size()), get(gs5, gst.size()), "chunked recurrent state");
+      }
       same(get(out2, std::size_t{T} * vd), get(out1, std::size_t{T} * vd), "output");
       same(get(cs2, cst.size()), get(cs1, cst.size()), "conv state");
       same(get(gs2, gst.size()), get(gs1, gst.size()), "recurrent state");
