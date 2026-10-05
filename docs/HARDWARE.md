@@ -28,9 +28,11 @@ LPDDR5X-8000 256-bit unified memory, 32 MB MALL. ROCm 7.2.3.
   high occupancy (16.5 cycles per dependent FMA per wave with ~16 waves per SIMD).
 - WMMA 16x16x16 (`halo_hwprobe wmma`): **f16, bf16 and iu8 all ~34 cycles per WMMA per SIMD at
   throughput (~55 T/s for the GPU)**. iu8 is not faster than f16 here: int8 activations can only
-  win by removing dequantization VALU and bytes, never by matrix throughput. A single dependent
-  f16 chain with one wave per SIMD takes 69 cycles (bf16, iu8: 35); two independent chains or
-  waves reach throughput.
+  win by removing dequantization VALU and bytes, never by matrix throughput. One dependent chain in
+  one wave per SIMD already runs at ~35-36 cycles: WMMA latency is about its issue interval, so a
+  single accumulator chain is not a bottleneck. (A first reading of 69 cycles for f16 was the clock
+  ramping from idle: the first kernel after idle can run ~2x slow, so probes warm up with a
+  full-length run first.)
 - **VALU does not overlap WMMA.** Each independent VALU instruction interleaved adds ~1 cycle per
   WMMA (4 FMAs: +4.2, 16 FMAs: +16). Per SIMD, time ~ 34 x WMMAs + VALU instructions + other
   issue. A GEMM that dequantizes in VALU pays for every dequant instruction directly.
@@ -84,6 +86,20 @@ The `_m` row led to the first change derived from this model: the mixers' fp16 s
 K-blocked ([cols / 64][T][64]) so a stage reads one contiguous 8 KB run. Study: 0.67 -> 0.44 ms
 warm, 1.33 -> 0.62 after writes (predicted 0.35-0.45 warm). In-engine: 101.9 -> 55.2 ms per
 prefill (predicted -40 to -50), the norm kernel writing it +10.6, net -31.7 ms.
+
+## Open questions (from a GPT-6.1 review of the probes, 2026-10-05)
+
+- Same-rows vs different-rows bandwidth: count unique vs requested bytes and transactions to tell
+  DRAM row locality from cache or translation reuse.
+- Random 4 KB pages at a flat ~34 GB/s for every loads-in-flight / occupancy setting: verify in the
+  ISA that the sweep really varied outstanding loads; vary page size and locality.
+- Pointer-chase knees are effective latencies, not cache sizes (translation, associativity and
+  residency mix in).
+- Harness: ISA-checked kernels with observable outputs, randomized run order, distributions over
+  repeats, and real producer -> consumer sequences in place of the generic "after 96 MB of writes".
+- The cost model built on this must be an empirically calibrated search, validated on held-out
+  shapes and fused sequences, with launch amortization, occupancy cliffs, transaction amplification,
+  layout conversions, MoE routing distributions and one-time transformation costs included.
 
 ## Consequences for kernel design
 

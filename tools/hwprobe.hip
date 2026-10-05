@@ -214,6 +214,7 @@ void Wmma() {
                 wmmas * 8192 / (ms * 1e-3) / 1e12, t == 2 ? "OP" : "FLOP");
   };
   const int iters = 20000;
+  (void)WmmaTime<0, 4, 0>(80, 128, iters, out);  // a full-length throwaway first: the clock ramps from idle
 #define WMMA_ROWS(T)                                                                                               \
   row("1 wave/SIMD, 1 chain (latency)", T, 1, 1, WmmaTime<T, 1, 0>(80, 32, iters, out), iters);                  \
   row("1 wave/SIMD, 4 chains", T, 1, 4, WmmaTime<T, 4, 0>(80, 32, iters, out), iters);                          \
@@ -226,6 +227,7 @@ void Wmma() {
   WMMA_ROWS(0)
   WMMA_ROWS(1)
   WMMA_ROWS(2)
+  row("1 wave/SIMD, 1 chain, again", 0, 1, 1, WmmaTime<0, 1, 0>(80, 32, iters, out), iters);
 #undef WMMA_ROWS
   CHECK(hipFree(out));
 }
