@@ -598,6 +598,12 @@ tiles re-read xh once per row tile (5x, ~210 MB), and the cost grew with the spl
 library's split without its tile economics does not work; next is a microbenchmark study of
 `_m` tile shapes with a trace, not more in-engine guesses.
 
+**4i. QSA attention over 4-token unions (173b279).** Attention for an 8K-token prefill: 1578 -> 654
+ms (pinned), 13.46 -> 6.11 ms per 512-token call, as predicted. Quality is unchanged at prompt
+lengths up to 24K. The next long-prompt target is the indexer's scoring: `halo_qsa_scores_rows`
+takes 1.39 s per 8K prefill, as much as attention did before. It scores every complete block for
+every token. Then the serial n-gram read per chunk (4h).
+
 **4h. Chunk size and long prompts (2026-10-04, pinned, pseudo-random tokens, n-gram not
 resident).** For an 8192-token prompt:
 
