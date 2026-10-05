@@ -276,7 +276,10 @@ bool FlashNextGpu::MixUp(const model::HcMixer& m, std::uint32_t T, std::string* 
     const bool rebuild = xn_skipped_;  // xn was not written: rebuild it from res
     xn_skipped_ = false;
     return Half(ck_.lo, ck_.xh, T * low, error) &&
-           Launch("halo_gemm_q8r_f16_mix", {(T + 127) / 128, (rows + 255) / 256}, {256},
+           // Row tiles fastest: resident blocks read whole residual rows of the same
+           // tokens (token tiles fastest: 1.41 vs 1.15 ms warm, 1.62 vs 1.19 after
+           // its input was just written).
+           Launch("halo_gemm_q8r_f16_mixt", {(rows + 255) / 256, (T + 127) / 128}, {256},
                   {rt::Arg::Buf(it->second.qs), rt::Arg::Buf(it->second.d), rt::Arg::Buf(ck_.xh), rt::Arg::Buf(ck_.mixed),
                    rt::Arg::Val(rows), rt::Arg::Val(low), rt::Arg::Val(dt.qstride), rt::Arg::Val(T),
                    rt::Arg::Buf(rebuild ? ck_.res : ck_.xn), rt::Arg::Buf(ck_.mh),

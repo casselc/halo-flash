@@ -5715,7 +5715,8 @@ HALO_GDN_SKEL(halo_gdnskel_c64_n32_pf_seq, 64, 32, 256, 4, true, true)
 // mixed[t][i] = sum_s xn[t][s h + i] * sigmoid(gate) / 4, in fp32 and fp16.
 // With rs and nw, xn is the residual and xn[t][s h + i] is rebuilt as
 // (res * rs[t * 4 + s]) * nw[s h + i] (combine_norm's arithmetic).
-template <std::uint32_t BM, std::uint32_t BN, std::uint32_t WM, std::uint32_t WN, std::uint32_t KS, bool kMix = false>
+template <std::uint32_t BM, std::uint32_t BN, std::uint32_t WM, std::uint32_t WN, std::uint32_t KS, bool kMix = false,
+          bool kRowsFast = false>
 __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
                            std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens,
                            const float* xn = nullptr, _Float16* y16 = nullptr, const float* rs = nullptr,
@@ -5733,7 +5734,8 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
   _Float16* As = smem;
   _Float16* Bs = smem + BM * RS;
   const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
-  const std::uint32_t r0 = blockIdx.y * BM, t0 = blockIdx.x * BN;
+  // kRowsFast: row tiles vary fastest in dispatch order (grid (row tiles, token tiles)).
+  const std::uint32_t r0 = (kRowsFast ? blockIdx.x : blockIdx.y) * BM, t0 = (kRowsFast ? blockIdx.y : blockIdx.x) * BN;
   const std::uint32_t wr = wave % WM, wt = wave / WM;
   const std::uint32_t nblk = cols / 32;
   // Native vectors, not HIP's int4/uint4: those are structs, and LLVM's
@@ -5862,6 +5864,13 @@ extern "C" __global__ void __launch_bounds__(256)
                           std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens,
                           const float* xn, _Float16* y16, const float* rs, const float* nw) {
   GemmQ8rF16<256, 128, 8, 1, 32, true>(qs, d, x, y, rows, cols, qstride, tokens, xn, y16, rs, nw);
+}
+// The same with row tiles fastest: grid (ceil(rows / 256), ceil(T / 128)).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_q8r_f16_mixt(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
+                           std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens,
+                           const float* xn, _Float16* y16, const float* rs, const float* nw) {
+  GemmQ8rF16<256, 128, 8, 1, 32, true, true>(qs, d, x, y, rows, cols, qstride, tokens, xn, y16, rs, nw);
 }
 
 // Repacked Q8_0 rows reordered stream-major -> index-major: destination row

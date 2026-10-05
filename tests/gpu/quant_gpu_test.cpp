@@ -1701,6 +1701,20 @@ TEST(GpuQuant, FusedMixerUpMatchesReference) {
       ASSERT_TRUE(dev->Download(yb, 0, y.data(), y.size() * 4, &error) &&
                   dev->Download(y16, 0, yh.data(), yh.size() * 2, &error))
           << error;
+      {  // halo_gemm_q8r_f16_mixt (row tiles fastest) is the same kernel in another dispatch order: bit-identical
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemm_q8r_f16_mixt", &error), {(rows + 255) / 256, (T + 127) / 128},
+                                {256}, ga, &error))
+            << error;
+        std::vector<float> yt(y.size());
+        std::vector<_Float16> yth(y.size());
+        ASSERT_TRUE(dev->Download(yb, 0, yt.data(), yt.size() * 4, &error) &&
+                    dev->Download(y16, 0, yth.data(), yth.size() * 2, &error))
+            << error;
+        for (std::size_t i = 0; i < y.size(); ++i) {
+          ASSERT_EQ(std::bit_cast<std::uint32_t>(yt[i]), std::bit_cast<std::uint32_t>(y[i])) << "mixt " << i;
+          ASSERT_EQ(std::bit_cast<std::uint16_t>(yth[i]), std::bit_cast<std::uint16_t>(yh[i])) << "mixt16 " << i;
+        }
+      }
       for (auto* b : {&wb, &qs, &db, &pqs, &pdb, &xb, &nb, &yb, &y16, &rsb, &nwb}) dev->Free(*b);
       // Weights in fp16 as the kernel stages them, row-major (stream s, index i at row s h + i).
       std::vector<float> wf(std::size_t{rows} * cols);

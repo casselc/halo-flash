@@ -292,6 +292,75 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (argc > 1 && std::string(argv[1]) == "mixstudy") {
+    // The mixer's fused up-projection + mix (rebuild form, as in prefill:
+    // xn rebuilt from res, rscale and the norm gammas) at its real shape,
+    // timed warm, cold (LLC evicted by a 96 MB read), after 96 MB of
+    // unrelated writes, and after rewriting its own input res (84 MB), as
+    // combine_norm does just before it in the engine.
+    auto d = rt::Device::Create(rt::Backend::kHip, &e);
+    if (!d || !d->LoadModule(kernels::CoreHsaco(), &e)) return std::printf("%s\n", e.c_str()), 1;
+    const std::uint32_t h = 2560, rows = 4 * h, cols = 320, T = 2048;
+    const std::size_t row_bytes = cols / 32 * 34;
+    std::vector<std::uint8_t> w(std::size_t{rows} * row_bytes);
+    std::mt19937 g(5);
+    for (auto& b : w) b = static_cast<std::uint8_t>(g());
+    for (std::size_t r = 0; r < rows; ++r)
+      for (std::size_t b = 0; b < cols / 32; ++b) {
+        const std::uint16_t hv = 0x2000 | (g() & 0x3FF);
+        std::memcpy(w.data() + r * row_bytes + b * 34, &hv, 2);
+      }
+    std::vector<std::uint16_t> lo(std::size_t{T} * cols);
+    for (auto& v : lo) v = static_cast<std::uint16_t>(0x3000 | (g() & 0x3FF));
+    std::vector<float> res(std::size_t{T} * rows, 0.5f), rs(std::size_t{T} * 4, 1.0f), nw(rows, 1.0f);
+    auto wb = d->Alloc(w.size(), &e), qs = d->Alloc(std::size_t{rows} * cols, &e),
+         db = d->Alloc(std::size_t{rows} * (cols / 32) * 2, &e), xb = d->Alloc(lo.size() * 2, &e),
+         rb = d->Alloc(res.size() * 4, &e), rsb = d->Alloc(rs.size() * 4, &e), nwb = d->Alloc(nw.size() * 4, &e),
+         yb = d->Alloc(std::size_t{T} * h * 4, &e), y16 = d->Alloc(std::size_t{T} * h * 2, &e);
+    (void)d->Upload(wb, 0, w.data(), w.size(), &e);
+    (void)d->Upload(xb, 0, lo.data(), lo.size() * 2, &e);
+    (void)d->Upload(rb, 0, res.data(), res.size() * 4, &e);
+    (void)d->Upload(rsb, 0, rs.data(), rs.size() * 4, &e);
+    (void)d->Upload(nwb, 0, nw.data(), nw.size() * 4, &e);
+    const rt::Arg ra[] = {rt::Arg::Buf(wb), rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                          rt::Arg::Val(cols)};
+    (void)d->Launch(d->Kernel("halo_repack_q8_0", &e), {4096}, {256}, ra, &e);
+    const auto k = d->Kernel(argc > 2 ? argv[2] : "halo_gemm_q8r_f16_mix", &e);
+    const rt::Arg a[] = {rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Buf(xb), rt::Arg::Buf(yb), rt::Arg::Val(rows),
+                         rt::Arg::Val(cols), rt::Arg::Val(cols), rt::Arg::Val(T), rt::Arg::Buf(rb), rt::Arg::Buf(y16),
+                         rt::Arg::Buf(rsb), rt::Arg::Buf(nwb)};
+    const bool rows_fast = argc > 2 && std::string(argv[2]) == "halo_gemm_q8r_f16_mixt";
+    const rt::Dim3 grid = rows_fast ? rt::Dim3{(rows + 255) / 256, (T + 127) / 128} : rt::Dim3{(T + 127) / 128, (rows + 255) / 256};
+    const auto kf = d->Kernel("halo_bench_read", &e);
+    auto fb = d->Alloc(96ull << 20, &e), fo = d->Alloc(64, &e);
+    {
+      std::vector<float> fill((96ull << 20) / 4, 1.0f);
+      (void)d->Upload(fb, 0, fill.data(), fill.size() * 4, &e);
+    }
+    const rt::Arg fa[] = {rt::Arg::Buf(fb), rt::Arg::Val(std::uint64_t{(96ull << 20) / 16}), rt::Arg::Val(std::uint32_t{1}),
+                          rt::Arg::Buf(fo)};
+    const auto timed = [&](auto&& before) {
+      double sum = 0;
+      for (int r = 0; r < 20; ++r) {
+        before(r);
+        (void)d->Synchronize(&e);
+        const auto c0 = std::chrono::steady_clock::now();
+        (void)d->Launch(k, grid, {256}, a, &e);
+        (void)d->Synchronize(&e);
+        sum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+      }
+      return sum / 20;
+    };
+    for (int r = 0; r < 5; ++r) (void)d->Launch(k, grid, {256}, a, &e);
+    const double warm = timed([](int) {});
+    const double cold = timed([&](int) { (void)d->Launch(kf, {1280}, {256}, fa, &e); });
+    const double other = timed([&](int r) { (void)d->Fill(fb, static_cast<std::uint8_t>(r), &e); });
+    // Own input rewritten: res set to the same bit pattern again (0x3f000000 = 0.5f) through a fill kernel.
+    const double own = timed([&](int) { (void)d->Fill(rb, 0x00, &e); });
+    std::printf("mix 10240 x 320, T 2048: warm %.3f ms  cold %.3f  after 96 MB other writes %.3f  "
+                "after rewriting its own res (84 MB) %.3f\n", warm, cold, other, own);
+    return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "peak") {
     // Register-only WMMA throughput: the ceiling the GEMMs are measured against.
     auto d = rt::Device::Create(rt::Backend::kHip, &e);
