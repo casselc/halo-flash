@@ -4,6 +4,7 @@
 // or far apart and CPU/GPU rounding cannot reorder them; the tie rule is
 // then checked exactly.
 
+#include <bit>
 #include <hegel/gtest.h>
 
 #include <algorithm>
@@ -366,11 +367,32 @@ TEST(GpuSelect, QsaUnionAttentionMatchesSelectKernel) {
                             rt::Arg::Buf(pb), rt::Arg::Buf(ub), rt::Arg::Buf(mb), rt::Arg::Buf(cb), rt::Arg::Val(max_u),
                             rt::Arg::Val(ratio), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(T)};
       ASSERT_TRUE(dev->Launch(dev->Kernel("halo_attention_wmma_qsel", &error), {nkv, groups}, {256}, wa, &error)) << error;
-      std::vector<float> want(q.size()), got(q.size());
-      ASSERT_TRUE(dev->Download(o1, 0, want.data(), want.size() * 4, &error) &&
-                  dev->Download(o2, 0, got.data(), got.size() * 4, &error))
+      // The fp16-cache variant on the same values rounded to fp16 (as the
+      // engine's copy is): bit-identical to the fp32-cache kernel, which
+      // rounds them the same way while staging.
+      std::vector<_Float16> k16(kc.size()), v16(vc.size());
+      for (std::size_t i = 0; i < kc.size(); ++i) {
+        k16[i] = static_cast<_Float16>(kc[i]);
+        v16[i] = static_cast<_Float16>(vc[i]);
+      }
+      auto k16b = dev->Alloc(k16.size() * 2, &error), v16b = dev->Alloc(v16.size() * 2, &error),
+           o3 = dev->Alloc(q.size() * 4, &error);
+      ASSERT_TRUE(k16b && v16b && o3 && dev->Upload(k16b, 0, k16.data(), k16.size() * 2, &error) &&
+                  dev->Upload(v16b, 0, v16.data(), v16.size() * 2, &error))
           << error;
-      for (auto* b : {&qb, &gb, &kb, &vb, &sb, &pb, &o1, &o2, &sc, &ub, &mb, &cb}) dev->Free(*b);
+      const rt::Arg ha[] = {rt::Arg::Buf(qb), rt::Arg::Buf(k16b), rt::Arg::Buf(v16b), rt::Arg::Buf(gb), rt::Arg::Buf(o3),
+                            rt::Arg::Buf(pb), rt::Arg::Buf(ub), rt::Arg::Buf(mb), rt::Arg::Buf(cb), rt::Arg::Val(max_u),
+                            rt::Arg::Val(ratio), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(T)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_attention_wmma_qsel_h", &error), {nkv, groups}, {256}, ha, &error)) << error;
+      std::vector<float> want(q.size()), got(q.size()), got16(q.size());
+      ASSERT_TRUE(dev->Download(o1, 0, want.data(), want.size() * 4, &error) &&
+                  dev->Download(o2, 0, got.data(), got.size() * 4, &error) &&
+                  dev->Download(o3, 0, got16.data(), got16.size() * 4, &error))
+          << error;
+      for (auto* b : {&qb, &gb, &kb, &vb, &sb, &pb, &o1, &o2, &sc, &ub, &mb, &cb, &k16b, &v16b, &o3}) dev->Free(*b);
+      for (std::size_t i = 0; i < got.size(); ++i)
+        ASSERT_EQ(std::bit_cast<std::uint32_t>(got16[i]), std::bit_cast<std::uint32_t>(got[i]))
+            << "fp16-cache variant " << i << ": " << got16[i] << " vs " << got[i];
       for (std::uint32_t t = 0; t < T; ++t) {
         double d = 0, m = 0;
         for (std::size_t i = std::size_t{t} * nh * hd; i < std::size_t{t + 1} * nh * hd; ++i) {

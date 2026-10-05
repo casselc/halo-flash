@@ -499,6 +499,18 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   const std::uint32_t max_u = 4 * budget + 4;
   const bool qsel = wmma && prefill_qsel_attention_ && 4 * G <= 48 && max_blocks <= 65537;
   const bool scores_wmma = prefill_scores_wmma_ && !prefill_exact_projections_ && ih == 4 && idim % 16 == 0;
+  // The fp16 K/V copy: convert what is not current yet (this chunk, and
+  // anything decode wrote since), then the union attention reads it.
+  const bool kv16 = qsel && prefill_kv16_ && s.k16;
+  if (kv16 && s.valid16 < pos0 + T) {
+    const std::size_t lo = std::size_t{s.valid16} * kvdim, nv = std::size_t{pos0 + T - s.valid16} * kvdim;
+    for (const auto& [f, h] : {std::pair{&s.k, &s.k16}, std::pair{&s.v, &s.v16}})
+      if (!Launch("halo_f16_rows", {static_cast<std::uint32_t>((nv + 255) / 256)}, {kBlock},
+                  {rt::Arg::Buf(*f, lo * 4), rt::Arg::Buf(*h, lo * 2), rt::Arg::Val(static_cast<std::uint32_t>(nv))},
+                  error))
+        return false;
+    s.valid16 = pos0 + T;
+  }
   for (std::uint32_t t0 = 0; t0 < T; t0 += kAttnSub) {
     const std::uint32_t n = std::min(kAttnSub, T - t0);
     const rt::Arg params = rt::Arg::Buf(ck_.host, ck_.params_offset + std::size_t{t0} * 64);
@@ -525,8 +537,9 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
                          rt::Arg::Val(max_blocks), rt::Arg::Val(n), rt::Arg::Buf(ck_.ublk), rt::Arg::Buf(ck_.umask),
                          rt::Arg::Buf(ck_.ucount), rt::Arg::Val(max_u)},
                         error) &&
-                     Launch("halo_attention_wmma_qsel", {nkv, (n + 3) / 4}, {256},
-                            {rt::Arg::Buf(ck_.q, std::size_t{t0} * qdim * 4), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v),
+                     Launch(kv16 ? "halo_attention_wmma_qsel_h" : "halo_attention_wmma_qsel", {nkv, (n + 3) / 4}, {256},
+                            {rt::Arg::Buf(ck_.q, std::size_t{t0} * qdim * 4), rt::Arg::Buf(kv16 ? s.k16 : s.k),
+                             rt::Arg::Buf(kv16 ? s.v16 : s.v),
                              rt::Arg::Buf(ck_.gate_a, std::size_t{t0} * qdim * 4),
                              rt::Arg::Buf(ck_.ctx, std::size_t{t0} * qdim * 4), params, rt::Arg::Buf(ck_.ublk),
                              rt::Arg::Buf(ck_.umask), rt::Arg::Buf(ck_.ucount), rt::Arg::Val(max_u),

@@ -99,6 +99,9 @@ class FlashNextGpu {
   // combine_norm skips the fp32 xn the mixer's mix epilogue would re-read;
   // the epilogue rebuilds it from res (same arithmetic, bit-identical).
   static inline bool prefill_mix_rebuild_ = true;
+  /// The chunked QSA attention reads an fp16 copy of the K/V cache (same
+  /// results; ~24.6 KB more per cached token).
+  static inline bool prefill_kv16_ = true;
   /// QSA block scores of a chunk as one bf16x3 WMMA GEMM (near-fp32).
   static inline bool prefill_scores_wmma_ = true;
   /// Past the QSA budget, attention for 4 tokens at a time over the union of
@@ -183,6 +186,11 @@ class FlashNextGpu {
   struct AttnState {
     rt::Buffer k, v, index_k, block_k;
     std::uint32_t blocks = 0;
+    // fp16 copy of k and v for the chunked QSA attention (which rounds K/V
+    // to fp16 anyway): positions [0, valid16) are current. Filled lazily
+    // before use; Restore and Reset set valid16 to 0.
+    rt::Buffer k16, v16;
+    std::uint32_t valid16 = 0;
   };
 
   FlashNextGpu(rt::Device& d, const model::ModelWeights& w, model::NgramTable* ngram)

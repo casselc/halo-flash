@@ -4871,6 +4871,13 @@ extern "C" __global__ void __launch_bounds__(256)
   // The union's keys; token q sees key j when its bit is set and the
   // position is before its own causal limit.
   const std::uint32_t n = ucount[blockIdx.y] * ratio;
+  // Positions past the group's last causal limit (the tail block's unused
+  // slots) are masked for every token, but their K/V must not be read: past
+  // the cache's end, or stale and possibly non-finite (0 * NaN poisons P . V).
+  std::uint32_t pend = 0;
+  for (std::uint32_t i = 0; i < QT; ++i) pend = max(pend, nkv[i]);
+  const auto pos_in = [&](std::uint32_t j) { return min(pos_of(min(j, n - 1)), pend - 1); };
+  const auto live_at = [&](std::uint32_t j) { return j < n && pos_of(min(j, n - 1)) < pend; };
   // P . V work: wave owns dim tiles 2 * (wave % 8) .. + 1 for every row tile.
   halo_v8f acc[3][2] = {};
   // Only LDS is shared between the waves: LDS-only barriers keep the next
@@ -4889,7 +4896,7 @@ extern "C" __global__ void __launch_bounds__(256)
     for (std::uint32_t p = 0; p < VP; ++p) {
       const std::uint32_t i = tid + p * 256, j = i / (HD / 4), d = (i % (HD / 4)) * 4;
       rv[p] = *reinterpret_cast<const float4*>(
-          vc + (static_cast<std::size_t>(pos_of(min(c + j, n - 1))) * num_kv_heads + g) * HD + d);
+          vc + (static_cast<std::size_t>(pos_in(c + j)) * num_kv_heads + g) * HD + d);
     }
   };
   if (n > 0) load_v(0);
@@ -4898,7 +4905,7 @@ extern "C" __global__ void __launch_bounds__(256)
 #pragma unroll
     for (std::uint32_t p = 0; p < VP; ++p) {
       const std::uint32_t i = tid + p * 256, j = i / (HD / 4), d = (i % (HD / 4)) * 4;
-      const bool live = c0 + j < n;
+      const bool live = live_at(c0 + j);
       _Float16* dst = Vs + j * VR + d;
       dst[0] = static_cast<_Float16>(live ? rv[p].x : 0.0f);
       dst[1] = static_cast<_Float16>(live ? rv[p].y : 0.0f);
@@ -4911,7 +4918,7 @@ extern "C" __global__ void __launch_bounds__(256)
     if (rt < rtiles) {
       const std::uint32_t kj = c0 + kt * 16 + lane % 16;
       const std::uint32_t kp = pos_of(min(kj, n - 1)), km = um[min(kj, n - 1) / ratio];
-      const float* krow = kc + (static_cast<std::size_t>(kp) * num_kv_heads + g) * HD;
+      const float* krow = kc + (static_cast<std::size_t>(pos_in(kj)) * num_kv_heads + g) * HD;
       halo_v8f s = {};
       for (std::uint32_t k0 = 0; k0 < HD; k0 += 16) {
         const halo_v16h a = LdsFrag(&Qs[(rt * 16 + lane % 16) * QR + k0]);
@@ -4926,6 +4933,168 @@ extern "C" __global__ void __launch_bounds__(256)
         }
         s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, s);
       }
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint32_t r = rt * 16 + 2 * j + lane / 16, tq = r / G;
+        const std::uint32_t qq = min(tq, QT - 1);
+        const bool ok = r < rows && kj < n && ((km >> qq) & 1u) && kp < nkv[qq];
+        Ss[r * KC + kt * 16 + lane % 16] = ok ? s[j] * scale : -INFINITY;
+      }
+    }
+    barrier();
+    // Online softmax: 4 threads per row (192 of 256), 8 keys each.
+    if (tid < MR * 4) {
+      const std::uint32_t row = tid / 4, part = tid % 4;
+      float mx = -INFINITY;
+      if (row < rows)
+        for (std::uint32_t c = part * 8; c < part * 8 + 8; ++c) mx = fmaxf(mx, Ss[row * KC + c]);
+      for (int o = 2; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 32));
+      const float m_old = mrow[row], m_new = fmaxf(m_old, mx);
+      float sum = 0.0f;
+      for (std::uint32_t c = part * 8; c < part * 8 + 8; ++c) {
+        const float p = row < rows && m_new != -INFINITY ? expf(Ss[row * KC + c] - m_new) : 0.0f;
+        Ps[row * PR + c] = static_cast<_Float16>(p);
+        sum += p;
+      }
+      for (int o = 2; o > 0; o >>= 1) sum += __shfl_xor(sum, o, 32);
+      if (part == 0) {
+        const float a = m_old == -INFINITY ? 0.0f : expf(m_old - m_new);
+        alpha[row] = a;
+        lrow[row] = lrow[row] * a + sum;
+        mrow[row] = m_new;
+      }
+    }
+    barrier();
+#pragma unroll
+    for (std::uint32_t r = 0; r < 3; ++r) {  // fully unrolled: acc stays in registers
+      if (r >= rtiles) break;
+#pragma unroll
+      for (int dt = 0; dt < 2; ++dt)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[r][dt][j] *= alpha[r * 16 + 2 * j + lane / 16];
+      for (std::uint32_t kk = 0; kk < KC; kk += 16) {
+        const halo_v16h a = LdsFrag(&Ps[(r * 16 + lane % 16) * PR + kk]);
+#pragma unroll
+        for (int dt = 0; dt < 2; ++dt) {
+          const std::uint32_t d = (wave * 2 + dt) * 16 + lane % 16;
+          halo_v16h b;
+#pragma unroll
+          for (int i = 0; i < 16; ++i) b[i] = Vs[(kk + i) * VR + d];
+          acc[r][dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[r][dt]);
+        }
+      }
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (std::uint32_t r = 0; r < 3; ++r)
+#pragma unroll
+    for (int dt = 0; dt < 2; ++dt)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint32_t row = r * 16 + 2 * j + lane / 16, tq = row / G, h = row % G;
+        if (r >= rtiles || row >= rows || t0 + tq >= tokens) continue;
+        const std::uint32_t d = (wave * 2 + dt) * 16 + lane % 16;
+        const std::size_t idx = (static_cast<std::size_t>(t0 + tq) * num_heads + g * G + h) * HD + d;
+        out[idx] = acc[r][dt][j] / lrow[row] * Sigmoid(gate[idx]);
+      }
+}
+
+// halo_attention_wmma_qsel over the fp16 copy of the K/V cache (the WMMA
+// path rounds K/V to fp16 anyway, so the result is the same): K and V of
+// the next chunk prefetched together, K staged in LDS for the scoring waves.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_attention_wmma_qsel_h(const float* q, const _Float16* kc, const _Float16* vc, const float* gate, float* out,
+                             const std::uint32_t* params, const std::uint32_t* ublk, const std::uint8_t* umask,
+                             const std::uint32_t* ucount, std::uint32_t max_u, std::uint32_t ratio,
+                             std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t tokens) {
+  constexpr std::uint32_t HD = 256, QT = 4, KC = 32, QR = HD + 8, VR = HD + 8, PR = KC + 8, MR = 48;
+  __shared__ __attribute__((aligned(16))) _Float16 Qs[MR * QR];
+  __shared__ __attribute__((aligned(16))) _Float16 Vs[KC * VR];
+  __shared__ __attribute__((aligned(16))) _Float16 Ps[MR * PR];
+  // The chunk's K, staged once for every scoring wave; its space is reused
+  // for the scores once all waves have read it.
+  __shared__ __attribute__((aligned(16))) _Float16 Ks[KC * VR];
+  float* const Ss = reinterpret_cast<float*>(Ks);
+  static_assert(sizeof(float) * MR * KC <= sizeof(_Float16) * KC * VR, "scores fit the K tile");
+  __shared__ float mrow[MR], lrow[MR], alpha[MR];
+  __shared__ std::uint32_t nkv[QT];
+  const std::uint32_t g = blockIdx.x, t0 = blockIdx.y * QT, G = num_heads / num_kv_heads;
+  const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const std::uint32_t rows = QT * G, rtiles = (rows + 15) / 16;
+  const float scale = 1.0f / sqrtf(static_cast<float>(HD));
+  if (tid < QT) nkv[tid] = t0 + tid < tokens ? params[static_cast<std::size_t>(t0 + tid) * 16 + kHaloNkv] : 0;
+  const std::uint32_t* ub = ublk + static_cast<std::size_t>(blockIdx.y) * max_u;
+  const std::uint8_t* um = umask + static_cast<std::size_t>(blockIdx.y) * max_u;
+  // Key j of the union: position ub[j / ratio] * ratio + j % ratio.
+  const auto pos_of = [&](std::uint32_t j) { return ub[j / ratio] * ratio + j % ratio; };
+  for (std::uint32_t i = tid; i < MR * HD; i += blockDim.x) {
+    const std::uint32_t r = i / HD, d = i % HD, tq = r / G, h = r % G;
+    const bool live = r < rows && t0 + tq < tokens;
+    Qs[r * QR + d] = static_cast<_Float16>(live ? q[(static_cast<std::size_t>(t0 + tq) * num_heads + g * G + h) * HD + d] : 0.0f);
+  }
+  if (tid < MR) {
+    mrow[tid] = -INFINITY;
+    lrow[tid] = 0.0f;
+  }
+  __syncthreads();
+  // The union's keys; token q sees key j when its bit is set and the
+  // position is before its own causal limit.
+  const std::uint32_t n = ucount[blockIdx.y] * ratio;
+  // Positions past the group's last causal limit (the tail block's unused
+  // slots) are masked for every token, but their K/V must not be read: past
+  // the cache's end, or stale and possibly non-finite (0 * NaN poisons P . V).
+  std::uint32_t pend = 0;
+  for (std::uint32_t i = 0; i < QT; ++i) pend = max(pend, nkv[i]);
+  const auto pos_in = [&](std::uint32_t j) { return min(pos_of(min(j, n - 1)), pend - 1); };
+  const auto live_at = [&](std::uint32_t j) { return j < n && pos_of(min(j, n - 1)) < pend; };
+  // P . V work: wave owns dim tiles 2 * (wave % 8) .. + 1 for every row tile.
+  halo_v8f acc[3][2] = {};
+  // Only LDS is shared between the waves: LDS-only barriers keep the next
+  // chunk's V rows (prefetched into registers, unconditionally: clamped to
+  // the last key) in flight while this chunk is scored and multiplied (a
+  // trace of the synchronous version: 51% of cycles waiting on gathers).
+  const auto barrier = [] {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+  };
+  // K and V of the next chunk in flight as fp16 (the fp16 cache copy: half
+  // the bytes and registers of fp32), 16 bytes = 8 values per load.
+  constexpr std::uint32_t KP = KC * HD / 8 / 256;  // uint4 per thread per chunk, each of K and V
+  uint4 rk[KP], rv[KP];
+  const auto load_kv = [&](std::uint32_t c) {
+#pragma unroll
+    for (std::uint32_t p = 0; p < KP; ++p) {
+      const std::uint32_t i = tid + p * 256, j = i / (HD / 8), d = (i % (HD / 8)) * 8;
+      const std::size_t at = (static_cast<std::size_t>(pos_in(c + j)) * num_kv_heads + g) * HD + d;
+      rk[p] = *reinterpret_cast<const uint4*>(kc + at);
+      rv[p] = *reinterpret_cast<const uint4*>(vc + at);
+    }
+  };
+  if (n > 0) load_kv(0);
+  for (std::uint32_t c0 = 0; c0 < n; c0 += KC) {
+    barrier();  // previous chunk's Ks (scores) / Vs / Ps reads done
+#pragma unroll
+    for (std::uint32_t p = 0; p < KP; ++p) {
+      const std::uint32_t i = tid + p * 256, j = i / (HD / 8), d = (i % (HD / 8)) * 8;
+      const bool live = live_at(c0 + j);
+      *reinterpret_cast<uint4*>(Ks + j * VR + d) = live ? rk[p] : make_uint4(0, 0, 0, 0);
+      *reinterpret_cast<uint4*>(Vs + j * VR + d) = live ? rv[p] : make_uint4(0, 0, 0, 0);
+    }
+    load_kv(min(c0 + KC, n - 1));  // next chunk, in flight during the work below
+    barrier();                     // Ks, Vs complete
+    // Scores: wave -> (row tile wave / 2, key tile wave % 2), up to 6 waves.
+    const std::uint32_t rt = wave / 2, kt = wave % 2;
+    const std::uint32_t kj = c0 + kt * 16 + lane % 16;
+    const std::uint32_t kp = pos_of(min(kj, n - 1)), km = um[min(kj, n - 1) / ratio];
+    halo_v8f s = {};
+    if (rt < rtiles)
+      for (std::uint32_t k0 = 0; k0 < HD; k0 += 16)
+        s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(LdsFrag(&Qs[(rt * 16 + lane % 16) * QR + k0]),
+                                                       LdsFrag(&Ks[(kt * 16 + lane % 16) * VR + k0]), s);
+    barrier();  // every wave's Ks reads done: the scores overwrite it
+    if (rt < rtiles) {
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
         const std::uint32_t r = rt * 16 + 2 * j + lane / 16, tq = r / G;

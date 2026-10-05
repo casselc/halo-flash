@@ -356,6 +356,12 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
       s.index_k = Scratch(std::size_t{max_context} * c.indexer_head_dim, error);
       s.block_k = Scratch((max_context / c.compress_ratio + 1) * std::size_t{c.indexer_head_dim}, error);
       if (!s.k || !s.v || !s.index_k || !s.block_k) return false;
+      if (prefill_kv16_) {
+        const std::size_t halves = std::size_t{max_context} * c.AttentionKvDim();
+        s.k16 = Scratch((halves + 1) / 2, error);
+        s.v16 = Scratch((halves + 1) / 2, error);
+        if (!s.k16 || !s.v16) return false;
+      }
     }
   }
   return dev_.Synchronize(error);
@@ -881,7 +887,10 @@ bool FlashNextGpu::Restore(const Snapshot& snap, std::string* error) {
   }
   // Counts first: ForEachState sizes the KV copies from the restored position.
   position_ = snap.position_;
-  for (std::size_t l = 0; l < attn_.size(); ++l) attn_[l].blocks = snap.blocks_[l];
+  for (std::size_t l = 0; l < attn_.size(); ++l) {
+    attn_[l].blocks = snap.blocks_[l];
+    attn_[l].valid16 = 0;  // the restored K/V may differ anywhere
+  }
   ngram_history_ = snap.ngram_history_;
   std::size_t i = 0;
   return ForEachState([&](const rt::Buffer& live, std::size_t n) { return CopyFloats(live, snap.buffers_[i++], n, error); }) &&
@@ -893,7 +902,10 @@ bool FlashNextGpu::Reset(std::string* error) {
   for (std::uint32_t l = 0; l < c.num_layers; ++l)
     if (c.IsLinearLayer(l) && (!dev_.Fill(linear_[l].conv, 0, error) || !dev_.Fill(linear_[l].state, 0, error)))
       return false;
-  for (auto& s : attn_) s.blocks = 0;  // KV beyond position is never read
+  for (auto& s : attn_) {
+    s.blocks = 0;  // KV beyond position is never read
+    s.valid16 = 0;
+  }
   ngram_history_.Reset();
   position_ = 0;
   return dev_.Fill(ple_history_, 0, error) && dev_.Synchronize(error);
