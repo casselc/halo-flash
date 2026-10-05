@@ -4,6 +4,7 @@
 //   halo_hwprobe keepalive [ms] [s] an empty marker every ms: keeps rocprofv3 instruction counters armed
 //   halo_hwprobe sweep [custom]   staged-read patterns as kernels issue them (feeds perf_model)
 //   halo_hwprobe rounds          dependent load rounds vs concurrency (feeds perf_model)
+//   halo_hwprobe empty           cost of blocks that exit at once (grids sized for the most tiles)
 //   halo_hwprobe stream          the hyper-connection residual's DRAM traffic patterns
 //   halo_hwprobe clock           shader clock (in-kernel counters) vs load
 //   halo_hwprobe dram [MB]       bandwidth vs segment size, dispatch order, read/write
@@ -390,6 +391,58 @@ void Rounds() {
         std::printf("  %-5s %3d %6u %10.0f %10.1f\n", src ? "L2" : "DRAM", L, waves, ms * 1e6 / N,
                     double(waves) * N * L * 128 / (ms * 1e-3) / 1e9);
       }
+}
+
+// ---- empty: the cost of blocks that exit at once (a grid sized for the most tiles) ----------
+// Blocks with blockIdx.y >= *active return after one scalar load, as the grouped MoE kernels' blocks past the
+// routed tile count do; the others spin `work` iterations.
+__global__ void __launch_bounds__(256) EmptyTilesKernel(const std::uint32_t* active, std::uint32_t work, float* sink) {
+  if (blockIdx.y >= *active) return;
+  float a = threadIdx.x;
+  for (std::uint32_t i = 0; i < work; ++i) a = a * 1.0001f + 0.5f;
+  if (a == 12345.f) sink[0] = a;
+}
+
+void EmptyTiles() {
+  std::uint32_t* active;
+  float* sink;
+  CHECK(hipMalloc(&active, 4));
+  CHECK(hipMalloc(&sink, 64));
+  hipEvent_t e0, e1;
+  CHECK(hipEventCreate(&e0));
+  CHECK(hipEventCreate(&e1));
+  std::printf("empty: grid (x, tiles) of 256-thread blocks; blocks with tile >= active exit at once\n");
+  for (const std::uint32_t gx : {20u, 5u})
+    for (const std::uint32_t n : {285u, 833u}) {
+      CHECK(hipMemcpy(active, &n, 4, hipMemcpyHostToDevice));
+      for (const std::uint32_t gy : {n, 833u}) {
+        const auto run = [&] { hipLaunchKernelGGL(EmptyTilesKernel, dim3(gx, gy), 256, 0, 0, active, 2000u, sink); };
+        for (int w = 0; w < 3; ++w) run();
+        CHECK(hipDeviceSynchronize());
+        CHECK(hipEventRecord(e0));
+        for (int r = 0; r < 10; ++r) run();
+        CHECK(hipEventRecord(e1));
+        CHECK(hipEventSynchronize(e1));
+        float ms;
+        CHECK(hipEventElapsedTime(&ms, e0, e1));
+        std::printf("  grid %2u x %3u, active tiles %3u: %7.3f ms\n", gx, gy, n, ms / 10);
+      }
+    }
+  // Empty blocks alone.
+  const std::uint32_t zero = 0;
+  CHECK(hipMemcpy(active, &zero, 4, hipMemcpyHostToDevice));
+  for (const std::uint32_t gy : {833u, 548u}) {
+    const auto run = [&] { hipLaunchKernelGGL(EmptyTilesKernel, dim3(20, gy), 256, 0, 0, active, 0u, sink); };
+    for (int w = 0; w < 3; ++w) run();
+    CHECK(hipDeviceSynchronize());
+    CHECK(hipEventRecord(e0));
+    for (int r = 0; r < 10; ++r) run();
+    CHECK(hipEventRecord(e1));
+    CHECK(hipEventSynchronize(e1));
+    float ms;
+    CHECK(hipEventElapsedTime(&ms, e0, e1));
+    std::printf("  all-empty grid 20 x %u (%u blocks): %.3f ms (%.0f ns a block)\n", gy, 20 * gy, ms / 10, ms / 10 * 1e6 / (20.0 * gy));
+  }
 }
 
 void Stream() {
@@ -949,6 +1002,7 @@ int main(int argc, char** argv) {
   else if (cmd == "sync") Sync();
   else if (cmd == "counters") Counters();
   else if (cmd == "stream") Stream();
+  else if (cmd == "empty") EmptyTiles();
   else if (cmd == "sweep") Sweep(argc, argv);
   else if (cmd == "rounds") Rounds();
   else if (cmd == "keepalive") {  // keepalive [period_ms] [seconds]: see tools/pmc.sh
