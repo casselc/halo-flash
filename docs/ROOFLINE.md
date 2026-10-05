@@ -598,6 +598,28 @@ tiles re-read xh once per row tile (5x, ~210 MB), and the cost grew with the spl
 library's split without its tile economics does not work; next is a microbenchmark study of
 `_m` tile shapes with a trace, not more in-engine guesses.
 
+**4h. Chunk size and long prompts (2026-10-04, pinned, pseudo-random tokens, n-gram not
+resident).** For an 8192-token prompt:
+
+| Chunk size | 2048 | 4096 | 8192 |
+|---|---:|---:|---:|
+| tok/s | 640 | 619 | 596 |
+
+The expert kernels amortize only ~15% (gate/up 1207 -> 1021 ms, down 935 -> 776 ms): they are
+dequant/VALU-bound per token, so 4g's "75 GB weight-stream floor" overstates them. With
+2048-token chunks, the device time per chunk climbs with context:
+
+| Chunk | 1 | 2 | 3 | 4 |
+|---|---:|---:|---:|---:|
+| device time | 2.06 s | 2.88 s | 3.40 s | 4.12 s |
+
+The growth is almost all `halo_attention_wmma_rows`: the attention path once the context exceeds
+one chunk. It takes 13.5 ms per call, 1.94 s of 13.0 s. That is the long-prompt bottleneck, and
+most of the distance to halogen's 1,584 tok/s on an 8K-token prompt.
+
+Also: the n-gram read for each chunk (~115 ms of random tokens, not resident) runs serially
+before that chunk's device work. Overlapping it with the previous chunk saves ~0.35-0.45 s at 8K.
+
 **4g. Bytes audit (2026-10-04).** Per 2048-token prefill, analytic from tensor shapes. rocprofv3
 7.2.3's FETCH_SIZE/WRITE_SIZE read 0 for every prefill dispatch (with or without graphs) while
 counting the load-time repack, so they could not be used. Writes are weighted like reads (4f),
