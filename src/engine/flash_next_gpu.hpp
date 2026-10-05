@@ -99,6 +99,8 @@ class FlashNextGpu {
   // combine_norm skips the fp32 xn the mixer's mix epilogue would re-read;
   // the epilogue rebuilds it from res (same arithmetic, bit-identical).
   static inline bool prefill_mix_rebuild_ = true;
+  /// QSA block scores of a chunk as one bf16x3 WMMA GEMM (near-fp32).
+  static inline bool prefill_scores_wmma_ = true;
   /// Past the QSA budget, attention for 4 tokens at a time over the union of
   /// their selections (shared K/V reads) instead of token by token.
   static inline bool prefill_qsel_attention_ = true;

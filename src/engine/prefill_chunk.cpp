@@ -498,13 +498,24 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   // 4 tokens at a time over the union of their selections (shared K/V).
   const std::uint32_t max_u = 4 * budget + 4;
   const bool qsel = wmma && prefill_qsel_attention_ && 4 * G <= 48 && max_blocks <= 65537;
+  const bool scores_wmma = prefill_scores_wmma_ && !prefill_exact_projections_ && ih == 4 && idim % 16 == 0;
   for (std::uint32_t t0 = 0; t0 < T; t0 += kAttnSub) {
     const std::uint32_t n = std::min(kAttnSub, T - t0);
     const rt::Arg params = rt::Arg::Buf(ck_.host, ck_.params_offset + std::size_t{t0} * 64);
-    if (!Launch("halo_qsa_scores_rows", {std::min(Blocks(max_blocks), 64u), n}, {kBlock},
-                {rt::Arg::Buf(ck_.iq, std::size_t{t0} * ih * idim * 4), rt::Arg::Buf(s.block_k),
-                 rt::Arg::Buf(ck_.bscores), params, rt::Arg::Val(ih), rt::Arg::Val(idim), rt::Arg::Val(max_blocks)},
-                error) ||
+    // Block scores as one bf16x3 WMMA GEMM per sub-chunk (rows: token x head,
+    // columns: the complete blocks of the sub-chunk's last token).
+    const std::uint32_t cols = (pos0 + t0 + n) / ratio;
+    if (!(scores_wmma && cols > 0
+              ? Launch("halo_qsa_scores_wmma", {(cols + 63) / 64, (n + 15) / 16}, {128},
+                       {rt::Arg::Buf(ck_.iq, std::size_t{t0} * ih * idim * 4), rt::Arg::Buf(s.block_k),
+                        rt::Arg::Buf(ck_.bscores), rt::Arg::Val(n), rt::Arg::Val(cols), rt::Arg::Val(idim),
+                        rt::Arg::Val(max_blocks)},
+                       error)
+              : Launch("halo_qsa_scores_rows", {std::min(Blocks(max_blocks), 64u), n}, {kBlock},
+                       {rt::Arg::Buf(ck_.iq, std::size_t{t0} * ih * idim * 4), rt::Arg::Buf(s.block_k),
+                        rt::Arg::Buf(ck_.bscores), params, rt::Arg::Val(ih), rt::Arg::Val(idim),
+                        rt::Arg::Val(max_blocks)},
+                       error)) ||
         !Launch("halo_qsa_select_rows", {n}, {1024},
                 {rt::Arg::Buf(ck_.bscores), rt::Arg::Buf(ck_.vis), params, rt::Arg::Val(budget), rt::Arg::Val(ratio),
                  rt::Arg::Val(max_blocks), rt::Arg::Val(vstride)},

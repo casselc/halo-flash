@@ -225,6 +225,66 @@ TEST(GpuSelect, WmmaChunkAttentionMatchesSelectKernel) {
   }
 }
 
+// P4: QSA block scores of a chunk as one bf16x3 WMMA GEMM
+// (halo_qsa_scores_wmma) against the fp32 per-token kernel
+// (halo_qsa_scores_rows). Bound fixed in advance: relu is 1-Lipschitz, so
+// |d score| <= sum over heads of (2^-15 + dim 2^-23) * sum_i |q_i k_i| (the
+// hi/lo split as in the router GEMM, plus fp32 summation either side).
+// Ragged token counts and block counts.
+TEST(GpuSelect, WmmaBlockScoresMatchFp32Kernel) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      constexpr std::uint32_t heads = 4, dim = 128;
+      const std::uint32_t T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 70}));
+      const std::uint32_t cols = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 700}));
+      const std::uint32_t stride = cols + tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = 9}));
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return static_cast<float>(seed >> 8) / 16777216.0f - 0.5f; };
+      const float amp = tc.draw(gs::sampled_from(std::vector<float>{0.25f, 2.0f, 16.0f}));
+      std::vector<float> q(std::size_t{T} * heads * dim), kb(std::size_t{cols} * dim);
+      for (auto& x : q) x = amp * rnd();
+      for (auto& x : kb) x = rnd();
+      std::vector<std::uint32_t> params(std::size_t{T} * 16, 0);
+      for (std::uint32_t t = 0; t < T; ++t) params[t * 16 + kHaloComplete] = cols;
+      auto qb = dev->Alloc(q.size() * 4, &error), bb = dev->Alloc(kb.size() * 4, &error), pb = dev->Alloc(params.size() * 4, &error),
+           s1 = dev->Alloc(std::size_t{T} * stride * 4, &error), s2 = dev->Alloc(std::size_t{T} * stride * 4, &error);
+      ASSERT_TRUE(qb && bb && pb && s1 && s2) << error;
+      ASSERT_TRUE(dev->Upload(qb, 0, q.data(), q.size() * 4, &error) && dev->Upload(bb, 0, kb.data(), kb.size() * 4, &error) &&
+                  dev->Upload(pb, 0, params.data(), params.size() * 4, &error))
+          << error;
+      const rt::Arg ra[] = {rt::Arg::Buf(qb), rt::Arg::Buf(bb), rt::Arg::Buf(s1), rt::Arg::Buf(pb), rt::Arg::Val(heads),
+                            rt::Arg::Val(dim), rt::Arg::Val(stride)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_qsa_scores_rows", &error), {(cols + 255) / 256, T}, {256}, ra, &error)) << error;
+      const rt::Arg wa[] = {rt::Arg::Buf(qb), rt::Arg::Buf(bb), rt::Arg::Buf(s2), rt::Arg::Val(T), rt::Arg::Val(cols),
+                            rt::Arg::Val(dim), rt::Arg::Val(stride)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_qsa_scores_wmma", &error), {(cols + 63) / 64, (T + 15) / 16}, {128}, wa,
+                              &error))
+          << error;
+      std::vector<float> want(std::size_t{T} * stride), got(want.size());
+      ASSERT_TRUE(dev->Download(s1, 0, want.data(), want.size() * 4, &error) &&
+                  dev->Download(s2, 0, got.data(), got.size() * 4, &error))
+          << error;
+      for (auto* b : {&qb, &bb, &pb, &s1, &s2}) dev->Free(*b);
+      for (std::uint32_t t = 0; t < T; ++t)
+        for (std::uint32_t b = 0; b < cols; ++b) {
+          double bound = 0;
+          for (std::uint32_t h = 0; h < heads; ++h) {
+            double mag = 0;
+            for (std::uint32_t i = 0; i < dim; ++i)
+              mag += std::fabs(double(q[(std::size_t{t} * heads + h) * dim + i]) * kb[std::size_t{b} * dim + i]);
+            bound += (0x1p-15 + dim * 0x1p-23) * mag;
+          }
+          ASSERT_NEAR(got[std::size_t{t} * stride + b], want[std::size_t{t} * stride + b], bound + 1e-30)
+              << rt::BackendName(backend) << " t " << t << " b " << b << " T " << T << " cols " << cols;
+        }
+    }, {.test_cases = 40});
+  }
+}
+
 // P4: QSA-selected chunk attention, 4 tokens per block over the union of
 // their selections (halo_qsa_union4 + halo_attention_wmma_qsel), against the
 // decode kernel's arithmetic over each token's own list

@@ -4300,6 +4300,73 @@ extern "C" __global__ void __launch_bounds__(256)
   }
 }
 
+// ---- P4: QSA block scores for a chunk on bf16 WMMA (hi/lo split) -----------
+// halo_qsa_scores_rows for 4 indexer heads as one GEMM: rows are (token,
+// head) pairs, columns key blocks, K = dim; score[t][b] = sum_h relu(q_th .
+// k_b). Operands split into bf16 hi/lo as in halo_gemm_f32_bf16x3 (~2^-15
+// relative per product), so the top-k selection sees near-fp32 scores. Each
+// wave: 16 rows (4 tokens) x 64 blocks, fragments built from global memory
+// (K = 128 needs no staging); the pooled keys of a layer (~1 MB) stay in L2.
+// Scores are written for every block < cols; the selection reads only the
+// first n_complete(t).
+//   grid (ceil(cols / 64), ceil(tokens / 16)), block 128; heads == 4,
+//   dim % 16 == 0.
+extern "C" __global__ void __launch_bounds__(128)
+    halo_qsa_scores_wmma(const float* q, const float* blocks, float* score, std::uint32_t tokens, std::uint32_t cols,
+                         std::uint32_t dim, std::uint32_t score_stride) {
+  constexpr std::uint32_t HEADS = 4, TN = 4;
+  const std::uint32_t lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+  const std::uint32_t r0 = (blockIdx.y * 4 + wave) * 16;  // 16 rows = 4 tokens x 4 heads
+  const std::uint32_t c0 = blockIdx.x * 64;
+  const std::uint32_t rows = tokens * HEADS;
+  if (r0 >= rows) return;
+  const float* qa = q + static_cast<std::size_t>(min(r0 + lane % 16, rows - 1)) * dim;
+  const float* kb[TN];
+#pragma unroll
+  for (std::uint32_t n = 0; n < TN; ++n) kb[n] = blocks + static_cast<std::size_t>(min(c0 + n * 16 + lane % 16, cols - 1)) * dim;
+  const auto frag = [](const float* p, halo_v16s& hi, halo_v16s& lo) {
+#pragma unroll
+    for (int e = 0; e < 16; e += 4) {
+      const float4 v = *reinterpret_cast<const float4*>(p + e);
+      const float f[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        short h, l;
+        SplitBf16(f[i], h, l);
+        hi[e + i] = h;
+        lo[e + i] = l;
+      }
+    }
+  };
+  halo_v8f acc[TN] = {};
+  for (std::uint32_t k0 = 0; k0 < dim; k0 += 16) {
+    halo_v16s ah, al;
+    frag(qa + k0, ah, al);
+#pragma unroll
+    for (std::uint32_t n = 0; n < TN; ++n) {
+      halo_v16s bh, bl;
+      frag(kb[n] + k0, bh, bl);
+      acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al, bh, acc[n]);
+      acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ah, bl, acc[n]);
+      acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ah, bh, acc[n]);
+    }
+  }
+  // C layout: lane holds column lane % 16 and rows 2 j + lane / 16. Row
+  // 4 tq + h: this lane holds heads lane / 16 and lane / 16 + 2 of token tq
+  // (elements 2 tq, 2 tq + 1); the other half-wave the other two heads.
+#pragma unroll
+  for (std::uint32_t n = 0; n < TN; ++n) {
+    const std::uint32_t b = c0 + n * 16 + lane % 16;
+#pragma unroll
+    for (std::uint32_t tq = 0; tq < 4; ++tq) {
+      float part = fmaxf(0.0f, acc[n][2 * tq]) + fmaxf(0.0f, acc[n][2 * tq + 1]);
+      part += __shfl_xor(part, 16, 32);
+      const std::uint32_t t = r0 / HEADS + tq;
+      if (lane < 16 && b < cols && t < tokens) score[static_cast<std::size_t>(t) * score_stride + b] = part;
+    }
+  }
+}
+
 // Lane exchange within aligned groups of 4 lanes by DPP quad permutes:
 // QuadXor1 reads lane ^ 1, QuadXor2 lane ^ 2 (quad_perm [1,0,3,2], [2,3,0,1]).
 __device__ inline float QuadXor1(float v) {
