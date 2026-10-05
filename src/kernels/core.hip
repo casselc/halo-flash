@@ -4004,6 +4004,7 @@ __device__ void MoeDown(SL load, SG get, const _Float16* hp, const std::uint32_t
   __shared__ __attribute__((aligned(16))) _Float16 Bs[kMoeTile * kMoeRs];
   const std::uint32_t tile = blockIdx.y;
   if (tile >= *ntiles) return;
+  HALO_SPAN_BEGIN(kSpanMoeDown, 3 * ((ff + kMoeKs - 1) / kMoeKs) + 8);  // 3 a stage + 2 + 2 anchors
   const std::uint32_t e = tiles[3 * tile], first = tiles[3 * tile + 1], n = tiles[3 * tile + 2];
   const std::uint32_t subs = (n + 15) / 16;
   const std::uint32_t lane = threadIdx.x % 32, wave = threadIdx.x / 32;
@@ -4037,11 +4038,14 @@ __device__ void MoeDown(SL load, SG get, const _Float16* hp, const std::uint32_t
   for (std::uint32_t k0 = 0; k0 < ff; k0 += kMoeKs) {
     const std::uint32_t ks = min(kMoeKs, ff - k0);
     __syncthreads();  // the previous stage's LDS reads are done
+    HALO_SPAN(1);     // stage start
     *bs_at(0) = xr0;
     *bs_at(1) = xr1;
     *bs_at(2) = xr2;
     *bs_at(3) = xr3;
+    HALO_SPAN(2);  // this wave's activation pieces arrived and stored
     __syncthreads();
+    HALO_SPAN(3);  // every wave's pieces stored
     const auto cur = st;
     if (k0 + kMoeKs < ff) {  // next stage, in flight during the math below
       st = load(e, row, k0 + kMoeKs, min(kMoeKs, ff - k0 - kMoeKs));
@@ -4063,6 +4067,7 @@ __device__ void MoeDown(SL load, SG get, const _Float16* hp, const std::uint32_t
     }
   }
 #undef HALO_MOE_LOAD_HP
+  HALO_SPAN(4);  // math done
 #pragma unroll
   for (std::uint32_t rt = 0; rt < kMoeRowTiles; ++rt)
 #pragma unroll
@@ -4075,6 +4080,7 @@ __device__ void MoeDown(SL load, SG get, const _Float16* hp, const std::uint32_t
         if (r < H) yp[static_cast<std::size_t>(first + t) * H + r] = static_cast<_Float16>(acc[rt][h][j]);
       }
     }
+  HALO_SPAN_END(5);  // outputs stored (end)
 }
 
 }  // namespace

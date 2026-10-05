@@ -524,9 +524,14 @@ int main(int argc, char** argv) {
     const std::uint32_t cap = 1u << 22;
     std::vector<std::uint8_t> recs(std::size_t{cap} * 16, 0);
     if (!dt->WriteGlobal("halo_spans", recs.data(), recs.size(), &e)) return std::printf("%s\n", e.c_str()), 1;
+    const std::uint32_t no_drops = 0;
+    if (!dt->WriteGlobal("halo_span_dropped", &no_drops, 4, &e)) return std::printf("%s\n", e.c_str()), 1;
     run(ct);
-    if (!dt->Synchronize(&e) || !dt->ReadGlobal("halo_spans", recs.data(), recs.size(), &e))
+    std::uint32_t dropped = 0;
+    if (!dt->Synchronize(&e) || !dt->ReadGlobal("halo_spans", recs.data(), recs.size(), &e) ||
+        !dt->ReadGlobal("halo_span_dropped", &dropped, 4, &e))
       return std::printf("%s\n", e.c_str()), 1;
+    if (dropped) std::printf("trace: WARNING %u traced waves past the buffer recorded nothing\n", dropped);
     // Keep the written records only (valid byte set).
     std::vector<std::uint8_t> kept;
     for (std::size_t i = 0; i < cap; ++i)

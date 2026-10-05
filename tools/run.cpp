@@ -239,7 +239,8 @@ int main(int argc, char** argv) {
       if (!dev->WriteGlobal("halo_span_enable", &off, 4, &error) ||
           !dev->WriteGlobal("halo_span_sample", &span_sample, 4, &error) ||
           !dev->WriteGlobal("halo_span_offset", &zero_offset, 4, &error) ||
-          !dev->WriteGlobal("halo_spans", zeros.data(), zeros.size(), &error))
+          !dev->WriteGlobal("halo_spans", zeros.data(), zeros.size(), &error) ||
+          !dev->WriteGlobal("halo_span_dropped", &off, 4, &error))
         return std::fprintf(stderr, "span trace: %s\n", error.c_str()), 1;
     }
   }
@@ -299,8 +300,13 @@ int main(int argc, char** argv) {
     }
     if (!span_hsaco.empty()) {
       std::vector<std::uint8_t> recs(std::size_t{1} << 26);
-      if (!dev->ReadGlobal("halo_spans", recs.data(), recs.size(), &error))
+      std::uint32_t dropped = 0;
+      if (!dev->ReadGlobal("halo_spans", recs.data(), recs.size(), &error) ||
+          !dev->ReadGlobal("halo_span_dropped", &dropped, 4, &error))
         return std::fprintf(stderr, "span trace: %s\n", error.c_str()), 1;
+      if (dropped)
+        std::printf("span trace: WARNING %u traced waves past the buffer recorded nothing (raise --span-sample)\n",
+                    dropped);
       std::vector<std::uint8_t> kept;
       for (std::size_t i = 0; i < recs.size() / 16; ++i)
         if (recs[i * 16 + 15]) kept.insert(kept.end(), recs.begin() + i * 16, recs.begin() + i * 16 + 16);

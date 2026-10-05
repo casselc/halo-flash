@@ -29,6 +29,7 @@ enum HaloSpanTag : std::uint8_t {
   kSpanControl = 1,      // halo_span_control: known delays, for checking the tracer
   kSpanCombineNorm = 2,  // halo_hc_combine_norm_rows
   kSpanGemmQ8rF16 = 3,   // GemmQ8rF16 (every kernel built on it)
+  kSpanMoeDown = 4,      // MoeDown (halo_moe_down_grouped_*)
 };
 
 #ifdef HALO_TRACE
@@ -55,6 +56,10 @@ __device__ std::uint32_t halo_span_offset = 0;  // records blocks with block % s
 // 0 records nothing. The engine (halo_run --span-*) clears it after loading and brackets the one dispatch it
 // traces with halo_span_set(1) / halo_span_set(0), stream-ordered kernels: no host synchronization.
 __device__ std::uint32_t halo_span_enable = 1;
+// Traced waves whose slots fell past their tag's region (recorded nothing): the host reports it, so a
+// truncated trace is never silent (a 16660-block MoE grid overflowed at block ~5700 before slots counted
+// sampled blocks only).
+__device__ std::uint32_t halo_span_dropped = 0;
 
 struct HaloSpanState {
   std::uint32_t base, n, max, hw;
@@ -92,17 +97,25 @@ __device__ inline HaloSpanState HaloSpanBegin(std::uint32_t tag, std::uint32_t m
   const std::uint32_t tid = threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
   const std::uint32_t wpb = (blockDim.x * blockDim.y * blockDim.z + 31) / 32;
   s.block = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
-  s.wave = static_cast<std::uint8_t>(tid / 32);
+  // Wave-uniform state in scalar registers (readfirstlane): in vector registers it raised the mix GEMM's
+  // VGPRs 209 -> 242 and cut its occupancy 7 -> 5 waves/SIMD (+40% time with recording off).
+  s.wave = static_cast<std::uint8_t>(__builtin_amdgcn_readfirstlane(tid / 32));
   s.tag = static_cast<std::uint8_t>(tag);
   s.n = 0;
-  const std::uint64_t slot = (std::uint64_t{s.block} * wpb + s.wave) * max_events;
+  // Slots count sampled blocks only (block / sample), so sampling multiplies the capacity.
+  const std::uint64_t slot = (std::uint64_t{s.block / sample} * wpb + s.wave) * max_events;
   s.base = (tag % 4) * kHaloSpanRegion + static_cast<std::uint32_t>(slot);
-  s.max = enable && slot + max_events <= kHaloSpanRegion && s.block % sample == offset ? max_events : 0;
+  const bool sampled = enable && s.block % sample == offset;
+  const bool fits = slot + max_events <= kHaloSpanRegion;
+  if (sampled && !fits && (tid % 32) == 0) atomicAdd(&halo_span_dropped, 1u);
+  s.max = sampled && fits ? max_events : 0;
+  s.base = __builtin_amdgcn_readfirstlane(s.base);
+  s.max = __builtin_amdgcn_readfirstlane(s.max);
   // HW_ID1 (gfx11): SIMD_ID 9:8, WGP_ID 13:10, SA_ID 16, SE_ID 20:18 -> bits 20-31 as
   // SIMD 2 bits, WGP 4, SA 1, SE 3.
   std::uint32_t hw;
   asm volatile("s_getreg_b32 %0, hwreg(HW_REG_HW_ID1)" : "=s"(hw));
-  s.hw = (((hw >> 8) & 3u) | (((hw >> 10) & 15u) << 2) | (((hw >> 16) & 1u) << 6) | (((hw >> 18) & 7u) << 7)) << 20;
+  s.hw = __builtin_amdgcn_readfirstlane((((hw >> 8) & 3u) | (((hw >> 10) & 15u) << 2) | (((hw >> 16) & 1u) << 6) | (((hw >> 18) & 7u) << 7)) << 20);
   HaloSpanStore(s, 0, 0, cy0);
   // SHADER_CYCLES is effectively per SIMD: under continuous load the SIMDs' counters agree to tens of cycles,
   // but in the engine (after idle power-downs) SIMDs of one WGP differ by arbitrary offsets. So every traced
