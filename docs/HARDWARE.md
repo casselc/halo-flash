@@ -126,6 +126,25 @@ K-blocked ([cols / 64][T][64]) so a stage reads one contiguous 8 KB run. Study: 
 warm, 1.33 -> 0.62 after writes (predicted 0.35-0.45 warm). In-engine: 101.9 -> 55.2 ms per
 prefill (predicted -40 to -50), the norm kernel writing it +10.6, net -31.7 ms.
 
+## Model v2: design-level terms and their validation (`tools/perf_model.py validate`)
+
+v1 priced bytes at peak bandwidth; two exact mixer designs predicted at 1.25 and 1.55 ms measured 2.13.
+v2 adds, from probes only: access-pattern bandwidth at the kernel's own grid (`halo_hwprobe sweep`:
+the down GEMM's activation read takes 0.15 ms K-blocked fp16, 0.36 row-major fp16, 0.66 row-major
+fp32 residual, 0.35 K-blocked fp32; the mix epilogue's residual read 0.46 ms with row tiles fastest,
+1.65 with token tiles fastest); dependent-round parallelism (`halo_hwprobe rounds`: a round of L
+128-byte loads per wave takes max(~440 ns, bytes in flight / ~185 GB/s) from DRAM, max(~240 ns,
+in flight / ~1000 GB/s) from L2); lockstep phases adding; in a GEMM stage only WMMA overlapping
+the next stage's loads; the MALL's 32 MB of dirty lines paid by the kernel after a large writer.
+
+Validated on 13 measured cases it was not fitted to: median |error| 16%, max 55% (an older, weak
+measurement); 12 of 13 predictions are low, by 10-44% where DRAM patterns are poor. It ranks both of
+2026-10-05's designs correctly (fused 1.97 and rebuild 1.70 vs 1.53 for the current pair; measured
+2.13, 2.13, 1.68). Known blind spots: per-iteration load waits inside a loop (it predicts nothing
+for the combine_norm batching that saved 40.5 ms), and the in-engine write-drain interaction with
+poor patterns (blocked xh: predicted -21 ms, measured -47). Use: a design must beat the current
+kernel by more than the model's error for its class, and then pass a skeleton probe, before it is built.
+
 ## Open questions (from a GPT-6.1 review of the probes, 2026-10-05)
 
 - Same-rows vs different-rows bandwidth: answered, DRAM row locality (the same pattern inside the

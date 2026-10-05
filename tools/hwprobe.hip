@@ -2,6 +2,8 @@
 // performance work relies on. Standalone HIP; each subcommand prints one table.
 //
 //   halo_hwprobe keepalive [ms] [s] an empty marker every ms: keeps rocprofv3 instruction counters armed
+//   halo_hwprobe sweep [custom]   staged-read patterns as kernels issue them (feeds perf_model)
+//   halo_hwprobe rounds          dependent load rounds vs concurrency (feeds perf_model)
 //   halo_hwprobe stream          the hyper-connection residual's DRAM traffic patterns
 //   halo_hwprobe clock           shader clock (in-kernel counters) vs load
 //   halo_hwprobe dram [MB]       bandwidth vs segment size, dispatch order, read/write
@@ -21,6 +23,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -210,6 +213,183 @@ __global__ void __launch_bounds__(1024) StreamTileKernel(float4* res, const floa
     }
   }
   if (acc == 12345.f) sink[0] = acc;
+}
+
+// ---- sweep: staged reads as a kernel's blocks issue them ----------------------
+// Block b (coordinates b % n0, b / n0), stage k reads `seg` bytes from each of R rows at
+// (b % n0) s0 + (b / n0) s1 + r rs + k ks (bytes); the next stage's loads are issued before the current one is
+// consumed (a GEMM's one-stage prefetch), one barrier a stage. rmw: the read bytes are also written back.
+// `lds` bytes of dynamic LDS per block give the kernel's residency. tools/perf_model.py prices access
+// patterns from these measurements.
+template <int P>
+__global__ void __launch_bounds__(256) SweepKernel(char* g, std::uint32_t n0, std::uint64_t s0, std::uint64_t s1,
+                                                   std::uint64_t rs, std::uint64_t ks, std::uint32_t R,
+                                                   std::uint32_t seg, std::uint32_t S, int rmw, float* sink) {
+  extern __shared__ float lds_dyn[];
+  const std::uint32_t per_row = seg / 16, pieces = R * per_row;
+  char* base = g + (blockIdx.x % n0) * s0 + (blockIdx.x / n0) * s1;
+  float4 cur[P], nxt[P];
+  const auto at = [&](std::uint32_t k, std::uint32_t q) {
+    return reinterpret_cast<float4*>(base + (q / per_row) * rs + k * ks + (q % per_row) * 16);
+  };
+  const auto load = [&](std::uint32_t k) {
+#pragma unroll
+    for (int p = 0; p < P; ++p) {
+      const std::uint32_t q = threadIdx.x + p * 256;
+      nxt[p] = q < pieces ? *at(k, q) : make_float4(0, 0, 0, 0);
+    }
+  };
+  float acc = 0.0f;
+  load(0);
+  for (std::uint32_t k = 0; k < S; ++k) {
+#pragma unroll
+    for (int p = 0; p < P; ++p) cur[p] = nxt[p];
+    if (k + 1 < S) load(k + 1);
+#pragma unroll
+    for (int p = 0; p < P; ++p) {
+      const std::uint32_t q = threadIdx.x + p * 256;
+      acc += cur[p].x + cur[p].w;
+      if (rmw && q < pieces) *at(k, q) = cur[p];
+    }
+    __syncthreads();
+  }
+  if (acc == 12345.f) sink[0] = acc + lds_dyn[0];
+}
+
+struct SweepCfg {
+  const char* name;
+  std::uint32_t blocks, n0;
+  std::uint64_t s0, s1, rs, ks;
+  std::uint32_t R, seg, S, lds;
+  int rmw;
+};
+
+double RunSweep(const SweepCfg& c, char* g, std::size_t gbytes, float* sink) {
+  const std::uint32_t pieces = c.R * (c.seg / 16), P = (pieces + 255) / 256;
+  const std::uint64_t span = (c.n0 - 1) * c.s0 + (c.blocks / c.n0) * c.s1 + c.R * c.rs + c.S * c.ks + c.seg;
+  if (span > gbytes) {
+    std::printf("  %-40s span %zu MB exceeds the buffer\n", c.name, static_cast<std::size_t>(span >> 20));
+    return 0;
+  }
+  const auto run = [&] {
+    switch (P) {
+#define HALO_SWEEP(n) case n: hipLaunchKernelGGL(SweepKernel<n>, c.blocks, 256, c.lds, 0, g, c.n0, c.s0, c.s1, c.rs, c.ks, c.R, c.seg, c.S, c.rmw, sink); break;
+      HALO_SWEEP(1) HALO_SWEEP(2) HALO_SWEEP(3) HALO_SWEEP(4) HALO_SWEEP(8) HALO_SWEEP(16) HALO_SWEEP(32)
+#undef HALO_SWEEP
+      default: std::printf("  %-40s %u pieces a thread: no instance\n", c.name, P); std::exit(1);
+    }
+  };
+  hipEvent_t e0, e1;
+  CHECK(hipEventCreate(&e0));
+  CHECK(hipEventCreate(&e1));
+  for (int w = 0; w < 3; ++w) run();
+  CHECK(hipDeviceSynchronize());
+  CHECK(hipEventRecord(e0));
+  for (int r = 0; r < 10; ++r) run();
+  CHECK(hipEventRecord(e1));
+  CHECK(hipEventSynchronize(e1));
+  float ms;
+  CHECK(hipEventElapsedTime(&ms, e0, e1));
+  ms /= 10;
+  const double bytes = double(c.blocks) * c.R * c.seg * c.S * (c.rmw ? 2 : 1);
+  std::printf("  %-40s %7.3f ms  %6.1f GB/s  (%zu MB%s)\n", c.name, ms, bytes / (ms * 1e-3) / 1e9,
+              static_cast<std::size_t>(bytes / 1e6), c.rmw ? " moved, read + write" : " read");
+  return ms;
+}
+
+void Sweep(int argc, char** argv) {
+  const std::size_t gbytes = 512ull << 20;
+  char* g;
+  float* sink;
+  CHECK(hipMalloc(&g, gbytes));
+  CHECK(hipMalloc(&sink, 64));
+  CHECK(hipMemset(g, 0, gbytes));
+  if (argc >= 13) {  // sweep blocks n0 s0 s1 rs ks R seg S lds rmw
+    const SweepCfg c{"custom", static_cast<std::uint32_t>(std::atoi(argv[2])), static_cast<std::uint32_t>(std::atoi(argv[3])),
+                     std::strtoull(argv[4], nullptr, 10), std::strtoull(argv[5], nullptr, 10),
+                     std::strtoull(argv[6], nullptr, 10), std::strtoull(argv[7], nullptr, 10),
+                     static_cast<std::uint32_t>(std::atoi(argv[8])), static_cast<std::uint32_t>(std::atoi(argv[9])),
+                     static_cast<std::uint32_t>(std::atoi(argv[10])), static_cast<std::uint32_t>(std::atoi(argv[11])),
+                     std::atoi(argv[12])};
+    RunSweep(c, g, gbytes, sink);
+  } else {
+    // The prefill's activation patterns at T = 2048 (token rows: residual 40 KB fp32, fp16 copy 20 KB).
+    const std::uint64_t KB = 1024;
+    const SweepCfg cfgs[] = {
+        {"down GEMM from res fp32 (_mr)", 32, 32, 64 * 40 * KB, 0, 40 * KB, 256, 64, 256, 160, 55552, 0},
+        {"down GEMM from fp16 row-major (_m)", 32, 32, 64 * 20 * KB, 0, 20 * KB, 128, 64, 128, 160, 55296, 0},
+        {"down GEMM from fp16 K-blocked (_mb)", 32, 32, 8 * KB, 0, 0, 2048 * 128, 1, 8192, 160, 55296, 0},
+        {"down GEMM from res fp32 K-blocked", 32, 32, 16 * KB, 0, 0, 2048 * 256, 1, 16384, 160, 55552, 0},
+        {"mix epilogue res, row tiles fastest", 640, 40, 256, 128 * 40 * KB, 10 * KB, 0, 512, 256, 1, 31744, 0},
+        {"mix epilogue res, token tiles fastest", 640, 16, 128 * 40 * KB, 256, 10 * KB, 0, 512, 256, 1, 31744, 0},
+        {"combine rows (one 10 KB row a block), rmw", 8192, 8192, 10 * KB, 0, 0, 0, 1, 10 * KB, 1, 384, 1},
+        {"stream contiguous 84 MB, 1280 blocks", 1280, 1280, 64 * KB, 0, 0, 0, 1, 64 * KB, 1, 0, 0},
+    };
+    std::printf("sweep: staged reads (B blocks, R rows x seg bytes a stage, S stages; one-stage prefetch)\n");
+    for (const auto& c : cfgs) RunSweep(c, g, gbytes, sink);
+  }
+  CHECK(hipFree(g));
+}
+
+// ---- rounds: dependent load rounds under concurrency ------------------------
+// Each wave runs N rounds of L coalesced 128-byte loads (one float a lane); the next round's address depends
+// on this round's values, so every round waits for its loads (a loop whose iterations each wait on their own
+// loads). src 0: fresh addresses in a 512 MB buffer (DRAM); 1: a 1 MB buffer (L2 after the first touch).
+// `offset` (floats) moves each launch to addresses no recent launch touched, so DRAM rounds miss the MALL.
+template <int L>
+__global__ void __launch_bounds__(1024) RoundsKernel(const float* g, std::uint64_t n_floats, int N, int src,
+                                                     std::uint64_t offset, float* sink) {
+  const std::uint64_t w = (blockIdx.x * std::uint64_t{blockDim.x} + threadIdx.x) / 32, lane = threadIdx.x % 32;
+  const std::uint64_t mod = src ? (1ull << 18) : n_floats;
+  float acc = 0.0f;
+  std::uint64_t dep = 0;
+  for (int i = 0; i < N; ++i) {
+    const std::uint64_t b = ((w * N + i) * L * 32 + dep + (src ? 0 : offset)) % mod;
+    float v[L];
+#pragma unroll
+    for (int l = 0; l < L; ++l) v[l] = g[(b + l * 32 + lane) % mod];
+#pragma unroll
+    for (int l = 0; l < L; ++l) acc += v[l];
+    dep = acc == 12345.f ? 1 : 0;
+  }
+  if (acc == 12345.f) sink[0] = acc;
+}
+
+void Rounds() {
+  const std::size_t n = (512ull << 20) / 4;
+  float *g, *sink;
+  CHECK(hipMalloc(&g, n * 4));
+  CHECK(hipMalloc(&sink, 64));
+  CHECK(hipMemset(g, 0, n * 4));
+  hipEvent_t e0, e1;
+  CHECK(hipEventCreate(&e0));
+  CHECK(hipEventCreate(&e1));
+  std::printf("rounds: each wave N dependent rounds of L 128-byte loads; ns per round (per wave) and GB/s\n");
+  std::printf("  %-5s %3s %6s %10s %10s\n", "src", "L", "waves", "ns/round", "GB/s");
+  for (int src = 0; src < 2; ++src)
+    for (const int L : {1, 8, 16})
+      for (const std::uint32_t waves : {80u, 160u, 320u, 640u, 1280u, 2560u}) {
+        const int N = 100;
+        std::uint64_t offset = 0;
+        const auto run = [&] {
+          const std::uint32_t blocks = waves / 8;
+          offset += std::uint64_t{waves} * N * L * 32 + (1ull << 20);  // past the last launch's footprint
+          if (L == 1) hipLaunchKernelGGL(RoundsKernel<1>, blocks, 256, 0, 0, g, n, N, src, offset, sink);
+          else if (L == 8) hipLaunchKernelGGL(RoundsKernel<8>, blocks, 256, 0, 0, g, n, N, src, offset, sink);
+          else hipLaunchKernelGGL(RoundsKernel<16>, blocks, 256, 0, 0, g, n, N, src, offset, sink);
+        };
+        for (int w = 0; w < 2; ++w) run();
+        CHECK(hipDeviceSynchronize());
+        CHECK(hipEventRecord(e0));
+        for (int r = 0; r < 5; ++r) run();
+        CHECK(hipEventRecord(e1));
+        CHECK(hipEventSynchronize(e1));
+        float ms;
+        CHECK(hipEventElapsedTime(&ms, e0, e1));
+        ms /= 5;
+        std::printf("  %-5s %3d %6u %10.0f %10.1f\n", src ? "L2" : "DRAM", L, waves, ms * 1e6 / N,
+                    double(waves) * N * L * 128 / (ms * 1e-3) / 1e9);
+      }
 }
 
 void Stream() {
@@ -769,6 +949,8 @@ int main(int argc, char** argv) {
   else if (cmd == "sync") Sync();
   else if (cmd == "counters") Counters();
   else if (cmd == "stream") Stream();
+  else if (cmd == "sweep") Sweep(argc, argv);
+  else if (cmd == "rounds") Rounds();
   else if (cmd == "keepalive") {  // keepalive [period_ms] [seconds]: see tools/pmc.sh
     const int period = argc > 2 ? std::atoi(argv[2]) : 10;
     const double secs = argc > 3 ? std::atof(argv[3]) : 3600.0;

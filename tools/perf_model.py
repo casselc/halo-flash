@@ -217,7 +217,150 @@ def floors(pmc_dir, timing_path):
         print(f"  {r['key'][0]} [{r['key'][1]}]: {r['ms'] - r['floor']:.1f} ms")
 
 
+# ---- v2: design-level terms (2026-10-05) -------------------------------------
+# v1 priced bytes at peak bandwidth and issue at peak rate, per kernel. Two exact designs predicted that way at
+# 1.25 and 1.55 ms measured 2.13. v2 adds the three terms that decided them, every constant from a probe
+# (never fitted to the kernels it is validated on):
+#   1. access-pattern bandwidth: `halo_hwprobe sweep` measures each activation pattern at the kernel's own grid
+#      and residency (ms for the whole read);
+#   2. parallelism: a wave's dependent load round takes max(latency, bytes in flight GPU-wide / bandwidth)
+#      (`halo_hwprobe rounds`: DRAM ~440 ns and ~185 GB/s, L2 ~240 ns and ~1000 GB/s);
+#   3. serialization: phases every block runs in lockstep add; inside a GEMM stage only WMMA overlaps the next
+#      stage's loads (one-stage prefetch), VALU and LDS issue and the barriers do not.
+# And one interference term: a kernel after one that wrote >= 32 MB also pays the MALL's dirty lines (32 MB)
+# draining at its own pattern's bandwidth ("writes are paid by the next kernel").
+US = 1e-6
+BARRIER = 0.04 * US
+DRAM_LAT, DRAM_DEP_BPS = 0.44 * US, 185e9
+L2_LAT, L2_BPS = 0.24 * US, 1000e9
+MALL_DIRTY = 32 * 2**20
+
+# halo_hwprobe sweep, pinned, 2026-10-05 (ms for the whole read at the kernel's grid and residency)
+SWEEP_MS = {
+    "res fp32 row-major, 32 blocks x 64 tokens (_mr)": 0.660,
+    "fp16 row-major, 32 x 64 (_m)": 0.360,
+    "fp16 K-blocked, 32 x 64 (_mb)": 0.153,
+    "res fp32 K-blocked, 32 x 64": 0.351,
+    "mix epilogue res, row tiles fastest": 0.459,
+    "mix epilogue res, token tiles fastest": 1.653,
+}
+COMBINE_BPS = 204e9  # halo_hwprobe stream: the combine's traffic (res += out in place + fp16 copy)
+
+
+def dram_round(waves, loads):
+    """One dependent round of `loads` 128-byte loads per wave, `waves` waves in the same phase."""
+    return max(DRAM_LAT, waves * loads * 128 / DRAM_DEP_BPS)
+
+
+def l2_round(waves, loads):
+    return max(L2_LAT, waves * loads * 128 / L2_BPS)
+
+
+def simd_s(wave_instr, simds):
+    """Seconds to issue `wave_instr` wave-instructions (VALU / LDS, ~1 cycle each) spread over `simds` SIMDs."""
+    return wave_instr / simds / CLOCK_HZ
+
+
+def gemm_stages(stages, valu_lds_per_simd_s, wmma_per_simd_s, mem_s):
+    """GemmQ8rF16's loop: per stage the VALU/LDS issue and two barriers in series, then WMMA overlapping the next
+    stage's loads (one-stage prefetch)."""
+    return stages * (valu_lds_per_simd_s / stages + 2 * BARRIER + max(wmma_per_simd_s, mem_s) / stages)
+
+
+def down_gemm(sweep_key, valu_lds, after_writes=False):
+    """The mixer's down projection (320 x 10240, T 2048): 32 blocks of 64 tokens, LDS 55 KB (two blocks a WGP:
+    a block's 8 waves effectively share 2 SIMDs), 160 stages of 64."""
+    wmma = 64 // 16 * (320 // 16) * (10240 // 16)  # per block
+    mem = SWEEP_MS[sweep_key] * 1e-3
+    t = gemm_stages(160, simd_s(valu_lds / 32, 2), WMMA_CYCLES * wmma / 2 / CLOCK_HZ, mem)
+    if after_writes:
+        t += MALL_DIRTY / (84e6 / mem if "fp32" in sweep_key else 42e6 / mem)
+    return t
+
+
+def combine_norm(dram_bytes, l2_bytes, valu_lds):
+    """halo_hc_combine_norm_rows: 8192 short blocks at 16 waves/SIMD, not in lockstep, so DRAM traffic, L2 traffic
+    and issue overlap; the slowest of them."""
+    return max(dram_bytes / COMBINE_BPS, l2_bytes / L2_BPS, simd_s(valu_lds, SIMDS))
+
+
+def combine_down(valu_lds):
+    """halo_hc_combine_down (study): per stream, a lockstep combine phase in every block (each of 256 waves takes
+    8 rows; per row 10 DRAM rounds of 16 loads, then 10 L2 rounds of 48: residual, gamma, 4 inject rows), then the
+    stream's 40 GEMM stages reading the rows just written (21 MB live: MALL, ~800 GB/s)."""
+    waves = 256
+    phase_a = 4 * 8 * (10 * dram_round(waves, 16) + 10 * l2_round(waves, 48))
+    gemm_valu = 15.3e6  # the GEMM part's issue, as _mb's
+    wmma = 64 // 16 * (320 // 16) * (10240 // 16)
+    phase_b = gemm_stages(160, simd_s(gemm_valu / 32, 2), WMMA_CYCLES * wmma / 2 / CLOCK_HZ, 84e6 / 800e9)
+    return phase_a + simd_s((valu_lds - gemm_valu) / 32, 2) + phase_b
+
+
+def mixt(epilogue_key, valu_lds):
+    """halo_gemm_q8r_f16_mixt: 640 blocks (2 a CU), K 320 (10 short stages); the epilogue reads the residual
+    (pattern measured by the sweep) and writes `mixed` (31 MB). A block's GEMM and epilogue run in series."""
+    wmma_total = 640 * (128 // 16) * (256 // 16) * (320 // 16)
+    return (WMMA_CYCLES * wmma_total / SIMDS / CLOCK_HZ + simd_s(valu_lds, SIMDS)
+            + SWEEP_MS[epilogue_key] * 1e-3 + 31e6 / 222e9)
+
+
+def validate():
+    """Predictions against measurements the model was not fitted to (study harness = halo_gemm_bench, warm,
+    pinned; engine = per-call kernel timing). Instruction counts per call from tools/pmc.sh."""
+    RES = 4 * 2048 * 2560 * 4
+    cases = [
+        # (case, predicted s, measured s, source of the measurement)
+        ("down GEMM _mb (K-blocked fp16), study", down_gemm("fp16 K-blocked, 32 x 64 (_mb)", 15.27e6), 0.442e-3,
+         "combinedown"),
+        ("down GEMM _m (row-major fp16), study", down_gemm("fp16 row-major, 32 x 64 (_m)", 15.27e6), 0.67e-3,
+         "HARDWARE.md"),
+        ("down GEMM _mr (rebuild from res), study", down_gemm("res fp32 row-major, 32 blocks x 64 tokens (_mr)",
+                                                              18.10e6), 1.038e-3, "combinedown"),
+        ("down GEMM _mb after 96 MB of writes, study", down_gemm("fp16 K-blocked, 32 x 64 (_mb)", 15.27e6, True),
+         0.62e-3, "HARDWARE.md"),
+        ("down GEMM _m after 96 MB of writes, study", down_gemm("fp16 row-major, 32 x 64 (_m)", 15.27e6, True),
+         1.33e-3, "HARDWARE.md"),
+        ("down GEMM _mb in engine", down_gemm("fp16 K-blocked, 32 x 64 (_mb)", 15.27e6, True), 59.4e-3 / 96,
+         "kt_model2"),
+        ("down GEMM _m in engine (before blocked xh)", down_gemm("fp16 row-major, 32 x 64 (_m)", 15.27e6, True),
+         101.9e-3 / 96, "ROOFLINE"),
+        ("combine_norm (y16, inject), study", combine_norm(2 * RES + 2048 * 2560 * 4 + RES // 2, 8192 * 50e3, 39.6e6),
+         1.289e-3, "combinestudy"),
+        ("combine_norm, no y16, study", combine_norm(2 * RES + 2048 * 2560 * 4, 8192 * 50e3, 37e6), 0.939e-3,
+         "combinestudy"),
+        ("combine_norm before the load batching, study", combine_norm(2 * RES + 2048 * 2560 * 4 + RES // 2,
+                                                                      8192 * 50e3, 39.6e6), 1.704e-3, "combinestudy"),
+        ("combine + down fused (combine_down), study", combine_down(44.36e6), 2.138e-3, "combinedown"),
+        ("mixt, row tiles fastest, study", mixt("mix epilogue res, row tiles fastest", 0.15e-3 * SIMDS * CLOCK_HZ),
+         1.097e-3, "mixstudy"),
+        ("mixt, token tiles fastest, study", mixt("mix epilogue res, token tiles fastest", 0.15e-3 * SIMDS * CLOCK_HZ),
+         1.41e-3, "core.hip comment (older build: weak)"),
+    ]
+    print(f"{'case':48} {'predicted':>9} {'measured':>9} {'error':>7}  source")
+    errs = []
+    for name, p, m, src in cases:
+        errs.append(abs(p - m) / m)
+        print(f"{name:48} {p * 1e3:8.3f}  {m * 1e3:8.3f}  {(p - m) / m * 100:+6.0f}%  {src}")
+    print(f"\nmedian |error| {sorted(errs)[len(errs) // 2] * 100:.0f}%, max {max(errs) * 100:.0f}%")
+    # The two design decisions of 2026-10-05: did the model say "loses"?
+    base = combine_norm(2 * RES + 2048 * 2560 * 4 + RES // 2, 8192 * 50e3, 39.6e6) + down_gemm(
+        "fp16 K-blocked, 32 x 64 (_mb)", 15.27e6)
+    fused = combine_down(44.36e6)
+    rebuild = combine_norm(2 * RES + 2048 * 2560 * 4, 8192 * 50e3, 37e6) + down_gemm(
+        "res fp32 row-major, 32 blocks x 64 tokens (_mr)", 18.10e6)
+    print(f"decisions: current pair {base * 1e3:.2f} ms (measured 1.68); fused {fused * 1e3:.2f} (2.13); "
+          f"rebuild pair {rebuild * 1e3:.2f} (2.13)")
+    # Past in-engine A/B deltas (ms per prefill).
+    xh = 96 * (down_gemm("fp16 K-blocked, 32 x 64 (_mb)", 15.27e6, True)
+               - down_gemm("fp16 row-major, 32 x 64 (_m)", 15.27e6, True)) * 1e3
+    print(f"A/B: blocked xh (down GEMM kernel) predicted {xh:+.1f} ms, measured -46.7; combine_norm load batching "
+          f"predicted +0.0 (the model has no per-iteration wait term), measured -40.5 (device)")
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "validate":
+        validate()
+        sys.exit(0)
     if len(sys.argv) >= 4 and sys.argv[1] == "floors":
         floors(sys.argv[2], sys.argv[3])
         sys.exit(0)
