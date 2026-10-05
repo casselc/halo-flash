@@ -33,54 +33,41 @@ def pct(v, q):
 
 
 def timelines(recs):
-    """(tag, block, wave) -> [(event, seconds)], where each wave ran, and the shader clock (Hz) per tag.
-    SHADER_CYCLES is one GPU-wide 20-bit counter; every 64th block's wave 0 also records the realtime clock.
-    Per tag the anchors give the clock rate (least squares on cycles unwrapped along realtime) and place every
-    wave: its first cycles reading is unwrapped against the nearest anchor (within half a wrap, ~180 us),
-    later readings cumulatively."""
+    """(tag, block, wave) -> [(event, seconds)], where each wave ran, and per tag the blocks' clocks (Hz).
+    SHADER_CYCLES is effectively per SIMD in the engine, so every traced wave writes an anchor record (event 255:
+    realtime + cycles read together) after its start stamp, and wave 0 another at its end. Each wave's readings
+    are unwrapped from its own anchor (within half a wrap, ~180 us, then cumulatively) and converted at the
+    block's clock (wave 0's anchors: cycles over realtime; 2.88 GHz without an end anchor)."""
     waves = collections.defaultdict(list)
-    anchors = collections.defaultdict(dict)  # tag -> {block: (rt, cycles)}: anchor records (event 255)
+    anchors = collections.defaultdict(list)  # (tag, block, wave) -> [(rt, cycles)] in record order
     for rt, cy, block, wave, event, tag, valid in recs:
         if not valid:
             continue
         if event == ANCHOR:
-            anchors[tag][block] = (rt, cy & (WRAP - 1))
+            anchors[(tag, block, wave)].append((rt, cy & (WRAP - 1)))
         else:
             waves[(tag, block, wave)].append((event, rt, cy & (WRAP - 1), cy >> 20))
-    clock, placed = {}, {}
-    for tag, an in anchors.items():
-        blocks = sorted(an)
-        # Unwrap the anchors' cycles along realtime (each step < half a wrap at ~2.9 GHz), then fit the clock.
-        un = []
-        for k, b in enumerate(blocks):
-            rt, cy = an[b]
-            if k:
-                prt = an[blocks[k - 1]][0]
-                expect = un[-1] + (rt - prt) / RT_HZ * 2.88e9
-                un.append(cy + round((expect - cy) / WRAP) * WRAP)
-            else:
-                un.append(cy)
-        x = [an[b][0] / RT_HZ for b in blocks]
-        # Fit only over a long enough baseline (the realtime message's latency varies by ~0.5 us); short
-        # kernels use the pinned clock (docs/HARDWARE.md: ~2.88 GHz, tools/gpu_clock.sh pin).
-        if len(x) > 1 and max(x) - min(x) > 50e-6:
-            mx, my = sum(x) / len(x), sum(un) / len(un)
-            clock[tag] = sum((xi - mx) * (u - my) for xi, u in zip(x, un)) / sum((xi - mx) ** 2 for xi in x)
-        else:
-            clock[tag] = 2.88e9
-        placed[tag] = (blocks, {b: (an[b][0] / RT_HZ, u) for b, u in zip(blocks, un)})
-    out, where = {}, {}
-    import bisect
-    for (tag, block, wave), ev in waves.items():
-        if tag not in placed:
+    clock = {}
+    for (tag, block, wave), an in anchors.items():
+        if wave != 0:
             continue
-        blocks, pos = placed[tag]
-        # The anchor of the nearest block index at or before this block (dispatch is in order, so it started
-        # within a fraction of a wrap of this one), else the first.
-        i = bisect.bisect_right(blocks, block) - 1
-        t_a, u_a = pos[blocks[max(i, 0)]]
-        hz = clock[tag]
-        d = (ev[0][2] - u_a) % WRAP
+        hz = 2.88e9
+        if len(an) >= 2:
+            (r0, c0), (r1, c1) = an[0], an[-1]
+            dt = (r1 - r0) / RT_HZ
+            if dt > 0:
+                d = (c1 - c0) % WRAP
+                d += round((dt * 2.88e9 - d) / WRAP) * WRAP
+                hz = d / dt if d > 0 else hz
+        clock[(tag, block)] = hz
+    out, where = {}, {}
+    for (tag, block, wave), ev in waves.items():
+        an = anchors.get((tag, block, wave))
+        if not an:
+            continue
+        r0, c0 = an[0]
+        hz = clock.get((tag, block), 2.88e9)
+        d = (ev[0][2] - c0) % WRAP
         if d >= WRAP // 2:
             d -= WRAP
         t, prev, times = d, ev[0][2], []
@@ -88,11 +75,14 @@ def timelines(recs):
             if k:
                 t += (cy - prev) % WRAP
                 prev = cy
-            times.append((e, t_a + t / hz))
+            times.append((e, r0 / RT_HZ + t / hz))
         out[(tag, block, wave)] = times
         hw = ev[0][3]
         where[(tag, block, wave)] = {"simd": hw & 3, "wgp": (hw >> 2) & 15, "sa": (hw >> 6) & 1, "se": (hw >> 7) & 7}
-    return out, where, clock
+    per_tag = collections.defaultdict(list)
+    for (tag, block), hz in clock.items():
+        per_tag[tag].append(hz)
+    return out, where, {t: sorted(v)[len(v) // 2] for t, v in per_tag.items()}, per_tag
 
 
 def main():
@@ -103,7 +93,7 @@ def main():
                     help="check: realtime vs cycle-derived durations of the control kernel's 4 -> 5")
     a = ap.parse_args()
     recs = load(a.trace)
-    tl, where, clock = timelines(recs)
+    tl, where, clock, clocks = timelines(recs)
     if a.control:
         rt = {}
         for r, cy, block, wave, event, tag, valid in recs:
@@ -136,8 +126,10 @@ def main():
         t0 = min(ev[0][1] for ev in ws.values())
         t1 = max(ev[-1][1] for ev in ws.values())
         print(f"== {TAGS.get(tag, tag)}: {len(ws)} waves, {(t1 - t0) * 1e6:.1f} us from the first wave's start to "
-              f"the last's end; shader clock {clock[tag] / 1e9:.3f} GHz "
-              f"({'fitted to the anchors' if clock[tag] != 2.88e9 else 'pinned value: anchors span < 50 us'})")
+              f"the last's end")
+        cl = sorted(clocks[tag])
+        print(f"  block clocks (start/end anchors) GHz: p10 {pct(cl, .1) / 1e9:.3f} p50 {pct(cl, .5) / 1e9:.3f} "
+              f"p90 {pct(cl, .9) / 1e9:.3f} ({len(cl)} blocks)")
         nb = a.bins
         width = (t1 - t0) / nb or 1e-9
         active = [0.0] * nb

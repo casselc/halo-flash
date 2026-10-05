@@ -126,6 +126,10 @@ int main(int argc, char** argv) {
   int n = 16, prefill_bench = 0, reps = 3;
   std::string prefill_file, prefill_warm;
   bool kernel_timing = false;  // --kernel-timing 1: sync-free per-kernel times of the last prefill rep
+  // --span-hsaco FILE --span-kernel NAME --span-occurrence N --span-out FILE [--span-sample N]: load the traced
+  // code object and record the N-th launch (from 0) of kernel NAME in the last prefill rep (docs/TRACING.md).
+  std::string span_hsaco, span_out;
+  std::uint32_t span_sample = 1;
   bool eager = false, profile = false, device_sample = false;
   bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
   setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -142,6 +146,11 @@ int main(int argc, char** argv) {
     else if (a == "--device-sample") device_sample = std::string(argv[i + 1]) == "1";
     else if (a == "--int8-moe") engine::FlashNextGpu::int8_act_moe_ = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill-bench") prefill_bench = std::atoi(argv[i + 1]);
+    else if (a == "--span-hsaco") span_hsaco = argv[i + 1];
+    else if (a == "--span-kernel") engine::FlashNextGpu::span_kernel_ = argv[i + 1];
+    else if (a == "--span-occurrence") engine::FlashNextGpu::span_occurrence_ = std::atoll(argv[i + 1]);
+    else if (a == "--span-out") span_out = argv[i + 1];
+    else if (a == "--span-sample") span_sample = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--prefill-file") prefill_file = argv[i + 1];
     else if (a == "--split-gdn") engine::FlashNextGpu::prefill_split_gdn_ = std::string(argv[i + 1]) == "1";
     else if (a == "--mq-attention") engine::FlashNextGpu::prefill_mq_attention_ = std::string(argv[i + 1]) == "1";
@@ -202,6 +211,11 @@ int main(int argc, char** argv) {
   const rt::Backend backend = device.ends_with("hrx") ? rt::Backend::kHrx : rt::Backend::kHip;
   std::unique_ptr<rt::Device> dev;
   std::unique_ptr<engine::FlashNextGpu> gpu;
+  if (!span_hsaco.empty()) {
+    std::ifstream f(span_hsaco, std::ios::binary);
+    engine::FlashNextGpu::span_hsaco_.assign(std::istreambuf_iterator<char>(f), {});
+    if (engine::FlashNextGpu::span_hsaco_.empty()) return std::fprintf(stderr, "cannot read %s\n", span_hsaco.c_str()), 1;
+  }
   if (use_gpu) {
     dev = rt::Device::Create(backend, &error);
     if (!dev) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
@@ -219,6 +233,15 @@ int main(int argc, char** argv) {
     std::printf("gpu (%s) ready in %.1f s\n", rt::BackendName(backend),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tu).count());
     gpu->SetUseGraphs(!eager);
+    if (!span_hsaco.empty()) {  // recording off until the traced launch; buffer cleared
+      const std::uint32_t off = 0, zero_offset = 0;
+      std::vector<std::uint8_t> zeros(std::size_t{1} << 26);
+      if (!dev->WriteGlobal("halo_span_enable", &off, 4, &error) ||
+          !dev->WriteGlobal("halo_span_sample", &span_sample, 4, &error) ||
+          !dev->WriteGlobal("halo_span_offset", &zero_offset, 4, &error) ||
+          !dev->WriteGlobal("halo_spans", zeros.data(), zeros.size(), &error))
+        return std::fprintf(stderr, "span trace: %s\n", error.c_str()), 1;
+    }
   }
   // After the engine: its allocations come first (see BENCHMARKS.md).
   if (ngram_resident) {
@@ -256,6 +279,7 @@ int main(int argc, char** argv) {
     for (int r = 0; r < reps; ++r) {
       if (!gpu->Reset(&error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
       const bool timed = kernel_timing && r + 1 == reps;
+      if (!span_hsaco.empty() && r + 1 == reps) gpu->SpanArm();
       if (timed && !gpu->StartKernelTiming(1 << 20, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
       const auto st = std::chrono::steady_clock::now();
       if (!gpu->Prefill(toks, logits, &error)) return std::fprintf(stderr, "prefill: %s\n", error.c_str()), 1;
@@ -272,6 +296,21 @@ int main(int argc, char** argv) {
       secs.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - st).count());
       std::printf("prefill %zu tokens: %.3f s (%.1f tok/s), argmax %u\n", toks.size(), secs.back(),
                   toks.size() / secs.back(), Argmax(logits).best);
+    }
+    if (!span_hsaco.empty()) {
+      std::vector<std::uint8_t> recs(std::size_t{1} << 26);
+      if (!dev->ReadGlobal("halo_spans", recs.data(), recs.size(), &error))
+        return std::fprintf(stderr, "span trace: %s\n", error.c_str()), 1;
+      std::vector<std::uint8_t> kept;
+      for (std::size_t i = 0; i < recs.size() / 16; ++i)
+        if (recs[i * 16 + 15]) kept.insert(kept.end(), recs.begin() + i * 16, recs.begin() + i * 16 + 16);
+      const auto n = static_cast<std::uint32_t>(kept.size() / 16);
+      std::ofstream f(span_out, std::ios::binary);
+      f.write(reinterpret_cast<const char*>(&n), 4);
+      f.write(reinterpret_cast<const char*>(kept.data()), static_cast<std::streamsize>(kept.size()));
+      std::printf("span trace: %u records of %s launch %lld (of %lld in the last rep) -> %s\n", n,
+                  engine::FlashNextGpu::span_kernel_.c_str(), static_cast<long long>(engine::FlashNextGpu::span_occurrence_),
+                  static_cast<long long>(gpu->SpanSeen()), span_out.c_str());
     }
     std::sort(secs.begin(), secs.end());
     std::printf("prefill median: %.1f tok/s over %d reps of %zu tokens (batched %d, int8 GEMMs %d)\n",

@@ -35,7 +35,7 @@ cheaply, rebuild the timeline, and explain each difference.
 | Realtime clock read on every event | `s_sendmsg_rtn` GET_REALTIME takes about 0.6 µs | Every event reads SHADER_CYCLES only (an `s_getreg`) |
 | Per-wave `atomicAdd` slot reservation | Combined with the clock reads: +70% on `combine_norm` | Deterministic slots |
 | Plain stores of trace records | A barrier's release fence (`s_waitcnt_vscnt 0`) then waits for the trace stores: GEMM +37% | Records stored through inline asm, which the compiler's wait insertion does not track |
-| Is SHADER_CYCLES one GPU-wide counter? | Yes. The anchors' (cycles − realtime × clock) agree across all 20 WGPs to within about 100 cycles | Real time from anchors only. Each wave is placed against the anchor of the nearest earlier block index; nearest-in-cycles picks the wrong 20-bit wrap |
+| Is SHADER_CYCLES one GPU-wide counter? (first answer, refuted below) | Yes. The anchors' (cycles − realtime × clock) agree across all 20 WGPs to within about 100 cycles | Real time from anchors only. Each wave is placed against the anchor of the nearest earlier block index; nearest-in-cycles picks the wrong 20-bit wrap |
 
 Review fixes (GPT-6.1-sol and GLM 5.3 reviewed the first version):
 - **Wave 0 started late.** It started 3-4 µs after the other waves in every block. Wave 0 evaluated
@@ -52,6 +52,24 @@ Review fixes (GPT-6.1-sol and GLM 5.3 reviewed the first version):
 - **Stalls.** The cycle counter keeps counting while a wave is parked at `s_barrier`: control
   events 6 -> 7 (wave 0 waits while waves 1-7 run a loop). Cycle-derived 11.75 µs vs realtime
   11.88 µs (-1.1%).
+
+**SHADER_CYCLES is per SIMD.** In the engine, not under the study harness's continuous load, the
+4 SIMDs of one WGP held counters hundreds of thousands of cycles apart. Waves on SIMD 0 agreed with
+their block's wave 0 to about 16 cycles; waves on SIMDs 1-3 did not. Most likely each SIMD's counter
+restarts when it powers up after idle. The study's global-looking agreement held only under its own
+conditions. Fix: every traced wave writes its own anchor (realtime and cycles read together) after
+its start stamp, about 0.6 µs on traced waves only. Wave 0 also writes a closing anchor, which gives
+the block's clock: 2.88-2.91 GHz in every block, in the study and in the engine.
+
+**In the engine** (`halo_run ... --span-hsaco build/nix-gpu/gen/core_trace.hsaco --span-kernel NAME
+--span-occurrence N --span-out FILE [--span-sample 7]`):
+- `halo_run` loads the traced code object with recording off.
+- In the last prefill rep it brackets the N-th launch of NAME with stream-ordered
+  `halo_span_set(1)` / `halo_span_set(0)` kernels, so no host synchronization changes the
+  surrounding cache or write-drain state.
+- Cross-check against `--kernel-timing`: the `_mb` trace spans 631 µs (kernel timing 0.619 ms per
+  call), `combine_norm` 1,170 µs (1.15 ms). Placement: 0 waves before their block's wave 0.
+- Realtime messages jitter: a ~10 µs span measured -0.4% to -5% against realtime across runs.
 
 Positive control (`halo_span_control`, `span_report.py --control`): a loop bracketed by both
 clocks. The cycle-derived duration matches the realtime one within 1.1% (9.73 vs 9.84 µs), which

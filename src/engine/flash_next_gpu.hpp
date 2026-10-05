@@ -104,7 +104,15 @@ class FlashNextGpu {
   static inline bool prefill_banded_gemm_ = true;  // large dense GEMMs in bands of 8 row tiles
   static inline bool prefill_reg_gemm_ = true;  // banded GEMMs with weights in registers (halo_gemm_q8r_f16_lr8)
   static inline bool prefill_fused_moe_combine_ = true;  // routed combine + shared expert in one pass
-  static inline bool prefill_ple_overlap_ = true;  // read the n-gram rows while the layers before the PLE run
+  static inline bool prefill_ple_overlap_ = true;
+  /// Span tracing (docs/TRACING.md): when set, the engine loads this code object (core_trace.hsaco) instead
+  /// of the embedded one, and after SpanArm() brackets the span_occurrence_-th launch (from 0) of kernel
+  /// span_kernel_ with halo_span_set(1) / halo_span_set(0).
+  static inline std::vector<std::uint8_t> span_hsaco_;
+  static inline std::string span_kernel_;
+  static inline std::int64_t span_occurrence_ = 0;
+  void SpanArm() { span_seen_ = 0; }
+  [[nodiscard]] std::int64_t SpanSeen() const { return span_seen_; }  // read the n-gram rows while the layers before the PLE run
   /// DeltaNet over 16-token chunks (prep + scan) instead of token by token.
   static inline bool prefill_gdn_chunked_ = true;
   static inline bool prefill_gdn_chunk_fp32_ = false;  // study: the fp32 chunked kernels instead of c16
@@ -293,7 +301,8 @@ class FlashNextGpu {
                          bool fused_combine = false);
   bool MoeChunk(const model::LayerWeights& l, std::uint32_t tokens, std::string* error);
 
-  rt::Device& dev_;
+std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: not armed
+    rt::Device& dev_;
   const model::ModelWeights& w_;
   model::NgramTable* ngram_;
   std::uint32_t max_context_ = 0, position_ = 0;

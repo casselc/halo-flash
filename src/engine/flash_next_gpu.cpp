@@ -103,7 +103,15 @@ bool FlashNextGpu::Launch(const char* name, rt::Dim3 grid, rt::Dim3 block, std::
     return v ? "," + std::string(v) + "," : std::string();
   }();
   if (!skip.empty() && skip.find("," + std::string(name) + ",") != std::string::npos) return true;
+  const bool traced = span_seen_ >= 0 && span_kernel_ == name && span_seen_++ == span_occurrence_;
+  const auto span_set = [&](std::uint32_t on) {
+    const rt::Arg a[] = {rt::Arg::Val(on)};
+    const auto id = dev_.Kernel("halo_span_set", error);
+    return id >= 0 && dev_.Launch(id, {1}, {1}, a, error);
+  };
+  if (traced && !span_set(1)) return false;
   if (!dev_.Launch(it->second, grid, block, std::span<const rt::Arg>(args.begin(), args.size()), error)) return false;
+  if (traced && !span_set(0)) return false;
   if (timing_)
     Stamp(std::string(name) + " [" + std::to_string(grid.x) + "x" + std::to_string(grid.y) + "x" +
           std::to_string(grid.z) + "]");
@@ -218,7 +226,8 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
     if (error) *error = "halo_router_topk supports 1..1024 experts with 0 < used <= experts";
     return false;
   }
-  if (!dev_.LoadModule(kernels::CoreHsaco(), error)) return false;
+  if (!dev_.LoadModule(span_hsaco_.empty() ? kernels::CoreHsaco() : std::span<const std::uint8_t>(span_hsaco_), error))
+    return false;
   std::uint32_t max_rank = 1;
   // Every tensor the step reads goes up once; LoRA pairs attach to dense
   // projections by base name, exactly where the reference applies them.

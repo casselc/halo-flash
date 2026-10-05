@@ -3262,7 +3262,7 @@ extern "C" __global__ void __launch_bounds__(256)
   __shared__ float scratch[32];
   const std::size_t v = blockIdx.x, t = v / hc, row = v * h;
   const std::uint32_t st = static_cast<std::uint32_t>(v % hc);
-  HALO_SPAN_BEGIN(kSpanCombineNorm, 8);  // 6 events + an anchor
+  HALO_SPAN_BEGIN(kSpanCombineNorm, 9);  // 6 events + 2 anchors (+1 spare)
   const float a = 2.0f * Sigmoid(inject[t * hc + st] / static_cast<float>(hc));
   const float* w = w_all + static_cast<std::size_t>(st) * h;
   // All of a thread's loads are issued before any is used. Combined with the
@@ -3346,7 +3346,7 @@ extern "C" __global__ void __launch_bounds__(256)
       }
     }
   }
-  HALO_SPAN(5);  // inject partials done (end)
+  HALO_SPAN_END(5);  // inject partials done (end)
 }
 
 // inject[t][r] = sum over streams s (in order) of ipart[(t * hc + s) * irows + r].
@@ -5897,7 +5897,7 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
     }
   };
   halo_v8f acc[TM][TN] = {};
-  HALO_SPAN_BEGIN(kSpanGemmQ8rF16, 3 * (cols / KS) + 8);
+  HALO_SPAN_BEGIN(kSpanGemmQ8rF16, 3 * (cols / KS) + 8);  // 3 a stage + 3 + 2 anchors
   load(0);
   for (std::uint32_t k0 = 0; k0 < cols; k0 += KS) {
     __syncthreads();  // the previous stage's fragment reads are done
@@ -5961,7 +5961,7 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
     }
     __builtin_amdgcn_wave_barrier();
   }
-  HALO_SPAN(5);  // epilogue stored (end)
+  HALO_SPAN_END(5);  // epilogue stored (end)
 }
 
 extern "C" __global__ void __launch_bounds__(256)
@@ -6158,13 +6158,16 @@ extern "C" __global__ void __launch_bounds__(256)
 }
 
 #ifdef HALO_TRACE
+// Turns span recording on or off, in stream order (src/kernels/span_trace.h). grid 1, block 1
+extern "C" __global__ void halo_span_set(std::uint32_t enable) { halo_span_enable = enable; }
+
 // Known delays between spans, for checking the tracer (tools/span_report.py --control): event 1 after
 // s_sleep 10 (10 x 64 shader cycles), event 2 after `iters` dependent FMAs (5.2 cycles each,
 // docs/HARDWARE.md), event 3 after a barrier.
 // Events 4 and 5 bracket the loop again with the realtime clock as well: the cycle-derived and the
 // realtime durations of 4 -> 5 must agree (tools/span_report.py --control).
 extern "C" __global__ void halo_span_control(float* out, std::uint32_t iters) {
-  HALO_SPAN_BEGIN(kSpanControl, 10);
+  HALO_SPAN_BEGIN(kSpanControl, 12);
   __builtin_amdgcn_s_sleep(10);
   HALO_SPAN(1);
   float a = threadIdx.x;
@@ -6182,6 +6185,7 @@ extern "C" __global__ void halo_span_control(float* out, std::uint32_t iters) {
     for (std::uint32_t i = 0; i < iters; ++i) a = a * 1.0001f + 0.5f;
   __syncthreads();
   HALO_SPAN_RT(7);
+  HALO_SPAN_END(8);
   if (a == 12345.f) out[0] = a;
 }
 #endif
