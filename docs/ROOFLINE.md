@@ -938,3 +938,16 @@ GEMMs depend more on sharing weight rows across token tiles than on output-write
 Wall clock after these (default clock, `prose_long.txt`): 2048 tokens 1.582 s (1294 tok/s),
 6940 tokens 5.78 s (1200 tok/s). gufo's dense GEMM is ~15% faster than ours at the same shapes
 (16384 x 2560: ~5.15 vs 5.9-6.6 ms); fusing shapes or reordering blocks does not close that.
+| `combine_norm` loads batched + one barrier for the inject sums (fe82591, bit-identical; perf model + `combinestudy` ablation) | -40 | kernel 158.5 -> 108.5 ms, device -40.5 | yes |
+| Mix epilogue (`mixt`) loads batched (study) | -40 | 1.10 -> 1.22 ms a call (worse: VGPRs); the epilogue is bound by its 84 MB residual read | no |
+| combine + norm fused into the down GEMM (`halo_hc_combine_down`, bit-identical, study) | -45 | 2.13 ms vs 1.68 for combine_norm + `_mb` | no |
+| combine_norm without y16 + down GEMM rebuilding operands from `res` (`_mr`, bit-identical, study) | -12 | 0.92 + 1.04 = 2.13 ms vs 1.68 | no |
+
+Why the exact two-kernel mixer loses (patch kept at `/data/halo-work/patches/combine_down_and_mr.diff`):
+the down GEMM has 32 blocks (64-token tiles). Fused, each block alternates a latency-bound combine
+phase with its GEMM phase, all blocks in the same phase at once, so neither overlaps the other. Unfused
+but reading the fp32 residual, each stage takes 256-byte pieces of 64 different 40 KB rows, the DRAM
+pattern the K-blocked fp16 copy exists to avoid. What remains open: a K-blocked residual layout
+([cols / 64][T][64] fp32, every residual kernel changed; makes the GEMM's and the mix epilogue's
+reads contiguous), or the numerics-changing options (mix reading the fp16 copy; an fp16/bf16 residual),
+which need a quality eval first.
