@@ -575,6 +575,22 @@ Also found:
 - A GEMM tile whose stage does not split evenly over 256 threads silently skipped rows; it is
   now a `static_assert`.
 
+**4d. Library-derived GEMM targets** (user decision 2026-10-04: use these as targets for our
+own kernels; a ROCm upgrade is acceptable if needed). hipBLASLt 7.2.3, pinned clock, 2048
+tokens (`tools/blaslt_bench.cpp`):
+
+| Shape | Ours | Target (hipBLASLt 7.2.3) | Halogen (ROCm 7.14, tuned) |
+|---|---:|---:|---:|
+| 320 x 10240 (`_m`) | 1.048 ms | 0.638 | 0.410 |
+| 10240 x 320 (mix, GEMM part) | ~0.6 of 1.460 | 0.672 | 0.471 |
+| 512 x 2560 (router, F32) | 1.276 | 0.193-0.225 (16-bit) | ~0.40 (hi/lo split, inferred) |
+| 10240 x 2560 (dense) | 3.457 | 3.530 | 2.79 |
+
+How the library gets there on the skinny K = 10240 shape (kernel names from a rocprofv3
+trace):
+- tiles of 96 x 96 to 128 x 96 with 128 threads, and two stages of global prefetch (`PGR2`);
+- roughly 25-way split K, so thousands of short-K workgroups rather than our 32 long ones.
+
 **4b. Router F32 GEMM (`f32_tiled [32x8]`, 512 x 2560 x 2048 per layer).** DONE, partly. A
 trace first: 52% of cycles in `s_waitcnt vmcnt`, 33% at barriers, ~4% in FMAs. With a 32-wide K
 step and a one-stage register prefetch it measured **-36.5 ms** against a predicted -65 to -85:
