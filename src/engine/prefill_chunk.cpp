@@ -819,20 +819,36 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
   // Host side: every token's n-gram rows and step parameters, one upload.
   model::NgramHistory history = ngram_history_;
   const std::uint32_t ratio = c.compress_ratio, budget = c.indexer_top_k / ratio;
+  // With the PLE past layer 0 and no prefetched rows, the n-gram read (tens
+  // of ms from disk) waits until the layers before the PLE are queued, so it
+  // runs while the GPU works on them.
+  const std::span<float> ple_emb(reinterpret_cast<float*>(ck_host_.data()),
+                             c.ple_layer >= 0 ? std::size_t{T} * c.PleEmbeddingDim() : 0);
+  const bool defer_read = c.ple_layer > 0 && prefill_ple_overlap_ && !(pre_emb && pre_emb->size() == ple_emb.size());
+  std::vector<std::uint32_t> rows;
+  double deferred_read_ms = 0;
   if (c.ple_layer >= 0) {
     // One sorted, batched read for the chunk's rows.
-    std::vector<std::uint32_t> rows(std::size_t{T} * c.ple_heads);
+    rows.resize(std::size_t{T} * c.ple_heads);
     model::HashNgramRows(c, history, tokens, rows);
     t_hash = std::chrono::steady_clock::now();
-    const std::span<float> emb(reinterpret_cast<float*>(ck_host_.data()), std::size_t{T} * c.PleEmbeddingDim());
-    if (pre_emb && pre_emb->size() == emb.size()) {
-      std::memcpy(emb.data(), pre_emb->data(), emb.size_bytes());
-    } else if (!ngram_ || !ngram_->Read(rows, emb)) {
+    if (pre_emb && pre_emb->size() == ple_emb.size()) {
+      std::memcpy(ple_emb.data(), pre_emb->data(), ple_emb.size_bytes());
+    } else if (!defer_read && (!ngram_ || !ngram_->Read(rows, ple_emb))) {
       if (error) *error = "n-gram table read failed";
       return false;
     }
     t_read = std::chrono::steady_clock::now();
   }
+  const auto read_ple = [&] {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!ngram_ || !ngram_->Read(rows, ple_emb)) {
+      if (error) *error = "n-gram table read failed";
+      return false;
+    }
+    deferred_read_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return dev_.Upload(ck_.host, 0, ple_emb.data(), ple_emb.size_bytes(), error);
+  };
   for (std::uint32_t t = 0; t < T; ++t) {
     const std::uint32_t pos = position_ + t, n_kv = pos + 1, complete = n_kv / ratio;
     std::uint32_t params[kHaloStepParamCount] = {};
@@ -845,17 +861,20 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
     std::memcpy(ck_host_.data() + ck_.params_offset + std::size_t{t} * 64, params, sizeof(params));
   }
   const auto t_prep = std::chrono::steady_clock::now();
-  if (!dev_.Upload(ck_.host, 0, ck_host_.data(), ck_.params_offset + std::size_t{T} * 64, error)) return false;
+  if (!(defer_read ? dev_.Upload(ck_.host, ck_.params_offset, ck_host_.data() + ck_.params_offset, std::size_t{T} * 64,
+                                 error)
+                   : dev_.Upload(ck_.host, 0, ck_host_.data(), ck_.params_offset + std::size_t{T} * 64, error)))
+    return false;
   const auto t_upload = std::chrono::steady_clock::now();
   if (after_prep) after_prep(history);
 
   const std::uint32_t H = c.hidden_size, D = c.HcDim();
   const auto& emb = tensors_.at(w_.token_embd.data);
-  for (std::uint32_t t = 0; t < T; ++t) {
-    const rt::Arg eargs[] = {rt::Arg::Buf(emb.buf), rt::Arg::Buf(ck_.embd, std::size_t{t} * H * 4),
-                             rt::Arg::Buf(ck_.host, ck_.params_offset + std::size_t{t} * 64), rt::Arg::Val(H),
+  {  // all T rows in one launch (a launch per token cost ~45 ms per 2048 tokens)
+    const rt::Arg eargs[] = {rt::Arg::Buf(emb.buf), rt::Arg::Buf(ck_.embd),
+                             rt::Arg::Buf(ck_.host, ck_.params_offset), rt::Arg::Val(H),
                              rt::Arg::Val<std::uint64_t>(w_.token_embd.RowBytes())};
-    if (!dev_.Launch(emb.embed, {Blocks(H)}, {kBlock}, eargs, error)) return false;
+    if (!dev_.Launch(emb.embed_rows, {Blocks(H), T}, {kBlock}, eargs, error)) return false;
   }
   if (timing_) Stamp("token embedding (per token)");
   if (!Launch("halo_broadcast_rows", {Blocks(std::size_t{T} * D)}, {kBlock},
@@ -892,7 +911,7 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
   bool normed = false;
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
     const auto& l = w_.layers[il];
-    if (c.IsPleLayer(il) && !PleChunk(l, T, error)) return false;
+    if (c.IsPleLayer(il) && ((defer_read && !read_ple()) || !PleChunk(l, T, error))) return false;
     if (!HcMixChunk(l.hc_attn, true, T, error, normed)) return false;
     if (l.linear ? !LinearChunk(l, linear_[il], T, error) : !AttentionChunk(l, attn_[il], T, error)) return false;
     if (!(fuse ? combine_norm(l.hc_ffn) : combine()) || !HcMixChunk(l.hc_ffn, true, T, error, fuse) ||
@@ -914,10 +933,10 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
   if (timing) {
     const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     std::fprintf(stderr,
-                 "prefill chunk %u tokens: host prep %.1f ms (hash %.1f, n-gram read %.1f), upload %.1f ms, "
-                 "device %.1f ms\n",
-                 T, ms(t_start, t_prep), ms(t_start, t_hash), ms(t_hash, t_read), ms(t_prep, t_upload),
-                 ms(t_upload, std::chrono::steady_clock::now()));
+                 "prefill chunk %u tokens: host prep %.1f ms (hash %.1f, n-gram read %.1f, deferred %.1f), "
+                 "upload %.1f ms, device %.1f ms\n",
+                 T, ms(t_start, t_prep), ms(t_start, t_hash), ms(t_hash, t_read), deferred_read_ms,
+                 ms(t_prep, t_upload), ms(t_upload, std::chrono::steady_clock::now()));
   }
   ngram_history_ = history;
   const std::uint32_t complete = (position_ + T) / ratio;

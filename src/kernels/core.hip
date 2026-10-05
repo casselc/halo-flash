@@ -207,6 +207,12 @@ __device__ void Embed(const std::uint8_t* w, float* out, std::uint32_t token, st
   extern "C" __global__ void NAME##_embed(const std::uint8_t* w, float* out, std::uint32_t token,              \
                                           std::uint32_t cols, std::uint64_t row_bytes) {                       \
     Embed<L>(w, out, token, cols, row_bytes);                                                                  \
+  }                                                                                                            \
+  /* T tokens at once (grid (ceil(cols / 256), T)): token t from params[t * 16 + kHaloToken], row t of out. */ \
+  extern "C" __global__ void NAME##_embed_rows(const std::uint8_t* w, float* out, const std::uint32_t* params,    \
+                                               std::uint32_t cols, std::uint64_t row_bytes) {                     \
+    Embed<L>(w, out + static_cast<std::size_t>(blockIdx.y) * cols, params[blockIdx.y * 16 + kHaloToken], cols,   \
+             row_bytes);                                                                                         \
   }
 
 HALO_MATVEC(halo_matvec_f32, LoadF32)

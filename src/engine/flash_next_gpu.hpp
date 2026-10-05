@@ -100,6 +100,7 @@ class FlashNextGpu {
   // combine_norm skips the fp32 xn the mixer's mix epilogue would re-read;
   // the epilogue rebuilds it from res (same arithmetic, bit-identical).
   static inline bool prefill_mix_rebuild_ = true;
+  static inline bool prefill_ple_overlap_ = true;  // read the n-gram rows while the layers before the PLE run
   /// DeltaNet over 16-token chunks (prep + scan) instead of token by token.
   static inline bool prefill_gdn_chunked_ = true;
   static inline bool prefill_gdn_chunk_fp32_ = false;  // study: the fp32 chunked kernels instead of c16
@@ -179,7 +180,7 @@ class FlashNextGpu {
  private:
   struct DevTensor {
     rt::Buffer buf;
-    rt::KernelId matvec = -1, embed = -1, expert = -1;
+    rt::KernelId matvec = -1, embed = -1, expert = -1, embed_rows = -1;
     // P3: Q8_0 repacked into aligned int8 rows (`qs`) and fp16 scales (`d`).
     rt::Buffer qs, d;
     std::uint32_t qstride = 0;
