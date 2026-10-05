@@ -966,3 +966,9 @@ fp16 copy instead of the fp32 residual) is the remaining lever; it changes round
 | Register-weight GEMM in bands of 5 for the 2560-row shapes (`lr5`, bit-identical) | -20..-25 (lr8 runs 75% of its floor, `_l` 60%) | `_l` 118.6 -> lr5 172.0 ms; end to end +57 ms | no |
 | Down GEMM `_mb` with two stages of operands in flight (kDepth 2, bit-identical) | -11 (in-engine vmcnt waits were 64%) | `_mb` 59.2 -> 61.2 ms, end to end -1.3 within noise: the waits are bandwidth after combine_norm's writes, not latency | no |
 | `moe_combine_shared`: the k expert values loaded before the sum (bit-identical) | ~-5 (rounds model: near bandwidth-bound at 1280 waves) | not among the kernels that moved; end to end within noise (spreads 20-28 ms) | no |
+
+DeltaNet scan (`halo_gdn_c16_scan3u`, 76 ms, issue floor ~60): 96 blocks x 4 waves, all resident in one
+generation (~4.8 waves/SIMD), each walking 128 chunk steps in series at ~16.5 us per step; per SIMD a step
+issues ~6.7 us of WMMA and ~6.3 us of VALU, so it runs at ~80% of issue. Its 6 spilled VGPRs are reloaded
+4 times a step from scratch (~0.3 us of 16.5, ~1.3 ms per prefill). No cheap lever: the remaining 20% is
+issue packing across the steps' phases.
