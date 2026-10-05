@@ -961,3 +961,4 @@ does not reproduce the engine's, as noted before; decide by the engine (A/B and 
 What remains in the mix epilogue fits the rounds model as DRAM-bound: ~500 waves in it at once, a 16-load
 round each ~1.1 MB / 185 GB/s ~ 6 us, 8 rounds + the sigmoids ~ 65-70 us (traced 70-74). Fewer bytes (the
 fp16 copy instead of the fp32 residual) is the remaining lever; it changes rounding (quality eval first).
+| MoE down: output tile staged in LDS, written as 16-byte pieces of contiguous token rows (bit-identical: logits compared bitwise; found with the span tracer: the epilogue was 7-19 us of a 35 us wave) | -18..-25 | MoE down 179.8 -> 133.1 ms (-46.8), q8r -4.9; end to end -60.2 ms (1541 -> 1481, significant; 1383 tok/s); trace: epilogue 8.6 -> 2.0 us, wave 35.4 -> 27.5 us | yes |

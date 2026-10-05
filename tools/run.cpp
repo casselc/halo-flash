@@ -129,6 +129,7 @@ int main(int argc, char** argv) {
   // --span-hsaco FILE --span-kernel NAME --span-occurrence N --span-out FILE [--span-sample N]: load the traced
   // code object and record the N-th launch (from 0) of kernel NAME in the last prefill rep (docs/TRACING.md).
   std::string span_hsaco, span_out;
+  std::string logits_out;  // --logits-out FILE: the last prefill's logits (fp32), for bitwise comparison of builds
   std::uint32_t span_sample = 1;
   bool eager = false, profile = false, device_sample = false;
   bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
@@ -147,6 +148,7 @@ int main(int argc, char** argv) {
     else if (a == "--int8-moe") engine::FlashNextGpu::int8_act_moe_ = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill-bench") prefill_bench = std::atoi(argv[i + 1]);
     else if (a == "--span-hsaco") span_hsaco = argv[i + 1];
+    else if (a == "--logits-out") logits_out = argv[i + 1];
     else if (a == "--span-kernel") engine::FlashNextGpu::span_kernel_ = argv[i + 1];
     else if (a == "--span-occurrence") engine::FlashNextGpu::span_occurrence_ = std::atoll(argv[i + 1]);
     else if (a == "--span-out") span_out = argv[i + 1];
@@ -297,6 +299,10 @@ int main(int argc, char** argv) {
       secs.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - st).count());
       std::printf("prefill %zu tokens: %.3f s (%.1f tok/s), argmax %u\n", toks.size(), secs.back(),
                   toks.size() / secs.back(), Argmax(logits).best);
+    }
+    if (!logits_out.empty()) {
+      std::ofstream f(logits_out, std::ios::binary);
+      f.write(reinterpret_cast<const char*>(logits.data()), static_cast<std::streamsize>(logits.size() * sizeof(logits[0])));
     }
     if (!span_hsaco.empty()) {
       std::vector<std::uint8_t> recs(std::size_t{1} << 26);

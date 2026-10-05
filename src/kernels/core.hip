@@ -4068,18 +4068,33 @@ __device__ void MoeDown(SL load, SG get, const _Float16* hp, const std::uint32_t
   }
 #undef HALO_MOE_LOAD_HP
   HALO_SPAN(4);  // math done
+  // The output tile goes through LDS (the activation stage's buffer) token-major, then leaves as 16-byte pieces
+  // of each token's contiguous rows: stored straight from the accumulators, each instruction wrote 2 bytes
+  // into each of 16 token rows (the epilogue was ~7-19 us of a 35 us wave, docs/TRACING.md).
+  static_assert(kMoeRowTiles == 1 && kMoeTile * (kMoeBlockRows + 2) <= kMoeTile * kMoeRs,
+                "the output tile fits the stage buffer");
+  constexpr std::uint32_t kOs = kMoeBlockRows + 2;  // token stride in halves: 65 words, conflict-free stores
+  __syncthreads();  // every wave's last fragment reads of Bs are done
 #pragma unroll
-  for (std::uint32_t rt = 0; rt < kMoeRowTiles; ++rt)
+  for (std::uint32_t h = 0; h < kMoeSub; ++h) {
+    const std::uint32_t t = h * 16 + lane % 16;
 #pragma unroll
-    for (std::uint32_t h = 0; h < kMoeSub; ++h) {
-      const std::uint32_t t = h * 16 + lane % 16;
-      if (t >= n) continue;
-#pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const std::uint32_t r = r0 + rt * 16 + 2 * j + lane / 16;
-        if (r < H) yp[static_cast<std::size_t>(first + t) * H + r] = static_cast<_Float16>(acc[rt][h][j]);
-      }
+    for (int j = 0; j < 8; ++j) Bs[t * kOs + wave * 16 + 2 * j + lane / 16] = static_cast<_Float16>(acc[0][h][j]);
+  }
+  __syncthreads();
+  const std::uint32_t rb = blockIdx.x * kMoeBlockRows;
+  for (std::uint32_t idx = threadIdx.x; idx < kMoeTile * (kMoeBlockRows / 8); idx += 256) {
+    const std::uint32_t t = idx / (kMoeBlockRows / 8), c = (idx % (kMoeBlockRows / 8)) * 8;
+    if (t >= n) continue;
+    const _Float16* src = Bs + t * kOs + c;
+    _Float16* dst = yp + static_cast<std::size_t>(first + t) * H + rb + c;
+    if (rb + c + 8 <= H) {
+      const std::uint32_t* s32 = reinterpret_cast<const std::uint32_t*>(src);  // 4-byte aligned: kOs, c even
+      *reinterpret_cast<uint4*>(dst) = make_uint4(s32[0], s32[1], s32[2], s32[3]);
+    } else {
+      for (std::uint32_t q = 0; q < 8 && rb + c + q < H; ++q) dst[q] = src[q];
     }
+  }
   HALO_SPAN_END(5);  // outputs stored (end)
 }
 
