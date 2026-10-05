@@ -346,18 +346,31 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
                      // 16-token chunks: everything but the state-dependent
                      // products over all chunks at once, then a WMMA scan
                      // over chunks instead of over tokens.
-                     ? Launch("halo_gdn_c16_prep", {(T + 15) / 16, c.ssm_num_k_heads}, {256},
+                     ? (prefill_gdn_chunk_fp32_
+                            ? Launch("halo_gdn_chunk_prep", {(T + 15) / 16, c.ssm_num_v_heads}, {256},
+                                     {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull), rt::Arg::Buf(ck_.alpha),
+                                      rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
+                                      rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(ck_.gdnprep),
+                                      rt::Arg::Val(c.ssm_num_k_heads), rt::Arg::Val(T), rt::Arg::Val(ch)},
+                                     error) &&
+                                  Launch("halo_gdn_chunk_scan", {2, c.ssm_num_v_heads}, {256},
+                                         {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull),
+                                          rt::Arg::Buf(ck_.conv, 2ull * kd * 4), rt::Arg::Buf(ck_.gdnprep),
+                                          rt::Arg::Buf(s.state), rt::Arg::Buf(ck_.gdn), rt::Arg::Val(c.ssm_num_k_heads),
+                                          rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)},
+                                         error)
+                            : Launch("halo_gdn_c16_prep", {(T + 15) / 16, c.ssm_num_k_heads}, {256},
                               {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull), rt::Arg::Buf(ck_.alpha),
                                rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
                                rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(ck_.gdnprep),
                                rt::Arg::Val(c.ssm_num_v_heads), rt::Arg::Val(T), rt::Arg::Val(ch)},
                               error) &&
-                           Launch("halo_gdn_c16_scan", {2, c.ssm_num_v_heads}, {128},
+                           Launch(prefill_gdn_c16_bf16_ ? "halo_gdn_c16_scan" : "halo_gdn_c16_scan3", {2, c.ssm_num_v_heads}, {128},
                                   {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull),
                                    rt::Arg::Buf(ck_.conv, 2ull * kd * 4), rt::Arg::Buf(ck_.gdnprep),
                                    rt::Arg::Buf(s.state), rt::Arg::Buf(ck_.gdn), rt::Arg::Val(c.ssm_num_k_heads),
                                    rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)},
-                                  error)
+                                  error))
                      : Launch("halo_gdn_prefill_split", {2, c.ssm_num_v_heads}, {256},
                        {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull), rt::Arg::Buf(ck_.conv, 2ull * kd * 4),
                         rt::Arg::Buf(ck_.alpha), rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),

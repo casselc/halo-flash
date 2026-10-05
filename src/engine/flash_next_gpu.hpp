@@ -102,6 +102,8 @@ class FlashNextGpu {
   static inline bool prefill_mix_rebuild_ = true;
   /// DeltaNet over 16-token chunks (prep + scan) instead of token by token.
   static inline bool prefill_gdn_chunked_ = true;
+  static inline bool prefill_gdn_chunk_fp32_ = false;  // study: the fp32 chunked kernels instead of c16
+  static inline bool prefill_gdn_c16_bf16_ = false;    // study: the two-way bf16 scan (fails the long-set gate)
   /// Read the next prefill chunk's n-gram rows on a host thread while the
   /// current chunk runs on the device.
   static inline bool prefill_ngram_prefetch_ = true;

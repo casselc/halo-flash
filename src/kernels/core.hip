@@ -4962,6 +4962,60 @@ __device__ inline void AccToBSplitP(const halo_v8f& c, halo_v16s& hi, halo_v16s&
   hi = AsFrag(h);
   lo = AsFrag(l);
 }
+// Three-way split (hi + mid + lo, ~24 bits): for products whose result
+// cancels, e.g. V - S^T k once the state predicts the values well.
+__device__ inline void SplitPair3(float a, float b, std::uint32_t& hi, std::uint32_t& mi, std::uint32_t& lo) {
+  const auto rne = [](float f) {
+    const std::uint32_t u = __float_as_uint(f);
+    return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+  };
+  const std::uint32_t ha = rne(a), hb = rne(b);
+  const float ra = a - __uint_as_float(ha << 16), rb = b - __uint_as_float(hb << 16);
+  const std::uint32_t ma = rne(ra), mb = rne(rb);
+  hi = (ha & 0xFFFFu) | (hb << 16);
+  mi = (ma & 0xFFFFu) | (mb << 16);
+  lo = (rne(ra - __uint_as_float(ma << 16)) & 0xFFFFu) | (rne(rb - __uint_as_float(mb << 16)) << 16);
+}
+__device__ inline void RowSplit3P(const float* p, halo_v16s& hi, halo_v16s& mi, halo_v16s& lo) {
+  halo_v8u h, m, l;
+#pragma unroll
+  for (int e = 0; e < 16; e += 2) {
+    std::uint32_t a, b, c;
+    SplitPair3(p[e], p[e + 1], a, b, c);
+    h[e / 2] = a;
+    m[e / 2] = b;
+    l[e / 2] = c;
+  }
+  hi = AsFrag(h);
+  mi = AsFrag(m);
+  lo = AsFrag(l);
+}
+__device__ inline void AccToBSplit3P(const halo_v8f& c, halo_v16s& hi, halo_v16s& mi, halo_v16s& lo) {
+  const bool upper = (threadIdx.x % 32) >= 16;
+  halo_v8u h, m, l;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const float own = c[j], other = __shfl_xor(c[j], 16, 32);
+    std::uint32_t a, b, x;
+    SplitPair3(upper ? other : own, upper ? own : other, a, b, x);
+    h[j] = a;
+    m[j] = b;
+    l[j] = x;
+  }
+  hi = AsFrag(h);
+  mi = AsFrag(m);
+  lo = AsFrag(l);
+}
+// The six terms down to 2^-16 x 2^-16 relative, smallest first.
+__device__ inline halo_v8f Wmma6(const halo_v16s& ah, const halo_v16s& am, const halo_v16s& al, const halo_v16s& bh,
+                                 const halo_v16s& bm, const halo_v16s& bl, halo_v8f c) {
+  c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al, bh, c);
+  c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ah, bl, c);
+  c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(am, bm, c);
+  c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(am, bh, c);
+  c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ah, bm, c);
+  return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ah, bh, c);
+}
 }  // namespace
 constexpr std::uint32_t kGdnP16 = 576;
 // One block per (k-head, chunk) serves the k-head's v-heads kh + r nk
@@ -5058,11 +5112,11 @@ extern "C" __global__ void __launch_bounds__(256)
   }
 }
 
-//   grid (2, heads), block 128
-extern "C" __global__ void __launch_bounds__(128)
-    halo_gdn_c16_scan(const float* q, const float* k, const float* v, const float* prep, float* state, float* out,
-                      std::uint32_t num_k_heads, std::uint32_t tokens, std::uint32_t qk_stride, std::uint32_t v_stride,
-                      std::uint32_t o_stride) {
+// KS3: K S0 with the three-way split (6 WMMAs a tile).
+template <bool KS3>
+__device__ void GdnC16Scan(const float* q, const float* k, const float* v, const float* prep, float* state, float* out,
+                           std::uint32_t num_k_heads, std::uint32_t tokens, std::uint32_t qk_stride,
+                           std::uint32_t v_stride, std::uint32_t o_stride) {
   constexpr std::uint32_t d = 128, C = 16, KR = d + 4, NT = 128, KP = C * d / 4 / NT, PP = kGdnP16 / 4;
   __shared__ __attribute__((aligned(16))) float ks[C][KR], qs[C][KR], P[kGdnP16];
   const std::uint32_t h = blockIdx.y, tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
@@ -5136,9 +5190,18 @@ extern "C" __global__ void __launch_bounds__(128)
 #pragma unroll
     for (int kt = 0; kt < 8; ++kt) {
       halo_v16s bhh, bll, xh, xl;
-      AccToBSplitP(acc[kt], bhh, bll);
-      RowSplitP(&ks[lane % 16][kt * 16], xh, xl);
-      pk = Wmma3(xh, xl, bhh, bll, pk);
+      if constexpr (KS3) {
+        halo_v16s bmm, xm;
+        AccToBSplit3P(acc[kt], bhh, bmm, bll);
+        RowSplit3P(&ks[lane % 16][kt * 16], xh, xm, xl);
+        pk = Wmma6(xh, xm, xl, bhh, bmm, bll, pk);
+        // Q S0 keeps hi/lo: the pair's lo, rne(x - hi), is the triple's mid.
+        bll = bmm;
+      } else {
+        AccToBSplitP(acc[kt], bhh, bll);
+        RowSplitP(&ks[lane % 16][kt * 16], xh, xl);
+        pk = Wmma3(xh, xl, bhh, bll, pk);
+      }
       RowSplitP(&qs[lane % 16][kt * 16], xh, xl);
       pq = Wmma3(xh, xl, bhh, bll, pq);
       __builtin_amdgcn_sched_barrier(0);
@@ -5186,6 +5249,158 @@ extern "C" __global__ void __launch_bounds__(128)
   }
   // Recompute the store addresses (an opaque offset): reusing the loads'
   // 64 addresses kept them live across the loop and spilled.
+  asm volatile("" : "+v"(so));
+#pragma unroll
+  for (int kt = 0; kt < 8; ++kt)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) (S + (kt * 16 + 2 * j) * d)[so] = acc[kt][j];
+}
+
+#define HALO_GDN_C16_SCAN(NAME, KS3)                                                                             \
+  extern "C" __global__ void __launch_bounds__(128)                                                              \
+      NAME(const float* q, const float* k, const float* v, const float* prep, float* state, float* out,          \
+           std::uint32_t num_k_heads, std::uint32_t tokens, std::uint32_t qk_stride, std::uint32_t v_stride,      \
+           std::uint32_t o_stride) {                                                                             \
+    GdnC16Scan<KS3>(q, k, v, prep, state, out, num_k_heads, tokens, qk_stride, v_stride, o_stride);              \
+  }
+//   grid (2, heads), block 128
+HALO_GDN_C16_SCAN(halo_gdn_c16_scan, false)
+HALO_GDN_C16_SCAN(halo_gdn_c16_scan_ks3, true)
+#undef HALO_GDN_C16_SCAN
+
+// halo_gdn_c16_scan with K S0 on the three-way split (a two-way split there
+// shifted long-prompt NLL by +0.002: V - S^T k cancels once the state
+// predicts the values) and the splitting done once a block, at staging:
+// K is staged as bf16 hi / mid / lo and Q as hi / lo, not fp32 split again
+// by every wave. The update folds the decay weights into Delta,
+// S = e^G_n S0 + K^T (w Delta), so its A operand is K's hi / mid gathered
+// as they are. ~24 KB of LDS: every block of a layer still resident.
+//   grid (2, heads), block 128
+extern "C" __global__ void __launch_bounds__(128)
+    halo_gdn_c16_scan3(const float* q, const float* k, const float* v, const float* prep, float* state, float* out,
+                       std::uint32_t num_k_heads, std::uint32_t tokens, std::uint32_t qk_stride, std::uint32_t v_stride,
+                       std::uint32_t o_stride) {
+  constexpr std::uint32_t d = 128, C = 16, KR = d + 8, NT = 128, KP = C * d / 4 / NT, PP = kGdnP16 / 4;
+  __shared__ __attribute__((aligned(16))) short kh[C][KR], km[C][KR], kl[C][KR], qh[C][KR], ql[C][KR];
+  __shared__ __attribute__((aligned(16))) float P[kGdnP16];
+  const std::uint32_t h = blockIdx.y, tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const std::uint32_t kh_ = h % num_k_heads, col = blockIdx.x * 64 + wave * 16 + lane % 16, hi = lane / 16;
+  const std::uint32_t nchunks = (tokens + C - 1) / C;
+  float* S = state + static_cast<std::size_t>(h) * d * d;
+  std::uint32_t so = hi * d + col;
+  halo_v8f acc[8];
+#pragma unroll
+  for (int kt = 0; kt < 8; ++kt)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[kt][j] = (S + (kt * 16 + 2 * j) * d)[so];
+  const auto barrier = [] {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+  };
+  typedef float v16f __attribute__((ext_vector_type(16)));
+  static_assert(KP == 4, "rk/rq hold 4 float4");
+  v16f rk, rq;
+  halo_v8f rp, rv;
+  const auto load_v = [&](std::uint32_t ch) {
+    const std::uint32_t t0 = ch * C, n = min(C, tokens - t0);
+#pragma unroll
+    for (std::uint32_t j = 0; j < 8; ++j) rv[j] = v[(t0 + min(2 * j + hi, n - 1)) * v_stride + h * d + col];
+  };
+  const auto load = [&](std::uint32_t ch) {
+    const std::uint32_t t0 = ch * C, n = min(C, tokens - t0);
+#pragma unroll
+    for (std::uint32_t p = 0; p < KP; ++p) {
+      const std::uint32_t x = tid + p * NT, tt = x / (d / 4), i = (x % (d / 4)) * 4;
+      const std::uint32_t row = (t0 + min(tt, n - 1)) * qk_stride + kh_ * d + i;
+      const float4 k4 = *reinterpret_cast<const float4*>(k + row), q4 = *reinterpret_cast<const float4*>(q + row);
+      rk[4 * p] = k4.x, rk[4 * p + 1] = k4.y, rk[4 * p + 2] = k4.z, rk[4 * p + 3] = k4.w;
+      rq[4 * p] = q4.x, rq[4 * p + 1] = q4.y, rq[4 * p + 2] = q4.z, rq[4 * p + 3] = q4.w;
+    }
+    const float4* pp = reinterpret_cast<const float4*>(prep);
+#pragma unroll
+    for (std::uint32_t p = 0; p < 2; ++p) {
+      const float4 x = pp[(h * nchunks + ch) * PP + min(tid + p * NT, PP - 1)];
+      rp[4 * p] = x.x, rp[4 * p + 1] = x.y, rp[4 * p + 2] = x.z, rp[4 * p + 3] = x.w;
+    }
+  };
+  load(0);
+  load_v(0);
+  for (std::uint32_t ch = 0; ch < nchunks; ++ch) {
+    const std::uint32_t t0 = ch * C, n = min(C, tokens - t0);
+#pragma unroll
+    for (std::uint32_t p = 0; p < KP; ++p) {  // split once, for every wave
+      const std::uint32_t x = tid + p * NT, tt = x / (d / 4), i = (x % (d / 4)) * 4;
+      uint2 a, b, c;
+      SplitPair3(rk[4 * p], rk[4 * p + 1], a.x, b.x, c.x);
+      SplitPair3(rk[4 * p + 2], rk[4 * p + 3], a.y, b.y, c.y);
+      *reinterpret_cast<uint2*>(&kh[tt][i]) = a;
+      *reinterpret_cast<uint2*>(&km[tt][i]) = b;
+      *reinterpret_cast<uint2*>(&kl[tt][i]) = c;
+      SplitPair(rq[4 * p], rq[4 * p + 1], a.x, b.x);
+      SplitPair(rq[4 * p + 2], rq[4 * p + 3], a.y, b.y);
+      *reinterpret_cast<uint2*>(&qh[tt][i]) = a;
+      *reinterpret_cast<uint2*>(&ql[tt][i]) = b;
+    }
+#pragma unroll
+    for (std::uint32_t p = 0; p < 2; ++p)
+      if (tid + p * NT < PP)
+        reinterpret_cast<float4*>(P)[tid + p * NT] = make_float4(rp[4 * p], rp[4 * p + 1], rp[4 * p + 2], rp[4 * p + 3]);
+    const std::uint32_t nx = min(ch + 1, nchunks - 1);
+    load(nx);
+    barrier();
+    // K S0 (three-way) and Q S0 (two-way: the pair's lo is the triple's mid).
+    halo_v8f pk = {}, pq = {};
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+      halo_v16s bh, bm, bl;
+      AccToBSplit3P(acc[kt], bh, bm, bl);
+      pk = Wmma6(LdsFragS(&kh[lane % 16][kt * 16]), LdsFragS(&km[lane % 16][kt * 16]),
+                 LdsFragS(&kl[lane % 16][kt * 16]), bh, bm, bl, pk);
+      pq = Wmma3(LdsFragS(&qh[lane % 16][kt * 16]), LdsFragS(&ql[lane % 16][kt * 16]), bh, bm, pq);
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    // Delta = T' (V - e^G (K S0)); accumulator rows are tokens 2 j + hi.
+    halo_v8f r;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) r[j] = rv[j] - P[2 * C * C + C + 2 * j + hi] * pk[j];
+    load_v(nx);
+    halo_v16s rh, rl, th, tl;
+    AccToBSplitP(r, rh, rl);
+    RowSplitP(&P[(lane % 16) * C], th, tl);
+    halo_v8f dl = {};
+    dl = Wmma3(th, tl, rh, rl, dl);
+    halo_v16s dh, dlo;
+    AccToBSplitP(dl, dh, dlo);
+    // O = e^G / sqrt d (Q S0) + P' Delta.
+    RowSplitP(&P[C * C + (lane % 16) * C], th, tl);
+    halo_v8f o = {};
+    o = Wmma3(th, tl, dh, dlo, o);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const std::uint32_t t = 2 * j + hi;
+      if (t < n) out[static_cast<std::size_t>(t0 + t) * o_stride + h * d + col] = P[2 * C * C + t] * pq[j] + o[j];
+    }
+    // S = e^G_n S0 + K^T (w Delta): B operand w Delta, A operand K^T (hi, mid).
+#pragma unroll
+    for (int j = 0; j < 8; ++j) dl[j] *= P[2 * C * C + 2 * C + 2 * j + hi];
+    AccToBSplitP(dl, dh, dlo);
+    const float en = P[2 * C * C + 3 * C];
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[kt][j] *= en;
+      halo_v16s ah, am;  // key kt * 16 + lane % 16 over the chunk's tokens
+#pragma unroll
+      for (int e = 0; e < 16; ++e) {
+        ah[e] = kh[e][kt * 16 + lane % 16];
+        am[e] = km[e][kt * 16 + lane % 16];
+      }
+      acc[kt] = Wmma3(ah, am, dh, dlo, acc[kt]);
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    barrier();
+  }
   asm volatile("" : "+v"(so));
 #pragma unroll
   for (int kt = 0; kt < 8; ++kt)

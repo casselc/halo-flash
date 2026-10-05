@@ -37,6 +37,83 @@ using namespace halo;
 
 int main(int argc, char** argv) {
   std::string e;
+  if (argc > 1 && std::string(argv[1]) == "gdnerr") {
+    // Chunked DeltaNet (prep + scan) against the fp32 split kernel on the same
+    // inputs at a layer's shape: L2-normalized q and k per head, gates drawn as
+    // in the property test. Relative L2 error of the outputs and final state.
+    auto d = rt::Device::Create(rt::Backend::kHip, &e);
+    if (!d || !d->LoadModule(kernels::CoreHsaco(), &e)) return std::printf("%s\n", e.c_str()), 1;
+    const std::uint32_t T = std::max(argc > 2 ? std::atoi(argv[2]) : 2048, 256), heads = 48, kheads = 16, stride = 10240,
+                        nch = (T + 15) / 16;
+    std::uint32_t seed = 12345;
+    const auto rnd = [&] {
+      seed = seed * 1664525u + 1013904223u;
+      return static_cast<float>(seed >> 8) / 16777216.0f - 0.5f;
+    };
+    std::vector<float> conv(std::size_t{T} * stride), al(std::size_t{T} * heads), be(al.size()), av(heads), dtv(heads),
+        st(std::size_t{heads} * 128 * 128);
+    // corr > 0: each q/k head's vectors share a fixed direction (weight corr
+    // against unit noise), as real keys within a chunk do.
+    const float corr = argc > 4 ? static_cast<float>(std::atof(argv[4])) : 0.0f;
+    for (auto& x : conv) x = 4.0f * rnd();
+    std::vector<float> base(2 * kheads * 128);
+    for (auto& x : base) x = 4.0f * rnd();
+    for (std::uint32_t t = 0; t < T; ++t)
+      for (std::uint32_t v = 0; v < 2 * kheads; ++v) {  // q and k heads: unit L2
+        float* p = &conv[std::size_t{t} * stride + v * 128];
+        for (int i = 0; i < 128; ++i) p[i] += corr * base[v * 128 + i];
+        double n = 0;
+        for (int i = 0; i < 128; ++i) n += double(p[i]) * p[i];
+        for (int i = 0; i < 128; ++i) p[i] = static_cast<float>(p[i] / std::sqrt(n));
+      }
+    for (auto& x : al) x = 4.0f * rnd();
+    for (auto& x : be) x = 4.0f * rnd();
+    for (auto& x : av) x = -std::exp(2.0f * rnd());
+    for (auto& x : dtv) x = 2.0f * rnd();
+    for (auto& x : st) x = 0.2f * rnd();
+    const auto up = [&](const std::vector<float>& h) {
+      auto b = d->Alloc(h.size() * 4, &e);
+      (void)d->Upload(b, 0, h.data(), h.size() * 4, &e);
+      return b;
+    };
+    auto cb = up(conv), alb = up(al), beb = up(be), ab = up(av), dtb = up(dtv), s1 = up(st), s2 = up(st);
+    auto o1 = d->Alloc(std::size_t{T} * heads * 128 * 4, &e), o2 = d->Alloc(std::size_t{T} * heads * 128 * 4, &e),
+         prep = d->Alloc(std::size_t{heads} * nch * 576 * 4, &e);
+    const rt::Arg sa[] = {rt::Arg::Buf(cb), rt::Arg::Buf(cb, 2048ull * 4), rt::Arg::Buf(cb, 4096ull * 4),
+                          rt::Arg::Buf(alb), rt::Arg::Buf(beb), rt::Arg::Buf(ab), rt::Arg::Buf(dtb), rt::Arg::Buf(s1),
+                          rt::Arg::Buf(o1), rt::Arg::Val(kheads), rt::Arg::Val(T), rt::Arg::Val(stride),
+                          rt::Arg::Val(stride), rt::Arg::Val(heads * 128u)};
+    const rt::Arg pa[] = {rt::Arg::Buf(cb), rt::Arg::Buf(cb, 2048ull * 4), rt::Arg::Buf(alb), rt::Arg::Buf(beb),
+                          rt::Arg::Buf(ab), rt::Arg::Buf(dtb), rt::Arg::Buf(prep), rt::Arg::Val(heads), rt::Arg::Val(T),
+                          rt::Arg::Val(stride)};
+    const char* scan = argc > 3 ? argv[3] : "halo_gdn_c16_scan";
+    const rt::Arg ca[] = {rt::Arg::Buf(cb), rt::Arg::Buf(cb, 2048ull * 4), rt::Arg::Buf(cb, 4096ull * 4),
+                          rt::Arg::Buf(prep), rt::Arg::Buf(s2), rt::Arg::Buf(o2), rt::Arg::Val(kheads), rt::Arg::Val(T),
+                          rt::Arg::Val(stride), rt::Arg::Val(stride), rt::Arg::Val(heads * 128u)};
+    (void)d->Launch(d->Kernel("halo_gdn_prefill_split", &e), {2, heads}, {256}, sa, &e);
+    (void)d->Launch(d->Kernel("halo_gdn_c16_prep", &e), {nch, kheads}, {256}, pa, &e);
+    (void)d->Launch(d->Kernel(scan, &e), {2, heads}, {128}, ca, &e);
+    (void)d->Synchronize(&e);
+    const auto get = [&](rt::Buffer b, std::size_t n) {
+      std::vector<float> h(n);
+      (void)d->Download(b, 0, h.data(), n * 4, &e);
+      return h;
+    };
+    const auto rel = [](const std::vector<float>& x, const std::vector<float>& y) {
+      double dd = 0, m = 0;
+      for (std::size_t i = 0; i < x.size(); ++i) dd += double(x[i] - y[i]) * (x[i] - y[i]), m += double(y[i]) * y[i];
+      return std::sqrt(dd / m);
+    };
+    const auto x1 = get(o1, std::size_t{T} * heads * 128), x2 = get(o2, x1.size());
+    std::printf("%s T %u: output rel L2 %.3e (first 256 tokens %.3e, last 256 %.3e), state rel L2 %.3e\n", scan, T,
+                rel(x2, x1),
+                rel(std::vector<float>(x2.begin(), x2.begin() + 256 * heads * 128),
+                    std::vector<float>(x1.begin(), x1.begin() + 256 * heads * 128)),
+                rel(std::vector<float>(x2.end() - 256 * heads * 128, x2.end()),
+                    std::vector<float>(x1.end() - 256 * heads * 128, x1.end())),
+                rel(get(s2, st.size()), get(s1, st.size())));
+    return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "gdnskel") {
     // Structural floor of chunked DeltaNet scans (no math) at one layer's real
     // shape: 2048 tokens, 48 v-heads, 16 k-heads, conv rows of 10240.
@@ -92,6 +169,10 @@ int main(int argc, char** argv) {
       time("halo_gdn_prefill_split", [&] { (void)d->Launch(ks, {2, heads}, {256}, sa, &e); });
       time("halo_gdn_c16_prep", [&] { (void)d->Launch(kp, {T / 16, kheads}, {256}, pa, &e); });
       time("halo_gdn_c16_scan", [&] { (void)d->Launch(kc, {2, heads}, {128}, ca, &e); });
+      const auto k3 = d->Kernel("halo_gdn_c16_scan_ks3", &e);
+      time("halo_gdn_c16_scan_ks3", [&] { (void)d->Launch(k3, {2, heads}, {128}, ca, &e); });
+      const auto k4 = d->Kernel("halo_gdn_c16_scan3", &e);
+      time("halo_gdn_c16_scan3", [&] { (void)d->Launch(k4, {2, heads}, {128}, ca, &e); });
       time("halo_gdn_c16 prep + scan", [&] {
         (void)d->Launch(kp, {T / 16, kheads}, {256}, pa, &e);
         (void)d->Launch(kc, {2, heads}, {128}, ca, &e);
