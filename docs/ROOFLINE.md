@@ -931,3 +931,10 @@ The mix probe sequence that found it: `halo_gemm_bench mixstudy` showed the kern
 a GPT-6.1 review of the code and numbers ranked DRAM locality of the dispatch order first. With
 token tiles fastest, resident blocks read 256-byte pieces of many tokens' 40 KB rows. The `_l`
 GEMMs depend more on sharing weight rows across token tiles than on output-write locality.
+| DeltaNet conv + L2 norm, 8 tokens a block (c25cdb5, bit-identical) | -15..-20 | conv 46.8 -> 27.2 ms, device -9.4 | yes |
+| qkv + z as one 16384-row GEMM (study) | -10..-20 | 6.66 ms vs 4.02 + 2.48 separately: no gain | no |
+| Dense GEMMs in bands of 8 row tiles (0841284, bit-identical) | -15..-20 | -5.8 kernel (study promised -0.17..-0.36 ms a call) | yes |
+
+Wall clock after these (default clock, `prose_long.txt`): 2048 tokens 1.582 s (1294 tok/s),
+6940 tokens 5.78 s (1200 tok/s). gufo's dense GEMM is ~15% faster than ours at the same shapes
+(16384 x 2560: ~5.15 vs 5.9-6.6 ms); fusing shapes or reordering blocks does not close that.
