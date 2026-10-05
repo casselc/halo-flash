@@ -653,6 +653,26 @@ most of the distance to halogen's 1,584 tok/s on an 8K-token prompt.
 Also: the n-gram read for each chunk (~115 ms of random tokens, not resident) runs serially
 before that chunk's device work. Overlapping it with the previous chunk saves ~0.35-0.45 s at 8K.
 
+**4l. Routed experts: ablations (2026-10-04, `halo_gemm_bench moe`, one layer, pinned).** Base
+13.83 ms per layer (x48 = 664 ms). Each probe removes one cost with wrong numerics:
+
+| Probe | Layer | Saving | x48 |
+|---|---:|---:|---:|
+| gate/up (Q4_K) without dequant arithmetic | 12.14 ms | -1.69 | -81 ms |
+| gate/up without weight loads | 12.48 ms | -1.35 | -65 ms |
+| down (Q5_1) without dequant arithmetic | 13.51 ms | -0.32 | -15 ms |
+| down without weight loads | 11.91 ms | -1.92 | -92 ms |
+
+Tried and not kept: prefetching down's next weight stage with LDS-only barriers and unconditional
+loads made the layer 14.18 ms (+0.35). VGPRs went 106 -> 130 and occupancy 12 -> 10 waves, so
+the load saving above is probably DRAM bandwidth freed for the other kernels, not latency.
+Expert weights stream at ~114 GB/s overall (1.57 GB per layer).
+
+Gate/up does ~134 GFLOP per layer, plus ~20% sub-tile padding, at ~23 TFLOP/s: it is near
+WMMA + dequant-VALU bound. The open lever is cheaper dequant (bounded by -81 ms), e.g. a lookup
+table (halogen). Activation re-staging (x restaged per 128-row block, ~1.4 GB per layer from the
+MALL) is the other candidate.
+
 **4k. Mixer down GEMM `_m`, closed for now (2026-10-04, `halo_gemm_bench study`, pinned).**
 
 | Variant (320 x 10240, T 2048) | warm | cold | after 96 MB of writes |
