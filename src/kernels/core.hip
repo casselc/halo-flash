@@ -4497,7 +4497,6 @@ extern "C" __global__ void __launch_bounds__(256)
   for (std::uint32_t i = 0; i < 32; ++i) S[(i0 + i) * d] = s[i];
 }
 
-<<<<<<< Updated upstream
 // ---- P4: chunked gated DeltaNet ---------------------------------------------
 //
 // halo_gdn_prefill_split's recurrence per v-head (S key x value, decay
@@ -4906,7 +4905,7 @@ extern "C" __global__ void __launch_bounds__(128)
 #pragma unroll
     for (int j = 0; j < 8; ++j) S[((kh2 * 4 + kt) * 16 + 2 * j + hi) * d + col] = acc[kt][j];
 }
-=======
+
 // ---- Study: structural floor of a chunked DeltaNet scan ---------------------
 // The loads, LDS staging, barriers and state traffic of a chunked scan with
 // no math: per chunk of C tokens, K and Q (C x 128 fp32) and the block's NC
@@ -5007,7 +5006,6 @@ HALO_GDN_SKEL(halo_gdnskel_c32_n64_pf_seq_nost, 32, 64, 256, 4, true, true, fals
 HALO_GDN_SKEL(halo_gdnskel_c64_n32_seq, 64, 32, 256, 4, false, true)
 HALO_GDN_SKEL(halo_gdnskel_c64_n32_pf_seq, 64, 32, 256, 4, true, true)
 #undef HALO_GDN_SKEL
->>>>>>> Stashed changes
 
 // ---- P4: dense GEMM over repacked Q8_0 on FP16 WMMA ---------------------------
 //
