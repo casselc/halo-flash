@@ -1049,7 +1049,7 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
       const std::uint32_t nk = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 2}));
       const std::uint32_t nv = nk * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 3}));
       const std::uint32_t kern = tc.draw(gs::sampled_from(std::vector<std::uint32_t>{2, 4}));
-      const std::uint32_t T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 24}));
+      const std::uint32_t T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 40}));
       const std::uint32_t mode = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = 1}));
       const std::uint32_t kd = nk * d, vd = nv * d, ch = 2 * kd + vd;
       std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
@@ -1135,6 +1135,80 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
       };
       close(get(out3, std::size_t{T} * vd), get(out2, std::size_t{T} * vd), "output");
       close(get(gs3, gst.size()), get(gs2, gst.size()), "recurrent state");
+      // The chunked form (halo_gdn_chunk_prep + halo_gdn_chunk_scan, 16-token
+      // chunks) against the split kernel, before the gated norm: same bound.
+      {
+        constexpr std::uint32_t C = 16, kPrep = 2 * C + 2 * C * C;
+        const std::uint32_t nch = (T + C - 1) / C;
+        auto gs4 = up(gst), out4 = zeros(std::size_t{T} * vd), out5 = zeros(std::size_t{T} * vd), gs5 = up(gst),
+             prep = zeros(std::size_t{nv} * nch * kPrep);
+        launch("halo_gdn_prefill_split", {2, nv}, {256},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(conv2, 2ull * kd * 4), rt::Arg::Buf(alb),
+                rt::Arg::Buf(beb), rt::Arg::Buf(ab), rt::Arg::Buf(dtb), rt::Arg::Buf(gs5), rt::Arg::Buf(out5),
+                rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)});
+        launch("halo_gdn_chunk_prep", {nch, nv}, {256},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(alb), rt::Arg::Buf(beb), rt::Arg::Buf(ab),
+                rt::Arg::Buf(dtb), rt::Arg::Buf(prep), rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch)});
+        launch("halo_gdn_chunk_scan", {2, nv}, {256},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(conv2, 2ull * kd * 4), rt::Arg::Buf(prep),
+                rt::Arg::Buf(gs4), rt::Arg::Buf(out4), rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch),
+                rt::Arg::Val(vd)});
+        close(get(out4, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "chunked output");
+        close(get(gs4, gst.size()), get(gs5, gst.size()), "chunked recurrent state");
+        // The WMMA chunked kernel: every product bf16 hi/lo split (~2^-15
+        // relative per product), so its bound is 1e-4 (fixed in advance).
+        auto gs6 = up(gst), out6 = zeros(std::size_t{T} * vd);
+        launch("halo_gdn_chunk_wmma", {4, nv}, {128},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(conv2, 2ull * kd * 4), rt::Arg::Buf(alb),
+                rt::Arg::Buf(beb), rt::Arg::Buf(ab), rt::Arg::Buf(dtb), rt::Arg::Buf(gs6), rt::Arg::Buf(out6),
+                rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)});
+        const auto close4 = [&](const std::vector<float>& x, const std::vector<float>& y, const char* what) {
+          double dd = 0, m = 0;
+          for (std::size_t i = 0; i < x.size(); ++i) {
+            ASSERT_TRUE(std::isfinite(x[i])) << what << "[" << i << "]";
+            dd += double(x[i] - y[i]) * (x[i] - y[i]);
+            m += double(y[i]) * y[i];
+          }
+          ASSERT_LT(std::sqrt(dd / std::max(m, 1e-30)), 1e-4) << rt::BackendName(backend) << " " << what << " T " << T;
+        };
+        close4(get(out6, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "wmma chunked output");
+        close4(get(gs6, gst.size()), get(gs5, gst.size()), "wmma chunked recurrent state");
+        // Prep + WMMA scan (halo_gdn_c16_prep, halo_gdn_c16_scan): same products, same bound.
+        auto gs7 = up(gst), out7 = zeros(std::size_t{T} * vd), prep7 = zeros(std::size_t{nv} * nch * 576);
+        launch("halo_gdn_c16_prep", {nch, nk}, {256},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(alb), rt::Arg::Buf(beb), rt::Arg::Buf(ab),
+                rt::Arg::Buf(dtb), rt::Arg::Buf(prep7), rt::Arg::Val(nv), rt::Arg::Val(T), rt::Arg::Val(ch)});
+        launch("halo_gdn_c16_scan", {2, nv}, {128},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(conv2, 2ull * kd * 4), rt::Arg::Buf(prep7),
+                rt::Arg::Buf(gs7), rt::Arg::Buf(out7), rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch),
+                rt::Arg::Val(vd)});
+        close4(get(out7, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "c16 chunked output");
+        close4(get(gs7, gst.size()), get(gs5, gst.size()), "c16 chunked recurrent state");
+        // halo_gdn_c16_scan3 (three-way K S0, split at staging) on the same prep.
+        auto gs8 = up(gst), out8 = zeros(std::size_t{T} * vd);
+        launch("halo_gdn_c16_scan3", {2, nv}, {128},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(conv2, 2ull * kd * 4), rt::Arg::Buf(prep7),
+                rt::Arg::Buf(gs8), rt::Arg::Buf(out8), rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch),
+                rt::Arg::Val(vd)});
+        close4(get(out8, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "c16 scan3 output");
+        close4(get(gs8, gst.size()), get(gs5, gst.size()), "c16 scan3 recurrent state");
+        auto gs9 = up(gst), out9 = zeros(std::size_t{T} * vd);
+        launch("halo_gdn_c16_scan3u", {2, nv}, {128},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(conv2, 2ull * kd * 4), rt::Arg::Buf(prep7),
+                rt::Arg::Buf(gs9), rt::Arg::Buf(out9), rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch),
+                rt::Arg::Val(vd)});
+        close4(get(out9, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "c16 scan3u output");
+        close4(get(gs9, gst.size()), get(gs5, gst.size()), "c16 scan3u recurrent state");
+        // prep2 (cpb chunks a block, prefetched) writes the same prep as prep.
+        for (const std::uint32_t cpb : {1u, 2u, 3u}) {
+          auto prep2 = zeros(std::size_t{nv} * nch * 576);
+          launch("halo_gdn_c16_prep2", {(nch + cpb - 1) / cpb, nk}, {256},
+                 {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(alb), rt::Arg::Buf(beb),
+                  rt::Arg::Buf(ab), rt::Arg::Buf(dtb), rt::Arg::Buf(prep2), rt::Arg::Val(nv), rt::Arg::Val(T),
+                  rt::Arg::Val(ch), rt::Arg::Val(cpb)});
+          same(get(prep2, std::size_t{nv} * nch * 576), get(prep7, std::size_t{nv} * nch * 576), "prep2");
+        }
+      }
       same(get(out2, std::size_t{T} * vd), get(out1, std::size_t{T} * vd), "output");
       same(get(cs2, cst.size()), get(cs1, cst.size()), "conv state");
       same(get(gs2, gst.size()), get(gs1, gst.size()), "recurrent state");

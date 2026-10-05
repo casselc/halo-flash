@@ -76,6 +76,14 @@ int main(int argc, char** argv) {
     else if (a == "--eager") eager = std::string(argv[i + 1]) == "1";
     else if (a == "--int8-moe") engine::FlashNextGpu::int8_act_moe_ = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill") prefill = std::string(argv[i + 1]) == "1";
+    else if (a == "--fa-attention") engine::FlashNextGpu::prefill_fa_attention_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--fused-moe-combine") engine::FlashNextGpu::prefill_fused_moe_combine_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--gdn-chunked") {
+      engine::FlashNextGpu::prefill_gdn_chunked_ = std::string(argv[i + 1]) != "0";
+      engine::FlashNextGpu::prefill_gdn_chunk_fp32_ = std::string(argv[i + 1]) == "fp32";
+      engine::FlashNextGpu::prefill_gdn_c16_bf16_ = std::string(argv[i + 1]) == "bf16";
+      engine::FlashNextGpu::prefill_gdn_c16_u3_ = std::string(argv[i + 1]) != "u2";
+    }
     else if (a == "--start") start = std::atoi(argv[i + 1]);
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill-int8") engine::FlashNextGpu::prefill_int8_gemm_ = std::string(argv[i + 1]) == "1";

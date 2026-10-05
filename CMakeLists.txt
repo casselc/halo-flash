@@ -104,11 +104,17 @@ if(HALO_GPU)
   file(WRITE ${HALO_GEN}/toolchain.h.in
        "#pragma once\n#define HALO_TOOLCHAIN \"${HALO_TOOLCHAIN_ID}; ${HALO_HIP_VERSION}; hipcc ${_halo_hipcc_real}; runtime ${HALO_AMDHIP}\"\n")
   configure_file(${HALO_GEN}/toolchain.h.in ${HALO_GEN}/halo_toolchain.h COPYONLY)
+  # The kernels may be compiled by another device compiler than the runtime's
+  # hipcc (e.g. a TheRock nightly clang with its device libraries), the rest
+  # of the build unchanged:
+  #   -DHALO_HSACO_COMPILER=<clang> "-DHALO_HSACO_FLAGS=--hip-path=<hip>;--rocm-device-lib-path=<bitcode>"
+  set(HALO_HSACO_COMPILER "${HIPCC}" CACHE FILEPATH "Compiler for the GPU kernels (HSACO)")
+  set(HALO_HSACO_FLAGS "" CACHE STRING "Extra flags for HALO_HSACO_COMPILER (a CMake list)")
   add_custom_command(
     OUTPUT ${HALO_GEN}/core.hsaco
     COMMAND ${CMAKE_COMMAND} -E make_directory ${HALO_GEN}/kernels
-    COMMAND ${HIPCC} -x hip --offload-arch=gfx1151 --offload-device-only --no-gpu-bundle-output
-            -O3 -std=c++20 -I${CMAKE_CURRENT_SOURCE_DIR}/src
+    COMMAND ${HALO_HSACO_COMPILER} -x hip --offload-arch=gfx1151 --offload-device-only --no-gpu-bundle-output
+            ${HALO_HSACO_FLAGS} -O3 -std=c++20 -I${CMAKE_CURRENT_SOURCE_DIR}/src
             -o ${HALO_GEN}/core.hsaco ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/core.hip
     DEPENDS src/kernels/core.hip src/kernels/step_params.h
     COMMENT "Compiling GPU kernels (gfx1151 HSACO)")

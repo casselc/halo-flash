@@ -100,6 +100,13 @@ class FlashNextGpu {
   // combine_norm skips the fp32 xn the mixer's mix epilogue would re-read;
   // the epilogue rebuilds it from res (same arithmetic, bit-identical).
   static inline bool prefill_mix_rebuild_ = true;
+  static inline bool prefill_fused_moe_combine_ = true;  // routed combine + shared expert in one pass
+  static inline bool prefill_ple_overlap_ = true;  // read the n-gram rows while the layers before the PLE run
+  /// DeltaNet over 16-token chunks (prep + scan) instead of token by token.
+  static inline bool prefill_gdn_chunked_ = true;
+  static inline bool prefill_gdn_chunk_fp32_ = false;  // study: the fp32 chunked kernels instead of c16
+  static inline bool prefill_gdn_c16_bf16_ = false;    // study: the two-way bf16 scan (fails the long-set gate)
+  static inline bool prefill_gdn_c16_u3_ = true;       // scan3u (update's K three-way); false: scan3, +0.0013 NLL
   /// Read the next prefill chunk's n-gram rows on a host thread while the
   /// current chunk runs on the device.
   static inline bool prefill_ngram_prefetch_ = true;
@@ -123,6 +130,7 @@ class FlashNextGpu {
   /// While every token sees every earlier position (under the QSA budget),
   /// 4 tokens per attention block share K/V and QSA selection is skipped.
   static inline bool prefill_mq_attention_ = true;
+  static inline bool prefill_fa_attention_ = true;  // dense causal: halo_attention_fa (needs the fp16 K/V copy)
   /// DeltaNet recurrence with each state column over 4 lanes (2 blocks per
   /// head), its inputs staged and prefetched per 8 tokens, and a separate
   /// gated norm; exact mode keeps the fused kernel, bit-identical to
@@ -174,7 +182,7 @@ class FlashNextGpu {
  private:
   struct DevTensor {
     rt::Buffer buf;
-    rt::KernelId matvec = -1, embed = -1, expert = -1;
+    rt::KernelId matvec = -1, embed = -1, expert = -1, embed_rows = -1;
     // P3: Q8_0 repacked into aligned int8 rows (`qs`) and fp16 scales (`d`).
     rt::Buffer qs, d;
     std::uint32_t qstride = 0;
@@ -239,6 +247,7 @@ class FlashNextGpu {
     rt::Buffer xh, mh;  // fp16 activations: per GEMM, and the shared `mixed`  // grouped experts (hp, x16 fp16)
     rt::Buffer bscores, vis, ascores;                // batched attention, kAttnSub tokens at a time
     rt::Buffer ublk, umask, ucount;                  // QSA unions of 4 tokens (halo_qsa_union4)
+    rt::Buffer gdnprep;                              // chunked DeltaNet: per (head, 16-token chunk) halo_gdn_c16_prep
     std::size_t params_offset = 0;  // in `host`: per-token step params after the n-gram rows
     std::uint32_t cap = 0;  // tokens the buffers hold
   };
@@ -275,8 +284,9 @@ class FlashNextGpu {
   const rt::Buffer* MixedH() const;
   bool Bucket(std::uint32_t pairs, std::uint32_t E, std::string* error);
   bool GroupedMoeFits(const model::LayerWeights& l) const;
-  bool GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std::string* error);
-  bool SharedExpertChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error);
+  bool GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std::string* error, bool combine = true);
+  bool SharedExpertChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error,
+                         bool fused_combine = false);
   bool MoeChunk(const model::LayerWeights& l, std::uint32_t tokens, std::string* error);
 
   rt::Device& dev_;

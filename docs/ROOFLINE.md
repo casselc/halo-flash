@@ -816,3 +816,105 @@ dense, attention, F32 router; section 4).
   granule was wrong until a65df43.
 - The remaining LDS-limited mismatches come from the compiler using the declared
   `__launch_bounds__`; settle them as part of that test.
+
+## 8. 2026-10-05 (branch `proto/gdn-chunked`): chunked DeltaNet in, and where gufo is ahead
+
+All numbers: `tools/ab_bench.py`, 2048 tokens, clock pinned, 3 rounds x 3 reps, in-engine
+per-kernel attribution. Device time went 2046 -> 1866 ms (1097.5 tok/s pinned).
+
+**DeltaNet, chunked (16-token chunks), kept.**
+
+| Step | Predicted | Measured | Notes |
+|---|---|---|---|
+| Skeleton floor (loads, staging, barriers, no math) | 0.4-1.0 ms/layer | 1.25 | 64-token chunks with fp32 K and Q do not fit 64 KB of LDS |
+| prep + bf16 hi/lo WMMA scan (4033919) | -100..-140 | -120.8 | **failed the long-set gate**: +0.0020 +- 0.0009 NLL |
+| scan3: K S0 three-way, split once at staging (90c134e) | -140..-170 | -155.5 | +0.0013 +- 0.0009 |
+| scan3u: the update's K three-way too (e92b8eb) | ~-150 | **-140.5** | -0.0001 +- 0.0008: no shift |
+| prep2: chunks walked a block, prefetched (1c74cd9) | -40 | **-35.1** | prep 57.1 -> 15.3 ms, bit-identical |
+
+Why the bf16 scan failed while random-data error was 6e-6 (flat in length, also with
+correlated keys): once the state predicts the values, V - S^T k cancels, and a two-way
+split's ~2^-17 error in K S0 is large against the residual. The fp32 chunked kernels scored
++0.0007 +- 0.0008 on the same set, which isolated precision from the chunked math. A
+TheRock nightly clang (24.0.0git, `HALO_HSACO_COMPILER`) removed the scan's spills
+(256 -> 227 VGPRs) but made the whole engine 71 ms slower (the `q8r_f16_l` GEMMs +86 ms,
+grouped gate/up -14): ROCm 7.2.3 stays.
+
+**gufo, profiled the same way** (`tools/prof/prof.py`, one timed 2048-token pass, 1245 ms),
+gaps per prefill by role (ours - gufo):
+
+| Role | ours | gufo | gap |
+|---|---|---|---|
+| MoE routed (gate/up 6.0 ms/call vs ~5.5; down 5.18 vs ~4.1; our separate combine 0.82) | ~593 | ~433 | ~160 |
+| HC mixers (combine, mix GEMM + epilogue, `_m` down: fp16 1.04 ms vs W8A8 int8 0.50) | ~396 | ~245 | ~150 |
+| Attention, dense 2K (7.15 ms/call vs 4.07) | 86 | 49 | 37 |
+| DeltaNet (now) | 108 | ~114 | -6 |
+
+**Mix epilogue probes, none kept** (`halo_gemm_q8r_f16_mix`, 1.45 ms/call; trace: 78% of
+cycles in `vmcnt` waits, one stream's loads at a time):
+
+| Probe | Measured mix ms (from 140) |
+|---|---|
+| Read combine_norm's fp16 `xh` instead of rebuilding from fp32 `res` (half the bytes) | 140.4 |
+| Rebuild as a template choice, all of a lane's loads issued first | 154.9 |
+| Block-wide epilogue, float4 loads, 256 contiguous bytes per (token, stream) | 138.4 |
+| Ablation: epilogue loads replaced by constants | **72.7** |
+| Ablation: epilogue stores removed | 114.5 |
+
+The loads cost ~0.7 ms/call, but not through bytes, batching or access width. The likely
+cause: `res` / `xh` were written by `combine_norm` two kernels earlier (126 MB still draining:
+writes are paid by the next kernels). The lever is upstream, in what combine_norm writes.
+A runtime branch (`xh ?` / `rs ?`) inside the template cost the plain mix 39 VGPRs and 388 B
+of scratch: keep such choices compile-time.
+
+**Attention at 2K:** routing the dense case through QSA (`--mq-attention 0`, fp16 K/V,
+prefetch) measured -9.6 ms (noise; predicted -30..-45): `qsel_h` 75.4 vs `mq` 87.1. Trace of
+`qsel_h`: 43% barriers, 21% `vmcnt`, 18% `lgkmcnt`, WMMA 1%: per-chunk block-wide phases
+(scores on 6 waves, softmax on 192 threads, P.V on 8) wait on each other. gufo's dense kernel:
+32 rows a block (16 queries x 2 heads), 16-key tiles, 8 waves = S tiles x head-dim halves,
+K/V prefetched into registers, V transposed in LDS. Next: a kernel whose waves each own their
+rows and softmax, so only K/V staging needs a block barrier.
+
+**Later the same night (main line of the branch, each A/B 3 rounds x 3 reps, pinned):**
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| n-gram rows read while layer 0 runs (PLE is layer 1; 41-110 ms host read) (0647d6b) | -35..-40 wall | **-42 ms wall** (1.733 -> 1.691 s) | yes |
+| token embedding in one launch instead of T | (the 45 ms stamp was the read above) | neutral | yes (0647d6b) |
+| MoE down: stage pipeline + multiply bit spread for Q5_1 (9343638) | -40..-55 | down 224 -> 207 ms | yes |
+| `Unpack4` via byte permutes | -25..-40 | not built: its element order already avoids the interleave | — |
+| W8A8 for the mixer down (`_m`): tall `GemmQ8rWmma<5,2,4,2>` | -35..-60 | microbench 976 us vs fp16 725 us | no |
+
+The down pipeline missed its prediction for a reason worth keeping: the trace showed 28% of
+wave cycles in `vmcnt(0)`, but at 12 waves/SIMD other waves covered most of it; the kernel is
+VALU-bound (40%) on dequant. A wave-level stall share says little at high occupancy.
+The int8 GEMM template is staging-limited (~20 of 56 TOPS); W8A8 needs a better int8 kernel
+first (gufo's runs the same shape in 0.50 ms in-engine).
+| Flash-style dense attention `halo_attention_fa` (0cdb694) | -25..-45 | **-31.8** (attention 86.6 -> 47.0 ms; gufo 49) | yes |
+
+0647d6b broke every multi-chunk prompt (the deferred n-gram read collided with the next chunk's
+async prefetch, which after_prep starts); fixed in 0cdb694, found by the long quality set. Host
+or control-flow changes to prefill need a multi-chunk run before they are committed.
+First version of the attention kernel: 95 ms, 40% of cycles in `ds_store_b16` (a wave's
+transposed V stores 640 bytes apart); one key per lane fixed it.
+| Router weights split to bf16 once (`halo_gemm_f32_bf16x3w`, bit-identical) | -12..-20 | -1.9 (49.2 -> 47.3) | no (252 MB for 2 ms) |
+
+**Night total, wall clock** (`halo_run --prefill-bench`, default clock, `prose_long.txt`, same
+argmax): 2048 tokens 1.896 -> 1.651 s (1080 -> 1240 tok/s, +15%); 6940 tokens 6.82 -> 5.98 s
+(1017 -> 1160 tok/s, +14%). Over the 8K prefill the kernel sums fell 972 ms (DeltaNet -698,
+host n-gram read -262, MoE down -58, first-chunk attention -42). gufo pp2048: 1599 tok/s.
+The router probe repeated the high-occupancy mistake above: at 10 waves/SIMD its trace's
+26% `vmcnt` and 24% split VALU were covered by other waves.
+| Routed combine + shared-expert add in one pass (f4ab695, bit-identical) | -10..-15 | kernels -10, device -5.2 (noise) | yes |
+
+**Queue after this night, ranked by measured gap to gufo (2K, per prefill):**
+1. HC mixers (~150 ms): the mix epilogue's ~0.7 ms/call of loads did not respond to bytes,
+   batching or access width; test the write-back hypothesis directly (e.g. a probe kernel that
+   only reads `res` right after combine_norm vs after an unrelated kernel), then decide whether
+   combine_norm should write less (int8 / fp16 streams, as gufo does).
+2. Mixer down `_m` (~50 ms): needs an int8 GEMM faster than the fp16 one (ours is
+   staging-limited at ~20 of 56 TOPS); gufo's W8A8 runs the shape in 0.50 ms.
+3. MoE gate/up (~24 ms) and down (~10 ms left): VALU-bound on dequant at high occupancy.
+4. Dense GEMMs: gufo fuses the DeltaNet qkv and z projections (one 16384-row GEMM, ~21 ms).
+Rules learned tonight: check occupancy before trusting a stall share; run a multi-chunk prompt
+for any host or control-flow change; keep kernel variants compile-time.

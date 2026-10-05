@@ -89,6 +89,7 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   k.bbase = f(c.num_experts);
   k.pa = f(T * D);
   k.ipart = f(T * c.hc_count * 8);
+  k.gdnprep = f(std::size_t{c.ssm_num_v_heads} * ((T + 15) / 16) * 576);  // kGdnP16
   k.rscale = f(T * c.hc_count);
   k.xh = f(T * max_cols / 2 + 1);
   k.mh = f(T * H / 2 + 1);
@@ -110,7 +111,7 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   for (const auto* b : {&k.res, &k.xn, &k.lo, &k.gate, &k.mixed, &k.inject, &k.block_out, &k.embd, &k.xq, &k.xd,
                         &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg, &k.q, &k.gate_a, &k.k, &k.v, &k.ctx,
                         &k.iq, &k.ik, &k.router, &k.ids, &k.wts, &k.eg, &k.eu, &k.ed, &k.sgate, &k.host,
-                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16, &k.bcounts, &k.bbase, &k.pa, &k.pb, &k.ipart, &k.rscale, &k.xh, &k.mh,
+                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16, &k.bcounts, &k.bbase, &k.pa, &k.pb, &k.ipart, &k.rscale, &k.gdnprep, &k.xh, &k.mh,
                         &k.bscores, &k.vis, &k.ascores, &k.ublk, &k.umask, &k.ucount})
     if (!*b) return false;
   // Index-major copies of the mixers' up projections (fused GEMM + mix).
@@ -324,8 +325,15 @@ bool FlashNextGpu::PleChunk(const model::LayerWeights& l, std::uint32_t T, std::
                 error);
 }
 
+namespace {
+// Chunks a halo_gdn_c16_prep2 block walks: ~64 blocks a layer (cpb 32 at
+// 2048 tokens and 16 k-heads: 0.35 ms vs 0.38 at cpb 16, 1.22 one a block).
+std::uint32_t GdnPrepCpb(std::uint32_t nch, std::uint32_t nk) { return std::max(1u, (nch * nk + 63) / 64); }
+}  // namespace
+
 bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std::uint32_t T, std::string* error) {
   const auto& c = w_.config;
+  const std::uint32_t nch = (T + 15) / 16;
   const std::uint32_t ch = c.SsmConvChannels(), kd = c.SsmKeyDim(), vd = c.SsmValueDim();
   return MixedHalf(T, error) && Gemm(l.ssm_qkv, ck_.mixed, ck_.qkv, T, error, MixedH()) &&
          Gemm(l.ssm_gate, ck_.mixed, ck_.z, T, error, MixedH()) &&
@@ -340,13 +348,49 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
                  rt::Arg::Val(T)},
                 error) &&
          (prefill_split_gdn_ && !prefill_exact_projections_
-              ? Launch("halo_gdn_prefill_split", {2, c.ssm_num_v_heads}, {256},
+              ? (prefill_gdn_chunked_ && c.ssm_head_dim == 128 && c.ssm_num_v_heads % c.ssm_num_k_heads == 0 &&
+                         c.ssm_num_v_heads / c.ssm_num_k_heads <= 8
+                     // 16-token chunks: everything but the state-dependent
+                     // products over all chunks at once, then a WMMA scan
+                     // over chunks instead of over tokens.
+                     ? (prefill_gdn_chunk_fp32_
+                            ? Launch("halo_gdn_chunk_prep", {(T + 15) / 16, c.ssm_num_v_heads}, {256},
+                                     {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull), rt::Arg::Buf(ck_.alpha),
+                                      rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
+                                      rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(ck_.gdnprep),
+                                      rt::Arg::Val(c.ssm_num_k_heads), rt::Arg::Val(T), rt::Arg::Val(ch)},
+                                     error) &&
+                                  Launch("halo_gdn_chunk_scan", {2, c.ssm_num_v_heads}, {256},
+                                         {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull),
+                                          rt::Arg::Buf(ck_.conv, 2ull * kd * 4), rt::Arg::Buf(ck_.gdnprep),
+                                          rt::Arg::Buf(s.state), rt::Arg::Buf(ck_.gdn), rt::Arg::Val(c.ssm_num_k_heads),
+                                          rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)},
+                                         error)
+                            // prep: ~64 blocks a layer, each walking cpb chunks
+                            // with the next one prefetched (halo_gdn_c16_prep2).
+                            : Launch("halo_gdn_c16_prep2",
+                                     {(nch + GdnPrepCpb(nch, c.ssm_num_k_heads) - 1) / GdnPrepCpb(nch, c.ssm_num_k_heads),
+                                      c.ssm_num_k_heads},
+                                     {256},
+                                     {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull), rt::Arg::Buf(ck_.alpha),
+                                      rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
+                                      rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(ck_.gdnprep),
+                                      rt::Arg::Val(c.ssm_num_v_heads), rt::Arg::Val(T), rt::Arg::Val(ch),
+                                      rt::Arg::Val(GdnPrepCpb(nch, c.ssm_num_k_heads))},
+                                     error) &&
+                           Launch(prefill_gdn_c16_bf16_ ? "halo_gdn_c16_scan" : prefill_gdn_c16_u3_ ? "halo_gdn_c16_scan3u" : "halo_gdn_c16_scan3", {2, c.ssm_num_v_heads}, {128},
+                                  {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull),
+                                   rt::Arg::Buf(ck_.conv, 2ull * kd * 4), rt::Arg::Buf(ck_.gdnprep),
+                                   rt::Arg::Buf(s.state), rt::Arg::Buf(ck_.gdn), rt::Arg::Val(c.ssm_num_k_heads),
+                                   rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)},
+                                  error))
+                     : Launch("halo_gdn_prefill_split", {2, c.ssm_num_v_heads}, {256},
                        {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull), rt::Arg::Buf(ck_.conv, 2ull * kd * 4),
                         rt::Arg::Buf(ck_.alpha), rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
                         rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(s.state), rt::Arg::Buf(ck_.gdn),
                         rt::Arg::Val(c.ssm_num_k_heads), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch),
                         rt::Arg::Val(vd)},
-                       error) &&
+                       error)) &&
                     (F16Route(l.ssm_out)
                          ? Launch("halo_gated_norm_h", {T * c.ssm_num_v_heads}, {128},
                                   {rt::Arg::Buf(ck_.gdn), rt::Arg::Buf(tensors_.at(l.ssm_norm.data).buf),
@@ -488,6 +532,30 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   // selected nothing away yet): 4 tokens per block share K/V, and the QSA
   // scores and selection are not needed.
   const std::uint32_t G = nh / nkv;
+  // The fp16 K/V copy: convert what is not current yet (this chunk, and
+  // anything decode wrote since); the flash and QSA kernels read it.
+  const auto kv16_current = [&] {
+    if (s.valid16 >= pos0 + T) return true;
+    const std::size_t lo = std::size_t{s.valid16} * kvdim, nv = std::size_t{pos0 + T - s.valid16} * kvdim;
+    for (const auto& [f, h] : {std::pair{&s.k, &s.k16}, std::pair{&s.v, &s.v16}})
+      if (!Launch("halo_f16_rows", {static_cast<std::uint32_t>((nv + 255) / 256)}, {kBlock},
+                  {rt::Arg::Buf(*f, lo * 4), rt::Arg::Buf(*h, lo * 2), rt::Arg::Val(static_cast<std::uint32_t>(nv))},
+                  error))
+        return false;
+    s.valid16 = pos0 + T;
+    return true;
+  };
+  // Dense causal, flash style: 16 tokens x 4 heads a block, each wave its
+  // own rows and softmax (halo_attention_fa).
+  if (wmma && prefill_mq_attention_ && prefill_fa_attention_ && prefill_kv16_ && s.k16 &&
+      (pos0 + T) / ratio <= budget)
+    return kv16_current() &&
+           Launch("halo_attention_fa", {(T + 15) / 16, nkv * ((G + 3) / 4)}, {256},
+                  {rt::Arg::Buf(ck_.q), rt::Arg::Buf(s.k16), rt::Arg::Buf(s.v16), rt::Arg::Buf(ck_.gate_a),
+                   rt::Arg::Buf(ck_.ctx), rt::Arg::Buf(ck_.host, ck_.params_offset), rt::Arg::Val(nh),
+                   rt::Arg::Val(nkv), rt::Arg::Val(T)},
+                  error) &&
+           Gemm(l.attn_out, ck_.ctx, ck_.block_out, T, error);
   if (wmma && prefill_mq_attention_ && (pos0 + T) / ratio <= budget && 4 * G <= 48)
     return Launch("halo_attention_wmma_mq", {nkv, (T + 3) / 4}, {256},
                   {rt::Arg::Buf(ck_.q), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v), rt::Arg::Buf(ck_.gate_a),
@@ -502,15 +570,7 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   // The fp16 K/V copy: convert what is not current yet (this chunk, and
   // anything decode wrote since), then the union attention reads it.
   const bool kv16 = qsel && prefill_kv16_ && s.k16;
-  if (kv16 && s.valid16 < pos0 + T) {
-    const std::size_t lo = std::size_t{s.valid16} * kvdim, nv = std::size_t{pos0 + T - s.valid16} * kvdim;
-    for (const auto& [f, h] : {std::pair{&s.k, &s.k16}, std::pair{&s.v, &s.v16}})
-      if (!Launch("halo_f16_rows", {static_cast<std::uint32_t>((nv + 255) / 256)}, {kBlock},
-                  {rt::Arg::Buf(*f, lo * 4), rt::Arg::Buf(*h, lo * 2), rt::Arg::Val(static_cast<std::uint32_t>(nv))},
-                  error))
-        return false;
-    s.valid16 = pos0 + T;
-  }
+  if (kv16 && !kv16_current()) return false;
   for (std::uint32_t t0 = 0; t0 < T; t0 += kAttnSub) {
     const std::uint32_t n = std::min(kAttnSub, T - t0);
     const rt::Arg params = rt::Arg::Buf(ck_.host, ck_.params_offset + std::size_t{t0} * 64);
@@ -586,7 +646,9 @@ bool FlashNextGpu::MoeChunk(const model::LayerWeights& l, std::uint32_t T, std::
                             up.rows == gate.rows && up.cols == gate.cols && gate.cols % 256 == 0 && H <= 4096;
   const bool down_q5_1 = down.type == core::GgmlType::kQ5_1 && down.cols % 32 == 0 && ff <= 2048;
   const bool fast = gate_up_fast && (down_q5_1 || static_cast<bool>(dd.qs));
-  if (prefill_grouped_moe_ && GroupedMoeFits(l)) return GroupedMoe(l, T, error) && SharedExpertChunk(l, T, error);
+  if (prefill_grouped_moe_ && GroupedMoeFits(l))
+    return GroupedMoe(l, T, error, !prefill_fused_moe_combine_) &&
+           SharedExpertChunk(l, T, error, prefill_fused_moe_combine_);
   const char* gu = int8_act_moe_ ? "halo_moe_gate_up_q4_k_dot" : "halo_moe_gate_up_q4_k_s2";
   for (std::uint32_t t = 0; t < T; ++t) {
     const std::size_t ido = std::size_t{t} * used * 4, xo = std::size_t{t} * H * 4;
@@ -696,7 +758,7 @@ bool FlashNextGpu::GroupedMoeFits(const model::LayerWeights& l) const {
 
 // Routed experts grouped by expert (stage B): top-k for every token,
 // bucketing, gate/up with SwiGLU, down, weighted combine; five launches.
-bool FlashNextGpu::GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std::string* error) {
+bool FlashNextGpu::GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std::string* error, bool combine) {
   const auto& c = w_.config;
   const std::uint32_t H = c.hidden_size, used = c.num_experts_used, E = c.num_experts;
   const auto& gate = l.ffn_gate_exps;
@@ -731,13 +793,15 @@ bool FlashNextGpu::GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std
                           rt::Arg::Val<std::uint64_t>(down.RowBytes()), rt::Arg::Buf(ck_.hp), rt::Arg::Buf(ck_.tiles),
                           rt::Arg::Buf(ck_.ntiles), rt::Arg::Buf(ck_.yp), rt::Arg::Val(H), rt::Arg::Val(ff)},
                          error)) &&
-         Launch("halo_moe_combine_grouped", {Blocks(H), T}, {kBlock},
-                {rt::Arg::Buf(ck_.yp), rt::Arg::Buf(ck_.pos), rt::Arg::Buf(ck_.wts), rt::Arg::Buf(ck_.block_out),
-                 rt::Arg::Val(used), rt::Arg::Val(H)},
-                error);
+         (!combine ||  // else SharedExpertChunk combines (fused_combine)
+          Launch("halo_moe_combine_grouped", {Blocks(H), T}, {kBlock},
+                 {rt::Arg::Buf(ck_.yp), rt::Arg::Buf(ck_.pos), rt::Arg::Buf(ck_.wts), rt::Arg::Buf(ck_.block_out),
+                  rt::Arg::Val(used), rt::Arg::Val(H)},
+                 error));
 }
 
-bool FlashNextGpu::SharedExpertChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error) {
+bool FlashNextGpu::SharedExpertChunk(const model::LayerWeights& l, std::uint32_t T, std::string* error,
+                                     bool fused_combine) {
   const auto& c = w_.config;
   const std::uint32_t H = c.hidden_size;
   const std::uint32_t sff = c.shared_expert_ff;
@@ -746,10 +810,16 @@ bool FlashNextGpu::SharedExpertChunk(const model::LayerWeights& l, std::uint32_t
          Launch("halo_silu_mul", {Blocks(std::size_t{T} * sff)}, {kBlock},
                 {rt::Arg::Buf(ck_.eg), rt::Arg::Buf(ck_.eu), rt::Arg::Val(T * sff)}, error) &&
          Gemm(l.shexp_down, ck_.eg, ck_.ed, T, error) && Gemm(l.shexp_gate_inp, ck_.mixed, ck_.sgate, T, error) &&
-         Launch("halo_axpy_sigmoid_rows", {Blocks(std::size_t{T} * H)}, {kBlock},
-                {rt::Arg::Buf(ck_.block_out), rt::Arg::Buf(ck_.ed), rt::Arg::Buf(ck_.sgate), rt::Arg::Val(H),
-                 rt::Arg::Val(T)},
-                error);
+         (fused_combine  // the routed experts' weighted sum and this expert in one pass
+              ? Launch("halo_moe_combine_shared", {Blocks(H), T}, {kBlock},
+                       {rt::Arg::Buf(ck_.yp), rt::Arg::Buf(ck_.pos), rt::Arg::Buf(ck_.wts), rt::Arg::Buf(ck_.ed),
+                        rt::Arg::Buf(ck_.sgate), rt::Arg::Buf(ck_.block_out),
+                        rt::Arg::Val(w_.config.num_experts_used), rt::Arg::Val(H)},
+                       error)
+              : Launch("halo_axpy_sigmoid_rows", {Blocks(std::size_t{T} * H)}, {kBlock},
+                       {rt::Arg::Buf(ck_.block_out), rt::Arg::Buf(ck_.ed), rt::Arg::Buf(ck_.sgate), rt::Arg::Val(H),
+                        rt::Arg::Val(T)},
+                       error));
 }
 
 bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error,
@@ -775,20 +845,38 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
   // Host side: every token's n-gram rows and step parameters, one upload.
   model::NgramHistory history = ngram_history_;
   const std::uint32_t ratio = c.compress_ratio, budget = c.indexer_top_k / ratio;
+  // With the PLE past layer 0 and no prefetched rows, the n-gram read (tens
+  // of ms from disk) waits until the layers before the PLE are queued, so it
+  // runs while the GPU works on them.
+  const std::span<float> ple_emb(reinterpret_cast<float*>(ck_host_.data()),
+                             c.ple_layer >= 0 ? std::size_t{T} * c.PleEmbeddingDim() : 0);
+  const bool defer_read = c.ple_layer > 0 && prefill_ple_overlap_ && !(pre_emb && pre_emb->size() == ple_emb.size());
+  std::vector<std::uint32_t> rows;
+  double deferred_read_ms = 0;
   if (c.ple_layer >= 0) {
     // One sorted, batched read for the chunk's rows.
-    std::vector<std::uint32_t> rows(std::size_t{T} * c.ple_heads);
+    rows.resize(std::size_t{T} * c.ple_heads);
     model::HashNgramRows(c, history, tokens, rows);
     t_hash = std::chrono::steady_clock::now();
-    const std::span<float> emb(reinterpret_cast<float*>(ck_host_.data()), std::size_t{T} * c.PleEmbeddingDim());
-    if (pre_emb && pre_emb->size() == emb.size()) {
-      std::memcpy(emb.data(), pre_emb->data(), emb.size_bytes());
-    } else if (!ngram_ || !ngram_->Read(rows, emb)) {
+    if (pre_emb && pre_emb->size() == ple_emb.size()) {
+      std::memcpy(ple_emb.data(), pre_emb->data(), ple_emb.size_bytes());
+    } else if (!defer_read && (!ngram_ || !ngram_->Read(rows, ple_emb))) {
       if (error) *error = "n-gram table read failed";
       return false;
     }
     t_read = std::chrono::steady_clock::now();
   }
+  const auto read_ple = [&] {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!ngram_ || !ngram_->Read(rows, ple_emb)) {
+      if (error) *error = "n-gram table read failed";
+      return false;
+    }
+    deferred_read_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (!dev_.Upload(ck_.host, 0, ple_emb.data(), ple_emb.size_bytes(), error)) return false;
+    if (after_prep) after_prep(history);
+    return true;
+  };
   for (std::uint32_t t = 0; t < T; ++t) {
     const std::uint32_t pos = position_ + t, n_kv = pos + 1, complete = n_kv / ratio;
     std::uint32_t params[kHaloStepParamCount] = {};
@@ -801,17 +889,22 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
     std::memcpy(ck_host_.data() + ck_.params_offset + std::size_t{t} * 64, params, sizeof(params));
   }
   const auto t_prep = std::chrono::steady_clock::now();
-  if (!dev_.Upload(ck_.host, 0, ck_host_.data(), ck_.params_offset + std::size_t{T} * 64, error)) return false;
+  if (!(defer_read ? dev_.Upload(ck_.host, ck_.params_offset, ck_host_.data() + ck_.params_offset, std::size_t{T} * 64,
+                                 error)
+                   : dev_.Upload(ck_.host, 0, ck_host_.data(), ck_.params_offset + std::size_t{T} * 64, error)))
+    return false;
   const auto t_upload = std::chrono::steady_clock::now();
-  if (after_prep) after_prep(history);
+  // after_prep may start the next chunk's n-gram prefetch; the table serves
+  // one read at a time, so with the read deferred it starts after that read.
+  if (after_prep && !defer_read) after_prep(history);
 
   const std::uint32_t H = c.hidden_size, D = c.HcDim();
   const auto& emb = tensors_.at(w_.token_embd.data);
-  for (std::uint32_t t = 0; t < T; ++t) {
-    const rt::Arg eargs[] = {rt::Arg::Buf(emb.buf), rt::Arg::Buf(ck_.embd, std::size_t{t} * H * 4),
-                             rt::Arg::Buf(ck_.host, ck_.params_offset + std::size_t{t} * 64), rt::Arg::Val(H),
+  {  // all T rows in one launch (a launch per token cost ~45 ms per 2048 tokens)
+    const rt::Arg eargs[] = {rt::Arg::Buf(emb.buf), rt::Arg::Buf(ck_.embd),
+                             rt::Arg::Buf(ck_.host, ck_.params_offset), rt::Arg::Val(H),
                              rt::Arg::Val<std::uint64_t>(w_.token_embd.RowBytes())};
-    if (!dev_.Launch(emb.embed, {Blocks(H)}, {kBlock}, eargs, error)) return false;
+    if (!dev_.Launch(emb.embed_rows, {Blocks(H), T}, {kBlock}, eargs, error)) return false;
   }
   if (timing_) Stamp("token embedding (per token)");
   if (!Launch("halo_broadcast_rows", {Blocks(std::size_t{T} * D)}, {kBlock},
@@ -848,7 +941,7 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
   bool normed = false;
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
     const auto& l = w_.layers[il];
-    if (c.IsPleLayer(il) && !PleChunk(l, T, error)) return false;
+    if (c.IsPleLayer(il) && ((defer_read && !read_ple()) || !PleChunk(l, T, error))) return false;
     if (!HcMixChunk(l.hc_attn, true, T, error, normed)) return false;
     if (l.linear ? !LinearChunk(l, linear_[il], T, error) : !AttentionChunk(l, attn_[il], T, error)) return false;
     if (!(fuse ? combine_norm(l.hc_ffn) : combine()) || !HcMixChunk(l.hc_ffn, true, T, error, fuse) ||
@@ -870,10 +963,10 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
   if (timing) {
     const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     std::fprintf(stderr,
-                 "prefill chunk %u tokens: host prep %.1f ms (hash %.1f, n-gram read %.1f), upload %.1f ms, "
-                 "device %.1f ms\n",
-                 T, ms(t_start, t_prep), ms(t_start, t_hash), ms(t_hash, t_read), ms(t_prep, t_upload),
-                 ms(t_upload, std::chrono::steady_clock::now()));
+                 "prefill chunk %u tokens: host prep %.1f ms (hash %.1f, n-gram read %.1f, deferred %.1f), "
+                 "upload %.1f ms, device %.1f ms\n",
+                 T, ms(t_start, t_prep), ms(t_start, t_hash), ms(t_hash, t_read), deferred_read_ms,
+                 ms(t_prep, t_upload), ms(t_upload, std::chrono::steady_clock::now()));
   }
   ngram_history_ = history;
   const std::uint32_t complete = (position_ + T) / ratio;

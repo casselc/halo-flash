@@ -71,6 +71,7 @@ bool FlashNextGpu::Upload(const model::TensorRef& t, std::string* error) {
   if (const char* k = MatVecKernel(t.type)) {
     d.matvec = dev_.Kernel(k, error);
     d.embed = dev_.Kernel(std::string(k) + "_embed_p", error);
+    d.embed_rows = dev_.Kernel(std::string(k) + "_embed_rows", error);
     d.expert = dev_.Kernel(std::string(k) + "_expert", error);
     // P3 bandwidth GEMVs (same argument layout) where the row fits in LDS.
     const char* fast = t.type == core::GgmlType::kQ4_K && t.cols % 256 == 0 && t.cols <= 8192   ? "halo_gemv_q4_k"
