@@ -30,6 +30,7 @@ enum HaloSpanTag : std::uint8_t {
   kSpanCombineNorm = 2,  // halo_hc_combine_norm_rows
   kSpanGemmQ8rF16 = 3,   // GemmQ8rF16 (every kernel built on it)
   kSpanMoeDown = 4,      // MoeDown (halo_moe_down_grouped_*)
+  kSpanMoeGateUp = 5,    // MoeGateUp (halo_moe_gate_up_grouped_*)
 };
 
 #ifdef HALO_TRACE

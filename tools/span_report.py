@@ -15,7 +15,7 @@ import collections
 import struct
 import sys
 
-TAGS = {1: "span_control", 2: "hc_combine_norm_rows", 3: "GemmQ8rF16", 4: "MoeDown"}
+TAGS = {1: "span_control", 2: "hc_combine_norm_rows", 3: "GemmQ8rF16", 4: "MoeDown", 5: "MoeGateUp"}
 RT_HZ = 100e6
 WRAP = 1 << 20  # SHADER_CYCLES width
 ANCHOR = 255  # anchor records: realtime and cycles read together
