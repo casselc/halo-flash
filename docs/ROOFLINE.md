@@ -965,3 +965,4 @@ fp16 copy instead of the fp32 residual) is the remaining lever; it changes round
 | MoE gate/up: the same LDS-staged output epilogue (bit-identical) | similar to down | gate/up 248.3 -> 245.1 ms (-3.3, spread 2.5); end to end -6.5 ms within noise | no |
 | Register-weight GEMM in bands of 5 for the 2560-row shapes (`lr5`, bit-identical) | -20..-25 (lr8 runs 75% of its floor, `_l` 60%) | `_l` 118.6 -> lr5 172.0 ms; end to end +57 ms | no |
 | Down GEMM `_mb` with two stages of operands in flight (kDepth 2, bit-identical) | -11 (in-engine vmcnt waits were 64%) | `_mb` 59.2 -> 61.2 ms, end to end -1.3 within noise: the waits are bandwidth after combine_norm's writes, not latency | no |
+| `moe_combine_shared`: the k expert values loaded before the sum (bit-identical) | ~-5 (rounds model: near bandwidth-bound at 1280 waves) | not among the kernels that moved; end to end within noise (spreads 20-28 ms) | no |
