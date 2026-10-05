@@ -956,3 +956,8 @@ which need a quality eval first.
 
 The study harness (`mixstudy`, after 96 MB of writes) said the opposite (1.10 -> 1.21 ms): its condition
 does not reproduce the engine's, as noted before; decide by the engine (A/B and in-engine traces).
+| Mix epilogue lanes over 64 columns of the block's tile (128-byte coalesced residual loads; bit-identical) | lower request count | trace: epilogue 74 -> 70 us, kernel extent 1175 -> 1196 us (VGPRs 216 -> 225: occupancy 7 -> 6) | no |
+
+What remains in the mix epilogue fits the rounds model as DRAM-bound: ~500 waves in it at once, a 16-load
+round each ~1.1 MB / 185 GB/s ~ 6 us, 8 rounds + the sigmoids ~ 65-70 us (traced 70-74). Fewer bytes (the
+fp16 copy instead of the fp32 residual) is the remaining lever; it changes rounding (quality eval first).
