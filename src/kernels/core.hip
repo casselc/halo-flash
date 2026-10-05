@@ -9,6 +9,7 @@
 
 #include <cstdint>
 
+#include "kernels/span_trace.h"
 #include "kernels/step_params.h"
 
 namespace {
@@ -3261,6 +3262,7 @@ extern "C" __global__ void __launch_bounds__(256)
   __shared__ float scratch[32];
   const std::size_t v = blockIdx.x, t = v / hc, row = v * h;
   const std::uint32_t st = static_cast<std::uint32_t>(v % hc);
+  HALO_SPAN_BEGIN(kSpanCombineNorm, 8);
   const float a = 2.0f * Sigmoid(inject[t * hc + st] / static_cast<float>(hc));
   const float* w = w_all + static_cast<std::size_t>(st) * h;
   // All of a thread's loads are issued before any is used. Combined with the
@@ -3273,6 +3275,7 @@ extern "C" __global__ void __launch_bounds__(256)
     vals[k] = i < h ? res[row + i] : 0.0f;
     outs[k] = i < h ? out[t * h + i] : 0.0f;
   }
+  HALO_SPAN(1);  // residual and block_out loads issued
   float ss = 0.0f;
 #pragma unroll
   for (std::uint32_t k = 0; k < 16; ++k) {
@@ -3284,7 +3287,9 @@ extern "C" __global__ void __launch_bounds__(256)
       ss += x * x;
     }
   }
+  HALO_SPAN(2);  // combined (loads arrived), residual stores issued
   ss = BlockSum(ss, scratch);
+  HALO_SPAN(3);  // row sum of squares reduced
   const float scale = 1.0f / sqrtf(ss / static_cast<float>(h) + eps);
   if (rscale && threadIdx.x == 0) rscale[v] = scale;
   float ip[8] = {};
@@ -3304,6 +3309,7 @@ extern "C" __global__ void __launch_bounds__(256)
       if (y16) y16[y16_tokens ? XhBlocked(t, st * h + i, y16_tokens) : row + i] = static_cast<_Float16>(vals[k]);
     }
   }
+  HALO_SPAN(4);  // normalized copy stored
   if (iw) {
 #pragma unroll
     for (std::uint32_t r = 0; r < 8; ++r) {
@@ -3340,6 +3346,7 @@ extern "C" __global__ void __launch_bounds__(256)
       }
     }
   }
+  HALO_SPAN(5);  // inject partials done (end)
 }
 
 // inject[t][r] = sum over streams s (in order) of ipart[(t * hc + s) * irows + r].
@@ -5890,11 +5897,15 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
     }
   };
   halo_v8f acc[TM][TN] = {};
+  HALO_SPAN_BEGIN(kSpanGemmQ8rF16, 3 * (cols / KS) + 8);
   load(0);
   for (std::uint32_t k0 = 0; k0 < cols; k0 += KS) {
     __syncthreads();  // the previous stage's fragment reads are done
+    HALO_SPAN(1);     // stage start: all waves done with the previous stage
     store();
+    HALO_SPAN(2);     // this wave's stage operands arrived and stored to LDS
     __syncthreads();
+    HALO_SPAN(3);     // every wave's operands stored
     if (k0 + KS < cols) load(k0 + KS);  // in flight during the math below
 #pragma unroll
     for (std::uint32_t kk = 0; kk < KS; kk += 16) {
@@ -5911,6 +5922,7 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
   }
   // Epilogue: per 16-token tile, the wave's TM * 16 rows go through its own
   // LDS slice token-major, then lanes store consecutive rows of one token.
+  HALO_SPAN(4);  // math done
   __syncthreads();
   float* slice = reinterpret_cast<float*>(smem) + wave * (TM * 16 * 16);
 #pragma unroll
@@ -5949,6 +5961,7 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
     }
     __builtin_amdgcn_wave_barrier();
   }
+  HALO_SPAN(5);  // epilogue stored (end)
 }
 
 extern "C" __global__ void __launch_bounds__(256)
@@ -6143,6 +6156,28 @@ extern "C" __global__ void __launch_bounds__(256)
                          std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
   GemmQ8rF16<320, 64, 4, 2, 64, false, false, 1, true>(qs, d, x, y, rows, cols, qstride, tokens);
 }
+
+#ifdef HALO_TRACE
+// Known delays between spans, for checking the tracer (tools/span_report.py --control): event 1 after
+// s_sleep 10 (10 x 64 shader cycles), event 2 after `iters` dependent FMAs (5.2 cycles each,
+// docs/HARDWARE.md), event 3 after a barrier.
+// Events 4 and 5 bracket the loop again with the realtime clock as well: the cycle-derived and the
+// realtime durations of 4 -> 5 must agree (tools/span_report.py --control).
+extern "C" __global__ void halo_span_control(float* out, std::uint32_t iters) {
+  HALO_SPAN_BEGIN(kSpanControl, 8);
+  __builtin_amdgcn_s_sleep(10);
+  HALO_SPAN(1);
+  float a = threadIdx.x;
+  for (std::uint32_t i = 0; i < iters; ++i) a = a * 1.0001f + 0.5f;
+  HALO_SPAN(2);
+  __syncthreads();
+  HALO_SPAN(3);
+  HALO_SPAN_RT(4);
+  for (std::uint32_t i = 0; i < iters; ++i) a = a * 1.0001f + 0.5f;
+  HALO_SPAN_RT(5);
+  if (a == 12345.f) out[0] = a;
+}
+#endif
 
 // fp32 -> fp16 rows (n values). grid (ceil(n / 256))
 extern "C" __global__ void halo_f16_rows(const float* x, _Float16* y, std::uint32_t n) {

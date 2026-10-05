@@ -124,8 +124,18 @@ if(HALO_GPU)
     COMMAND ${HALO_HSACO_COMPILER} -x hip --offload-arch=gfx1151 --offload-device-only --no-gpu-bundle-output
             ${HALO_HSACO_FLAGS} -O3 -std=c++20 -I${CMAKE_CURRENT_SOURCE_DIR}/src
             -o ${HALO_GEN}/core.hsaco ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/core.hip
-    DEPENDS src/kernels/core.hip src/kernels/step_params.h
+    DEPENDS src/kernels/core.hip src/kernels/step_params.h src/kernels/span_trace.h
     COMMENT "Compiling GPU kernels (gfx1151 HSACO)")
+  # The same kernels with span tracing compiled in (src/kernels/span_trace.h): loaded from the file by the
+  # tools that trace (halo_gemm_bench trace), never embedded in the engine.
+  add_custom_command(
+    OUTPUT ${HALO_GEN}/core_trace.hsaco
+    COMMAND ${HALO_HSACO_COMPILER} -x hip --offload-arch=gfx1151 --offload-device-only --no-gpu-bundle-output
+            ${HALO_HSACO_FLAGS} -O3 -std=c++20 -DHALO_TRACE -I${CMAKE_CURRENT_SOURCE_DIR}/src
+            -o ${HALO_GEN}/core_trace.hsaco ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/core.hip
+    DEPENDS src/kernels/core.hip src/kernels/step_params.h src/kernels/span_trace.h
+    COMMENT "Building core_trace.hsaco (span tracing)")
+  add_custom_target(core_trace ALL DEPENDS ${HALO_GEN}/core_trace.hsaco)
   add_custom_command(
     OUTPUT ${HALO_GEN}/kernels/core_hsaco.cpp ${HALO_GEN}/kernels/core_hsaco.hpp
     COMMAND ${CMAKE_COMMAND} -DINPUT=${HALO_GEN}/core.hsaco -DNAME=core -DFUNC=CoreHsaco

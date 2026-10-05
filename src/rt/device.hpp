@@ -95,6 +95,12 @@ class Device {
   /// Loads one HSACO code object; kernels are then looked up by name.
   [[nodiscard]] virtual bool LoadModule(std::span<const std::uint8_t> hsaco, std::string* error) = 0;
   [[nodiscard]] virtual KernelId Kernel(std::string_view name, std::string* error) = 0;
+  /// Copies a module-scope __device__ variable of the loaded module to or from
+  /// the host (the span tracer's records: src/kernels/span_trace.h). HIP only;
+  /// other backends report unsupported.
+  [[nodiscard]] virtual bool ReadGlobal(std::string_view name, void* dst, std::size_t bytes, std::string* error);
+  [[nodiscard]] virtual bool WriteGlobal(std::string_view name, const void* src, std::size_t bytes,
+                                         std::string* error);
   [[nodiscard]] virtual bool Launch(KernelId kernel, Dim3 grid, Dim3 block, std::span<const Arg> args,
                                     std::string* error) = 0;
   [[nodiscard]] virtual bool Synchronize(std::string* error) = 0;

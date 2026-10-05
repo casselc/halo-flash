@@ -78,6 +78,15 @@ class HipDevice final : public Device {
     image_.assign(hsaco.begin(), hsaco.end());
     return Ok(hipModuleLoadData(&module_, image_.data()), "hipModuleLoadData", error);
   }
+  bool ReadGlobal(std::string_view name, void* dst, std::size_t bytes, std::string* error) override {
+    void* p = nullptr;
+    return Global(name, bytes, &p, error) && Ok(hipMemcpyDtoH(dst, p, bytes), "hipMemcpyDtoH", error);
+  }
+  bool WriteGlobal(std::string_view name, const void* src, std::size_t bytes, std::string* error) override {
+    void* p = nullptr;
+    return Global(name, bytes, &p, error) &&
+           Ok(hipMemcpyHtoD(p, const_cast<void*>(src), bytes), "hipMemcpyHtoD", error);
+  }
   KernelId Kernel(std::string_view name, std::string* error) override {
     hipFunction_t f = nullptr;
     if (!Ok(hipModuleGetFunction(&f, module_, std::string(name).c_str()), "hipModuleGetFunction", error)) return -1;
@@ -143,6 +152,18 @@ class HipDevice final : public Device {
   }
   bool capturing_ = false;
   hipStream_t stream_ = nullptr;
+  // The device address of a module global holding at least `bytes`.
+  bool Global(std::string_view name, std::size_t bytes, void** p, std::string* error) {
+    hipDeviceptr_t d = nullptr;
+    std::size_t size = 0;
+    if (!Ok(hipModuleGetGlobal(&d, &size, module_, std::string(name).c_str()), "hipModuleGetGlobal", error)) return false;
+    if (size < bytes) {
+      if (error) *error = std::string(name) + ": global holds " + std::to_string(size) + " bytes, asked " + std::to_string(bytes);
+      return false;
+    }
+    *p = d;
+    return true;
+  }
   hipModule_t module_ = nullptr;
   std::vector<std::uint8_t> image_;
   std::vector<hipFunction_t> functions_;

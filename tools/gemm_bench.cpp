@@ -408,6 +408,132 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (argc > 4 && std::string(argv[1]) == "trace") {
+    // Span traces (src/kernels/span_trace.h) of the HC mixer's kernels at prefill shape:
+    //   halo_gemm_bench trace CORE_TRACE_HSACO CASE OUT.bin [SAMPLE]   CASE: control | combine | combine+mb
+    //   SAMPLE: only every SAMPLE-th block records (default 1: all)
+    // Runs the case warm (5 runs), resets the record count, runs it once, writes the records for
+    // tools/span_report.py. Then times the case with the plain and the traced code object (20 runs each,
+    // interleaved by blocks of 5) for the tracer's overhead.
+    std::vector<std::uint8_t> traced;
+    {
+      std::FILE* f = std::fopen(argv[2], "rb");
+      if (!f) return std::printf("cannot open %s\n", argv[2]), 1;
+      std::fseek(f, 0, SEEK_END);
+      traced.resize(static_cast<std::size_t>(std::ftell(f)));
+      std::fseek(f, 0, SEEK_SET);
+      if (std::fread(traced.data(), 1, traced.size(), f) != traced.size()) return std::printf("short read\n"), 1;
+      std::fclose(f);
+    }
+    const std::string which = argv[3];
+    const std::uint32_t sample = argc > 5 ? static_cast<std::uint32_t>(std::atoi(argv[5])) : 1;  // trace every Nth block
+    auto dt = rt::Device::Create(rt::Backend::kHip, &e), dp = rt::Device::Create(rt::Backend::kHip, &e);
+    if (!dt || !dp || !dt->LoadModule(traced, &e) || !dp->LoadModule(kernels::CoreHsaco(), &e))
+      return std::printf("%s\n", e.c_str()), 1;
+    const std::uint32_t h = 2560, hc = 4, T = 2048, irows = 4, rows = 320, cols = hc * h, row_bytes = cols / 32 * 34;
+    // One set of inputs per device (each has its own module and allocations).
+    struct Case {
+      rt::Device* d;
+      std::vector<rt::Buffer> b;
+      rt::KernelId kc = -1, km = -1, kctl = -1;
+    };
+    const auto setup = [&](rt::Device* d) {
+      Case c{d, {}};
+      std::vector<std::uint8_t> wq(std::size_t{rows} * row_bytes);
+      std::mt19937 g(9);
+      for (auto& v : wq) v = static_cast<std::uint8_t>(g());
+      for (std::size_t r = 0; r < rows; ++r)
+        for (std::size_t k = 0; k < cols / 32; ++k) {
+          const std::uint16_t hv = 0x2000 | (g() & 0x3FF);
+          std::memcpy(wq.data() + r * row_bytes + k * 34, &hv, 2);
+        }
+      std::vector<float> res(std::size_t{T} * cols, 0.5f), zero(std::size_t{T} * h, 0.0f), w(cols, 1.0f),
+          iw(std::size_t{irows} * cols, 0.01f), inj(std::size_t{T} * hc, 0.0f);
+      const auto up = [&](const void* src, std::size_t bytes) {
+        auto buf = d->Alloc(bytes, &e);
+        if (src) (void)d->Upload(buf, 0, src, bytes, &e);
+        c.b.push_back(buf);
+        return buf;
+      };
+      up(wq.data(), wq.size());                                  // 0 raw weights
+      up(nullptr, std::size_t{rows} * cols);                     // 1 qs
+      up(nullptr, std::size_t{rows} * (cols / 32) * 2);          // 2 d
+      up(res.data(), res.size() * 4);                            // 3 res
+      up(zero.data(), zero.size() * 4);                          // 4 block_out
+      up(inj.data(), inj.size() * 4);                            // 5 inject
+      up(w.data(), w.size() * 4);                                // 6 gammas
+      up(iw.data(), iw.size() * 4);                              // 7 inject weights
+      up(nullptr, std::size_t{T} * hc * irows * 4);              // 8 ipart
+      up(nullptr, std::size_t{T} * hc * 4);                      // 9 rscale
+      up(nullptr, res.size() * 2);                               // 10 x16 (K-blocked)
+      up(nullptr, std::size_t{T} * rows * 4);                    // 11 lo
+      up(nullptr, 64);                                           // 12 control out
+      const rt::Arg ra[] = {rt::Arg::Buf(c.b[0]), rt::Arg::Buf(c.b[1]), rt::Arg::Buf(c.b[2]), rt::Arg::Val(rows),
+                            rt::Arg::Val(cols), rt::Arg::Val(cols)};
+      (void)d->Launch(d->Kernel("halo_repack_q8_0", &e), {4096}, {256}, ra, &e);
+      c.kc = d->Kernel("halo_hc_combine_norm_rows", &e);
+      c.km = d->Kernel("halo_gemm_q8r_f16_mb", &e);
+      if (d == dt.get()) c.kctl = d->Kernel("halo_span_control", &e);
+      return c;
+    };
+    Case ct = setup(dt.get()), cp = setup(dp.get());
+    if (!dt->WriteGlobal("halo_span_sample", &sample, 4, &e)) return std::printf("%s\n", e.c_str()), 1;
+    const auto run = [&](Case& c) {
+      const rt::Arg null = rt::Arg::Val<std::uint64_t>(0);
+      auto& b = c.b;
+      if (which == "control") {
+        const rt::Arg a[] = {rt::Arg::Buf(b[12]), rt::Arg::Val(std::uint32_t{1000})};
+        (void)c.d->Launch(c.kctl, {80}, {256}, a, &e);
+        return;
+      }
+      const rt::Arg ca[] = {rt::Arg::Buf(b[3]), rt::Arg::Buf(b[4]), rt::Arg::Buf(b[5]), rt::Arg::Buf(b[6]), null,
+                            rt::Arg::Buf(b[10]), rt::Arg::Val(hc), rt::Arg::Val(h), rt::Arg::Val(1e-6f),
+                            rt::Arg::Buf(b[7]), rt::Arg::Buf(b[8]), rt::Arg::Val(irows), rt::Arg::Buf(b[9]),
+                            rt::Arg::Val(T)};
+      (void)c.d->Launch(c.kc, {T * hc}, {256}, ca, &e);
+      if (which == "combine+mb") {
+        const rt::Arg ma[] = {rt::Arg::Buf(b[1]), rt::Arg::Buf(b[2]), rt::Arg::Buf(b[10]), rt::Arg::Buf(b[11]),
+                              rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(cols), rt::Arg::Val(T)};
+        (void)c.d->Launch(c.km, {T / 64, 1}, {256}, ma, &e);
+      }
+    };
+    for (int r = 0; r < 5; ++r) run(ct);
+    (void)dt->Synchronize(&e);
+    const std::uint32_t cap = 1u << 22;
+    std::vector<std::uint8_t> recs(std::size_t{cap} * 16, 0);
+    if (!dt->WriteGlobal("halo_spans", recs.data(), recs.size(), &e)) return std::printf("%s\n", e.c_str()), 1;
+    run(ct);
+    if (!dt->Synchronize(&e) || !dt->ReadGlobal("halo_spans", recs.data(), recs.size(), &e))
+      return std::printf("%s\n", e.c_str()), 1;
+    // Keep the written records only (valid byte set).
+    std::vector<std::uint8_t> kept;
+    for (std::size_t i = 0; i < cap; ++i)
+      if (recs[i * 16 + 15]) kept.insert(kept.end(), recs.begin() + i * 16, recs.begin() + i * 16 + 16);
+    const std::uint32_t n = static_cast<std::uint32_t>(kept.size() / 16);
+    std::FILE* out = std::fopen(argv[4], "wb");
+    if (!out) return std::printf("cannot write %s\n", argv[4]), 1;
+    std::fwrite(&n, 4, 1, out);
+    std::fwrite(kept.data(), 1, kept.size(), out);
+    std::fclose(out);
+    std::printf("trace %s: %u records -> %s\n", which.c_str(), n, argv[4]);
+    if (which != "control") {
+      double tp = 0, tt = 0;
+      const auto timed = [&](Case& c) {
+        (void)c.d->Synchronize(&e);
+        const auto c0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < 5; ++r) run(c);
+        (void)c.d->Synchronize(&e);
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count() / 5;
+      };
+      for (int r = 0; r < 3; ++r) run(cp);
+      for (int k = 0; k < 4; ++k) {
+        tp += timed(cp) / 4;
+        tt += timed(ct) / 4;
+      }
+      std::printf("overhead: plain %.3f ms, traced %.3f ms (%+.1f%%)\n", tp, tt, (tt - tp) / tp * 100);
+    }
+    return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "peak") {
     // Register-only WMMA throughput: the ceiling the GEMMs are measured against.
     auto d = rt::Device::Create(rt::Backend::kHip, &e);

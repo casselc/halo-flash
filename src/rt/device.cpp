@@ -18,6 +18,16 @@ void* Device::AllocHost(std::size_t bytes, std::string* error) {
 }
 void Device::FreeHost(void* p) noexcept { std::free(p); }
 
+bool Device::ReadGlobal(std::string_view, void*, std::size_t, std::string* error) {
+  if (error) *error = "ReadGlobal: not supported by this backend";
+  return false;
+}
+
+bool Device::WriteGlobal(std::string_view, const void*, std::size_t, std::string* error) {
+  if (error) *error = "WriteGlobal: not supported by this backend";
+  return false;
+}
+
 const char* BackendName(Backend b) noexcept { return b == Backend::kHip ? "hip" : "hrx"; }
 
 std::unique_ptr<Device> Device::Create(Backend backend, std::string* error) {

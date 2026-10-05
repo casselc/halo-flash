@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Report span traces (src/kernels/span_trace.h; captured by `halo_gemm_bench trace`).
+
+  span_report.py TRACE.bin [--bins N]
+
+Per kernel tag: the kernel's extent on the 100 MHz realtime clock, how many
+waves were active over time (ramp-up, steady state, tail), the busy share of
+each WGP, and for every event-to-event transition the distribution over
+waves of its duration (shader cycles, and realtime), with the effective clock
+(cycles / realtime) per transition. Read with the expected per-phase times
+written down first (Sites: estimate, observe, explain the difference).
+"""
+import argparse
+import collections
+import struct
+import sys
+
+TAGS = {1: "span_control", 2: "hc_combine_norm_rows", 3: "GemmQ8rF16"}
+RT_HZ = 100e6
+WRAP = 1 << 20  # SHADER_CYCLES width
+
+
+def load(path):
+    data = open(path, "rb").read()
+    (n,) = struct.unpack_from("<I", data, 0)
+    return [struct.unpack_from("<IIIBBBB", data, 4 + 16 * i) for i in range(n)]
+
+
+def pct(v, q):
+    v = sorted(v)
+    return v[min(len(v) - 1, int(q * len(v)))] if v else 0
+
+
+def timelines(recs):
+    """(tag, block, wave) -> [(event, seconds)], where each wave ran, and the shader clock (Hz) per tag.
+    SHADER_CYCLES is one GPU-wide 20-bit counter; every 64th block's wave 0 also records the realtime clock.
+    Per tag the anchors give the clock rate (least squares on cycles unwrapped along realtime) and place every
+    wave: its first cycles reading is unwrapped against the nearest anchor (within half a wrap, ~180 us),
+    later readings cumulatively."""
+    waves = collections.defaultdict(list)
+    for rt, cy, block, wave, event, tag, valid in recs:
+        if valid:
+            waves[(tag, block, wave)].append((event, rt, cy & (WRAP - 1), cy >> 20))
+    anchors = collections.defaultdict(dict)  # tag -> {block: (rt, cycles)}
+    for (tag, block, wave), ev in waves.items():
+        if wave == 0 and ev[0][1]:
+            anchors[tag][block] = (ev[0][1], ev[0][2])
+    clock, placed = {}, {}
+    for tag, an in anchors.items():
+        blocks = sorted(an)
+        # Unwrap the anchors' cycles along realtime (each step < half a wrap at ~2.9 GHz), then fit the clock.
+        un = []
+        for k, b in enumerate(blocks):
+            rt, cy = an[b]
+            if k:
+                prt = an[blocks[k - 1]][0]
+                expect = un[-1] + (rt - prt) / RT_HZ * 2.88e9
+                un.append(cy + round((expect - cy) / WRAP) * WRAP)
+            else:
+                un.append(cy)
+        x = [an[b][0] / RT_HZ for b in blocks]
+        # Fit only over a long enough baseline (the realtime message's latency varies by ~0.5 us); short
+        # kernels use the pinned clock (docs/HARDWARE.md: ~2.88 GHz, tools/gpu_clock.sh pin).
+        if len(x) > 1 and max(x) - min(x) > 50e-6:
+            mx, my = sum(x) / len(x), sum(un) / len(un)
+            clock[tag] = sum((xi - mx) * (u - my) for xi, u in zip(x, un)) / sum((xi - mx) ** 2 for xi in x)
+        else:
+            clock[tag] = 2.88e9
+        placed[tag] = (blocks, {b: (an[b][0] / RT_HZ, u) for b, u in zip(blocks, un)})
+    out, where = {}, {}
+    import bisect
+    for (tag, block, wave), ev in waves.items():
+        if tag not in placed:
+            continue
+        blocks, pos = placed[tag]
+        # The anchor of the nearest block index at or before this block (dispatch is in order, so it started
+        # within a fraction of a wrap of this one), else the first.
+        i = bisect.bisect_right(blocks, block) - 1
+        t_a, u_a = pos[blocks[max(i, 0)]]
+        hz = clock[tag]
+        d = (ev[0][2] - u_a) % WRAP
+        if d >= WRAP // 2:
+            d -= WRAP
+        t, prev, times = d, ev[0][2], []
+        for k, (e, _, cy, _) in enumerate(ev):
+            if k:
+                t += (cy - prev) % WRAP
+                prev = cy
+            times.append((e, t_a + t / hz))
+        out[(tag, block, wave)] = times
+        hw = ev[0][3]
+        where[(tag, block, wave)] = {"simd": hw & 3, "wgp": (hw >> 2) & 15, "sa": (hw >> 6) & 1, "se": (hw >> 7) & 7}
+    return out, where, clock
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("trace")
+    ap.add_argument("--bins", type=int, default=20)
+    ap.add_argument("--control", action="store_true",
+                    help="check: realtime vs cycle-derived durations of the control kernel's 4 -> 5")
+    a = ap.parse_args()
+    recs = load(a.trace)
+    tl, where, clock = timelines(recs)
+    if a.control:
+        rt = {}
+        for r, cy, block, wave, event, tag, valid in recs:
+            if valid and tag == 1 and event in (4, 5):
+                rt[(block, wave, event)] = r
+        d_rt = [(rt[(b, w, 5)] - rt[(b, w, 4)]) / RT_HZ for (b, w, e) in rt if e == 4 and (b, w, 5) in rt]
+        d_cy = []
+        for (tag, block, wave), ev in tl.items():
+            t = dict(ev)
+            if tag == 1 and 4 in t and 5 in t:
+                d_cy.append(t[5] - t[4])
+        print(f"control 4 -> 5: realtime p50 {pct(d_rt, .5) * 1e6:.3f} us, cycle-derived p50 {pct(d_cy, .5) * 1e6:.3f} us "
+              f"({(pct(d_cy, .5) / pct(d_rt, .5) - 1) * 100:+.2f}%), {len(d_rt)} waves")
+    by_tag = collections.defaultdict(dict)
+    for (tag, block, wave), ev in tl.items():
+        by_tag[tag][(block, wave)] = ev
+    for tag, ws in sorted(by_tag.items()):
+        t0 = min(ev[0][1] for ev in ws.values())
+        t1 = max(ev[-1][1] for ev in ws.values())
+        print(f"== {TAGS.get(tag, tag)}: {len(ws)} waves, {(t1 - t0) * 1e6:.1f} us from the first wave's start to "
+              f"the last's end; shader clock {clock[tag] / 1e9:.3f} GHz "
+              f"({'fitted to the anchors' if clock[tag] != 2.88e9 else 'pinned value: anchors span < 50 us'})")
+        nb = a.bins
+        width = (t1 - t0) / nb or 1e-9
+        active = [0.0] * nb
+        for ev in ws.values():
+            s_, e_ = ev[0][1] - t0, ev[-1][1] - t0
+            for b in range(nb):
+                lo, hi = b * width, (b + 1) * width
+                active[b] += max(0.0, min(e_, hi) - max(s_, lo)) / width
+        peak = max(active) or 1
+        print(f"  active waves over time ({nb} slices of {width * 1e6:.1f} us):")
+        for b in range(nb):
+            print(f"    {b * width * 1e6:8.1f} us {active[b]:7.0f} {'#' * int(50 * active[b] / peak)}")
+        # Busy share per WGP (union of its waves' lifetimes over the kernel's extent).
+        per = collections.defaultdict(list)
+        for (block, wave), ev in ws.items():
+            w = where[(tag, block, wave)]
+            per[(w["se"], w["sa"], w["wgp"])].append((ev[0][1], ev[-1][1]))
+        busy = []
+        for k, iv in per.items():
+            iv.sort()
+            tot, cs, ce = 0.0, None, None
+            for s_, e_ in iv:
+                if cs is None or s_ > ce:
+                    tot += (ce - cs) if cs is not None else 0
+                    cs, ce = s_, e_
+                else:
+                    ce = max(ce, e_)
+            tot += ce - cs
+            busy.append((tot / (t1 - t0), k, len(iv)))
+        busy.sort()
+        print(f"  WGPs used {len(busy)}; busy share min {busy[0][0] * 100:.0f}% median "
+              f"{busy[len(busy) // 2][0] * 100:.0f}% max {busy[-1][0] * 100:.0f}%; waves per WGP "
+              f"{min(b[2] for b in busy)}..{max(b[2] for b in busy)}")
+        trans = collections.defaultdict(list)
+        for ev in ws.values():
+            for (e0, s0), (e1, s1) in zip(ev, ev[1:]):
+                trans[(e0, e1)].append(s1 - s0)
+        nw = len(ws)
+        print(f"  {'transition':>10} {'count':>8} {'us p10':>8} {'p50':>8} {'p90':>8} {'max':>8} {'us/wave':>8}")
+        for (e0, e1), d in sorted(trans.items(), key=lambda kv: -sum(kv[1]))[:16]:
+            print(f"  {e0:>4} -> {e1:<3} {len(d):8d} {pct(d, .1) * 1e6:8.2f} {pct(d, .5) * 1e6:8.2f} "
+                  f"{pct(d, .9) * 1e6:8.2f} {max(d) * 1e6:8.2f} {sum(d) * 1e6 / nw:8.2f}")
+        life = [(ev[-1][1] - ev[0][1]) * 1e6 for ev in ws.values()]
+        print(f"  wave lifetime us: p10 {pct(life, .1):.2f} p50 {pct(life, .5):.2f} p90 {pct(life, .9):.2f} "
+              f"max {max(life):.2f}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
