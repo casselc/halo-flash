@@ -793,3 +793,61 @@ dense, attention, F32 router; section 4).
   granule was wrong until a65df43.
 - The remaining LDS-limited mismatches come from the compiler using the declared
   `__launch_bounds__`; settle them as part of that test.
+
+## 8. 2026-10-05 (branch `proto/gdn-chunked`): chunked DeltaNet in, and where gufo is ahead
+
+All numbers: `tools/ab_bench.py`, 2048 tokens, clock pinned, 3 rounds x 3 reps, in-engine
+per-kernel attribution. Device time went 2046 -> 1866 ms (1097.5 tok/s pinned).
+
+**DeltaNet, chunked (16-token chunks), kept.**
+
+| Step | Predicted | Measured | Notes |
+|---|---|---|---|
+| Skeleton floor (loads, staging, barriers, no math) | 0.4-1.0 ms/layer | 1.25 | 64-token chunks with fp32 K and Q do not fit 64 KB of LDS |
+| prep + bf16 hi/lo WMMA scan (4033919) | -100..-140 | -120.8 | **failed the long-set gate**: +0.0020 +- 0.0009 NLL |
+| scan3: K S0 three-way, split once at staging (90c134e) | -140..-170 | -155.5 | +0.0013 +- 0.0009 |
+| scan3u: the update's K three-way too (e92b8eb) | ~-150 | **-140.5** | -0.0001 +- 0.0008: no shift |
+| prep2: chunks walked a block, prefetched (1c74cd9) | -40 | **-35.1** | prep 57.1 -> 15.3 ms, bit-identical |
+
+Why the bf16 scan failed while random-data error was 6e-6 (flat in length, also with
+correlated keys): once the state predicts the values, V - S^T k cancels, and a two-way
+split's ~2^-17 error in K S0 is large against the residual. The fp32 chunked kernels scored
++0.0007 +- 0.0008 on the same set, which isolated precision from the chunked math. A
+TheRock nightly clang (24.0.0git, `HALO_HSACO_COMPILER`) removed the scan's spills
+(256 -> 227 VGPRs) but made the whole engine 71 ms slower (the `q8r_f16_l` GEMMs +86 ms,
+grouped gate/up -14): ROCm 7.2.3 stays.
+
+**gufo, profiled the same way** (`tools/prof/prof.py`, one timed 2048-token pass, 1245 ms),
+gaps per prefill by role (ours - gufo):
+
+| Role | ours | gufo | gap |
+|---|---|---|---|
+| MoE routed (gate/up 6.0 ms/call vs ~5.5; down 5.18 vs ~4.1; our separate combine 0.82) | ~593 | ~433 | ~160 |
+| HC mixers (combine, mix GEMM + epilogue, `_m` down: fp16 1.04 ms vs W8A8 int8 0.50) | ~396 | ~245 | ~150 |
+| Attention, dense 2K (7.15 ms/call vs 4.07) | 86 | 49 | 37 |
+| DeltaNet (now) | 108 | ~114 | -6 |
+
+**Mix epilogue probes, none kept** (`halo_gemm_q8r_f16_mix`, 1.45 ms/call; trace: 78% of
+cycles in `vmcnt` waits, one stream's loads at a time):
+
+| Probe | Measured mix ms (from 140) |
+|---|---|
+| Read combine_norm's fp16 `xh` instead of rebuilding from fp32 `res` (half the bytes) | 140.4 |
+| Rebuild as a template choice, all of a lane's loads issued first | 154.9 |
+| Block-wide epilogue, float4 loads, 256 contiguous bytes per (token, stream) | 138.4 |
+| Ablation: epilogue loads replaced by constants | **72.7** |
+| Ablation: epilogue stores removed | 114.5 |
+
+The loads cost ~0.7 ms/call, but not through bytes, batching or access width. The likely
+cause: `res` / `xh` were written by `combine_norm` two kernels earlier (126 MB still draining:
+writes are paid by the next kernels). The lever is upstream, in what combine_norm writes.
+A runtime branch (`xh ?` / `rs ?`) inside the template cost the plain mix 39 VGPRs and 388 B
+of scratch: keep such choices compile-time.
+
+**Attention at 2K:** routing the dense case through QSA (`--mq-attention 0`, fp16 K/V,
+prefetch) measured -9.6 ms (noise; predicted -30..-45): `qsel_h` 75.4 vs `mq` 87.1. Trace of
+`qsel_h`: 43% barriers, 21% `vmcnt`, 18% `lgkmcnt`, WMMA 1%: per-chunk block-wide phases
+(scores on 6 waves, softmax on 192 threads, P.V on 8) wait on each other. gufo's dense kernel:
+32 rows a block (16 queries x 2 heads), 16-key tiles, 8 waves = S tiles x head-dim halves,
+K/V prefetched into registers, V transposed in LDS. Next: a kernel whose waves each own their
+rows and softmax, so only K/V staging needs a block barrier.
