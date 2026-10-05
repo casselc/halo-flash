@@ -3288,26 +3288,56 @@ extern "C" __global__ void __launch_bounds__(256)
   const float scale = 1.0f / sqrtf(ss / static_cast<float>(h) + eps);
   if (rscale && threadIdx.x == 0) rscale[v] = scale;
   float ip[8] = {};
+  // Loads in batches of 16 issued before use (gammas, then each inject row), as for res above: interleaved
+  // with the stores, each iteration waited for its own L2 loads.
 #pragma unroll
   for (std::uint32_t k = 0; k < 16; ++k) {
     const std::uint32_t i = threadIdx.x + k * blockDim.x;
-    if (i < h) {
-      const float yv = vals[k] * scale * w[i];
-      if (y) y[row + i] = yv;
-      if (y16) y16[y16_tokens ? XhBlocked(t, st * h + i, y16_tokens) : row + i] = static_cast<_Float16>(yv);
-      if (iw) {
+    outs[k] = i < h ? w[i] : 0.0f;
+  }
 #pragma unroll
-        for (std::uint32_t r = 0; r < 8; ++r)
-          if (r < irows) ip[r] += yv * iw[static_cast<std::size_t>(r) * hc * h + static_cast<std::size_t>(st) * h + i];
-      }
+  for (std::uint32_t k = 0; k < 16; ++k) {
+    const std::uint32_t i = threadIdx.x + k * blockDim.x;
+    vals[k] = vals[k] * scale * outs[k];
+    if (i < h) {
+      if (y) y[row + i] = vals[k];
+      if (y16) y16[y16_tokens ? XhBlocked(t, st * h + i, y16_tokens) : row + i] = static_cast<_Float16>(vals[k]);
     }
   }
   if (iw) {
 #pragma unroll
     for (std::uint32_t r = 0; r < 8; ++r) {
       if (r >= irows) break;
-      const float sum = BlockSum(ip[r], scratch);
-      if (threadIdx.x == 0) ipart[v * irows + r] = sum;
+      const float* iwr = iw + static_cast<std::size_t>(r) * hc * h + static_cast<std::size_t>(st) * h;
+#pragma unroll
+      for (std::uint32_t k = 0; k < 16; ++k) {
+        const std::uint32_t i = threadIdx.x + k * blockDim.x;
+        outs[k] = i < h ? iwr[i] : 0.0f;
+      }
+#pragma unroll
+      for (std::uint32_t k = 0; k < 16; ++k)
+        if (threadIdx.x + k * blockDim.x < h) ip[r] += vals[k] * outs[k];
+    }
+  }
+  if (iw) {
+    // BlockSum's two stages (warp sums, then warp 0 sums the warps' partials) for all irows values with one
+    // barrier: the same additions in the same order as irows BlockSums, without their 3 barriers each.
+    __shared__ float part[8][8];  // [row][warp]
+    const std::uint32_t lane = threadIdx.x % kWarp, warp = threadIdx.x / kWarp;
+#pragma unroll
+    for (std::uint32_t r = 0; r < 8; ++r) {
+      if (r >= irows) break;
+      const float wsum = WarpSum(ip[r]);
+      if (lane == 0) part[r][warp] = wsum;
+    }
+    __syncthreads();
+    if (warp == 0) {
+#pragma unroll
+      for (std::uint32_t r = 0; r < 8; ++r) {
+        if (r >= irows) break;
+        const float sum = WarpSum(lane < blockDim.x / kWarp ? part[r][lane] : 0.0f);
+        if (lane == 0) ipart[v * irows + r] = sum;
+      }
     }
   }
 }

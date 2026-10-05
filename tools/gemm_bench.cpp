@@ -364,6 +364,50 @@ int main(int argc, char** argv) {
                 "after rewriting its own res (84 MB) %.3f\n", warm, cold, other, own);
     return 0;
   }
+  if (argc > 1 && std::string(argv[1]) == "combinestudy") {
+    // halo_hc_combine_norm_rows at its prefill shape (T 2048, 4 streams of 2560) with its outputs and fusions
+    // switched off one at a time: what each costs against the residual's traffic floor (hwprobe stream: 1.13 ms).
+    auto d = rt::Device::Create(rt::Backend::kHip, &e);
+    if (!d || !d->LoadModule(kernels::CoreHsaco(), &e)) return std::printf("%s\n", e.c_str()), 1;
+    const std::uint32_t h = 2560, hc = 4, T = 2048, irows = 4;
+    std::vector<float> res(std::size_t{T} * hc * h, 0.5f), zero(std::size_t{T} * h, 0.0f), w(hc * h, 1.0f),
+        iw(std::size_t{irows} * hc * h, 0.01f), inj(std::size_t{T} * hc, 0.0f);
+    auto rb = d->Alloc(res.size() * 4, &e), ob = d->Alloc(zero.size() * 4, &e), ib = d->Alloc(inj.size() * 4, &e),
+         wb = d->Alloc(w.size() * 4, &e), yb = d->Alloc(res.size() * 4, &e), y16 = d->Alloc(res.size() * 2, &e),
+         iwb = d->Alloc(iw.size() * 4, &e), ip = d->Alloc(std::size_t{T} * hc * irows * 4, &e),
+         rs = d->Alloc(std::size_t{T} * hc * 4, &e);
+    (void)d->Upload(rb, 0, res.data(), res.size() * 4, &e);
+    (void)d->Upload(ob, 0, zero.data(), zero.size() * 4, &e);
+    (void)d->Upload(ib, 0, inj.data(), inj.size() * 4, &e);
+    (void)d->Upload(wb, 0, w.data(), w.size() * 4, &e);
+    (void)d->Upload(iwb, 0, iw.data(), iw.size() * 4, &e);
+    const auto k = d->Kernel("halo_hc_combine_norm_rows", &e);
+    const rt::Arg null = rt::Arg::Val<std::uint64_t>(0);
+    struct V {
+      const char* name;
+      bool y, y16, blocked, inject, rscale;
+    };
+    const V vs[] = {{"engine (y16 blocked, inject, rscale)", false, true, true, true, true},
+                    {"no inject partials", false, true, true, false, true},
+                    {"y16 row-major", false, true, false, true, true},
+                    {"no y16", false, false, false, true, true},
+                    {"no y16, no inject", false, false, false, false, true},
+                    {"y fp32 instead of y16 (unfused form)", true, false, false, true, false}};
+    for (const auto& v : vs) {
+      const rt::Arg a[] = {rt::Arg::Buf(rb), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Buf(wb),
+                           v.y ? rt::Arg::Buf(yb) : null, v.y16 ? rt::Arg::Buf(y16) : null, rt::Arg::Val(hc),
+                           rt::Arg::Val(h), rt::Arg::Val(1e-6f), v.inject ? rt::Arg::Buf(iwb) : null, rt::Arg::Buf(ip),
+                           rt::Arg::Val(irows), v.rscale ? rt::Arg::Buf(rs) : null, rt::Arg::Val(v.blocked ? T : 0u)};
+      for (int r = 0; r < 5; ++r) (void)d->Launch(k, {T * hc}, {256}, a, &e);
+      (void)d->Synchronize(&e);
+      const auto c0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < 20; ++r) (void)d->Launch(k, {T * hc}, {256}, a, &e);
+      (void)d->Synchronize(&e);
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count() / 20;
+      std::printf("%-40s %7.3f ms\n", v.name, ms);
+    }
+    return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "peak") {
     // Register-only WMMA throughput: the ceiling the GEMMs are measured against.
     auto d = rt::Device::Create(rt::Backend::kHip, &e);
