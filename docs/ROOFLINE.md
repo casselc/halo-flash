@@ -604,6 +604,14 @@ lengths up to 24K. The next long-prompt target is the indexer's scoring: `halo_q
 takes 1.39 s per 8K prefill, as much as attention did before. It scores every complete block for
 every token. Then the serial n-gram read per chunk (4h).
 
+**4j. Long-prompt attention block (2026-10-04, 8K-token prefill, pinned).**
+- V prefetch in `qsel` (6c61579): 653 -> 502 ms.
+- Indexer scores as a bf16x3 WMMA GEMM: 1605 -> ~24 ms (-1.52 s); 8K prefill 697 -> 869 tok/s on
+  random tokens.
+
+What remains in attention: `qsel` at ~500 ms. The trace shows 43% barrier and 25% K gathers;
+K staging through LDS would help. Then the serial n-gram read per chunk.
+
 **4h. Chunk size and long prompts (2026-10-04, pinned, pseudo-random tokens, n-gram not
 resident).** For an 8192-token prompt:
 
