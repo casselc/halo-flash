@@ -59,6 +59,44 @@ int main(int argc, char** argv) {
                     {"halo_gdnskel_c16_n64_pf_nost", 64, 256}, {"halo_gdnskel_c32_n64_pf_seq_nost", 64, 256},
                     {"halo_gdnskel_c64_n32_seq", 32, 256},    {"halo_gdnskel_c64_n32_pf_seq", 32, 256}};
     std::printf("structural floor per layer (2048 tokens, no math); the split kernel takes 8.2 ms in-engine\n");
+    {  // the real kernels at the same shape: split, and chunked prep + scan
+      auto ab = d->Alloc(heads * 4, &e), be = d->Alloc(std::size_t{T} * heads * 4, &e),
+           prep = d->Alloc(std::size_t{heads} * (T / 16) * 576 * 4, &e), ob = d->Alloc(std::size_t{T} * heads * 128 * 4, &e);
+      {
+        std::vector<float> z(std::size_t{T} * heads, 0.0f), av(heads, -0.5f);
+        (void)d->Upload(al, 0, z.data(), z.size() * 4, &e);
+        (void)d->Upload(be, 0, z.data(), z.size() * 4, &e);
+        (void)d->Upload(ab, 0, av.data(), av.size() * 4, &e);
+      }
+      const auto time = [&](const char* name, auto&& go) {
+        for (int r = 0; r < 3; ++r) go();
+        (void)d->Synchronize(&e);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < 10; ++r) go();
+        (void)d->Synchronize(&e);
+        std::printf("%-28s             %7.3f ms\n", name,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 10);
+      };
+      const auto ks = d->Kernel("halo_gdn_prefill_split", &e), kp = d->Kernel("halo_gdn_c16_prep", &e),
+                 kc = d->Kernel("halo_gdn_c16_scan", &e);
+      const rt::Arg sa[] = {rt::Arg::Buf(conv), rt::Arg::Buf(conv, 2048ull * 4), rt::Arg::Buf(conv, 4096ull * 4),
+                            rt::Arg::Buf(al), rt::Arg::Buf(be), rt::Arg::Buf(ab), rt::Arg::Buf(al), rt::Arg::Buf(st),
+                            rt::Arg::Buf(ob), rt::Arg::Val(kheads), rt::Arg::Val(T), rt::Arg::Val(stride),
+                            rt::Arg::Val(stride), rt::Arg::Val(heads * 128u)};
+      const rt::Arg pa[] = {rt::Arg::Buf(conv), rt::Arg::Buf(conv, 2048ull * 4), rt::Arg::Buf(al), rt::Arg::Buf(be),
+                            rt::Arg::Buf(ab), rt::Arg::Buf(al), rt::Arg::Buf(prep), rt::Arg::Val(heads), rt::Arg::Val(T),
+                            rt::Arg::Val(stride)};
+      const rt::Arg ca[] = {rt::Arg::Buf(conv), rt::Arg::Buf(conv, 2048ull * 4), rt::Arg::Buf(conv, 4096ull * 4),
+                            rt::Arg::Buf(prep), rt::Arg::Buf(st), rt::Arg::Buf(ob), rt::Arg::Val(kheads), rt::Arg::Val(T),
+                            rt::Arg::Val(stride), rt::Arg::Val(stride), rt::Arg::Val(heads * 128u)};
+      time("halo_gdn_prefill_split", [&] { (void)d->Launch(ks, {2, heads}, {256}, sa, &e); });
+      time("halo_gdn_c16_prep", [&] { (void)d->Launch(kp, {T / 16, kheads}, {256}, pa, &e); });
+      time("halo_gdn_c16_scan", [&] { (void)d->Launch(kc, {2, heads}, {128}, ca, &e); });
+      time("halo_gdn_c16 prep + scan", [&] {
+        (void)d->Launch(kp, {T / 16, kheads}, {256}, pa, &e);
+        (void)d->Launch(kc, {2, heads}, {128}, ca, &e);
+      });
+    }
     for (const auto& v : vs) {
       const auto k = d->Kernel(v.k, &e);
       const rt::Arg a[] = {rt::Arg::Buf(conv), rt::Arg::Buf(conv, 2048ull * 4), rt::Arg::Buf(conv, 4096ull * 4),

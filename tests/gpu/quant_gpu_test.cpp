@@ -1173,6 +1173,17 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
         };
         close4(get(out6, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "wmma chunked output");
         close4(get(gs6, gst.size()), get(gs5, gst.size()), "wmma chunked recurrent state");
+        // Prep + WMMA scan (halo_gdn_c16_prep, halo_gdn_c16_scan): same products, same bound.
+        auto gs7 = up(gst), out7 = zeros(std::size_t{T} * vd), prep7 = zeros(std::size_t{nv} * nch * 576);
+        launch("halo_gdn_c16_prep", {nch, nk}, {256},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(alb), rt::Arg::Buf(beb), rt::Arg::Buf(ab),
+                rt::Arg::Buf(dtb), rt::Arg::Buf(prep7), rt::Arg::Val(nv), rt::Arg::Val(T), rt::Arg::Val(ch)});
+        launch("halo_gdn_c16_scan", {2, nv}, {128},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(conv2, 2ull * kd * 4), rt::Arg::Buf(prep7),
+                rt::Arg::Buf(gs7), rt::Arg::Buf(out7), rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch),
+                rt::Arg::Val(vd)});
+        close4(get(out7, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "c16 chunked output");
+        close4(get(gs7, gst.size()), get(gs5, gst.size()), "c16 chunked recurrent state");
       }
       same(get(out2, std::size_t{T} * vd), get(out1, std::size_t{T} * vd), "output");
       same(get(cs2, cst.size()), get(cs1, cst.size()), "conv state");
