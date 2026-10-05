@@ -612,7 +612,20 @@ at ~200 GB/s.
 | Attention (12): qg 100, split, norms, RoPE, ctx, f16 | ~9 GB | ~45 ms | epilogue fusion | ~30 ms |
 
 Order: DeltaNet fp16 intermediates first (mechanical; the quality gate decides), then the
-attention epilogues. Halogen's 32K-token chunks amortize the ~75 GB of expert weights over 16x
+attention epilogues.
+
+**First item measured, not kept:** `conv` stored in fp16 (conv kernel writes fp16, the split
+recurrence widens on load).
+- Quality: unchanged.
+- Speed: -1.0 ms end to end (noise); recurrence 300.6 -> 299.7 ms, conv 46.5 -> 45.9 ms.
+- Why: neither kernel is bandwidth-bound. The recurrence waits on LDS round trips and barriers
+  (4.2), and the conv kernel is latency-bound at ~130 GB/s. The write saved has no
+  bandwidth-bound successor.
+
+**Rule for the rest of this list:** a byte saving pays only where the writer or the next kernel is
+bandwidth-bound. Check that in the trace (vmcnt share) and in achieved GB/s first. Candidates that
+pass: the GEMM outputs feeding other GEMMs (qkv -> z, qg -> split), the experts' `yp` (combine
+streams at ~88% vmcnt), and the mixer chain. Halogen's 32K-token chunks amortize the ~75 GB of expert weights over 16x
 the tokens; for long prompts, the chunk size is the lever (memory, not code).
 
 **4f. GEMM-core latency study: the in-engine gap is write-back, not the GEMM** (2026-10-04,
