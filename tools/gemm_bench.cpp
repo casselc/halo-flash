@@ -168,6 +168,15 @@ int main(int argc, char** argv) {
                             rt::Arg::Val(stride), rt::Arg::Val(stride), rt::Arg::Val(heads * 128u)};
       time("halo_gdn_prefill_split", [&] { (void)d->Launch(ks, {2, heads}, {256}, sa, &e); });
       time("halo_gdn_c16_prep", [&] { (void)d->Launch(kp, {T / 16, kheads}, {256}, pa, &e); });
+      const auto kp2 = d->Kernel("halo_gdn_c16_prep2", &e);
+      for (const std::uint32_t cpb : {8u, 16u, 24u, 32u, 64u}) {
+        const rt::Arg pa2[] = {rt::Arg::Buf(conv), rt::Arg::Buf(conv, 2048ull * 4), rt::Arg::Buf(al), rt::Arg::Buf(be),
+                               rt::Arg::Buf(ab), rt::Arg::Buf(al), rt::Arg::Buf(prep), rt::Arg::Val(heads),
+                               rt::Arg::Val(T), rt::Arg::Val(stride), rt::Arg::Val(cpb)};
+        char name[64];
+        std::snprintf(name, sizeof name, "halo_gdn_c16_prep2 cpb %u", cpb);
+        time(name, [&] { (void)d->Launch(kp2, {(T / 16 + cpb - 1) / cpb, kheads}, {256}, pa2, &e); });
+      }
       time("halo_gdn_c16_scan", [&] { (void)d->Launch(kc, {2, heads}, {128}, ca, &e); });
       const auto k3 = d->Kernel("halo_gdn_c16_scan_ks3", &e);
       time("halo_gdn_c16_scan_ks3", [&] { (void)d->Launch(k3, {2, heads}, {128}, ca, &e); });

@@ -5112,6 +5112,120 @@ extern "C" __global__ void __launch_bounds__(256)
   }
 }
 
+// halo_gdn_c16_prep over cpb consecutive chunks a block, the next chunk's
+// K, Q and gates prefetched into registers behind LDS-only barriers (a trace
+// of the one-chunk version: 55% of cycles at barriers, 22% waiting on loads).
+//   grid (ceil(ceil(T / 16) / cpb), num_k_heads), block 256
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gdn_c16_prep2(const float* q, const float* k, const float* alpha, const float* beta, const float* a,
+                       const float* dt, float* prep, std::uint32_t heads, std::uint32_t tokens, std::uint32_t qk_stride,
+                       std::uint32_t cpb) {
+  constexpr std::uint32_t d = 128, C = 16, RM = 8, NT = 256;
+  __shared__ __attribute__((aligned(16))) float ks[C][d + 4], qs[C][d + 4];
+  __shared__ float KK[C][C + 1], QK[C][C + 1], G[RM][C], bs[RM][C], Am[RM][C][C + 1];
+  const std::uint32_t kh = blockIdx.y, nk = gridDim.y, tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const std::uint32_t R = heads / nk, nchunks = (tokens + C - 1) / C, c_begin = blockIdx.x * cpb,
+                      c_end = min(c_begin + cpb, nchunks);
+  if (c_begin >= nchunks) return;
+  const float inv_sqrt_d = 1.0f / sqrtf(static_cast<float>(d));
+  const auto barrier = [] {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+  };
+  const std::uint32_t h_mine = kh + min(wave, R - 1) * nk;  // the head whose gates this wave loads
+  const float ah = a[h_mine], dth = dt[h_mine];
+  float4 rk[2], rq[2];
+  float ral, rbe;
+  const auto load = [&](std::uint32_t c) {
+    const std::uint32_t t0 = c * C, n = min(C, tokens - t0);
+#pragma unroll
+    for (std::uint32_t p = 0; p < 2; ++p) {
+      const std::uint32_t x = tid + p * NT, tt = x / (d / 4), i = (x % (d / 4)) * 4;
+      const std::uint32_t row = (t0 + min(tt, n - 1)) * qk_stride + kh * d + i;
+      rk[p] = *reinterpret_cast<const float4*>(k + row);
+      rq[p] = *reinterpret_cast<const float4*>(q + row);
+    }
+    const std::uint32_t t = t0 + min(lane, n - 1);
+    ral = alpha[t * heads + h_mine];
+    rbe = beta[t * heads + h_mine];
+  };
+  load(c_begin);
+  for (std::uint32_t c = c_begin; c < c_end; ++c) {
+    const std::uint32_t t0 = c * C, n = min(C, tokens - t0);
+#pragma unroll
+    for (std::uint32_t p = 0; p < 2; ++p) {
+      const std::uint32_t x = tid + p * NT, tt = x / (d / 4), i = (x % (d / 4)) * 4;
+      *reinterpret_cast<float4*>(&ks[tt][i]) = rk[p];
+      *reinterpret_cast<float4*>(&qs[tt][i]) = rq[p];
+    }
+    const float al = ral, be = rbe;
+    load(min(c + 1, c_end - 1));
+    if (wave < R) {  // cumulative log decays and gates; padding: no decay, no gate
+      float g = lane < n ? ah * Softplus(al + dth) : 0.0f;
+      for (int o = 1; o < 32; o <<= 1) {
+        const float up = __shfl_up(g, o, 32);
+        if (lane >= static_cast<std::uint32_t>(o)) g += up;
+      }
+      if (lane < C) {
+        G[wave][lane] = g;
+        bs[wave][lane] = lane < n ? Sigmoid(be) : 0.0f;
+      }
+    }
+    barrier();
+#pragma unroll
+    for (std::uint32_t p = 0; p < 2; ++p) {
+      const std::uint32_t x = tid + p * NT, which = x / (C * C), t = (x % (C * C)) / C, sx = x % C;
+      const float* a0 = which == 0 ? ks[t] : qs[t];
+      float acc = 0.0f;
+#pragma unroll 8
+      for (std::uint32_t i = 0; i < d; i += 4) {
+        const float4 x4 = *reinterpret_cast<const float4*>(a0 + i), y4 = *reinterpret_cast<const float4*>(&ks[sx][i]);
+        acc += x4.x * y4.x + x4.y * y4.y + x4.z * y4.z + x4.w * y4.w;
+      }
+      (which == 0 ? KK : QK)[t][sx] = acc;
+    }
+    barrier();
+    const auto out_of = [&](std::uint32_t r) {
+      return prep + (static_cast<std::size_t>(kh + r * nk) * nchunks + c) * kGdnP16;
+    };
+    for (std::uint32_t x = tid; x < R * 2 * C * C; x += NT) {
+      const std::uint32_t r = x / (2 * C * C), which = (x / (C * C)) % 2, t = (x % (C * C)) / C, sx = x % C;
+      const bool live = t < n && sx < n && (which == 0 ? sx < t : sx <= t);
+      const float v = live ? (which == 0 ? KK : QK)[t][sx] * expf(G[r][t] - G[r][sx]) : 0.0f;
+      if (which == 0)
+        Am[r][t][sx] = v * bs[r][t];
+      else
+        out_of(r)[C * C + t * C + sx] = v * inv_sqrt_d;
+    }
+    for (std::uint32_t x = tid; x < R * C; x += NT) {
+      const std::uint32_t r = x / C, e = x % C;
+      float* out = out_of(r);
+      const float eg = expf(G[r][e]);
+      out[2 * C * C + e] = eg * inv_sqrt_d;
+      out[2 * C * C + C + e] = eg;
+      out[2 * C * C + 2 * C + e] = e < n ? expf(G[r][C - 1] - G[r][e]) : 0.0f;
+      out[2 * C * C + 3 * C + e] = e == 0 ? expf(G[r][C - 1]) : 0.0f;
+    }
+    barrier();
+    for (std::uint32_t x = tid; x < R * C; x += NT) {  // column sx of T = (I + A)^-1, scaled by b_sx
+      const std::uint32_t r = x / C, sx = x % C;
+      float tcol[C];
+#pragma unroll
+      for (std::uint32_t t = 0; t < C; ++t) {
+        float v = t == sx ? 1.0f : 0.0f;
+#pragma unroll
+        for (std::uint32_t u = 0; u < t; ++u) v -= Am[r][t][u] * tcol[u];
+        tcol[t] = v;
+      }
+      float* out = out_of(r);
+#pragma unroll
+      for (std::uint32_t t = 0; t < C; ++t) out[t * C + sx] = tcol[t] * bs[r][sx];
+    }
+    barrier();  // LDS reads done before the next chunk is staged
+  }
+}
+
 // KS3: K S0 with the three-way split (6 WMMAs a tile).
 template <bool KS3>
 __device__ void GdnC16Scan(const float* q, const float* k, const float* v, const float* prep, float* state, float* out,

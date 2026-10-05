@@ -1199,6 +1199,15 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
                 rt::Arg::Val(vd)});
         close4(get(out9, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "c16 scan3u output");
         close4(get(gs9, gst.size()), get(gs5, gst.size()), "c16 scan3u recurrent state");
+        // prep2 (cpb chunks a block, prefetched) writes the same prep as prep.
+        for (const std::uint32_t cpb : {1u, 2u, 3u}) {
+          auto prep2 = zeros(std::size_t{nv} * nch * 576);
+          launch("halo_gdn_c16_prep2", {(nch + cpb - 1) / cpb, nk}, {256},
+                 {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(alb), rt::Arg::Buf(beb),
+                  rt::Arg::Buf(ab), rt::Arg::Buf(dtb), rt::Arg::Buf(prep2), rt::Arg::Val(nv), rt::Arg::Val(T),
+                  rt::Arg::Val(ch), rt::Arg::Val(cpb)});
+          same(get(prep2, std::size_t{nv} * nch * 576), get(prep7, std::size_t{nv} * nch * 576), "prep2");
+        }
       }
       same(get(out2, std::size_t{T} * vd), get(out1, std::size_t{T} * vd), "output");
       same(get(cs2, cst.size()), get(cs1, cst.size()), "conv state");

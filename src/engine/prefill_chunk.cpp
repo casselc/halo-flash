@@ -325,8 +325,15 @@ bool FlashNextGpu::PleChunk(const model::LayerWeights& l, std::uint32_t T, std::
                 error);
 }
 
+namespace {
+// Chunks a halo_gdn_c16_prep2 block walks: ~64 blocks a layer (cpb 32 at
+// 2048 tokens and 16 k-heads: 0.35 ms vs 0.38 at cpb 16, 1.22 one a block).
+std::uint32_t GdnPrepCpb(std::uint32_t nch, std::uint32_t nk) { return std::max(1u, (nch * nk + 63) / 64); }
+}  // namespace
+
 bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std::uint32_t T, std::string* error) {
   const auto& c = w_.config;
+  const std::uint32_t nch = (T + 15) / 16;
   const std::uint32_t ch = c.SsmConvChannels(), kd = c.SsmKeyDim(), vd = c.SsmValueDim();
   return MixedHalf(T, error) && Gemm(l.ssm_qkv, ck_.mixed, ck_.qkv, T, error, MixedH()) &&
          Gemm(l.ssm_gate, ck_.mixed, ck_.z, T, error, MixedH()) &&
@@ -359,12 +366,18 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
                                           rt::Arg::Buf(s.state), rt::Arg::Buf(ck_.gdn), rt::Arg::Val(c.ssm_num_k_heads),
                                           rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)},
                                          error)
-                            : Launch("halo_gdn_c16_prep", {(T + 15) / 16, c.ssm_num_k_heads}, {256},
-                              {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull), rt::Arg::Buf(ck_.alpha),
-                               rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
-                               rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(ck_.gdnprep),
-                               rt::Arg::Val(c.ssm_num_v_heads), rt::Arg::Val(T), rt::Arg::Val(ch)},
-                              error) &&
+                            // prep: ~64 blocks a layer, each walking cpb chunks
+                            // with the next one prefetched (halo_gdn_c16_prep2).
+                            : Launch("halo_gdn_c16_prep2",
+                                     {(nch + GdnPrepCpb(nch, c.ssm_num_k_heads) - 1) / GdnPrepCpb(nch, c.ssm_num_k_heads),
+                                      c.ssm_num_k_heads},
+                                     {256},
+                                     {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull), rt::Arg::Buf(ck_.alpha),
+                                      rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
+                                      rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(ck_.gdnprep),
+                                      rt::Arg::Val(c.ssm_num_v_heads), rt::Arg::Val(T), rt::Arg::Val(ch),
+                                      rt::Arg::Val(GdnPrepCpb(nch, c.ssm_num_k_heads))},
+                                     error) &&
                            Launch(prefill_gdn_c16_bf16_ ? "halo_gdn_c16_scan" : prefill_gdn_c16_u3_ ? "halo_gdn_c16_scan3u" : "halo_gdn_c16_scan3", {2, c.ssm_num_v_heads}, {128},
                                   {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 4ull),
                                    rt::Arg::Buf(ck_.conv, 2ull * kd * 4), rt::Arg::Buf(ck_.gdnprep),
