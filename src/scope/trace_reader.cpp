@@ -1,6 +1,7 @@
 #include "scope/trace_reader.hpp"
 
 #include <charconv>
+#include <map>
 #include <sstream>
 
 #include "server/openai_response.hpp"
@@ -131,6 +132,63 @@ std::optional<Value> TraceReader::Trace(const std::string& trace_id, std::string
   out.set("metadata", std::move(meta));
   out.set("observations", std::move(*observations));
   out.set("scores", std::move(*scores));
+  return out;
+}
+
+std::optional<std::vector<ObservationContent>> TraceReader::Contents(const std::vector<std::string>& trace_ids,
+                                                                    const std::vector<std::string>& span_ids,
+                                                                    std::string* error) {
+  auto list = [](const std::vector<std::string>& v) {
+    std::string s;
+    for (const auto& x : v) s += (s.empty() ? "" : ", ") + SqlQuote(x);
+    return s;
+  };
+  std::string where = "project = " + SqlQuote(project_);
+  if (!span_ids.empty()) where += " AND span_id IN (" + list(span_ids) + ")";
+  else if (!trace_ids.empty()) where += " AND trace_id IN (" + list(trace_ids) + ") AND type = 'GENERATION'";
+  else return std::vector<ObservationContent>{};
+  auto obs = Rows("SELECT trace_id, span_id, type, name, arrayMap(x -> lower(hex(x)), input_refs) AS input_refs, "
+                  "arrayMap(x -> lower(hex(x)), output_refs) AS output_refs FROM halo_scope.llm_observations WHERE " +
+                      where + " ORDER BY start_time, span_id LIMIT 1 BY span_id",
+                  error);
+  if (!obs) return std::nullopt;
+  std::vector<std::string> hashes;
+  for (const auto& o : obs->items())
+    for (const char* k : {"input_refs", "output_refs"})
+      for (const auto& h : o.find(k)->items()) hashes.push_back(h.str());
+  std::map<std::string, std::string> content;
+  if (!hashes.empty()) {
+    std::string in;
+    for (const auto& h : hashes) in += (in.empty() ? "toFixedString(unhex(" : ", toFixedString(unhex(") + SqlQuote(h) + "), 16)";
+    auto rows = Rows("SELECT lower(hex(hash)) AS h, any(content) AS content FROM halo_scope.llm_payloads WHERE "
+                     "project = " + SqlQuote(project_) + " AND hash IN (" + in + ") GROUP BY hash",
+                     error);
+    if (!rows) return std::nullopt;
+    for (const auto& r : rows->items()) content[r.find("h")->str()] = r.find("content")->str();
+  }
+  std::vector<ObservationContent> out;
+  for (const auto& o : obs->items()) {
+    ObservationContent c;
+    c.trace_id = o.find("trace_id")->str();
+    c.span_id = o.find("span_id")->str();
+    c.type = o.find("type")->str();
+    c.name = o.find("name")->str();
+    auto fill = [&](const char* k, std::string* text, bool* has) {
+      const auto& refs = o.find(k)->items();
+      *has = !refs.empty();
+      for (const auto& h : refs) {
+        const auto it = content.find(h.str());
+        if (it == content.end()) {
+          *has = false;
+          return;
+        }
+        *text += it->second;
+      }
+    };
+    fill("input_refs", &c.input, &c.has_input);
+    fill("output_refs", &c.output, &c.has_output);
+    out.push_back(std::move(c));
+  }
   return out;
 }
 

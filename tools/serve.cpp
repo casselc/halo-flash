@@ -8,6 +8,10 @@
 // annotate traces through POST /v1/scope/... (scope/http_annotations.hpp)
 // and read them back with GET /v1/scope/traces[/{id}] (scope/trace_reader.hpp)
 // [--scope-project NAME] [--scope-capture off|digest|full] [--scope-wal PATH].
+// Datasets, evaluators and experiments are served under /v1/scope/
+// (scope/eval_routes.hpp); runs call this server's own OpenAI endpoints
+// (and /v1/systemone for decider evaluators) unless
+// --scope-eval-endpoint URL points them elsewhere.
 // --decider-dir serves POST /v1/systemone with strands-decider-2B (the
 // directory holds Qwen3.5-2B-Base-BF16.gguf and the strands-decider-*.gguf
 // files, as the decider tests expect).
@@ -39,6 +43,8 @@
 #include "scope/c_api.hpp"
 #include "scope/generation_observer.hpp"
 #include "scope/chdb.hpp"
+#include "scope/eval_routes.hpp"
+#include "scope/evals.hpp"
 #include "scope/http_annotations.hpp"
 #include "scope/prompt_routes.hpp"
 #include "scope/trace_reader.hpp"
@@ -67,7 +73,7 @@ class StrandsEngine : public server::DecisionEngine {
 int main(int argc, char** argv) {
   std::string model, device = "hip", host = "127.0.0.1", api_key, model_id = "qwen3.8-flash-next", decider_dir,
                     decider_device = "hip", scope_dir, scope_project = "halo-flash", scope_capture = "digest",
-                    scope_wal;
+                    scope_wal, scope_eval_endpoint;
   int port = 8080;
   std::uint32_t moe_topk = 0;  // --moe-topk N: experts per token (0: the file's count; CODESIGN arm B)
   double ngram_cache_gb = 4.0;  // cache of n-gram rows read from disk, GiB (0: off)
@@ -89,6 +95,7 @@ int main(int argc, char** argv) {
     else if (a == "--scope-project") scope_project = v;
     else if (a == "--scope-capture") scope_capture = v;
     else if (a == "--scope-wal") scope_wal = v;
+    else if (a == "--scope-eval-endpoint") scope_eval_endpoint = v;
     else return std::fprintf(stderr, "unknown option %s\n", a.c_str()), 2;
   }
   if (model.empty()) return std::fprintf(stderr, "usage: halo_serve --model <gguf> [options]\n"), 2;
@@ -126,6 +133,8 @@ int main(int argc, char** argv) {
   std::unique_ptr<scope::MetadataStore> metadata;
   std::unique_ptr<scope::SqliteResponseStore> responses;
   std::unique_ptr<scope::TraceReader> traces;
+  std::unique_ptr<scope::EvalStore> evals;
+  std::unique_ptr<scope::EvalService> eval_service;
   if (!scope_dir.empty()) {
     const auto capture = scope_capture == "off"    ? HALO_SCOPE_CAPTURE_OFF
                          : scope_capture == "full" ? HALO_SCOPE_CAPTURE_FULL
@@ -145,6 +154,14 @@ int main(int argc, char** argv) {
     auto reader_conn = lib ? scope::Conn::Open(*lib, scope_dir + "/chdb", &error) : nullptr;
     if (!reader_conn) return std::fprintf(stderr, "halo-scope reader: %s\n", error.c_str()), 1;
     traces = std::make_unique<scope::TraceReader>(std::move(reader_conn), scope_project);
+    evals = scope::EvalStore::Open(scope_dir + "/metadata.sqlite", &error);
+    if (!evals) return std::fprintf(stderr, "halo-scope evals: %s\n", error.c_str()), 1;
+    scope::EvalRoutesOptions eo;
+    eo.endpoint = scope_eval_endpoint.empty() ? "http://127.0.0.1:" + std::to_string(port) : scope_eval_endpoint;
+    if (!api_key.empty()) eo.headers.emplace_back("Authorization", "Bearer " + api_key);
+    eo.annotator = &scope::AnnotatorOf(scope);
+    eo.traces = traces.get();
+    eval_service = std::make_unique<scope::EvalService>(*evals, eo);
   }
 #else
   if (!scope_dir.empty()) return std::fprintf(stderr, "--scope-dir needs a build with HALO_SCOPE=ON\n"), 2;
@@ -158,6 +175,7 @@ int main(int argc, char** argv) {
     scope::RegisterAnnotationRoutes(http, scope::AnnotatorOf(scope));  // harnesses in other processes
     traces->Register(http);                                            // GET /v1/scope/traces[/{id}]
     scope::RegisterPromptRoutes(http, *metadata);                      // /v1/scope/prompts
+    eval_service->Register(http);  // datasets, evaluators, runs, compare
   }
 #endif
   std::unique_ptr<StrandsEngine> decider;
@@ -176,6 +194,9 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, OnSignal);
   std::signal(SIGTERM, OnSignal);
   while (!g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+#if HALO_WITH_SCOPE
+  if (eval_service) eval_service->Shutdown();  // running experiments stop after their current item
+#endif
   http.Stop();
 #if HALO_WITH_SCOPE
   if (scope) {
