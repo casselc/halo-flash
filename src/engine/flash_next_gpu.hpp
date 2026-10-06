@@ -320,6 +320,19 @@ class FlashNextGpu {
   };
   [[nodiscard]] SessionBytes SessionMemory(SessionId id) const;
 
+  // ---- P5 MTP draft layer (mtp.cpp), measurement stage: no verify path, the trunk's numerics untouched ----
+  /// Uploads the draft block (the `shared-*` sidecar). Its attention cache holds max_context positions.
+  [[nodiscard]] bool LoadMtp(const model::MtpWeights& mtp, std::string* error);
+  /// One draft-block step at MtpPosition() for `token` (the token after the hidden's position): the hidden input
+  /// is the bound session's trunk residual after its last Step (`from_trunk`) or the draft block's own previous
+  /// output (chained drafts), as ReferenceModel::MtpStep. Logits of the drafted next token when non-empty.
+  /// Advances MtpPosition(); MtpRewind(p) moves it back (later steps overwrite the cache rows).
+  [[nodiscard]] bool MtpStep(std::int32_t token, bool from_trunk, std::span<float> logits, std::string* error);
+  void MtpRewind(std::uint32_t position) noexcept { mtp_pos_ = position; }
+  [[nodiscard]] std::uint32_t MtpPosition() const noexcept { return mtp_pos_; }
+  /// The bound session's trunk residual (hc_dim floats) after its last Step.
+  [[nodiscard]] bool TrunkHidden(std::vector<float>* out, std::string* error);
+
   /// One decode step for several sessions at once (P6 batched decode): every weight is read once for the
   /// batch, routed experts grouped across sessions. Each entry's logits / sampled token / state are byte-identical
   /// to a Step / StepSample of that session alone. Sessions must be distinct; 1..kMaxBatch entries; every
@@ -578,6 +591,10 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   /// Points the per-token scratch members at entry b's slices of bb_ and binds its session (recording only).
   void BatchEntryScope(std::uint32_t b, std::span<const SessionId> sessions, bool enter);
   bool skip_attn_proj_ = false;  // Attention(): projections done by the batched caller
+  const model::MtpWeights* mtp_ = nullptr;
+  AttnState mtp_attn_;
+  rt::Buffer mtp_res_, mtp_in_, mtp_hn_, mtp_cat_;
+  std::uint32_t mtp_pos_ = 0;
   std::vector<LinearState> linear_;
   std::vector<AttnState> attn_;
   std::vector<rt::Buffer> owned_;
