@@ -231,6 +231,9 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   } clear{loader_};
   const auto& c = w_.config;
   max_context_ = max_context;
+  kv16_only_ = kv_f16_only_;
+  index_window_ = kv_index_window_;
+  if (const char* v = std::getenv("HALO_KV_INDEX_WINDOW")) index_window_ = v[0] != '0';  // A/B and tests
   if (c.num_experts > 1024 || c.num_experts_used == 0 || c.num_experts_used > c.num_experts) {
     if (error) *error = "halo_router_topk supports 1..1024 experts with 0 < used <= experts";
     return false;
@@ -329,7 +332,9 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   k_ = Scratch(c.AttentionKvDim(), error);
   v_ = Scratch(c.AttentionKvDim(), error);
   ctx_ = Scratch(c.AttentionQDim(), error);
-  scores_ = Scratch(std::size_t{c.num_heads} * max_context, error);
+  // Decode attention scores: a head's row holds the visible positions, at most AttnVisibleStride() (the QSA
+  // budget's positions plus a block), not max_context.
+  scores_ = Scratch(std::size_t{c.num_heads} * AttnVisibleStride(), error);
   iq_ = Scratch(std::size_t{c.indexer_heads} * c.indexer_head_dim, error);
   ik_ = Scratch(c.indexer_head_dim, error);
   pooled_ = Scratch(c.indexer_head_dim, error);
@@ -563,6 +568,14 @@ bool FlashNextGpu::Attention(const model::LayerWeights& l, AttnState& s, std::st
                   {rt::Arg::Buf(cache), rt::Arg::Buf(row), params, rt::Arg::Val(slot), rt::Arg::Val(n), rt::Arg::Val(n)},
                   error);
   };
+  // K / V rows: fp32 (with the fp16 copy filled lazily by prefill), or fp16 only (kv16_only_).
+  const auto append_kv = [&](const rt::Buffer& f32, const rt::Buffer& f16, const rt::Buffer& row, std::uint32_t n) {
+    if (!kv16_only_) return append(f32, row, kHaloPosition, n);
+    return Launch("halo_copy_at_h", {Blocks(n)}, {kBlock},
+                  {rt::Arg::Buf(f16), rt::Arg::Buf(row), params, rt::Arg::Val(kHaloPosition), rt::Arg::Val(n),
+                   rt::Arg::Val(n)},
+                  error);
+  };
   // D2: the indexer's two BF16 projections in one launch (halo_matvec_bf16's sums, batched loads).
   const auto indexer_qk = [&]() {
     const auto& iq = l.indexer_q;
@@ -586,8 +599,8 @@ bool FlashNextGpu::Attention(const model::LayerWeights& l, AttnState& s, std::st
          Launch("halo_split_qgate", {nh}, {kBlock},
                 {rt::Arg::Buf(qg_), rt::Arg::Buf(q_), rt::Arg::Buf(gate_), rt::Arg::Val(hd)}, error) &&
          norm(q_, l.attn_q_norm, nh, hd) && norm(k_, l.attn_k_norm, nkv, hd) && rope(q_, nh, hd, kHaloPosition, 1) &&
-         rope(k_, nkv, hd, kHaloPosition, 1) && append(s.k, k_, kHaloPosition, nkv * hd) &&
-         append(s.v, v_, kHaloPosition, nkv * hd) &&
+         rope(k_, nkv, hd, kHaloPosition, 1) && append_kv(s.k, s.k16, k_, nkv * hd) &&
+         append_kv(s.v, s.v16, v_, nkv * hd) &&
          // QSA indexer: raw keys cached; the block holding this token is
          // pooled, normalized and rotated at its start every step, final
          // once complete (incomplete slots are never scored).
@@ -604,19 +617,22 @@ bool FlashNextGpu::Attention(const model::LayerWeights& l, AttnState& s, std::st
                         idim % 8 == 0
                     ? "halo_qsa_scores_b"
                     : "halo_qsa_scores",
-                {std::min(Blocks(max_blocks), 64u)}, {kBlock},
+                {(decode_opt_ & kDecodeScoresWide) ? Blocks(max_blocks) : std::min(Blocks(max_blocks), 64u)}, {kBlock},
                 {rt::Arg::Buf(iq_), rt::Arg::Buf(s.block_k), rt::Arg::Buf(block_scores_), params,
                  rt::Arg::Val(c.indexer_heads), rt::Arg::Val(idim)},
                 error) &&
-         Launch("halo_qsa_select", {1}, {1024},
+         Launch((decode_opt_ & kDecodeSelect256) ? "halo_qsa_select256" : "halo_qsa_select", {1},
+                {(decode_opt_ & kDecodeSelect256) ? 256u : 1024u},
                 {rt::Arg::Buf(block_scores_), rt::Arg::Buf(visible_), params, rt::Arg::Val(budget), rt::Arg::Val(ratio)},
                 error) &&
-         Launch(decode_attn_batched_ && hd % 32 == 0 && hd <= kBlock && kBlock <= 256 ? "halo_attention_select_b"
-                                                                                    : "halo_attention_select",
+         Launch(decode_attn_batched_ && hd % 32 == 0 && hd <= kBlock && kBlock <= 256
+                    ? (kv16_only_ ? "halo_attention_select_bh" : "halo_attention_select_b")
+                    : (kv16_only_ ? "halo_attention_select_h" : "halo_attention_select"),
                 {nh}, {kBlock},
-                {rt::Arg::Buf(q_), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v), rt::Arg::Buf(gate_), rt::Arg::Buf(visible_),
+                {rt::Arg::Buf(q_), rt::Arg::Buf(kv16_only_ ? s.k16 : s.k), rt::Arg::Buf(kv16_only_ ? s.v16 : s.v),
+                 rt::Arg::Buf(gate_), rt::Arg::Buf(visible_),
                  rt::Arg::Buf(ctx_), rt::Arg::Buf(scores_), params, rt::Arg::Val(nh), rt::Arg::Val(nkv),
-                 rt::Arg::Val(hd), rt::Arg::Val(max_context_)},
+                 rt::Arg::Val(hd), rt::Arg::Val(AttnVisibleStride())},
                 error) &&
          (skip_attn_proj_ || MatVec(l.attn_out, 0, ctx_, block_out_, error));
 }
@@ -863,7 +879,7 @@ bool FlashNextGpu::Run(std::int32_t token, Head head, const SampleRequest* reque
     if (error) *error = position_ >= max_context_ ? "context is full" : "token out of range";
     return false;
   }
-  if (!EnsureKv(position_ + 1, error)) return false;
+  if (!EnsureKv(position_ + 1, position_, error)) return false;
   // Host side of the step: n-gram rows and the step parameters, uploaded
   // together; everything else is device work (captured once, replayed).
   model::NgramHistory history = ngram_history_;
@@ -972,7 +988,10 @@ bool FlashNextGpu::Run(std::int32_t token, Head head, const SampleRequest* reque
     result->rng = out.rng;
   }
   ngram_history_ = history;
-  for (auto& s : attn_) s.blocks = complete;
+  for (auto& s : attn_) {
+    s.blocks = complete;
+    if (kv16_only_) s.valid16 = position_ + 1;  // the step appended its fp16 rows
+  }
   ++position_;
   return true;
 }
@@ -1021,8 +1040,12 @@ bool FlashNextGpu::AllocSeq(SeqState& s, std::string* error) {
   s.linear.assign(c.num_layers, {});
   s.attn.assign(c.num_layers, {});
   const bool paged = dev_.PageBytes() > 0;
-  const auto region = [&](std::size_t row_bytes, std::uint32_t row_tokens, std::size_t capacity_bytes) -> rt::Buffer {
+  std::uint32_t layer = 0;
+  const auto region = [&](KvKind kind, std::size_t row_bytes, std::uint32_t row_tokens,
+                          std::size_t capacity_bytes) -> rt::Buffer {
     KvRegion r;
+    r.kind = kind;
+    r.layer = layer;
     r.row_bytes = row_bytes;
     r.row_tokens = row_tokens;
     r.paged = paged;
@@ -1032,6 +1055,7 @@ bool FlashNextGpu::AllocSeq(SeqState& s, std::string* error) {
     return s.kv.back().va;
   };
   for (std::uint32_t l = 0; l < c.num_layers; ++l) {
+    layer = l;
     if (c.IsLinearLayer(l)) {
       auto& ls = s.linear[l];
       ls.conv = alloc(std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels(), true);
@@ -1040,15 +1064,19 @@ bool FlashNextGpu::AllocSeq(SeqState& s, std::string* error) {
     } else {
       auto& as = s.attn[l];
       const std::size_t kv = c.AttentionKvDim(), idim = c.indexer_head_dim, mc = max_context_;
-      as.k = region(kv * 4, 1, mc * kv * 4);
-      as.v = region(kv * 4, 1, mc * kv * 4);
-      as.index_k = region(idim * 4, 1, mc * idim * 4);
-      as.block_k = region(idim * 4, c.compress_ratio, (mc / c.compress_ratio + 1) * idim * 4);
-      if (!as.k || !as.v || !as.index_k || !as.block_k) return false;
-      if (prefill_kv16_) {
+      // The kind table: fp32 K / V (unless kv16_only_), indexer keys, pooled blocks, fp16 K / V.
+      if (!kv16_only_) {
+        as.k = region(KvKind::kK, kv * 4, 1, mc * kv * 4);
+        as.v = region(KvKind::kV, kv * 4, 1, mc * kv * 4);
+        if (!as.k || !as.v) return false;
+      }
+      as.index_k = region(KvKind::kIndexK, idim * 4, 1, mc * idim * 4);
+      as.block_k = region(KvKind::kBlockK, idim * 4, c.compress_ratio, (mc / c.compress_ratio + 1) * idim * 4);
+      if (!as.index_k || !as.block_k) return false;
+      if (prefill_kv16_ || kv16_only_) {
         const std::size_t halves = mc * kv;
-        as.k16 = region(kv * 2, 1, (halves + 1) / 2 * 4);
-        as.v16 = region(kv * 2, 1, (halves + 1) / 2 * 4);
+        as.k16 = region(KvKind::kK16, kv * 2, 1, (halves + 1) / 2 * 4);
+        as.v16 = region(KvKind::kV16, kv * 2, 1, (halves + 1) / 2 * 4);
         if (!as.k16 || !as.v16) return false;
       }
     }
@@ -1069,7 +1097,8 @@ void FlashNextGpu::FreeSeq(SeqState& s) noexcept {
   for (auto& r : s.kv) {
     if (r.paged) {
       const std::size_t pb = dev_.PageBytes();
-      for (std::size_t j = 0; j < r.pages.size(); ++j) (void)dev_.UnmapPage(r.va, j * pb, nullptr);
+      for (std::size_t j = 0; j < r.pages.size(); ++j)
+        if (r.pages[j]) (void)dev_.UnmapPage(r.va, j * pb, nullptr);
       r.pages.clear();  // the last holder releases each page
       dev_.ReleaseRange(r.va);
     } else {
@@ -1081,19 +1110,31 @@ void FlashNextGpu::FreeSeq(SeqState& s) noexcept {
   s.attn.clear();
 }
 
-bool FlashNextGpu::EnsureKv(std::uint32_t tokens, std::string* error) {
+bool FlashNextGpu::EnsureKv(std::uint32_t tokens, std::uint32_t live, std::string* error) {
   const std::size_t pb = dev_.PageBytes();
   const std::uint64_t want = std::min<std::uint64_t>(std::uint64_t{tokens} + kKvSlackTokens, max_context_);
+  bool synced = false;
   for (auto& r : kv_) {
     if (!r.paged) continue;
     const std::size_t rows = (want + r.row_tokens - 1) / r.row_tokens + 1;  // +1: block_k's incomplete row
     const std::size_t pages = std::min((rows * r.row_bytes + pb - 1) / pb, r.va.bytes / pb);
-    while (r.pages.size() < pages) {
+    // Indexer keys: pages wholly below the live row are released, the others (re)mapped.
+    const std::size_t first = r.kind == KvKind::kIndexK ? std::size_t{IndexLiveRow(live)} * r.row_bytes / pb : 0;
+    for (std::size_t j = 0; j < std::min(first, r.pages.size()); ++j)
+      if (r.pages[j]) {
+        if (!synced && !dev_.Synchronize(error)) return false;  // earlier work may still read the page
+        synced = true;
+        if (!dev_.UnmapPage(r.va, j * pb, error)) return false;
+        r.pages[j].reset();  // the last holder (forks share pages) releases it
+      }
+    for (std::size_t j = first; j < pages; ++j) {
+      if (j < r.pages.size() && r.pages[j]) continue;
       void* h = dev_.CreatePage(error);
       if (!h) return false;
       auto page = std::make_shared<KvPage>(dev_, h);
-      if (!dev_.MapPage(r.va, r.pages.size() * pb, h, error)) return false;
-      r.pages.push_back(std::move(page));
+      if (!dev_.MapPage(r.va, j * pb, h, error)) return false;
+      if (j >= r.pages.size()) r.pages.resize(j + 1);
+      r.pages[j] = std::move(page);
     }
   }
   return true;
@@ -1175,16 +1216,15 @@ bool FlashNextGpu::ForkSession(SessionId src, SessionId* id, std::string* error)
       ok = to->linear[l].conv && to->linear[l].state;
     }
   (void)D;
-  // KV: region by region, in AllocSeq's order (k, v, index_k, block_k[, k16, v16] per attention layer).
+  // KV: region by region, as the source's kind table lists them (AllocSeq's order).
   const std::size_t pb = dev_.PageBytes();
-  std::size_t ri = 0;
-  for (std::uint32_t l = 0; ok && l < c.num_layers; ++l) {
-    if (c.IsLinearLayer(l)) continue;
-    const auto& fa = from.attn[l];
-    auto& ta = to->attn[l];
+  for (std::size_t ri = 0; ok && ri < from.kv.size(); ++ri) {
+    const KvRegion& fr = from.kv[ri];
+    const auto& fa = from.attn[fr.layer];
+    auto& ta = to->attn[fr.layer];
     ta.blocks = fa.blocks;
     ta.valid16 = fa.valid16;
-    const std::size_t nkinds = prefill_kv16_ ? 6 : 4;
+    const auto k = static_cast<std::size_t>(fr.kind);
     rt::Buffer* bufs[6] = {&ta.k, &ta.v, &ta.index_k, &ta.block_k, &ta.k16, &ta.v16};
     // Rows no later step rewrites: positions below the source's position; complete QSA blocks; fp16 rows
     // already converted.
@@ -1193,9 +1233,10 @@ bool FlashNextGpu::ForkSession(SessionId src, SessionId* id, std::string* error)
     // Rows that hold data (copied when not shared): written positions, the incomplete block row.
     const std::uint64_t written[6] = {from.position, from.position, from.position, std::uint64_t{fa.blocks} + 1,
                                       fa.valid16, fa.valid16};
-    for (std::size_t k = 0; ok && k < nkinds; ++k, ++ri) {
-      const KvRegion& fr = from.kv[ri];
+    {
       KvRegion tr;
+      tr.kind = fr.kind;
+      tr.layer = fr.layer;
       tr.row_bytes = fr.row_bytes;
       tr.row_tokens = fr.row_tokens;
       tr.paged = fr.paged;
@@ -1205,7 +1246,7 @@ bool FlashNextGpu::ForkSession(SessionId src, SessionId* id, std::string* error)
         const std::size_t shared = immut[k] * fr.row_bytes / pb;  // whole pages below the immutable bound
         for (std::size_t j = 0; ok && j < fr.pages.size(); ++j) {
           if (j < shared) {
-            ok = dev_.MapPage(tr.va, j * pb, fr.pages[j]->handle, error);
+            if (fr.pages[j]) ok = dev_.MapPage(tr.va, j * pb, fr.pages[j]->handle, error);  // null: released
             if (ok) tr.pages.push_back(fr.pages[j]);
           } else {
             void* h = dev_.CreatePage(error);
@@ -1257,6 +1298,7 @@ FlashNextGpu::SessionBytes FlashNextGpu::SessionMemory(SessionId id) const {
       continue;
     }
     for (const auto& p : r.pages) {
+      if (!p) continue;  // released
       b.kv_mapped += pb;
       if (p.use_count() == 1) b.kv_exclusive += pb;
     }
@@ -1278,18 +1320,23 @@ template <typename F>
 bool FlashNextGpu::ForEachState(F&& f) {
   const auto& c = w_.config;
   const std::size_t pos = position_;
+  // Each state buffer with the float range [offset, offset + n) that holds live data.
   for (std::uint32_t l = 0; l < c.num_layers; ++l) {
     if (c.IsLinearLayer(l)) {
       auto& s = linear_[l];
-      if (!f(s.conv, s.conv.bytes / 4) || !f(s.state, s.state.bytes / 4)) return false;
+      if (!f(s.conv, 0, s.conv.bytes / 4) || !f(s.state, 0, s.state.bytes / 4)) return false;
     } else {
       auto& s = attn_[l];
-      if (!f(s.k, pos * c.AttentionKvDim()) || !f(s.v, pos * c.AttentionKvDim()) ||
-          !f(s.index_k, pos * c.indexer_head_dim) || !f(s.block_k, std::size_t{s.blocks} * c.indexer_head_dim))
+      // fp16-only K / V: pos rows of fp16 pairs (kv dim even), counted in floats. Indexer keys: the live window.
+      const std::size_t live = IndexLiveRow(position_);
+      if ((kv16_only_ ? !f(s.k16, 0, (pos * c.AttentionKvDim() + 1) / 2) || !f(s.v16, 0, (pos * c.AttentionKvDim() + 1) / 2)
+                      : !f(s.k, 0, pos * c.AttentionKvDim()) || !f(s.v, 0, pos * c.AttentionKvDim())) ||
+          !f(s.index_k, live * c.indexer_head_dim, (pos - live) * c.indexer_head_dim) ||
+          !f(s.block_k, 0, std::size_t{s.blocks} * c.indexer_head_dim))
         return false;
     }
   }
-  return f(ple_history_, ple_history_.bytes / 4);
+  return f(ple_history_, 0, ple_history_.bytes / 4);
 }
 
 bool FlashNextGpu::CopyFloats(const rt::Buffer& dst, const rt::Buffer& src, std::size_t n, std::string* error) {
@@ -1297,20 +1344,25 @@ bool FlashNextGpu::CopyFloats(const rt::Buffer& dst, const rt::Buffer& src, std:
                           {rt::Arg::Buf(dst), rt::Arg::Buf(src), rt::Arg::Val(static_cast<std::uint32_t>(n))}, error);
 }
 
-std::unique_ptr<FlashNextGpu::Snapshot> FlashNextGpu::NewSnapshot(std::string* error) {
-  auto snap = std::unique_ptr<Snapshot>(new Snapshot(dev_));
-  const bool ok = ForEachState([&](const rt::Buffer& live, std::size_t) {
-    rt::Buffer b = dev_.Alloc(live.bytes, error);
-    if (!b) return false;
-    snap->buffers_.push_back(b);
-    return true;
-  });
-  return ok ? std::move(snap) : nullptr;
+std::unique_ptr<FlashNextGpu::Snapshot> FlashNextGpu::NewSnapshot(std::string*) {
+  // Buffers are sized by Save to what the state holds then (not the KV capacity at max_context).
+  return std::unique_ptr<Snapshot>(new Snapshot(dev_));
 }
 
 bool FlashNextGpu::Save(Snapshot& snap, std::string* error) {
   std::size_t i = 0;
-  if (!ForEachState([&](const rt::Buffer& live, std::size_t n) { return CopyFloats(snap.buffers_[i++], live, n, error); }))
+  snap.valid_ = false;
+  if (!ForEachState([&](const rt::Buffer& live, std::size_t off, std::size_t n) {
+        if (snap.buffers_.size() <= i) snap.buffers_.emplace_back();
+        rt::Buffer& b = snap.buffers_[i++];
+        if (b.bytes < std::max<std::size_t>(n, 1) * 4) {  // grown on demand
+          if (!dev_.Synchronize(error)) return false;
+          dev_.Free(b);
+          b = dev_.Alloc(std::max<std::size_t>(n, 1) * 4, error);
+          if (!b) return false;
+        }
+        return CopyFloats(b, rt::Buffer{static_cast<char*>(live.device) + off * 4, n * 4, nullptr}, n, error);
+      }))
     return false;
   snap.blocks_.clear();
   for (const auto& s : attn_) snap.blocks_.push_back(s.blocks);
@@ -1325,16 +1377,19 @@ bool FlashNextGpu::Restore(const Snapshot& snap, std::string* error) {
     if (error) *error = "snapshot is empty or from another device";
     return false;
   }
-  if (!EnsureKv(snap.position_, error)) return false;
+  if (!EnsureKv(snap.position_, snap.position_, error)) return false;
   // Counts first: ForEachState sizes the KV copies from the restored position.
   position_ = snap.position_;
   for (std::size_t l = 0; l < attn_.size(); ++l) {
     attn_[l].blocks = snap.blocks_[l];
-    attn_[l].valid16 = 0;  // the restored K/V may differ anywhere
+    attn_[l].valid16 = kv16_only_ ? position_ : 0;  // fp32 K/V: the restored rows may differ anywhere
   }
   ngram_history_ = snap.ngram_history_;
   std::size_t i = 0;
-  return ForEachState([&](const rt::Buffer& live, std::size_t n) { return CopyFloats(live, snap.buffers_[i++], n, error); }) &&
+  return ForEachState([&](const rt::Buffer& live, std::size_t off, std::size_t n) {
+           return CopyFloats(rt::Buffer{static_cast<char*>(live.device) + off * 4, n * 4, nullptr}, snap.buffers_[i++],
+                             n, error);
+         }) &&
          dev_.Synchronize(error);
 }
 

@@ -7,6 +7,7 @@
 
 #include <hegel/gtest.h>
 
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -96,16 +97,26 @@ TEST(Sessions, SwarmMatchesFreshReplay) {
   hegel::test([&](hegel::TestCase& tc) {
     auto& dev = *devices[tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = devices.size() - 1}))];
     std::string error;
+    // Both KV kind tables: fp32 K/V with the lazy fp16 copy, and fp16-only K/V (stream C); engine and oracle alike.
+    struct Kv16 {
+      bool saved = engine::FlashNextGpu::kv_f16_only_;
+      ~Kv16() { engine::FlashNextGpu::kv_f16_only_ = saved; }
+    } kv16_guard;
+    engine::FlashNextGpu::kv_f16_only_ = tc.draw(gs::booleans());
     auto gpu = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
     ASSERT_TRUE(gpu) << error;
     auto oracle = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
     ASSERT_TRUE(oracle) << error;
     gpu->SetUseGraphs(tc.draw(gs::booleans()));
+    // One snapshot slot: Save copies the bound session's state, Restore puts it back into whichever is bound.
+    auto snap = gpu->NewSnapshot(&error);
+    ASSERT_TRUE(snap) << error;
+    std::optional<std::vector<Op>> snap_hist;
     std::map<engine::FlashNextGpu::SessionId, std::vector<Op>> hist;  // live sessions and their histories
     hist[0] = {};
     std::map<engine::FlashNextGpu::SessionId, std::uint32_t> pos;
     pos[0] = 0;
-    enum Kind { kStep, kPrefill, kNew, kFork, kBind, kDrop, kReset, kToggleGraphs, kBatch, kKinds };
+    enum Kind { kStep, kPrefill, kNew, kFork, kBind, kDrop, kReset, kToggleGraphs, kBatch, kSave, kRestore, kKinds };
     bool enabled[kKinds];
     for (bool& e : enabled) e = tc.draw(gs::booleans());  // swarm: each run uses a random subset of rules
     enabled[kStep] = true;
@@ -192,6 +203,29 @@ TEST(Sessions, SwarmMatchesFreshReplay) {
         case kToggleGraphs:
           gpu->SetUseGraphs(tc.draw(gs::booleans()));
           break;
+        case kSave:
+          ASSERT_TRUE(gpu->Save(*snap, &error)) << error;
+          snap_hist = hist[cur];
+          break;
+        case kRestore: {
+          if (!snap_hist) {
+            ASSERT_FALSE(gpu->Restore(*snap, &error));  // never saved
+            break;
+          }
+          ASSERT_TRUE(gpu->Restore(*snap, &error)) << error;
+          hist[cur] = *snap_hist;
+          pos[cur] = 0;
+          for (const auto& op : hist[cur]) pos[cur] += static_cast<std::uint32_t>(op.tokens.size());
+          ASSERT_EQ(gpu->Position(), pos[cur]);
+          if (pos[cur] < kMaxContext) {  // the restored state steps like its replay
+            const auto t = token();
+            ASSERT_TRUE(gpu->Step(t, got, &error)) << error;
+            hist[cur].push_back({false, {t}});
+            ++pos[cur];
+            check("step after restore");
+          }
+          break;
+        }
         case kBatch: {  // one StepBatch over a random subset of the live sessions, in random order
           std::vector<engine::FlashNextGpu::SessionId> ids;
           for (auto& [id, _] : hist)
@@ -350,4 +384,109 @@ TEST(Sessions, BatchedStepsEqualSingleSteps) {
         ASSERT_TRUE(solo->BindSession(0, &error) && solo->DropSession(sids[b], &error)) << error;
       }
     }
+}
+
+// Stream C: with fp16-only KV the prefill reads the same fp16 K/V rows as with the fp32 store and its lazy fp16
+// copy (the flash and QSA-union kernels read only those), so prefill logits are bitwise equal to the default
+// kind table's, at every length and chunking, across the dense range and past the QSA budget. Decode reads fp16
+// rows instead of fp32 ones: a precision change (docs/BENCHMARKS.md quality gate), not checked for equality here.
+TEST(Sessions, Fp16OnlyKvPrefillEqualsDefault) {
+  Small* s = LoadSmall();
+  if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  auto devices = Devices();
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  const auto& c = s->weights->config;
+  const std::size_t V = c.vocab_size;
+  constexpr std::uint32_t kMaxContext = 1024;
+  struct Kv16 {
+    bool saved = engine::FlashNextGpu::kv_f16_only_;
+    ~Kv16() { engine::FlashNextGpu::kv_f16_only_ = saved; }
+  } kv16_guard;
+  std::string error;
+  auto& dev = *devices[0];
+  engine::FlashNextGpu::kv_f16_only_ = false;
+  auto base = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+  ASSERT_TRUE(base) << error;
+  engine::FlashNextGpu::kv_f16_only_ = true;
+  auto f16 = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+  ASSERT_TRUE(f16) << error;
+  // fp16-only sessions hold no fp32 K/V: fewer KV bytes for the same positions.
+  hegel::test([&](hegel::TestCase& tc) {
+    std::vector<std::vector<std::int32_t>> chunks(tc.draw(gs::integers<int>({.min_value = 1, .max_value = 4})));
+    std::uint32_t total = 0;
+    for (auto& ch : chunks) {
+      ch.resize(tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 250})));
+      for (auto& t : ch)
+        t = tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = static_cast<std::int32_t>(V - 1)}));
+      total += static_cast<std::uint32_t>(ch.size());
+    }
+    ASSERT_TRUE(base->Reset(&error) && f16->Reset(&error)) << error;
+    std::vector<float> a(V), b(V);
+    for (const auto& ch : chunks) {
+      ASSERT_TRUE(base->Prefill(ch, a, &error)) << error;
+      ASSERT_TRUE(f16->Prefill(ch, b, &error)) << error;
+      ASSERT_EQ(std::memcmp(a.data(), b.data(), V * 4), 0) << "prefill logits differ at position " << f16->Position();
+    }
+    const auto mb = base->SessionMemory(0), mf = f16->SessionMemory(0);
+    ASSERT_LT(mf.kv_mapped, mb.kv_mapped) << total << " positions";
+    // A decode step after the prefill reads fp16 K/V: close to the fp32 store's, not required equal.
+    ASSERT_TRUE(base->Step(chunks[0][0], a, &error) && f16->Step(chunks[0][0], b, &error)) << error;
+    double num = 0, den = 0;
+    for (std::size_t i = 0; i < V; ++i) {
+      num += (double(a[i]) - b[i]) * (double(a[i]) - b[i]);
+      den += double(a[i]) * a[i];
+    }
+    ASSERT_LT(std::sqrt(num / den), 1e-2) << "decode after " << total << " positions";
+  }, {.test_cases = 40});
+}
+
+// Stream C: a snapshot taken mid-block restored into another session that has moved past it (its indexer-key
+// pages below its own block released, its raw rows different), then stepped across block boundaries: equal to a
+// fresh replay. The restore must remap the released window and bring back the incomplete block's raw rows.
+TEST(Sessions, SnapshotRestoresIntoAnotherSessionMidBlock) {
+  Small* s = LoadSmall();
+  if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  auto devices = Devices();
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  const auto& c = s->weights->config;
+  const std::size_t V = c.vocab_size;
+  constexpr std::uint32_t kMaxContext = 512;
+  struct Kv16 {
+    bool saved = engine::FlashNextGpu::kv_f16_only_;
+    ~Kv16() { engine::FlashNextGpu::kv_f16_only_ = saved; }
+  } kv16_guard;
+  hegel::test([&](hegel::TestCase& tc) {
+    auto& dev = *devices[0];
+    std::string error;
+    engine::FlashNextGpu::kv_f16_only_ = tc.draw(gs::booleans());
+    auto gpu = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+    ASSERT_TRUE(gpu) << error;
+    auto oracle = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+    ASSERT_TRUE(oracle) << error;
+    const auto token = [&] {
+      return tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = static_cast<std::int32_t>(V - 1)}));
+    };
+    const auto n = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 200}));
+    const auto m = tc.draw(gs::integers<std::uint32_t>({.min_value = n, .max_value = 400}));
+    std::vector<std::int32_t> a(n), b(m), tail(tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 12})));
+    for (auto& t : a) t = token();
+    for (auto& t : b) t = token();
+    for (auto& t : tail) t = token();
+    // Session 0: a, saved. Session 1: b (further on), then the snapshot of a restored into it.
+    ASSERT_TRUE(gpu->Prefill(a, {}, &error)) << error;
+    auto snap = gpu->NewSnapshot(&error);
+    ASSERT_TRUE(snap && gpu->Save(*snap, &error)) << error;
+    engine::FlashNextGpu::SessionId other;
+    ASSERT_TRUE(gpu->NewSession(&other, &error) && gpu->BindSession(other, &error)) << error;
+    ASSERT_TRUE(gpu->Prefill(b, {}, &error)) << error;
+    ASSERT_TRUE(gpu->Restore(*snap, &error)) << error;
+    ASSERT_EQ(gpu->Position(), n);
+    ASSERT_TRUE(oracle->Prefill(a, {}, &error)) << error;
+    std::vector<float> got(V), want(V);
+    for (std::size_t j = 0; j < tail.size(); ++j) {
+      ASSERT_TRUE(gpu->Step(tail[j], got, &error) && oracle->Step(tail[j], want, &error)) << error;
+      ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0) << "step " << j << " after restoring position " << n
+                                                                << " into a session at " << m;
+    }
+  }, {.test_cases = 40});
 }

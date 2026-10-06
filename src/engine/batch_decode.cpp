@@ -437,7 +437,7 @@ bool FlashNextGpu::StepBatch(std::span<const BatchEntry> entries, std::string* e
   std::size_t upload = 0;
   for (std::uint32_t i = 0; i < B; ++i) {
     const auto& e = entries[i];
-    if (!BindSession(e.session, error) || !EnsureKv(position_ + 1, error)) {
+    if (!BindSession(e.session, error) || !EnsureKv(position_ + 1, position_, error)) {
       (void)BindSession(bound, nullptr);
       return false;
     }
@@ -560,7 +560,10 @@ bool FlashNextGpu::StepBatch(std::span<const BatchEntry> entries, std::string* e
     if (!BindSession(entries[i].session, error)) return false;
     ngram_history_ = hist[i];  // advanced by the row hashing above
     const std::uint32_t complete = (pos[i] + 1) / ratio;
-    for (auto& s : attn_) s.blocks = complete;
+    for (auto& s : attn_) {
+      s.blocks = complete;
+      if (kv16_only_) s.valid16 = pos[i] + 1;  // the step appended its fp16 rows
+    }
     position_ = pos[i] + 1;
   }
   return BindSession(bound, error);

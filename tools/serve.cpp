@@ -1,6 +1,6 @@
 // halo_serve: the OpenAI-compatible server on Flash-Next.
 //   halo_serve --model <shard-00001.gguf> [--host 127.0.0.1] [--port 8080]
-//              [--device hip|hrx] [--max-context 32768] [--api-key KEY]
+//              [--device hip|hrx] [--max-context 32768] [--kv-f16 0|1] [--api-key KEY]
 //              [--model-id NAME] [--decider-dir DIR [--decider-device hip|hrx|cpu]]
 // With halo-scope built in (HALO_SCOPE=ON): --scope-dir DIR records every
 // generation as a GENERATION observation in DIR/chdb and keeps stored
@@ -99,6 +99,7 @@ int main(int argc, char** argv) {
     else if (a == "--port") port = std::atoi(v.c_str());
     else if (a == "--max-context") max_context = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--ngram-cache-gb") ngram_cache_gb = std::atof(v.c_str());
+    else if (a == "--kv-f16") engine::FlashNextGpu::kv_f16_only_ = v == "1";  // fp16-only KV (docs/SESSIONS.md)
     else if (a == "--moe-topk") moe_topk = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--api-key") api_key = v;
     else if (a == "--model-id") model_id = v;
@@ -135,6 +136,9 @@ int main(int argc, char** argv) {
     tok = text::Tokenizer::FromGguf(*reader, &error);
     if (!weights || !tok) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
     if (moe_topk && !weights->SetExpertsUsed(moe_topk, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 2;
+    if (weights->config.context_length > 0 && max_context > weights->config.context_length)
+      return std::fprintf(stderr, "--max-context %u exceeds the model's context length %u\n", max_context,
+                          weights->config.context_length), 2;
     const auto& t = weights->ple_table;
     ngram = model::NgramTable::Open(reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset, t.rows,
                                     weights->config.ple_head_dim, t.type, &error,

@@ -78,10 +78,17 @@ class FlashNextGpu {
     kDecodeHoistSmall = 131072u,    ///< norm scales, combines, the mixers' prologues: loop loads issued first
     kDecodeGdnNoSpill = 262144u,    ///< DeltaNet step reads its state column twice instead of spilling it
     kDecodeTopkWarp = 524288u,      ///< router top-k by warp shuffles (halo_router_topk_w)
+    /// Stream C: QSA selection on one 256-thread block (halo_qsa_select256: the prefill's wave-digit radix
+    /// select and ballot compaction, same lists) instead of the 1024-thread kernel's serial digit walk and
+    /// Hillis-Steele scans (20 barriers per 1024 blocks: grows with the context).
+    kDecodeSelect256 = 8388608u,
+    /// Stream C, not kept: QSA block scores on one thread per block of the whole context (grid ceil(max_blocks /
+    /// 256)) instead of at most 64 x 256 threads looping over the blocks. 327 -> 439 us a call at 256K (slower).
+    kDecodeScoresWide = 16777216u,
   };
   static inline unsigned decode_opt_ = kDecodeQ5kExperts | kDecodeIndexerDual | kDecodeHcMixLds | kDecodeQsaScores |
                                        kDecodeShexpCombine | kDecodeSplitGraph | kDecodeQ8ActOnce | kDecodeHoistRowLoads |
-                                       kDecodeHoistSmall | kDecodeGdnNoSpill | kDecodeTopkWarp;
+                                       kDecodeHoistSmall | kDecodeGdnNoSpill | kDecodeTopkWarp | kDecodeSelect256;
   static inline bool small_row_kernels_ = true;  ///< P3 block-per-row F32 matvec for few rows
   /// P3 expert gate+up with int8 activations (llama.cpp-style Q8_1); false
   /// keeps the float kernel. A quality-gated choice (docs/BENCHMARKS.md).
@@ -176,6 +183,15 @@ class FlashNextGpu {
   /// The chunked QSA attention reads an fp16 copy of the K/V cache (same
   /// results; ~24.6 KB more per cached token).
   static inline bool prefill_kv16_ = true;
+  /// Stream C (precision option, default off): the fp16 K/V rows are the only K/V store. No fp32 K/V is kept
+  /// (48 KB a token less: ~32 KB instead of ~81 KB with today's indexer keys); decode attention reads fp16 rows
+  /// (halo_attention_select_bh), prefill appends fp16 rows directly and reads them as it does with prefill_kv16_.
+  /// Read at Create (it decides the sessions' KV kinds).
+  static inline bool kv_f16_only_ = false;
+  /// Stream C (exact): raw indexer keys are read only while their QSA block is incomplete (pooling), so pages of
+  /// them wholly below the current block are released (paged KV): 6.1 KB a token less (~1.6 GB at 262K).
+  /// Snapshots keep the live rows only. Read at Create.
+  static inline bool kv_index_window_ = true;
   /// QSA block scores of a chunk as one bf16x3 WMMA GEMM (near-fp32).
   static inline bool prefill_scores_wmma_ = true;
   /// Past the QSA budget, attention for 4 tokens at a time over the union of
@@ -360,11 +376,15 @@ class FlashNextGpu {
   /// mapped on demand and shared between forks (rt::Device paging), or one allocation at full capacity when the
   /// backend cannot map pages. `row_bytes` per `row_tokens` positions (block_k: one row per compress_ratio).
   struct KvPage;
+  /// What a KV region holds (the kind table of a session; docs/SESSIONS.md).
+  enum class KvKind : std::uint8_t { kK, kV, kIndexK, kBlockK, kK16, kV16 };
   struct KvRegion {
+    KvKind kind = KvKind::kK;
+    std::uint32_t layer = 0;
     rt::Buffer va;  // device address range of the whole capacity
     std::size_t row_bytes = 0;
     std::uint32_t row_tokens = 1;
-    std::vector<std::shared_ptr<KvPage>> pages;  // mapped pages, from offset 0 (paged mode)
+    std::vector<std::shared_ptr<KvPage>> pages;  // mapped pages, from offset 0 (paged mode); null: released
     bool paged = false;
   };
   struct AttnState {
@@ -423,10 +443,13 @@ class FlashNextGpu {
     rt::Buffer gdnprep;                              // chunked DeltaNet: per (head, 16-token chunk) halo_gdn_c16_prep
     std::size_t params_offset = 0;  // in `host`: per-token step params after the n-gram rows
     std::uint32_t cap = 0;  // tokens the buffers hold
+    std::uint32_t bstride = 0;  // bscores row stride (QSA blocks): grown with the position, not max_context
   };
   static constexpr std::uint32_t kAttnSub = 512;
   std::uint32_t AttnVisibleStride() const;
   ChunkBuffers ck_;
+  /// Grows ck_.bscores so a row holds `blocks` block scores (stream C: sized by the position reached).
+  bool GrowBlockScores(std::uint32_t blocks, std::string* error);
   bool ck_ready_ = false;
   std::vector<std::uint8_t> ck_host_;
   bool ChunkSupported() const;
@@ -495,6 +518,12 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   const model::ModelWeights& w_;
   model::NgramTable* ngram_;
   std::uint32_t max_context_ = 0, position_ = 0;
+  bool kv16_only_ = false;  // kv_f16_only_ at Create
+  bool index_window_ = false;  // kv_index_window_ at Create
+  /// First raw indexer-key row any later step or chunk reads at `position` (its QSA block's start).
+  std::uint32_t IndexLiveRow(std::uint32_t position) const {
+    return index_window_ ? position / w_.config.compress_ratio * w_.config.compress_ratio : 0;
+  }
   bool use_graphs_ = true;
   void Stamp(const std::string& key);  // after a kernel, while timing
   bool timing_ = false;
@@ -550,8 +579,9 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   void SwapBound(SeqState& s) noexcept;
   bool AllocSeq(SeqState& s, std::string* error);
   void FreeSeq(SeqState& s) noexcept;
-  /// Maps KV pages so the bound session can hold `tokens` positions.
-  bool EnsureKv(std::uint32_t tokens, std::string* error);
+  /// Maps KV pages so the bound session can hold `tokens` positions, read from `live` on (indexer-key pages wholly
+  /// below IndexLiveRow(live) are released, those at or above it mapped).
+  bool EnsureKv(std::uint32_t tokens, std::uint32_t live, std::string* error);
   // ---- P6 batched decode (batch_decode.cpp) ----
   struct BatchBuffers {
     rt::Buffer res, xn, mixed, block_out, embd, inject, scale, lo_part, inject_part;

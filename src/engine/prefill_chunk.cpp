@@ -48,6 +48,18 @@ std::string Rk(const char* base, int res16) {
 int Res16() { return FlashNextGpu::prefill_exact_projections_ ? 0 : FlashNextGpu::prefill_res16_; }
 }  // namespace
 
+bool FlashNextGpu::GrowBlockScores(std::uint32_t blocks, std::string* error) {
+  if (blocks <= ck_.bstride) return true;
+  const std::uint32_t max_blocks = max_context_ / w_.config.compress_ratio + 1;
+  const std::uint32_t want = std::min(max_blocks, std::max(blocks, ck_.bstride * 2));
+  if (!dev_.Synchronize(error)) return false;  // the old rows may still be read
+  std::erase_if(owned_, [&](const rt::Buffer& o) { return o.device == ck_.bscores.device; });
+  dev_.Free(ck_.bscores);
+  ck_.bscores = Scratch(std::size_t{std::min<std::uint32_t>(ck_.cap, kAttnSub)} * want, error);
+  ck_.bstride = want;
+  return static_cast<bool>(ck_.bscores);
+}
+
 void FlashNextGpu::FreeChunk() {
   auto& k = ck_;
   std::vector<rt::Buffer*> bufs = {&k.res, &k.xn, &k.lo, &k.gate, &k.mixed, &k.inject, &k.block_out, &k.embd, &k.xq,
@@ -132,7 +144,10 @@ bool FlashNextGpu::AllocChunk(std::uint32_t tokens, std::string* error) {
   k.ml = f(T * H / 2 + 1);  // the mixer's lo in fp16 when xh still holds xn (prefill_mix_h16_)
   k.pb = f(T * D);
   const std::size_t sub = std::min<std::size_t>(T, kAttnSub);
-  k.bscores = f(sub * (max_context_ / c.compress_ratio + 1));
+  // Block scores: a row per token of a sub-chunk, max_context / ratio + 1 wide at most; allocated for the
+  // first 16K blocks (64K positions) and grown with the position (GrowBlockScores).
+  k.bstride = std::min<std::uint32_t>(max_context_ / c.compress_ratio + 1, 16384);
+  k.bscores = f(sub * k.bstride);
   k.vis = f(sub * AttnVisibleStride());
   k.ascores = f(sub * c.num_heads * AttnVisibleStride());
   {
@@ -647,7 +662,7 @@ bool FlashNextGpu::AttentionChunk(const model::LayerWeights& l, AttnState& s, st
     const std::uint32_t budget_ = c.indexer_top_k / c.compress_ratio;
     const bool wmma_ = prefill_wmma_attention_ && hd == 256 && nh % c.num_kv_heads == 0 && nh / c.num_kv_heads <= 16;
     gate_in_qg_ = q_roped_ && prefill_gate_in_place_ && prefill_f16_out_ && F16Route(l.attn_out) && wmma_ &&
-                  prefill_mq_attention_ && prefill_fa_attention_ && prefill_kv16_ && s.k16 &&
+                  prefill_mq_attention_ && prefill_fa_attention_ && (prefill_kv16_ || kv16_only_) && s.k16 &&
                   (position_ + T) / c.compress_ratio <= budget_;
   }
   // k (with its cache append) and the indexer q: norm and rope in one pass each.
@@ -674,7 +689,8 @@ bool FlashNextGpu::AttentionChunk(const model::LayerWeights& l, AttnState& s, st
                           {rt::Arg::Buf(ck_.qg), rt::Arg::Buf(ck_.q), rt::Arg::Buf(ck_.gate_a), rt::Arg::Val(hd)},
                           error) &&
                        norm(ck_.q, l.attn_q_norm, T * nh, hd)) ||
-      !(kq_roped_ ? NormRope(ck_.k, l.attn_k_norm, nkv, hd, T, &s.k) : norm(ck_.k, l.attn_k_norm, T * nkv, hd)) ||
+      !(kq_roped_ ? NormRope(ck_.k, l.attn_k_norm, nkv, hd, T, kv16_only_ ? nullptr : &s.k)
+                  : norm(ck_.k, l.attn_k_norm, T * nkv, hd)) ||
       !(kq_roped_ ? NormRope(ck_.iq, l.indexer_q_norm, ih, idim, T, nullptr) : norm(ck_.iq, l.indexer_q_norm, T * ih, idim)))
     return false;
   if (prefill_batched_attention_) return AttentionBatched(l, s, T, error);
@@ -696,8 +712,15 @@ bool FlashNextGpu::AttentionChunk(const model::LayerWeights& l, AttnState& s, st
                      rt::Arg::Val(n)},
                     error);
     };
+    const auto append_kv = [&](const rt::Buffer& f32, const rt::Buffer& f16, const rt::Buffer& row, std::size_t off) {
+      if (!kv16_only_) return append(f32, row, off, kHaloPosition, kvdim);
+      return Launch("halo_copy_at_h", {Blocks(kvdim)}, {kBlock},
+                    {rt::Arg::Buf(f16), rt::Arg::Buf(row, off), params, rt::Arg::Val(kHaloPosition),
+                     rt::Arg::Val(kvdim), rt::Arg::Val(kvdim)},
+                    error);
+    };
     if (!rope(ck_.q, qo, nh, hd, kHaloPosition, 1) || !rope(ck_.k, ko, nkv, hd, kHaloPosition, 1) ||
-        !append(s.k, ck_.k, ko, kHaloPosition, kvdim) || !append(s.v, ck_.v, ko, kHaloPosition, kvdim) ||
+        !append_kv(s.k, s.k16, ck_.k, ko) || !append_kv(s.v, s.v16, ck_.v, ko) ||
         !append(s.index_k, ck_.ik, iko, kHaloPosition, idim) || !rope(ck_.iq, io, ih, idim, kHaloPosition, 1) ||
         !Launch("halo_pool_block", {1}, {128},
                 {rt::Arg::Buf(s.index_k), rt::Arg::Buf(pooled_), params, rt::Arg::Val(ratio), rt::Arg::Val(idim)},
@@ -711,10 +734,11 @@ bool FlashNextGpu::AttentionChunk(const model::LayerWeights& l, AttnState& s, st
         !Launch("halo_qsa_select", {1}, {1024},
                 {rt::Arg::Buf(block_scores_), rt::Arg::Buf(visible_), params, rt::Arg::Val(budget), rt::Arg::Val(ratio)},
                 error) ||
-        !Launch("halo_attention_select", {nh}, {kBlock},
-                {rt::Arg::Buf(ck_.q, qo), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v), rt::Arg::Buf(ck_.gate_a, qo),
+        !Launch(kv16_only_ ? "halo_attention_select_h" : "halo_attention_select", {nh}, {kBlock},
+                {rt::Arg::Buf(ck_.q, qo), rt::Arg::Buf(kv16_only_ ? s.k16 : s.k), rt::Arg::Buf(kv16_only_ ? s.v16 : s.v),
+                 rt::Arg::Buf(ck_.gate_a, qo),
                  rt::Arg::Buf(visible_), rt::Arg::Buf(ck_.ctx, qo), rt::Arg::Buf(scores_), params, rt::Arg::Val(nh),
-                 rt::Arg::Val(nkv), rt::Arg::Val(hd), rt::Arg::Val(max_context_)},
+                 rt::Arg::Val(nkv), rt::Arg::Val(hd), rt::Arg::Val(AttnVisibleStride())},
                 error))
       return false;
   }
@@ -743,6 +767,9 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   const std::uint32_t max_blocks = max_context_ / ratio + 1, vstride = AttnVisibleStride();
   const std::uint32_t pos0 = position_;
   const bool wmma = prefill_wmma_attention_ && hd == 256 && nh % nkv == 0 && nh / nkv <= 16;
+  // Block-score rows wide enough for this chunk's last token (+1: union4's bitmaps hold n_kv / ratio + 1 bits).
+  if (pos0 + T > budget * ratio && !GrowBlockScores((pos0 + T) / ratio + 1, error)) return false;
+  const std::uint32_t bstride = ck_.bstride;
   const auto rope = [&](const rt::Buffer& x, std::uint32_t heads, std::uint32_t dim) {
     return Launch("halo_rope_neox_rows", {T * heads}, {64},
                   {rt::Arg::Buf(x), rt::Arg::Val(dim), rt::Arg::Val(c.rotary_dim), rt::Arg::Val(pos0),
@@ -754,9 +781,19 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
                   {rt::Arg::Buf(cache, std::size_t{pos0} * n * 4), rt::Arg::Buf(rows), rt::Arg::Val(T * n)}, error);
   };
   const std::uint32_t b0 = pos0 / ratio, nb = (pos0 + T - 1) / ratio - b0 + 1;
+  // fp16-only KV: the chunk's K / V rows converted straight into the fp16 cache (halo_f16_rows, the rounding
+  // kv16_current applies to fp32 rows).
+  const auto append16 = [&](const rt::Buffer& cache16, const rt::Buffer& rows) {
+    const std::size_t nv = std::size_t{T} * kvdim;
+    return Launch("halo_f16_rows", {static_cast<std::uint32_t>((nv + 255) / 256)}, {kBlock},
+                  {rt::Arg::Buf(rows), rt::Arg::Buf(cache16, std::size_t{pos0} * kvdim * 2),
+                   rt::Arg::Val(static_cast<std::uint32_t>(nv))},
+                  error);
+  };
   if ((!q_roped_ && !rope(ck_.q, nh, hd)) || (!kq_roped_ && (!rope(ck_.k, nkv, hd) || !rope(ck_.iq, ih, idim) ||
-                                                              !append(s.k, ck_.k, kvdim))) ||
-      !append(s.v, ck_.v, kvdim) || !append(s.index_k, ck_.ik, idim) ||
+                                                              (!kv16_only_ && !append(s.k, ck_.k, kvdim)))) ||
+      (kv16_only_ ? !append16(s.k16, ck_.k) || !append16(s.v16, ck_.v) : !append(s.v, ck_.v, kvdim)) ||
+      !append(s.index_k, ck_.ik, idim) ||
       !Launch("halo_pool_blocks", {nb}, {128},
               {rt::Arg::Buf(s.index_k), rt::Arg::Buf(s.block_k), rt::Arg::Val(b0), rt::Arg::Val(ratio),
                rt::Arg::Val(idim)},
@@ -775,6 +812,8 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   // selected nothing away yet): 4 tokens per block share K/V, and the QSA
   // scores and selection are not needed.
   const std::uint32_t G = nh / nkv;
+  if (kv16_only_) s.valid16 = pos0 + T;  // appended above
+  const bool have16 = (prefill_kv16_ || kv16_only_) && s.k16;
   // The fp16 K/V copy: convert what is not current yet (this chunk, and
   // anything decode wrote since); the flash and QSA kernels read it.
   const auto kv16_current = [&] {
@@ -790,8 +829,7 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   };
   // Dense causal, flash style: 16 tokens x 4 heads a block, each wave its
   // own rows and softmax (halo_attention_fa).
-  if (wmma && prefill_mq_attention_ && prefill_fa_attention_ && prefill_kv16_ && s.k16 &&
-      (pos0 + T) / ratio <= budget)
+  if (wmma && prefill_mq_attention_ && prefill_fa_attention_ && have16 && (pos0 + T) / ratio <= budget)
   {
     // The context in fp16 only when the out projection reads it that way.
     const bool ctx_half = prefill_f16_out_ && F16Route(l.attn_out);
@@ -809,7 +847,7 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
                   error) &&
            Gemm(l.attn_out, ck_.ctx, ck_.block_out, T, error, ctx_half ? &ck_.xh : nullptr);
   }
-  if (wmma && prefill_mq_attention_ && (pos0 + T) / ratio <= budget && 4 * G <= 48)
+  if (wmma && prefill_mq_attention_ && (pos0 + T) / ratio <= budget && 4 * G <= 48 && !kv16_only_)
     return Launch("halo_attention_wmma_mq", {nkv, (T + 3) / 4}, {256},
                   {rt::Arg::Buf(ck_.q), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v), rt::Arg::Buf(ck_.gate_a),
                    rt::Arg::Buf(ck_.ctx), rt::Arg::Buf(ck_.host, ck_.params_offset), rt::Arg::Val(nh),
@@ -822,7 +860,7 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   const bool scores_wmma = prefill_scores_wmma_ && !prefill_exact_projections_ && ih == 4 && idim % 16 == 0;
   // The fp16 K/V copy: convert what is not current yet (this chunk, and
   // anything decode wrote since), then the union attention reads it.
-  const bool kv16 = qsel && prefill_kv16_ && s.k16;
+  const bool kv16 = qsel && have16;
   if (kv16 && !kv16_current()) return false;
   // A chunk that starts inside the dense range and runs past it (chunks longer than the budget's
   // positions): its dense prefix takes the flash kernel exactly as a chunk ending there would, the rest
@@ -830,7 +868,7 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   const std::uint32_t dense_end = budget * ratio;
   std::uint32_t tq0 = 0;
   bool prefix_half = false;
-  if (wmma && prefill_mq_attention_ && prefill_fa_attention_ && prefill_kv16_ && s.k16 && kv16 &&
+  if (wmma && prefill_mq_attention_ && prefill_fa_attention_ && have16 && kv16 &&
       prefill_dense_prefix_ && pos0 < dense_end && pos0 + T > dense_end) {
     tq0 = dense_end - pos0;
     prefix_half = prefill_f16_out_ && F16Route(l.attn_out);
@@ -852,21 +890,21 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
               ? Launch("halo_qsa_scores_wmma", {(cols + 63) / 64, (n + 15) / 16}, {128},
                        {rt::Arg::Buf(ck_.iq, std::size_t{t0} * ih * idim * 4), rt::Arg::Buf(s.block_k),
                         rt::Arg::Buf(ck_.bscores), rt::Arg::Val(n), rt::Arg::Val(cols), rt::Arg::Val(idim),
-                        rt::Arg::Val(max_blocks)},
+                        rt::Arg::Val(bstride)},
                        error)
               : Launch("halo_qsa_scores_rows", {std::min(Blocks(max_blocks), 64u), n}, {kBlock},
                        {rt::Arg::Buf(ck_.iq, std::size_t{t0} * ih * idim * 4), rt::Arg::Buf(s.block_k),
                         rt::Arg::Buf(ck_.bscores), params, rt::Arg::Val(ih), rt::Arg::Val(idim),
-                        rt::Arg::Val(max_blocks)},
+                        rt::Arg::Val(bstride)},
                        error)) ||
         !Launch(prefill_select256_ ? "halo_qsa_select_rows256" : "halo_qsa_select_rows", {n},
                 {prefill_select256_ ? 256u : 1024u},
                 {rt::Arg::Buf(ck_.bscores), rt::Arg::Buf(ck_.vis), params, rt::Arg::Val(budget), rt::Arg::Val(ratio),
-                 rt::Arg::Val(max_blocks), rt::Arg::Val(vstride)},
+                 rt::Arg::Val(bstride), rt::Arg::Val(vstride)},
                 error) ||
         !(qsel ? Launch("halo_qsa_union4", {(n + 3) / 4}, {1024},
                         {rt::Arg::Buf(ck_.vis), params, rt::Arg::Val(budget), rt::Arg::Val(ratio), rt::Arg::Val(vstride),
-                         rt::Arg::Val(max_blocks), rt::Arg::Val(n), rt::Arg::Buf(ck_.ublk), rt::Arg::Buf(ck_.umask),
+                         rt::Arg::Val(bstride), rt::Arg::Val(n), rt::Arg::Buf(ck_.ublk), rt::Arg::Buf(ck_.umask),
                          rt::Arg::Buf(ck_.ucount), rt::Arg::Val(max_u)},
                         error) &&
                      Launch(kv16 ? (prefill_qsel_h2_ ? "halo_attention_wmma_qsel_h2" : "halo_attention_wmma_qsel_h")
@@ -878,14 +916,15 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
                              rt::Arg::Buf(ck_.umask), rt::Arg::Buf(ck_.ucount), rt::Arg::Val(max_u),
                              rt::Arg::Val(ratio), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(n)},
                             error)
-         : wmma ? Launch("halo_attention_wmma_rows", {nkv, n}, {128},
+         : wmma && !kv16_only_ ? Launch("halo_attention_wmma_rows", {nkv, n}, {128},
                         {rt::Arg::Buf(ck_.q, std::size_t{t0} * qdim * 4), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v),
                          rt::Arg::Buf(ck_.gate_a, std::size_t{t0} * qdim * 4), rt::Arg::Buf(ck_.vis),
                          rt::Arg::Buf(ck_.ctx, std::size_t{t0} * qdim * 4), params, rt::Arg::Val(nh),
                          rt::Arg::Val(nkv), rt::Arg::Val(vstride)},
                         error)
-               : Launch("halo_attention_select_rows", {nh, n}, {kBlock},
-                {rt::Arg::Buf(ck_.q, std::size_t{t0} * qdim * 4), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v),
+               : Launch(kv16_only_ ? "halo_attention_select_rows_h" : "halo_attention_select_rows", {nh, n}, {kBlock},
+                {rt::Arg::Buf(ck_.q, std::size_t{t0} * qdim * 4), rt::Arg::Buf(kv16_only_ ? s.k16 : s.k),
+                 rt::Arg::Buf(kv16_only_ ? s.v16 : s.v),
                  rt::Arg::Buf(ck_.gate_a, std::size_t{t0} * qdim * 4), rt::Arg::Buf(ck_.vis),
                  rt::Arg::Buf(ck_.ctx, std::size_t{t0} * qdim * 4), rt::Arg::Buf(ck_.ascores), params,
                  rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(hd), rt::Arg::Val(vstride)},
@@ -1204,7 +1243,7 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
       if (error) *error = "token out of range";
       return false;
     }
-  if (!AllocChunk(prefill_chunk_, error) || !EnsureKv(position_ + T, error)) return false;
+  if (!AllocChunk(prefill_chunk_, error) || !EnsureKv(position_ + T, position_, error)) return false;
   // HALO_PREFILL_TIMING: host preparation, upload and device time per chunk.
   static const bool timing = std::getenv("HALO_PREFILL_TIMING") != nullptr;
   const auto t_start = std::chrono::steady_clock::now();
@@ -1397,7 +1436,10 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
   }
   ngram_history_ = history;
   const std::uint32_t complete = (position_ + T) / ratio;
-  for (auto& s : attn_) s.blocks = complete;
+  for (auto& s : attn_) {
+    s.blocks = complete;
+    if (kv16_only_) s.valid16 = position_ + T;  // the chunk appended its fp16 rows
+  }
   position_ += T;
   return true;
 }
