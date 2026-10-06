@@ -49,3 +49,285 @@ They spend about 0.9 ms per HC mixer in GEMMs; we spend about 4 ms (combine_norm
    split.
 5. **Their weights:** a Hadamard-rotated 4-bit trunk (QuIP#-style sign vectors), 6-bit HC
    weights, and one shared input rotation for all 512 experts. GGUFs are repacked at load.
+
+## Kernels run in our harness (2026-10-05)
+
+Their gfx1151 code object (`k000.co`) was loaded into our own host program with
+`hipModuleLoadData` and its expert kernels were launched on synthetic inputs. No halogen binary,
+script or service was run. The lab code and data are in `/data/halogen-research/lab`:
+- `hlab.cpp` launches their kernels;
+- `ours.cpp` launches our `core.hsaco` the way `halo_gemm_bench moe` does;
+- `att_offline.cpp` decodes their thread traces;
+- `run*.sh` are the scripts and `out/` holds the results.
+
+**Setup for every number below:**
+- T = 2048 tokens, top-10 of 512 experts, routing from random normal logits (as in `halo_gemm_bench moe`): all 512 experts used, at most 57 tokens per expert.
+- Clock pinned at 2.9 GHz, each kernel run alone and back to back, median of 30 calls.
+- Our in-engine times are about 0.8x these isolated, pinned times: gate/up 5.29 vs 6.7 ms, down 3.10 vs 3.69 ms.
+
+### Which kernels, and their arguments
+- **Kernels:** the v2 checkpoint's experts run `q4moe::k_q4moe<A, B, M, Tune<0,128>, C>(q4moe::Args)`.
+  - A: 1 = bf16 WMMA, 2 = f16.
+  - B: 0 = gate/up, 2 = down.
+  - M: 64 or 128 tokens per tile.
+  - C: epilogue. C = 1 uses the per-row output scale vectors and an in-register 128-point Hadamard (DPP butterflies plus `v_permlanex16`). C = 0 does not.
+- **Args (152 bytes, read from the kernarg loads):**
+
+  | Offset | Field |
+  |---|---|
+  | 0x00 | weight blob |
+  | 0x08 | offset of the 4-bit codes (row-major) |
+  | 0x10 | offset of the f16 scales (one per 128 weights) |
+  | 0x18 | scale row stride |
+  | 0x20 | 16 float codebook values |
+  | 0x60, 0x68 | f16 scale vectors for the C = 1 epilogue |
+  | 0x70 | activations: x [T][2560] bf16 for gate/up; h [P][640] for down |
+  | 0x78 | pair ids sorted by expert; the kernel computes token = id / 10 |
+  | 0x80 | items |
+  | 0x88 | device item count |
+  | 0x90 | output [P][640] or [P][2560] bf16, one row per sorted position |
+
+- **Items:** 16 bytes each: expert, row block, start, count.
+  - Gate/up has 5 row blocks per expert, each 128 gate rows plus the matching 128 up rows. Down has 10 blocks of 256 rows.
+  - Grid = number of items, 256 threads. Workgroups past the device count exit.
+- **Byte sizes:** these match the checkpoint exactly.
+  - Gate/up: 512 x 1280 x (1280 + 40) = 865,075,200 bytes.
+  - Down: 512 x 2560 x (320 + 10) = 432,537,600 bytes.
+  - That is 4.125 bits per weight, against our Q4_K 4.5 (944 MB) and Q5_1 6.0 (503 MB).
+- **Outputs:** every variant gave finite, non-zero outputs. Correctness against a reference was not checked; only the timing is used.
+
+### How they read the weights
+- **Layout:** one lane per weight row; 32 rows per wave (lanes 0-15 gate rows, lanes 16-31 the matching up rows); 256 rows per workgroup.
+- **Per stage (one 128-weight group):**
+  - Each lane loads its row's 64 contiguous bytes with 4 x `global_load_b128` (+0/16/32/48), plus one `global_load_u16` for the next group's scale.
+  - That is 2 KB per wave and 16 KB per workgroup per stage, with a row stride of 1280 B (gate/up) or 320 B (down).
+  - So this is the same row-strided 64-byte pattern as ours. No LDS is used for weights.
+- **Prefetch:** the next stage's weights load at the top of each iteration (one stage of register double buffering).
+  - The same iteration then waits with `s_waitcnt vmcnt(2)` for its activation loads.
+  - vmcnt counts loads in order, so that wait also waits for the prefetched weights, and the effective prefetch distance is about zero.
+  - Latency is covered by occupancy instead: 210 VGPRs, 34 KB LDS, giving 3 workgroups per WGP (6 waves per SIMD).
+  - In the M = 64 gate/up loop, that wait is the most stalled instruction (13.2 M of 45 M stall cycles).
+- **Dequant:**
+  - Per group, 16 `v_fma_mix_f32` (scale x codebook value) build a 16-entry table.
+  - Then `v_perm_b32` byte-selects bf16 values by nibble: 252 `v_perm_b32` per iteration.
+  - `v_permlanex16` forms the B fragment.
+- **Activations:** staged into LDS through VGPRs.
+
+### Measured: theirs vs ours (isolated, same harness style)
+
+| | Theirs (A=1, M=64, C=1) | Ours | Δ |
+|---|---:|---:|---:|
+| Gate/up time per call | 5.68-5.72 ms | 6.65-6.72 ms (q4_k) | -15% |
+| ... weight bytes | 865 MB (152 GB/s) | 944 MB (141 GB/s) | -8% bytes |
+| ... with weights cache-resident (every item uses expert 0/1) | 4.62 ms | 4.91 ms | -6% |
+| ... added by streaming weights from DRAM | 1.1 ms | 1.8 ms | -0.7 ms |
+| Down time per call | 2.96 ms | 3.69-3.70 ms (q5_1) | -20% |
+| ... weight bytes | 433 MB (146 GB/s) | 503 MB (136 GB/s) | -14% bytes |
+| ... with weights cache-resident | 2.57 ms | 2.73 ms | -6% |
+| ... added by streaming weights from DRAM | 0.39 ms | 0.97 ms | -0.58 ms |
+
+- **Other variants:**
+  - Gate/up: M = 128 takes 6.15 ms and C = 0 takes 6.09 ms.
+  - Down: C = 2 takes 2.74 ms and C = 0 takes 2.84 ms.
+  - A = 2 (f16) gate/up takes 5.67 ms, the same as bf16.
+- **Neither kernel is DRAM-bound at T = 2048.** With the weights cache-resident, theirs keeps 81% (gate/up) and 87% (down) of its time.
+  - Gate/up issues about 19.5 M WMMA, about 2.7-3.3 ms of WMMA issue at 2.9 GHz.
+  - On top of that, 357 M VALU wave-instructions (1.5-1.8 ms).
+  - 16-token padding adds 19%: 7,625 16-token tiles cover 122,000 rows for 102,400 real ones.
+- **The gap comes from three places.** The 6% compute difference is small; the large differences are:
+  - how much weight streaming the kernel exposes on top of its compute (0.7 and 0.58 ms);
+  - fewer bytes (8% and 14%);
+  - in down, our barriers.
+- **Counters per call (theirs / ours):**
+
+  | Counter | Gate/up | Down |
+  |---|---|---|
+  | VALU | 357 M / 313 M | 207 M / 201 M |
+  | LDS | 21.4 M / 22.7 M | 11.8 M / 24.1 M |
+  | FLAT | 3.74 M / 6.23 M | 2.45 M / 6.68 M |
+  | SALU | 10.2 M / 30.0 M | 6.1 M / 35.9 M |
+  | Waves | 20.5 K / 33.3 K | 41 K / 133 K |
+  | L2-to-fabric reads (x2) | 1.93 / 1.97 GB | 1.20 / 1.73 GB |
+
+  - Their dequant is not cheaper in VALU. Their wider loads (four 16-byte loads per lane per stage) and exact item list cut FLAT, SALU and wave counts.
+- **ATT (share of traced wave latency):**
+
+  | Kernel | vmcnt | VALU | Barrier | WMMA | Other |
+  |---|---:|---:|---:|---:|---|
+  | Their gate/up | 37% | 43% (18% is `v_perm`) | 10.5% | 4.7% | |
+  | Our gate/up | 40% | 31% | 11% | 7.5% | lgkmcnt 6% |
+  | Their down | 30% | 49% | 10% | | |
+  | Our down | 12% | 25-30% | **29-34%** | | lgkmcnt 9% |
+
+- **Occupancy inside their own code:** their own 252/256-VGPR variants run 4 waves per SIMD instead of 6, and are slower by:
+  - 7% on gate/up (M = 128 against M = 64);
+  - 17% on down (M = 128 against M = 64, same C = 1).
+
+  The M = 128 path differs in code too, so this comparison is confounded.
+- **Item order:** listing items by row block instead of by expert (so the 5 row blocks that share an expert's tokens no longer run together) costs +15% (6.53 ms). Our grid already places them together: x varies fastest.
+
+### What to try in our own design (predictions, to be checked in-engine)
+1. **Gate/up occupancy.** Ours runs at 241 VGPRs (4 waves per SIMD); theirs at 210 (6 per SIMD).
+   - Get our gate/up to 216 VGPRs or fewer, giving 3 workgroups per WGP.
+   - Expected: most of the 0.7 ms per call of exposed streaming, so roughly -0.4 to -0.7 ms isolated, or about -15 to -25 ms per pp2048 over 47 calls.
+   - Caveat: an earlier note says a sixth wave did not help gate/up. Decide it by ablation: re-measure the weights-cached gap after the change.
+2. **Down: 256 rows per workgroup and an exact item list.**
+   - Their down covers 256 rows over all of K = 640 (5 stages) with 8 waves, and launches only real items.
+   - Ours: 128-row blocks, grid 20 x 833 with early exits, 3.3x the waves, and 29-34% of latency in barriers.
+   - Expected: up to -0.6 to -0.7 ms per call isolated, about -25 ms per pp2048 over 43 calls.
+3. **Exact work lists in general.** A device item count plus an (expert, row block, start, count) list, so no grid of mostly empty tiles. SALU was 3-6x lower, and the FLAT count 1.7-2.7x lower. Expected: small directly, a prerequisite for 2.
+4. **A 4.125-bpw format.** 4-bit codes, one f16 scale per 128, a 16-value codebook in kernarg, dequant by building a LUT and byte-permuting.
+   - It saves 8% (gate/up) and 14% (down) of bytes. Only the exposed-streaming part speeds up from that, so about -0.1 to -0.15 ms per call.
+   - It is a requantization with a quality cost. They pair it with Hadamard rotation, which we do not have. Low priority.
+5. **The WMMA floor (~3 ms per gate/up call at T = 2048) is the real limit for both engines.** Further gains need:
+   - less 16-token padding (19% here);
+   - fewer dequant VALU per weight per tile, e.g. taller token tiles per weight load when an expert has more than 64 tokens.
+
+Not done in the time box: their DeltaNet chunked kernels and the HC combine.
+
+**ATT note:** rocprofv3 7.2.3 (comgr/LLVM 21-22) cannot decode their code. It contains true16 `v_mov_b16`, and VOP3 two-operand ops with src2 = 0x80. Its traces silently stop at the first such instruction.
+
+The workaround (in `lab/att_offline.cpp`):
+1. Take the instruction listing from TheRock's LLVM 24 `llvm-objdump`.
+2. Feed the raw `.att` files to `librocprof-trace-decoder` directly, with an ISA callback over that listing.
+
+### DeltaNet, its conv and norm, and the HC scatter-norm (2026-10-05, same harness)
+
+**Which path is their default (static reading of their host binary, not run):**
+- The `HALOGEN_DN_FUSED` getenv defaults to 1, which selects `k_dn_fused16<0,false,false,false>` (code object k002).
+- `HALOGEN_FLASH_CONV_TB` = 1 selects `k_conv1d_silu_tb<16>`.
+- `HALOGEN_DN_NORM_W` = 1 selects `k_rmsnorm_gated_w`.
+- The older multi-kernel chunk path (`k_dnc_prep/ut/att/scan*`, k001) remains behind flags.
+- **Caveat:** the `k_hc_scatter_norm` launch site exists, but I did not trace whether it is on the default prefill path.
+
+**`k_dn_fused16`: the whole chunked recurrence in one kernel**
+- **Layout:** one 256-thread workgroup (8 waves) per v-head, 48 workgroups.
+- **Per v-head, it:**
+  - walks T in 16-token chunks;
+  - reads bf16 q/k/v straight from the post-conv `[T][10240]` rows;
+  - applies the q/k L2 norm and the 1/sqrt(128) scale itself (3 `v_rsq`; no separate norm kernel or pass);
+  - keeps the 128x128 f32 state on-chip, mirroring it to f16 for f16 WMMA (about 232 WMMA per chunk per head);
+  - writes the bf16 output `[T][6144]` and the final state.
+- **Args (136 bytes):**
+
+  | Offset | Field |
+  |---|---|
+  | 0x00 | qkv |
+  | 0x08 | g [T][48] |
+  | 0x10 | beta [T][48] |
+  | 0x18 | state |
+  | 0x20 | slot index |
+  | 0x28 | state offset |
+  | 0x30 | out |
+  | 0x38 | T |
+  | 0x40-0x87 | probe and snapshot pointers |
+
+- **Checked against a CPU gated delta rule** (S *= exp(g); S += k ⊗ beta (v − kᵀS); o = qᵀS / sqrt(128)), 3 heads, T = 256:
+  - output relative error 1.7e-3 (bf16 output);
+  - state relative error 3e-4.
+
+| Per DeltaNet layer, T = 2048, isolated, pinned | Theirs | Ours |
+|---|---:|---:|
+| Conv | `k_conv1d_silu_tb<16>` 0.43 ms (bf16 in/out, no norm) | `halo_conv_l2norm_prefill8` 0.83 ms (f32, norm fused) |
+| Chunk prep + scan | `k_dn_fused16` **0.76 ms** | `halo_gdn_c16_prep2` 0.35 + `halo_gdn_c16_scan3u` 1.97 = 2.32 ms |
+| Gated RMSNorm | `k_rmsnorm_gated_w` 0.33 ms | `halo_gated_norm_h` 0.70 ms |
+| Total | **1.52 ms** | **3.86 ms** (x36 layers: 55 vs 139 ms) |
+
+**Counters per call (theirs / ours):**
+- Recurrence (their fused kernel / our prep2 + scan3u):
+  - VALU 44.6 M / 166 M; LDS 6.8 M / 32 M.
+  - Fabric reads 51 / 201 MB.
+  - Waves 384 / 896.
+- Our scan3u runs at 256 VGPRs. It builds its WMMA fragments from 384 static `ds_load_u16_d16(_hi)` gathers plus 88 `ds_bpermute`; theirs uses `ds_load_b128` fragment loads.
+- Conv: theirs moves 48 MB read / 21 MB written (bf16); ours 87 / 41 MB (f32).
+- Gated norm:
+  - Theirs: 50 MB read, 98 K waves (one wave per 128-wide row, 8 rows per workgroup).
+  - Ours: 101 MB read (f32 o and z), 393 K waves (one row per 128-thread block).
+
+**ATT:**
+- Their fused kernel (decoded offline): barrier 42%, lgkmcnt 21%, VALU 27%, WMMA 2.3%, vmcnt 1%.
+  - The 8 waves of a head synchronize every chunk; memory is not the limit.
+  - With 48 workgroups, most SIMDs hold at most one of its waves.
+- Our scan3u: VALU 45%, lgkmcnt 27%, vmcnt 12%, barrier 5%.
+
+**HC scatter-norm.** `k_hc_scatter_norm<false>`: one 256-thread workgroup per (token, stream) row of 2560.
+- Each row: stream += coef[t,s] x block_out[t], in bf16 and written in place.
+- Then RMS over the 2560 and x (1 + w), written as a bf16 normalized copy.
+- The divisor is 2560, so this normalizes each stream separately.
+- 0.72 ms at T = 2048 (the `<true>` variant 0.75 ms). Ours: `halo_hc_combine_norm_rows` 1.03-1.14 ms in-engine.
+- Counters: 53 MB read, 41 MB written.
+- Their residual streams are bf16 [T][4][2560]; ours are f32 [T][10240], with an f16 copy for the GEMMs.
+- Their mixer GEMMs are hipBLASLt (times in the plan table above). Their prefill dense GEMMs are also hipBLASLt bf16 from the tuned plan (10240 x 2560: 2.79 ms against our lr8 3.04), so I ran no kernel of theirs for them.
+
+### What to try in our own design (predictions; decide in-engine)
+1. **Fuse prep and scan into one kernel per v-head** (8 waves).
+   - Keep the f32 state on-chip with an f16 mirror for WMMA.
+   - Use `ds_load_b128` fragment loads instead of 16-bit LDS gathers.
+   - Fold the q/k L2 norm into the kernel, so the conv kernel no longer normalizes.
+   - Expected: about -1.5 ms per DeltaNet layer (2.32 → ~0.8), about -50 ms per pp2048 over 36 layers.
+   - Their kernel is barrier-bound with under one wave per SIMD, so a 2-way v split per head (as ours does) might still help on top. Measure.
+2. **bf16/f16 inputs and outputs for the conv and the gated norm, and one wave per norm row.**
+   - Expected: conv -0.4 ms, gated norm -0.35 ms per layer, about -27 ms per pp2048.
+   - Our f32 conv output feeds the scan, so this comes with item 1.
+3. **bf16 (or f16) residual streams.** Their scatter-norm is 0.72 ms against our 1.03-1.14 ms at about half the bytes. Expected about -0.3 ms per call, about -25 ms per pp2048 over 94 calls.
+   - Precision cost: f32 residual streams are part of our exactness guarantees. This needs a quality check, not just a speed test.
+4. **Attention and its small kernels:** not measured (time box).
+
+### Attention (2026-10-05, same harness)
+
+**Their default dense prefill kernel**, read statically from their host binary:
+- With no QSA selection, `HALOGEN_FA_TQ` defaults to 2, and with FA_VB=1, FA_RS=1, FA_OPT=5, FA_S21=1 and FA_LPT=1 the dispatch picks `k_attn_fa2<2,1,true,5,1,true>` (code object k003).
+- **Launch:** grid = 2 x ceil(T/32), block 768 (24 waves).
+- **Each workgroup:** one kv head and 32 query tokens (two 16-token tiles) x the 12 q heads that share that kv head, one wave per (tile, head).
+  - Workgroups take the token pairs in reverse order: the longest causal rows go first.
+  - K/V are staged in LDS once for all 12 heads.
+  - bf16 WMMA.
+- **Inputs:**
+  - q: bf16 [T][24 x 256], normalized and roped.
+  - The sigmoid gate is read in place from the fused q|gate projection rows, [T][24][q 256 | gate 256]. No separate split copy of the gate.
+  - k/v: bf16 [pos][2 x 256].
+- **Output:** bf16 [T][6144] with the gate applied.
+- **Args:**
+
+  | Offset | Field |
+  |---|---|
+  | 0x00 | q |
+  | 0x08 | k |
+  | 0x10 | v |
+  | 0x18 | kv row stride |
+  | 0x20 | q\|gate |
+  | 0x28 | out |
+  | 0x30 | params (position) |
+  | 0x38 | T |
+  | 0x3c | number of kv rows |
+  | 0x40 | 32-byte FaSel, null for dense |
+
+**Correctness.** Checked against a CPU causal softmax(qk/16)·v·sigmoid(gate) at T = 256: relative error 2e-3 (bf16 output). Against our `halo_attention_fa` on the same inputs: 3.4e-3.
+
+| Dense causal from position 0, isolated, pinned | Theirs | Ours (`halo_attention_fa`) |
+|---|---:|---:|
+| T = 2048 | **2.85 ms** | 3.20 ms (in-engine 3.30) |
+| T = 8192 | **36.3 ms** | 43.1 ms |
+
+Their 8K serving path may use QSA selection instead; this row is dense only.
+
+**Counters at T = 2048 (theirs / ours):**
+- VALU 76 M / 151 M; LDS 19 M / 45 M; SALU 8.9 M / 5.5 M.
+- Waves 3,072 / 6,144.
+- Fabric reads **1.72 GB / 0.29 GB**: theirs re-reads K/V from fabric far more.
+
+**ATT:**
+- Theirs (decoded offline): vmcnt 69%, lgkmcnt 10%, barrier 9%, VALU 9%. It is limited by K/V loads.
+- Ours: lgkmcnt 48%, vmcnt 18%, VALU 16%, LDS store 7%. LDS and fragment work dominates.
+
+**The small kernels around it (structure only, not timed):** one `k_qk_prep` launch per layer.
+- Grid T x 26: 24 q heads + 2 k heads, plus extra workgroups that write K/V rows into the cache.
+- It covers the q/k RMSNorm, the rope and the cache write in one kernel.
+- `k_attn_fa2` then reads the gate from the projection output directly.
+- So their attention block runs about two small launches where ours runs several (rope, q/k norm, qgate split, f16 K/V copy). I did not time `k_qk_prep`, because its 160-byte FdRows cache-row argument was not worth inferring in the time box.
+
+**What to try (predictions; decide in-engine):**
+1. **One workgroup per (kv head, 32 tokens) covering all 12 q heads that share the kv head.** Stage each K/V tile in LDS once for the 12 heads; issue the longest causal rows first. Their version halves VALU and LDS against ours.
+   - Expected about -0.35 ms per call at T = 2048 (12 layers: about -4 ms) and about -7 ms per call at 8K.
+   - Their kernel is then K/V-load-bound (1.7 GB of fabric reads). A version that keeps our lower K/V traffic might gain more than theirs shows.
+2. **Fuse the attention-side small kernels into one prep kernel** (q/k norm + rope + K/V cache write), and read the gate in place from the projection output. This targets part of our ~25 ms per prefill of small kernels. Size it with the per-kernel timing of those kernels, not from this note.

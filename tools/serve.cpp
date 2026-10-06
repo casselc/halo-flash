@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
                     decider_device = "hip", scope_dir, scope_project = "halo-flash", scope_capture = "digest",
                     scope_wal;
   int port = 8080;
+  double ngram_cache_gb = 4.0;  // cache of n-gram rows read from disk, GiB (0: off)
   std::uint32_t max_context = 32768;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i], v = argv[i + 1];
@@ -77,6 +78,7 @@ int main(int argc, char** argv) {
     else if (a == "--host") host = v;
     else if (a == "--port") port = std::atoi(v.c_str());
     else if (a == "--max-context") max_context = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+    else if (a == "--ngram-cache-gb") ngram_cache_gb = std::atof(v.c_str());
     else if (a == "--api-key") api_key = v;
     else if (a == "--model-id") model_id = v;
     else if (a == "--decider-dir") decider_dir = v;
@@ -96,7 +98,8 @@ int main(int argc, char** argv) {
   if (!weights || !tok) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
   const auto& t = weights->ple_table;
   auto ngram = model::NgramTable::Open(reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset, t.rows,
-                                       weights->config.ple_head_dim, t.type, &error);
+                                       weights->config.ple_head_dim, t.type, &error,
+                                       static_cast<std::size_t>(ngram_cache_gb * (1ull << 30)));
   if (!ngram) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
   auto dev = rt::Device::Create(device == "hrx" ? rt::Backend::kHrx : rt::Backend::kHip, &error);
   if (!dev) return std::fprintf(stderr, "%s\n", error.c_str()), 1;

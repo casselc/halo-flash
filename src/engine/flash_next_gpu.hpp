@@ -105,6 +105,19 @@ class FlashNextGpu {
   static inline bool prefill_banded_gemm_ = true;  // large dense GEMMs in bands of 8 row tiles
   static inline bool prefill_reg_gemm_ = true;  // banded GEMMs with weights in registers (halo_gemm_q8r_f16_lr8)
   static inline bool prefill_fused_moe_combine_ = true;  // routed combine + shared expert in one pass
+  /// combine_norm with one block per token (all four streams; halo_hc_combine_norm_tok, bit-identical).
+  static inline bool prefill_tok_combine_ = false;  // attention half: 56.9 vs 55.3 ms per prefill, not kept
+  /// ... which after the MoE block also builds the routed + shared experts' sum itself (_tok_moe).
+  static inline bool prefill_moe_in_combine_ = true;
+  /// Attention q: split, norm and rope in one kernel (halo_split_qgate_norm_rope, bit-identical).
+  static inline bool prefill_q_fused_ = true;
+  /// 64-row tiles (halo_gemm_q8r_f16_s) up to 640 rows instead of 512: the shared expert's 640-row gate/up
+  /// otherwise take three 256-row tiles (the last half empty).
+  static inline bool prefill_s640_ = true;
+  /// Producers whose fp32 output only feeds an FP16 GEMM write the fp16 copy directly (attention context,
+  /// mixer SiLU, shared-expert SiLU product) instead of a separate halo_f16_rows pass.
+  static inline bool prefill_f16_out_ = true;
+  static std::uint32_t SmallRows() { return prefill_s640_ ? 640 : 512; }
   static inline bool prefill_ple_overlap_ = true;
   /// Prototype: Q4_K gate/up experts repacked K-blocked on first prefill use (decode does not read that layout).
   static inline bool prefill_moe_blocked_ = false;
@@ -318,6 +331,9 @@ class FlashNextGpu {
   bool AttentionBatched(const model::LayerWeights& l, AttnState& s, std::uint32_t T, std::string* error);
   bool AttentionChunk(const model::LayerWeights& l, AttnState& s, std::uint32_t tokens, std::string* error);
   bool F16Route(const model::TensorRef& t) const;
+  bool TokCombineFits(const model::HcMixer& m) const;
+  bool TokCombine(const model::HcMixer& m) const;
+  bool MixH(const model::HcMixer& m) const;
   bool BlockedXh(const model::HcMixer& m) const;
   bool FuseInject(const model::HcMixer& m) const;
   bool MixFused(const model::HcMixer& m) const;
@@ -367,6 +383,10 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   bool mh_valid_ = false;
   bool xn_skipped_ = false;  // the last combine_norm wrote rscale instead of xn
   bool xq_valid_ = false;    // the last combine_norm wrote the int8 copy of xn (prefill_down_w8a8_)
+  bool moe_defer_ = false;    // the next SharedExpertChunk leaves the routed + shared sum to combine_norm
+  bool moe_pending_ = false;  // ... and it did: block_out was not written
+  bool q_roped_ = false;
+  bool lo_half_ = false;      // the mixer's SiLU pass already left lo in fp16 (in xh)      // this layer's q rows came out of halo_split_qgate_norm_rope
   rt::FileUploader* loader_ = nullptr;  ///< during Init: weights read from their files
   std::unordered_map<const void*, DevLora> lora_;
   std::unordered_map<std::string, rt::KernelId> kernels_;

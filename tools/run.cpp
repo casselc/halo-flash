@@ -133,6 +133,7 @@ int main(int argc, char** argv) {
   std::uint32_t span_sample = 1;
   bool eager = false, profile = false, device_sample = false;
   bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
+  double ngram_cache_gb = 4.0;  // --ngram-cache-gb N: cache of n-gram rows read from disk (0: off)
   setvbuf(stdout, nullptr, _IOLBF, 0);
   std::uint32_t max_context = 512;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -164,6 +165,11 @@ int main(int argc, char** argv) {
     else if (a == "--ple-overlap") engine::FlashNextGpu::prefill_ple_overlap_ = std::string(argv[i + 1]) == "1";
     else if (a == "--fa-attention") engine::FlashNextGpu::prefill_fa_attention_ = std::string(argv[i + 1]) == "1";
     else if (a == "--fused-moe-combine") engine::FlashNextGpu::prefill_fused_moe_combine_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--tok-combine") engine::FlashNextGpu::prefill_tok_combine_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--moe-in-combine") engine::FlashNextGpu::prefill_moe_in_combine_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--q-fused") engine::FlashNextGpu::prefill_q_fused_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--s640") engine::FlashNextGpu::prefill_s640_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--f16-out") engine::FlashNextGpu::prefill_f16_out_ = std::string(argv[i + 1]) == "1";
     else if (a == "--banded-gemm") engine::FlashNextGpu::prefill_banded_gemm_ = std::string(argv[i + 1]) == "1";
     else if (a == "--reg-gemm") engine::FlashNextGpu::prefill_reg_gemm_ = std::string(argv[i + 1]) == "1";
     else if (a == "--blocked-xh") engine::FlashNextGpu::prefill_blocked_xh_ = std::string(argv[i + 1]) == "1";
@@ -179,6 +185,7 @@ int main(int argc, char** argv) {
     else if (a == "--router-bf16x3") engine::FlashNextGpu::prefill_router_bf16x3_ = std::string(argv[i + 1]) == "1";
     else if (a == "--kernel-timing") kernel_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";
+    else if (a == "--ngram-cache-gb") ngram_cache_gb = std::atof(argv[i + 1]);
     else if (a == "--prefill-warm") prefill_warm = argv[i + 1];
     else if (a == "--reps") reps = std::max(1, std::atoi(argv[i + 1]));
     else if (a == "--batched-prefill") engine::FlashNextGpu::batched_prefill_ = std::string(argv[i + 1]) == "1";
@@ -210,7 +217,8 @@ int main(int argc, char** argv) {
   const auto& c = weights->config;
   const auto& t = weights->ple_table;
   auto ngram = model::NgramTable::Open(reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset, t.rows,
-                                       c.ple_head_dim, t.type, &error);
+                                       c.ple_head_dim, t.type, &error,
+                                       static_cast<std::size_t>(ngram_cache_gb * (1ull << 30)));
   if (!ngram) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
   std::printf("toolchain: %s\n", HALO_TOOLCHAIN);
   std::printf("model: %u layers, hidden %u, vocab %u, experts %u/%u, flash-next geometry %s\n", c.num_layers,
@@ -331,6 +339,12 @@ int main(int argc, char** argv) {
       std::printf("span trace: %u records of %s launch %lld (of %lld in the last rep) -> %s\n", n,
                   engine::FlashNextGpu::span_kernel_.c_str(), static_cast<long long>(engine::FlashNextGpu::span_occurrence_),
                   static_cast<long long>(gpu->SpanSeen()), span_out.c_str());
+    }
+    if (ngram) {
+      const auto st = ngram->Stats();
+      std::printf("n-gram cache: %.1f GiB, %llu hits, %llu misses (%.1f%% hits)\n", st.bytes / double(1ull << 30),
+                  static_cast<unsigned long long>(st.hits), static_cast<unsigned long long>(st.misses),
+                  st.hits + st.misses ? 100.0 * st.hits / (st.hits + st.misses) : 0.0);
     }
     std::sort(secs.begin(), secs.end());
     std::printf("prefill median: %.1f tok/s over %d reps of %zu tokens (batched %d, int8 GEMMs %d)\n",

@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
   bool prefill = false;
   int start = 0;  // --start N: skip the manifest's first N cases (resume an interrupted run)
   bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
+  double ngram_cache_gb = 4.0;  // --ngram-cache-gb N: cache of n-gram rows read from disk (0: off)
   setvbuf(stdout, nullptr, _IOLBF, 0);
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
@@ -94,6 +95,7 @@ int main(int argc, char** argv) {
     else if (a == "--gdn-io16") engine::FlashNextGpu::prefill_gdn_io16_ = std::string(argv[i + 1]) == "1";
     else if (a == "--res16") engine::FlashNextGpu::prefill_res16_ = std::atoi(argv[i + 1]);
     else if (a == "--router-f16") engine::FlashNextGpu::prefill_router_f16_ = std::atoi(argv[i + 1]);
+    else if (a == "--ngram-cache-gb") ngram_cache_gb = std::atof(argv[i + 1]);
     else if (a == "--prefill-int8") engine::FlashNextGpu::prefill_int8_gemm_ = std::string(argv[i + 1]) == "1";
     else return std::fprintf(stderr, "unknown option %s\n", a.c_str()), 2;
   }
@@ -108,7 +110,8 @@ int main(int argc, char** argv) {
   const auto& c = weights->config;
   const auto& t = weights->ple_table;
   auto ngram = model::NgramTable::Open(reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset, t.rows,
-                                       c.ple_head_dim, t.type, &error);
+                                       c.ple_head_dim, t.type, &error,
+                                       static_cast<std::size_t>(ngram_cache_gb * (1ull << 30)));
   if (!ngram) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
   if (ngram_resident) {
     const auto tr = std::chrono::steady_clock::now();
@@ -230,4 +233,10 @@ int main(int argc, char** argv) {
   }
   std::printf("cases %zu, target tokens %zu, aligned %zu (%zu misaligned cases)\nNLL %.6f   API top-token agreement %.2f%%\n",
               cases, targets, aligned, misaligned_cases, nll / targets, aligned ? 100.0 * agree / aligned : 0.0);
+  if (ngram) {
+    const auto st = ngram->Stats();
+    std::printf("n-gram cache: %.1f GiB, %llu hits, %llu misses (%.1f%% hits)\n", st.bytes / double(1ull << 30),
+                static_cast<unsigned long long>(st.hits), static_cast<unsigned long long>(st.misses),
+                st.hits + st.misses ? 100.0 * st.hits / (st.hits + st.misses) : 0.0);
+  }
 }
