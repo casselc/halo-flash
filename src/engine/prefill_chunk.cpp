@@ -100,7 +100,8 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   k.rscale = f(T * c.hc_count);
   k.xh = f(T * max_cols / 2 + 1);
   k.mh = f(T * H / 2 + 1);
-  k.lh = f(T * c.hc_low_rank / 2 + 1);  // the mixer's lo in fp16 when xh still holds xn (prefill_mix_h16_)
+  k.lh = f(T * c.hc_low_rank / 2 + 1);
+  k.ml = f(T * H / 2 + 1);  // the mixer's lo in fp16 when xh still holds xn (prefill_mix_h16_)
   k.pb = f(T * D);
   const std::size_t sub = std::min<std::size_t>(T, kAttnSub);
   k.bscores = f(sub * (max_context_ / c.compress_ratio + 1));
@@ -119,7 +120,7 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   for (const auto* b : {&k.res, &k.xn, &k.lo, &k.gate, &k.mixed, &k.inject, &k.block_out, &k.embd, &k.xq, &k.xd,
                         &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg, &k.q, &k.gate_a, &k.k, &k.v, &k.ctx,
                         &k.iq, &k.ik, &k.router, &k.ids, &k.wts, &k.eg, &k.eu, &k.ed, &k.sgate, &k.host,
-                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16, &k.bcounts, &k.bbase, &k.pa, &k.pb, &k.ipart, &k.rscale, &k.gdnprep, &k.xh, &k.mh, &k.lh,
+                        &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16, &k.bcounts, &k.bbase, &k.pa, &k.pb, &k.ipart, &k.rscale, &k.gdnprep, &k.xh, &k.mh, &k.lh, &k.ml,
                         &k.bscores, &k.vis, &k.ascores, &k.ublk, &k.umask, &k.ucount})
     if (!*b) return false;
   // Index-major copies of the mixers' up projections (fused GEMM + mix).
@@ -145,6 +146,20 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
   k.cap = static_cast<std::uint32_t>(T);
   ck_ready_ = true;
   return true;
+}
+
+// Router mode 4 (stream R): the MoE-half mix epilogue writes `mixed`'s fp16 lo half next to mh.
+bool FlashNextGpu::RouterHL(const model::LayerWeights& l) {
+  router_hl_ok_ = prefill_router_f16_ == 4 && prefill_f16_gemm_ && !prefill_exact_projections_ && prefill_mix_h16_ &&
+                  MixFused(l.hc_ffn) && MixH(l.hc_ffn) && !lora_.contains(l.router.data) &&
+                  l.router.type == core::GgmlType::kF32 && l.router.cols % 64 == 0 && l.router.rows % 128 == 0;
+  // Then nothing reads the fp32 `mixed` of this layer's MoE half: the epilogue skips it, the experts'
+  // permuted copy is taken from mh (the same bits).
+  const auto& gi = l.shexp_gate_inp;
+  mixed32_dead_ = router_hl_ok_ && prefill_mixed32_skip_ && !prefill_shexp_w8a8_ && prefill_grouped_moe_ &&
+                  GroupedMoeFits(l) && prefill_small_f16_ && gi.type == core::GgmlType::kF32 && gi.cols % 128 == 0 &&
+                  !lora_.contains(gi.data) && F16Route(l.shexp_gate) && F16Route(l.shexp_up);
+  return router_hl_ok_;
 }
 
 // `mixed` in fp16 for the GEMMs that share it (only when the FP16 route runs).
@@ -349,13 +364,20 @@ bool FlashNextGpu::MixUp(const model::HcMixer& m, std::uint32_t T, std::string* 
       return false;
     }
     // Precision option: the epilogue reads the norm's fp16 K-blocked copy of xn (still in xh).
+    const bool ml = want_ml_;
+    want_ml_ = false;
     if (mix_h)
       return (lo_half || Half(ck_.lo, ck_.lh, T * low, error)) &&
-             Launch("halo_gemm_q8r_f16_mixth", {(rows + 255) / 256, (T + 127) / 128}, {256},
-                    {rt::Arg::Buf(it->second.qs), rt::Arg::Buf(it->second.d), rt::Arg::Buf(ck_.lh),
-                     rt::Arg::Buf(ck_.mixed), rt::Arg::Val(rows), rt::Arg::Val(low), rt::Arg::Val(dt.qstride),
-                     rt::Arg::Val(T), rt::Arg::Buf(ck_.xh), rt::Arg::Buf(ck_.mh)},
-                    error);
+             (ml ? Launch("halo_gemm_q8r_f16_mixthl", {(rows + 255) / 256, (T + 127) / 128}, {256},
+                          {rt::Arg::Buf(it->second.qs), rt::Arg::Buf(it->second.d), rt::Arg::Buf(ck_.lh),
+                           mixed32_dead_ ? rt::Arg::Val<std::uint64_t>(0) : rt::Arg::Buf(ck_.mixed), rt::Arg::Val(rows), rt::Arg::Val(low), rt::Arg::Val(dt.qstride),
+                           rt::Arg::Val(T), rt::Arg::Buf(ck_.xh), rt::Arg::Buf(ck_.mh), rt::Arg::Buf(ck_.ml)},
+                          error)
+                 : Launch("halo_gemm_q8r_f16_mixth", {(rows + 255) / 256, (T + 127) / 128}, {256},
+                          {rt::Arg::Buf(it->second.qs), rt::Arg::Buf(it->second.d), rt::Arg::Buf(ck_.lh),
+                           rt::Arg::Buf(ck_.mixed), rt::Arg::Val(rows), rt::Arg::Val(low), rt::Arg::Val(dt.qstride),
+                           rt::Arg::Val(T), rt::Arg::Buf(ck_.xh), rt::Arg::Buf(ck_.mh)},
+                          error));
     return (lo_half || Half(ck_.lo, ck_.xh, T * low, error)) &&
            // Row tiles fastest: resident blocks read whole residual rows of the same
            // tokens (token tiles fastest: 1.41 vs 1.15 ms warm, 1.62 vs 1.19 after
@@ -427,8 +449,13 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
     return F16Route(t) && prefill_banded_gemm_ && prefill_reg_gemm_ && rows > 512 && rows % 256 == 0 &&
            (rows / 256) % 8 == 0 && !(rows <= 320 && t.cols >= 4096);
   };
-  const bool io16 = prefill_gdn_io16_ && c.ssm_conv_kernel == 4 && prefill_split_gdn_ && !prefill_exact_projections_ &&
-                    F16Route(l.ssm_out) && banded_h(l.ssm_qkv) && banded_h(l.ssm_gate);
+  const bool io16_ok = c.ssm_conv_kernel == 4 && prefill_split_gdn_ && !prefill_exact_projections_ &&
+                       F16Route(l.ssm_out) && banded_h(l.ssm_qkv) && banded_h(l.ssm_gate);
+  // Precision option (stream R): everything from the qkv / z GEMMs to the gated norm in fp16.
+  const bool f16 = prefill_gdn_f16_ > 0 && io16_ok && prefill_gdn_chunked_ && !prefill_gdn_chunk_fp32_ &&
+                   !prefill_gdn_c16_bf16_ && prefill_gated_wave_ && c.ssm_head_dim == 128 &&
+                   c.ssm_num_v_heads % c.ssm_num_k_heads == 0 && c.ssm_num_v_heads / c.ssm_num_k_heads <= 8;
+  const bool io16 = (prefill_gdn_io16_ || f16) && io16_ok;
   const auto gemm_h = [&](const model::TensorRef& t, const rt::Buffer& y) {
     const auto& d = tensors_.at(t.data);
     const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
@@ -437,6 +464,38 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
                    rt::Arg::Val(cols), rt::Arg::Val(d.qstride), rt::Arg::Val(T)},
                   error);
   };
+  if (f16) {
+    const std::uint32_t cpb = GdnPrepCpb(nch, c.ssm_num_k_heads);
+    return MixedHalf(T, error) && gemm_h(l.ssm_qkv, ck_.qkv) && gemm_h(l.ssm_gate, ck_.z) &&
+           MixedGemmF16(l.ssm_alpha, ck_.alpha, T, error) && MixedGemmF16(l.ssm_beta, ck_.beta, T, error) &&
+           Launch("halo_conv_l2norm_prefill8_hh", {ch / 128, (T + 7) / 8}, {128},
+                  {rt::Arg::Buf(ck_.qkv), rt::Arg::Buf(s.conv), rt::Arg::Buf(tensors_.at(l.ssm_conv1d.data).buf),
+                   rt::Arg::Buf(ck_.conv), rt::Arg::Val(ch), rt::Arg::Val(T), rt::Arg::Val(2 * kd),
+                   rt::Arg::Val(c.rms_eps)},
+                  error) &&
+           Launch("halo_conv_state_advance_h", {Blocks(ch)}, {kBlock},
+                  {rt::Arg::Buf(ck_.qkv), rt::Arg::Buf(s.conv), rt::Arg::Val(ch), rt::Arg::Val(c.ssm_conv_kernel),
+                   rt::Arg::Val(T)},
+                  error) &&
+           Launch("halo_gdn_c16_prep2_h", {(nch + cpb - 1) / cpb, c.ssm_num_k_heads}, {256},
+                  {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 2ull), rt::Arg::Buf(ck_.alpha),
+                   rt::Arg::Buf(ck_.beta), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
+                   rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(ck_.gdnprep),
+                   rt::Arg::Val(c.ssm_num_v_heads), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(cpb)},
+                  error) &&
+           Launch(prefill_gdn_f16_ == 2 ? "halo_gdn_c16_scanft" : "halo_gdn_c16_scanf", {2, c.ssm_num_v_heads}, {128},
+                  {rt::Arg::Buf(ck_.conv), rt::Arg::Buf(ck_.conv, kd * 2ull), rt::Arg::Buf(ck_.conv, 2ull * kd * 2),
+                   rt::Arg::Buf(ck_.gdnprep), rt::Arg::Buf(s.state), rt::Arg::Buf(ck_.gdn),
+                   rt::Arg::Val(c.ssm_num_k_heads), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch),
+                   rt::Arg::Val(vd)},
+                  error) &&
+           Launch("halo_gated_norm_h128w_hh", {(T * c.ssm_num_v_heads + 7) / 8}, {256},
+                  {rt::Arg::Buf(ck_.gdn), rt::Arg::Buf(tensors_.at(l.ssm_norm.data).buf), rt::Arg::Buf(ck_.z),
+                   rt::Arg::Buf(ck_.xh), rt::Arg::Val(T * c.ssm_num_v_heads), rt::Arg::Val(c.rms_eps),
+                   rt::Arg::Val<std::uint32_t>(1)},
+                  error) &&
+           Gemm(l.ssm_out, ck_.gdn, ck_.block_out, T, error, &ck_.xh);
+  }
   return MixedHalf(T, error) &&
          (io16 ? gemm_h(l.ssm_qkv, ck_.qkv) && gemm_h(l.ssm_gate, ck_.z)
                : Gemm(l.ssm_qkv, ck_.mixed, ck_.qkv, T, error, MixedH()) &&
@@ -796,7 +855,29 @@ bool FlashNextGpu::MoeChunk(const model::LayerWeights& l, std::uint32_t T, std::
   const bool bx3 = !rf16 && prefill_router_bf16x3_ && !prefill_exact_projections_ && !lora_.contains(l.router.data) &&
                    l.router.type == core::GgmlType::kF32 && rcols % 32 == 0;
   const int rmode = prefill_router_f16_;
-  if (rf16 && !((rmode == 3 || MixedHalf(T, error)) &&
+  if (rf16 && rmode == 4) {
+    if (!router_hl_ok_) {
+      if (error) *error = "internal: router mode 4 without the mix's fp16 hi / lo";
+      return false;
+    }
+    router_hl_ok_ = false;
+    auto it16 = router16_.find(l.router.data);
+    if (it16 == router16_.end()) {
+      auto b = dev_.Alloc(std::size_t{rrows} * rcols * 2, error);
+      if (!b) return false;
+      owned_.push_back(b);
+      if (!Half(rt_.buf, b, rrows * rcols, error)) return false;
+      it16 = router16_.emplace(l.router.data, b).first;
+    }
+    const int tile = prefill_router_tile_;
+    const std::uint32_t br = tile == 2 ? 64 : 128;
+    if (!Launch(tile == 0 ? "halo_gemm_h_hl_128x64" : tile == 1 ? "halo_gemm_h_hl_128x64k32" : "halo_gemm_h_hl_64x64",
+                {(T + 63) / 64, (rrows + br - 1) / br}, {tile == 2 ? 128u : 256u},
+                {rt::Arg::Buf(it16->second), rt::Arg::Buf(ck_.mh), rt::Arg::Buf(ck_.ml), rt::Arg::Buf(ck_.router),
+                 rt::Arg::Val(rrows), rt::Arg::Val(rcols), rt::Arg::Val(T)},
+                error))
+      return false;
+  } else if (rf16 && !((rmode == 3 || MixedHalf(T, error)) &&
                 Launch(rmode == 2 ? "halo_gemm_f32h_f16_w2" : rmode == 3 ? "halo_gemm_f32_f16_x2" : "halo_gemm_f32h_f16_k128",
                        {(T + 63) / 64, (rrows + 63) / 64}, {128},
                        {rt::Arg::Buf(rt_.buf), rt::Arg::Buf(rmode == 3 ? ck_.mixed : ck_.mh), rt::Arg::Buf(ck_.router),
@@ -968,8 +1049,8 @@ bool FlashNextGpu::GroupedMoe(const model::LayerWeights& l, std::uint32_t T, std
                  rt::Arg::Val(used)},
                 error) &&
          Bucket(pairs, E, error) &&
-         Launch("halo_f16_perm_rows", {Blocks(std::size_t{T} * H)}, {kBlock},
-                {rt::Arg::Buf(ck_.mixed), rt::Arg::Buf(ck_.x16), rt::Arg::Val(T * H)}, error) &&
+         Launch(mixed32_dead_ ? "halo_f16_perm_rows_h" : "halo_f16_perm_rows", {Blocks(std::size_t{T} * H)}, {kBlock},
+                {rt::Arg::Buf(mixed32_dead_ ? ck_.mh : ck_.mixed), rt::Arg::Buf(ck_.x16), rt::Arg::Val(T * H)}, error) &&
          Launch(gu.c_str(), {(ff + kMoeBlockRows - 1) / kMoeBlockRows, max_tiles}, {256},
                 {rt::Arg::Buf(tg.buf), rt::Arg::Buf(tu.buf), rt::Arg::Val<std::uint64_t>(gate.RowBytes() * gate.rows),
                  rt::Arg::Val<std::uint64_t>(gate.RowBytes()), rt::Arg::Buf(ck_.x16), rt::Arg::Buf(ck_.sorted),
@@ -1198,12 +1279,15 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
     if (c.IsPleLayer(il) && ((defer_read && !read_ple()) || !PleChunk(l, T, error))) return false;
     if (!HcMixChunk(l.hc_attn, true, T, error, normed)) return false;
     if (l.linear ? !LinearChunk(l, linear_[il], T, error) : !AttentionChunk(l, attn_[il], T, error)) return false;
+    want_ml_ = RouterHL(l);  // the router reads the mix's fp16 hi / lo (mh, ml)
     if (!(fuse ? combine_norm(l.hc_ffn) : combine()) || !HcMixChunk(l.hc_ffn, true, T, error, fuse))
       return false;
+    want_ml_ = false;
     normed = fuse && il + 1 < c.num_layers && !c.IsPleLayer(il + 1);
     // The routed + shared experts' sum is left to the per-token combine_norm when that one follows.
     moe_defer_ = normed && prefill_moe_in_combine_ && prefill_fused_moe_combine_ && TokCombineFits(w_.layers[il + 1].hc_attn);
     const bool moe_ok = MoeChunk(l, T, error);
+    mixed32_dead_ = false;
     moe_defer_ = false;
     if (!moe_ok) return false;
     if (!(normed ? combine_norm(w_.layers[il + 1].hc_attn) : combine())) return false;
