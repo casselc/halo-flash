@@ -18,12 +18,21 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "core/json.hpp"
 #include "scope/chdb.hpp"
 #include "server/http.hpp"
 
 namespace halo::scope {
+
+/// One observation's recorded content (capture policy "full" keeps it;
+/// "digest" keeps only hashes, so has_input/has_output are false).
+struct ObservationContent {
+  std::string trace_id, span_id, type, name;
+  std::string input, output;
+  bool has_input = false, has_output = false;
+};
 
 class TraceReader {
  public:
@@ -32,6 +41,11 @@ class TraceReader {
   [[nodiscard]] std::optional<json::Value> ListTraces(const std::string& session_id, std::uint32_t limit,
                                                       std::string* error);
   [[nodiscard]] std::optional<json::Value> Trace(const std::string& trace_id, std::string* error);
+  /// The content of the observations with these span ids, or of every
+  /// GENERATION observation in these traces (start order).
+  [[nodiscard]] std::optional<std::vector<ObservationContent>> Contents(const std::vector<std::string>& trace_ids,
+                                                                      const std::vector<std::string>& span_ids,
+                                                                      std::string* error);
   /// Registers the two GET routes.
   void Register(server::HttpServer& server);
 
