@@ -1,5 +1,7 @@
 #include "decide/systemone.hpp"
 
+#include "model/variant.hpp"
+
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -159,6 +161,19 @@ std::optional<Request> ParseRequest(const Value& body, std::string* error) {
   if (const Value* m = body.find("model")) {
     if (!m->is(Value::Kind::kString)) return fail("model must be a string");
     r.model = m->str();
+  }
+  if (const Value* v = body.find("variant"); v && !v->is(Value::Kind::kNull)) {
+    if (!v->is(Value::Kind::kString) || !model::ValidVariantName(v->str()))
+      return fail("variant must be a name of 1-64 of [A-Za-z0-9._-]");
+    r.variant = v->str();
+  }
+  if (r.model.find(':') != std::string::npos) {
+    std::string why;
+    const auto alias = model::ParseModelAlias(r.model, &why);
+    if (!alias) return fail(why);
+    if (!r.variant.empty() && r.variant != alias->variant)
+      return fail("variant \"" + r.variant + "\" differs from the model alias \"" + r.model + "\"");
+    r.variant = alias->variant;
   }
   if (const Value* im = body.find("images")) {
     if (!im->is(Value::Kind::kArray)) return fail("images must be an array of strings");

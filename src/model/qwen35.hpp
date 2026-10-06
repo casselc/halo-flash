@@ -64,10 +64,19 @@ class Qwen35Reference {
   /// final normalized hidden state; `logits` (vocab) the LM head output.
   [[nodiscard]] bool Step(std::int32_t token, std::span<float> hidden, std::span<float> logits,
                           std::string* error = nullptr);
+  /// Runs `token` through layers [0, layer) only and writes the residual
+  /// stream entering `layer` (hidden_size floats): the stage-1 trainer's
+  /// frozen trunk (P11). Layers from `layer` on are not advanced, so an
+  /// object used this way serves only further StepToLayer calls with the
+  /// same `layer`.
+  [[nodiscard]] bool StepToLayer(std::int32_t token, std::uint32_t layer, std::span<float> residual,
+                                 std::string* error = nullptr);
   void SetAdapter(const LoraAdapter* adapter) noexcept { lora_ = adapter; }
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
 
  private:
+  bool Run(std::int32_t token, std::uint32_t stop_layer, std::span<float> residual, std::span<float> hidden,
+           std::span<float> logits, std::string* error);
   void MatVec(const TensorRef& w, std::span<const float> x, std::span<float> y) const;
   void Linear(const Qwen35Layer& l, std::size_t index, std::span<const float> x, std::span<float> out);
   void Attention(const Qwen35Layer& l, std::size_t index, std::span<const float> x, std::span<float> out);

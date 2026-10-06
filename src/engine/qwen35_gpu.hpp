@@ -33,6 +33,25 @@ class Qwen35Gpu {
   /// (optional, tokens.size() x hidden_size) receives every position's final
   /// normalized hidden state. Long inputs run in chunks of kMaxChunk.
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> hidden, std::string* error);
+  /// The stage-1 trainer's frozen trunk (P11): runs `tokens` as Prefill does
+  /// but only through layers [0, layer), writing the residual stream
+  /// entering `layer` for every position (tokens.size() x hidden_size).
+  /// Layers from `layer` on are not advanced: Reset before any other use.
+  [[nodiscard]] bool PrefillToLayer(std::span<const std::int32_t> tokens, std::uint32_t layer,
+                                    std::span<float> residual, std::string* error);
+
+  /// Several LoRA adapters resident at once (P10 variants), selected per
+  /// call: AddAdapter uploads one under `id` (rank <= kMaxLoraRank; its
+  /// tensors must target this model's projections), SelectAdapter makes it
+  /// apply to the following Step/Prefill calls ("" = the base model).
+  /// The adapter given to Create is resident as "default" and selected.
+  /// Switching adapters mid-sequence mixes states; callers Reset between
+  /// requests of different variants.
+  static constexpr std::uint32_t kMaxLoraRank = 256;
+  [[nodiscard]] bool AddAdapter(const std::string& id, const model::LoraAdapter& lora, std::string* error);
+  bool RemoveAdapter(const std::string& id);
+  [[nodiscard]] bool SelectAdapter(const std::string& id, std::string* error);
+  [[nodiscard]] const std::string& selected_adapter() const noexcept { return selected_; }
   static constexpr std::uint32_t kMaxChunk = 256;
   /// Up to this context the chunk's attention runs in one launch (its score
   /// scratch is kMaxChunk x heads x max_context floats); beyond, a token at a time.
@@ -44,6 +63,7 @@ class Qwen35Gpu {
   [[nodiscard]] bool SaveState(std::string* error);
   [[nodiscard]] bool RestoreState(std::string* error);
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
+  [[nodiscard]] std::uint32_t vocab_size() const noexcept { return w_.config.vocab_size; }
 
  private:
   struct DevTensor {
@@ -68,7 +88,9 @@ class Qwen35Gpu {
   /// y[T][rows] = x[T][cols] W^T (+ LoRA), for T <= kMaxChunk.
   bool Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::Buffer& y, std::uint32_t tokens,
             std::string* error);
-  bool PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> hidden, std::string* error);
+  bool PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> hidden, std::string* error,
+                    std::uint32_t stop_layer = UINT32_MAX);
+  using AdapterSet = std::unordered_map<const void*, DevLora>;  // keyed by base tensor host pointer
   bool AllocChunk(std::string* error);
   bool Launch(const char* kernel, rt::Dim3 grid, rt::Dim3 block, std::initializer_list<rt::Arg> args,
               std::string* error);
@@ -77,7 +99,9 @@ class Qwen35Gpu {
   const model::Qwen35Weights& w_;
   std::uint32_t max_context_ = 0, position_ = 0, saved_position_ = 0;
   std::unordered_map<const void*, DevTensor> tensors_;  // keyed by host data pointer
-  std::unordered_map<const void*, DevLora> lora_;
+  std::unordered_map<std::string, AdapterSet> adapters_;
+  const AdapterSet* lora_ = nullptr;  // the selected adapter, or null
+  std::string selected_;
   std::unordered_map<std::string, rt::KernelId> kernels_;
   std::vector<LayerState> layers_, saved_;
   std::vector<rt::Buffer> owned_;

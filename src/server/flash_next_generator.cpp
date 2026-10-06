@@ -37,6 +37,7 @@ TextGenerator::Result FlashNextGenerator::Generate(const Params& params,
                                                    const std::function<bool(std::string_view)>& on_text) {
   std::lock_guard<std::mutex> lk(mu_);
   Result r;
+  if (!params.variant.empty()) return r.error = "Flash-Next variants are not supported yet (P11 stage 2)", r;
   const auto encoded = tok_.Encode(params.prompt, true);
   const std::vector<std::int32_t> ids(encoded.begin(), encoded.end());  // the engine's token type
   r.prompt_tokens = ids.size();

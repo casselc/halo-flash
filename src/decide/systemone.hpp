@@ -43,6 +43,9 @@ struct Request {
   json::Value state;  ///< Content
   std::vector<Question> questions;
   std::string model = "strands-decider-latest";
+  /// P10 variant: the "variant" field, or the suffix of a "base:variant"
+  /// model alias (both given must agree); "" = the decider as loaded.
+  std::string variant;
   std::vector<std::string> images;  ///< base64; text-only engines refuse them
 };
 

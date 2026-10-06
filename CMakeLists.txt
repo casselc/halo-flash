@@ -507,3 +507,46 @@ if(TARGET halo_gpu)
     endif()
   endif()
 endif()
+
+# --- variants and stage-1 training (P10, P11; docs/TRAINING.md) ------------
+target_sources(halo_core PRIVATE src/core/sha256.cpp src/core/atomic_file.cpp)
+target_sources(halo_model PRIVATE src/model/variant.cpp src/model/variant_c_api.cpp)
+target_include_directories(halo_model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# The trainer's FP32 GEMM is the stage-1 hot path; AVX-512 doubles it on Zen 5
+# (docs/TRAINING.md). Set to "" for a portable build.
+set(HALO_TRAIN_ARCH "x86-64-v4" CACHE STRING "-march for the CPU trainer (empty: compiler default)")
+add_library(halo_training STATIC
+  src/train/parallel.cpp
+  src/train/gemm.cpp
+  src/train/last_k.cpp
+  src/train/adamw.cpp
+  src/train/checkpoint.cpp
+  src/train/data.cpp
+  src/train/eval_report.cpp
+  src/train/export.cpp
+  src/train/trainer.cpp
+)
+target_link_libraries(halo_training PUBLIC halo_model halo_text Threads::Threads)
+if(HALO_TRAIN_ARCH)
+  target_compile_options(halo_training PRIVATE -march=${HALO_TRAIN_ARCH})
+endif()
+add_executable(halo_train tools/train.cpp)
+target_link_libraries(halo_train PRIVATE halo_training)
+if(HALO_GPU)
+  target_link_libraries(halo_train PRIVATE halo_gpu)
+endif()
+if(HALO_BUILD_TESTS)
+  halo_test(train_tests
+    tests/train/gemm_test.cpp
+    tests/train/grad_check_test.cpp
+    tests/core/sha256_test.cpp
+    tests/model/variant_test.cpp)
+  target_link_libraries(train_tests PRIVATE halo_training)
+endif()
+if(HALO_BUILD_TESTS AND HALO_GPU)
+  halo_test(variant_gpu_tests tests/gpu/variant_gpu_test.cpp)
+  target_link_libraries(variant_gpu_tests PRIVATE halo_gpu halo_training)
+endif()
+if(TARGET halo_server_engine)
+  target_sources(halo_server_engine PRIVATE src/server/qwen35_generator.cpp)
+endif()
