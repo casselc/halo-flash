@@ -39,7 +39,9 @@ changed and every result is byte-identical by construction (decode and prefill l
 - **Forks share pages.** A fork maps the parent's physical pages below the parent's immutable bound (positions
   written; complete QSA blocks; fp16 rows already converted) into its own range, refcounted; the page holding
   the bound and anything mapped above it are copied. Sessions only append, so neither side ever writes a shared
-  page: no fault handling is needed.
+  page: no fault handling is needed. Reset and Restore rewrite positions from 0, so they first unmap the bound
+  session's pages (stream C: before that fix a reset parent wrote into pages its forks shared; regression test
+  `Sessions.ForkSurvivesParentResetAndRestore`).
 - **Pluggable layout.** A region is `(row_bytes, row_tokens, pages)`; today's kinds are K / V (2048 B a token),
   indexer keys (512 B), pooled blocks (512 B per 4 tokens), fp16 K / V (1024 B). An fp16-only KV layout (stream
   for full context) is a different kind table with the same paging.
@@ -165,3 +167,32 @@ three drafts ~ 3 x 4.5 ms (MTP layer + LM head); at an assumed 0.7 acceptance (2
 ~34 ms/token, **~1.1x AR**. The bytes-only floor (experts' union ~3.1 ms per added position + ~1.3 ms dense FMA)
 would give ~1.5x. CODESIGN's table (1.5x "today", 1.16x after the dense byte diet) assumed bandwidth-bound
 verification; the measured per-column cost, not bytes, decides it here. Acceptance must be measured first.
+
+## 7. Full context (stream C, 2026-10-06; working files `/data/halo-work/streams/C/`)
+
+**KV kinds.** Every region carries its kind (`KvKind`: K, V, indexer keys, pooled blocks, fp16 K, fp16 V) and
+layer; forks, snapshots and paging go by the kind table. `--kv-f16 1` (`kv_f16_only_`, default off) drops the
+fp32 K/V: decode attention reads fp16 rows (`halo_attention_select_bh`, bit-identical to the fp32 kernel on the
+rounded cache), prefill appends fp16 rows directly; prefill logits are bit-identical to the default kinds.
+Raw indexer keys are read only while their QSA block is incomplete, so pages wholly below the current block
+are released (`kv_index_window_`, default on, exact; `HALO_KV_INDEX_WINDOW=0` disables).
+
+**Measured** (SessionMemory after prefill; GTT limit 104.86 GB, 83.27 GB after load; the 8192-token chunk
+buffers and the rest ~6.3 GB):
+
+| Context | Default KV (window off / on) | fp16-only KV (window off / on) | GTT used after prefill |
+|---:|---:|---:|---:|
+| 32,768 | 2.82 GB / — | 1.16 GB / — | 92.5 (default) |
+| 131,072 | 10.67 / 9.92 GB | 4.23 / 3.47 GB | 100.4 (default), 93.9 (fp16) |
+| 262,144 | does not fit (~19.7 GB) | 8.48 GB / ~6.9 GB | 98.2 (fp16) |
+
+Per token: default 81.4 KB (75.3 with the window), fp16-only 32.3 KB (26.2). One session fits up to ~185-200K
+positions with default KV; 262,144 needs fp16-only KV. Also fixed: snapshots were sized for max_context
+(~20 GB each at 256K; now sized at Save), the block-score scratch grows with the position, the decode
+attention scores are sized by the visible stride. `halo_serve` refuses a prompt the memory left cannot hold
+(`KvRoomFor`) before prefilling it.
+
+Quality of `--kv-f16 1` (docs/BENCHMARKS.md gate): passes vs main defaults and vs the original baseline; on a
+128K-token document its NLL equals the default kinds' (paired -0.0007 +- 0.0030). Long-range checks, speed and
+the open items: `/data/halo-work/streams/C/STATE.md`.
+

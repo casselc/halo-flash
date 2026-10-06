@@ -1390,3 +1390,17 @@ Design and memory tables: docs/SESSIONS.md. Pinned, graphs, 4 prompts (300-1,000
 | Mixer columns interleaved with row blocks instead of grid z | -5..-10 at B8 | -0.3 | kept (harmless) |
 
 Remaining at B=8 (eager): experts 46 (union bandwidth, expected), mixers 23, dense GEMVs ~35, per-entry ~20.
+
+## 13. 2026-10-06 (stream C, branch `stream/fullctx`): full context
+
+Pinned, real model. Prefill 32K 21.7 s (1,504 tok/s), 128K 95.6 s (1,369), 256K 201.7-203.4 s (1,288-1,300, fp16
+KV). 256K kernel profile: QSA path 52.1 of 204 s (qsel_h2 21.5, qsa_scores_wmma 20.6, select_rows256 8.8, union4
+1.3). Decode: 7K 38.6, 32K 39.2, 128K 42.0, 256K 44.5 ms/token; at 256K qsa_scores_b 3.6-3.9, select 2.7,
+attention 1.7 ms.
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| Decode QSA select on `halo_qsa_select256` (`kDecodeSelect256`, same lists) | 7K -0.2; 128K -1.5..-3; 256K -3..-6 | -0.21 / -0.20 / -0.27 (128K) / -0.27 (256K): the 1024-thread select costs only 136-274 us a call | yes (default) |
+| Decode qsa_scores_b on a full grid (one row a thread, `kDecodeScoresWide`) | 256K -1.8..-2.2 | +1.7 ms at 256K (327 -> 439 us a call) | no |
+| `halo_qsa_scores_wmma_b`: block-key tile split once per block in LDS, q pre-split (bit-identical) | 256K -7..-11 s, 128K -1.5..-2.5 s | pending (streams/C/STATE.md) | pending |
+

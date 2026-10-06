@@ -91,6 +91,8 @@ mean over cases of the per-case NLL difference ± its standard error.
 | Shared-expert gate/up as W8A8 (`--shexp-w8a8 1`) | 0.285309 / 92.60% | −0.00081 ± 0.00093 (56/42) | 0.121921 / 97.26% | +0.00064 ± 0.00095 (7/5), +0.0058 | passes (kept, then turned off after merging stream E's `_s` tiles: no speed gain left) |
 | DeltaNet fp16 data path, stream R (`--gdn-f16 1`: qkv / z GEMMs, conv output, prep / scan inputs, scan output and gated norm in fp16; paired against main 56693d8 defaults, scored as stream P's cumulative set: 6 long cases re-scored on this build matched it exactly) | 0.285022 / 92.60% | −0.00104 ± 0.00107 (45/53) | 0.122013 / 97.65% | +0.00034 ± 0.00054 (8/4), +0.0027 | **passes** (default on); against the original baseline: short −0.00102 ± 0.00106, long +0.00074 ± 0.00052 (9/3), worst +0.0043: passes |
 
+| fp16-only KV (`--kv-f16 1`, stream C; decode reads fp16 K/V, prefill unchanged; paired against main 6f3a1cf defaults) | 0.284722 / 92.67% | −0.00045 ± 0.00040 (48/50) | 0.121820 / 97.52% | −0.00019 ± 0.00053 (5/7), +0.0030 | **passes** (default off); vs the original baseline: short −0.00147 ± 0.00097, long +0.00055 ± 0.00088, worst +0.0062 |
+
 **Cumulative, everything kept** (stream/precision after merging main: `--router-f16 3`, `--small-f16`, `--mix-h16`,
 `--res16 1`, `--gdn-scan-h`), paired against the original baseline: short 0.286185 / 92.51% (paired
 +0.000015 ± 0.000453, 56/42, agreement −0.07 pp), long 0.121673 / 96.87% (paired +0.00039 ± 0.00072, 6/6, worst case
