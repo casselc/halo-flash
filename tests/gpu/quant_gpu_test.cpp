@@ -1105,6 +1105,28 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
         launch("halo_conv_l2norm_prefill8", {ch / d, (T + 7) / 8}, {d},
                {rt::Arg::Buf(inb), rt::Arg::Buf(cs2), rt::Arg::Buf(cwb), rt::Arg::Buf(*conv8), rt::Arg::Val(ch),
                 rt::Arg::Val(T), rt::Arg::Val(2 * kd), rt::Arg::Val(1e-6f)});
+        // Stream R (--gdn-f16): the fp16-out form over fp16 inputs equals the fp32-out form rounded once.
+        std::vector<_Float16> in16(in.size());
+        for (std::size_t i = 0; i < in.size(); ++i) in16[i] = static_cast<_Float16>(in[i]);
+        auto in16b = dev->Alloc(in16.size() * 2, &error), oh = dev->Alloc(std::size_t{T} * ch * 2, &error);
+        owned.push_back(in16b);
+        owned.push_back(oh);
+        ASSERT_TRUE(dev->Upload(in16b, 0, in16.data(), in16.size() * 2, &error)) << error;
+        auto of = zeros(std::size_t{T} * ch);
+        launch("halo_conv_l2norm_prefill8_h", {ch / d, (T + 7) / 8}, {d},
+               {rt::Arg::Buf(in16b), rt::Arg::Buf(cs2), rt::Arg::Buf(cwb), rt::Arg::Buf(of), rt::Arg::Val(ch),
+                rt::Arg::Val(T), rt::Arg::Val(2 * kd), rt::Arg::Val(1e-6f)});
+        launch("halo_conv_l2norm_prefill8_hh", {ch / d, (T + 7) / 8}, {d},
+               {rt::Arg::Buf(in16b), rt::Arg::Buf(cs2), rt::Arg::Buf(cwb), rt::Arg::Buf(oh), rt::Arg::Val(ch),
+                rt::Arg::Val(T), rt::Arg::Val(2 * kd), rt::Arg::Val(1e-6f)});
+        std::vector<float> fo(std::size_t{T} * ch);
+        std::vector<_Float16> ho(fo.size());
+        ASSERT_TRUE(dev->Download(of, 0, fo.data(), fo.size() * 4, &error) &&
+                    dev->Download(oh, 0, ho.data(), ho.size() * 2, &error))
+            << error;
+        for (std::size_t i = 0; i < fo.size(); ++i)
+          ASSERT_EQ(std::bit_cast<std::uint16_t>(ho[i]), std::bit_cast<std::uint16_t>(static_cast<_Float16>(fo[i])))
+              << "conv8_hh[" << i << "] T " << T;
       }
       launch("halo_conv_state_advance", {(ch + 255) / 256}, {256},
              {rt::Arg::Buf(inb), rt::Arg::Buf(cs2), rt::Arg::Val(ch), rt::Arg::Val(kern), rt::Arg::Val(T)});
@@ -1216,6 +1238,51 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
                 rt::Arg::Val(vd)});
         close4(get(out10, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "c16 scanh output");
         close4(get(gs10, gst.size()), get(gs5, gst.size()), "c16 scanh recurrent state");
+        // Stream R (--gdn-f16): conv output rounded to fp16. prep2_h over it equals prep2 over its widened
+        // copy bit for bit; scanf / scanft (K, Q exact in fp16: the lo halves dropped, fp16 V in, fp16 O out)
+        // equal scanh over the widened copy: the same state bits, O rounded once.
+        {
+          auto c32 = get(conv2, std::size_t{T} * ch);
+          std::vector<_Float16> c16(c32.size());
+          for (std::size_t i = 0; i < c32.size(); ++i) {
+            c16[i] = static_cast<_Float16>(c32[i]);
+            c32[i] = static_cast<float>(c16[i]);
+          }
+          auto cw = up(c32), ch16 = dev->Alloc(c16.size() * 2, &error);
+          owned.push_back(ch16);
+          ASSERT_TRUE(dev->Upload(ch16, 0, c16.data(), c16.size() * 2, &error)) << error;
+          const std::uint32_t cpb = 2;
+          auto pw = zeros(std::size_t{nv} * nch * 576), ph = zeros(std::size_t{nv} * nch * 576);
+          launch("halo_gdn_c16_prep2", {(nch + cpb - 1) / cpb, nk}, {256},
+                 {rt::Arg::Buf(cw), rt::Arg::Buf(cw, kd * 4ull), rt::Arg::Buf(alb), rt::Arg::Buf(beb), rt::Arg::Buf(ab),
+                  rt::Arg::Buf(dtb), rt::Arg::Buf(pw), rt::Arg::Val(nv), rt::Arg::Val(T), rt::Arg::Val(ch),
+                  rt::Arg::Val(cpb)});
+          launch("halo_gdn_c16_prep2_h", {(nch + cpb - 1) / cpb, nk}, {256},
+                 {rt::Arg::Buf(ch16), rt::Arg::Buf(ch16, kd * 2ull), rt::Arg::Buf(alb), rt::Arg::Buf(beb),
+                  rt::Arg::Buf(ab), rt::Arg::Buf(dtb), rt::Arg::Buf(ph), rt::Arg::Val(nv), rt::Arg::Val(T),
+                  rt::Arg::Val(ch), rt::Arg::Val(cpb)});
+          same(get(ph, std::size_t{nv} * nch * 576), get(pw, std::size_t{nv} * nch * 576), "prep2_h");
+          auto gsw = up(gst), outw = zeros(std::size_t{T} * vd);
+          launch("halo_gdn_c16_scanh", {2, nv}, {128},
+                 {rt::Arg::Buf(cw), rt::Arg::Buf(cw, kd * 4ull), rt::Arg::Buf(cw, 2ull * kd * 4), rt::Arg::Buf(pw),
+                  rt::Arg::Buf(gsw), rt::Arg::Buf(outw), rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch),
+                  rt::Arg::Val(ch), rt::Arg::Val(vd)});
+          const auto ow = get(outw, std::size_t{T} * vd), sw = get(gsw, gst.size());
+          for (const char* kname : {"halo_gdn_c16_scanf", "halo_gdn_c16_scanft"}) {
+            auto gsf = up(gst), outf = dev->Alloc(std::size_t{T} * vd * 2, &error);
+            owned.push_back(outf);
+            launch(kname, {2, nv}, {128},
+                   {rt::Arg::Buf(ch16), rt::Arg::Buf(ch16, kd * 2ull), rt::Arg::Buf(ch16, 2ull * kd * 2),
+                    rt::Arg::Buf(ph), rt::Arg::Buf(gsf), rt::Arg::Buf(outf), rt::Arg::Val(nk), rt::Arg::Val(T),
+                    rt::Arg::Val(ch), rt::Arg::Val(ch), rt::Arg::Val(vd)});
+            same(get(gsf, gst.size()), sw, kname);
+            std::vector<_Float16> of(std::size_t{T} * vd);
+            ASSERT_TRUE(dev->Download(outf, 0, of.data(), of.size() * 2, &error)) << error;
+            for (std::size_t i = 0; i < of.size(); ++i)
+              ASSERT_EQ(std::bit_cast<std::uint16_t>(of[i]), std::bit_cast<std::uint16_t>(static_cast<_Float16>(ow[i])))
+                  << kname << " output[" << i << "] T " << T;
+          }
+        }
         // prep2 (cpb chunks a block, prefetched) writes the same prep as prep.
         for (const std::uint32_t cpb : {1u, 2u, 3u}) {
           auto prep2 = zeros(std::size_t{nv} * nch * 576);
@@ -1666,6 +1733,57 @@ TEST(GpuQuant, SplitOperandF16GemmsMatchSums) {
   }, {.test_cases = 30});
 }
 
+// Stream R (router mode 4): halo_gemm_h_hl_* over fp16 W and x given as fp16 hi / lo halves (rne(x),
+// rne(x - hi)) equal halo_gemm_f32_f16_x2 over fp32 W and x bit for bit (same products, same order per
+// output). rows % 128 == 0, cols % 64 == 0.
+TEST(GpuQuant, RouterHiLoGemmEqualsSplitGemm) {
+  std::string error;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &error);
+  if (!dev) GTEST_SKIP() << error;
+  ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+  hegel::test([&](hegel::TestCase& tc) {
+    const auto rows = 128 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 4}));
+    const auto cols = 64 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 40}));
+    const auto T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 200}));
+    std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+    const auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return static_cast<float>(seed >> 8) / 16777216.0f; };
+    const auto val = [&] { return (rnd() < 0.5f ? -1.0f : 1.0f) * std::ldexp(1.0f + rnd(), static_cast<int>(rnd() * 12) - 6); };
+    std::vector<float> w(std::size_t{rows} * cols), xf(std::size_t{T} * cols), y0(std::size_t{T} * rows), y1(y0.size());
+    for (auto& v : w) v = val();
+    for (auto& v : xf) v = val();
+    std::vector<_Float16> w16(w.size()), xh(xf.size()), xl(xf.size());
+    for (std::size_t i = 0; i < w.size(); ++i) w16[i] = static_cast<_Float16>(w[i]);
+    for (std::size_t i = 0; i < xf.size(); ++i) {
+      xh[i] = static_cast<_Float16>(xf[i]);
+      xl[i] = static_cast<_Float16>(xf[i] - static_cast<float>(xh[i]));
+    }
+    auto wb = dev->Alloc(w.size() * 4, &error), xb = dev->Alloc(xf.size() * 4, &error), yb = dev->Alloc(y0.size() * 4, &error),
+         w16b = dev->Alloc(w16.size() * 2, &error), xhb = dev->Alloc(xh.size() * 2, &error),
+         xlb = dev->Alloc(xl.size() * 2, &error), y1b = dev->Alloc(y1.size() * 4, &error);
+    ASSERT_TRUE(dev->Upload(wb, 0, w.data(), w.size() * 4, &error) && dev->Upload(xb, 0, xf.data(), xf.size() * 4, &error) &&
+                dev->Upload(w16b, 0, w16.data(), w16.size() * 2, &error) &&
+                dev->Upload(xhb, 0, xh.data(), xh.size() * 2, &error) && dev->Upload(xlb, 0, xl.data(), xl.size() * 2, &error))
+        << error;
+    const rt::Arg a[] = {rt::Arg::Buf(wb), rt::Arg::Buf(xb), rt::Arg::Buf(yb), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                         rt::Arg::Val(T)};
+    ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemm_f32_f16_x2", &error), {(T + 63) / 64, (rows + 63) / 64}, {128}, a, &error))
+        << error;
+    ASSERT_TRUE(dev->Download(yb, 0, y0.data(), y0.size() * 4, &error)) << error;
+    const rt::Arg b[] = {rt::Arg::Buf(w16b), rt::Arg::Buf(xhb), rt::Arg::Buf(xlb), rt::Arg::Buf(y1b), rt::Arg::Val(rows),
+                         rt::Arg::Val(cols), rt::Arg::Val(T)};
+    for (const auto& [name, br, nt] : {std::tuple{"halo_gemm_h_hl_128x64", 128u, 256u},
+                                       std::tuple{"halo_gemm_h_hl_128x64k32", 128u, 256u},
+                                       std::tuple{"halo_gemm_h_hl_64x64", 64u, 128u}}) {
+      ASSERT_TRUE(dev->Launch(dev->Kernel(name, &error), {(T + 63) / 64, rows / br}, {nt}, b, &error)) << error;
+      ASSERT_TRUE(dev->Download(y1b, 0, y1.data(), y1.size() * 4, &error)) << error;
+      for (std::size_t i = 0; i < y0.size(); ++i)
+        ASSERT_EQ(std::bit_cast<std::uint32_t>(y1[i]), std::bit_cast<std::uint32_t>(y0[i]))
+            << name << " [" << i << "] rows " << rows << " cols " << cols << " T " << T;
+    }
+    for (auto* x : {&wb, &xb, &yb, &w16b, &xhb, &xlb, &y1b}) dev->Free(*x);
+  }, {.test_cases = 30});
+}
+
 // Precision option (stream P): halo_gemm_q8r_f16_lr8h stores fp16(the fp32
 // result of halo_gemm_q8r_f16_lr8), bit for bit (same tiles, same sums).
 TEST(GpuQuant, HalfOutputBandedGemmIsRoundedFp32Gemm) {
@@ -2049,6 +2167,43 @@ TEST(GpuQuant, FusedMixerUpMatchesReference) {
           ASSERT_EQ(std::bit_cast<std::uint32_t>(yt[i]), std::bit_cast<std::uint32_t>(y[i])) << "mixt " << i;
           ASSERT_EQ(std::bit_cast<std::uint16_t>(yth[i]), std::bit_cast<std::uint16_t>(yh[i])) << "mixt16 " << i;
         }
+      }
+      if (!rebuild) {  // stream R: mixthl writes mixth's y and y16 bit for bit, plus ylo = rne(y - y16)
+        std::vector<_Float16> xhk(std::size_t{T} * rows);
+        for (std::uint32_t t = 0; t < T; ++t)
+          for (std::uint32_t c = 0; c < rows; ++c)
+            xhk[(std::size_t{c / 64} * T + t) * 64 + c % 64] = static_cast<_Float16>(xn[std::size_t{t} * rows + c]);
+        auto xkb = dev->Alloc(xhk.size() * 2, &error), ylb = dev->Alloc(std::size_t{T} * h * 2, &error);
+        ASSERT_TRUE(xkb && ylb && dev->Upload(xkb, 0, xhk.data(), xhk.size() * 2, &error)) << error;
+        std::vector<float> ya(y.size()), yb2(y.size());
+        std::vector<_Float16> ha(y.size()), hb(y.size()), hl(y.size());
+        const rt::Arg ma[] = {rt::Arg::Buf(pqs), rt::Arg::Buf(pdb), rt::Arg::Buf(xb), rt::Arg::Buf(yb), rt::Arg::Val(rows),
+                              rt::Arg::Val(cols), rt::Arg::Val(qstride), rt::Arg::Val(T), rt::Arg::Buf(xkb),
+                              rt::Arg::Buf(y16)};
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemm_q8r_f16_mixth", &error), {(rows + 255) / 256, (T + 127) / 128},
+                                {256}, ma, &error))
+            << error;
+        ASSERT_TRUE(dev->Download(yb, 0, ya.data(), ya.size() * 4, &error) &&
+                    dev->Download(y16, 0, ha.data(), ha.size() * 2, &error))
+            << error;
+        const rt::Arg mb[] = {rt::Arg::Buf(pqs), rt::Arg::Buf(pdb), rt::Arg::Buf(xb), rt::Arg::Buf(yb), rt::Arg::Val(rows),
+                              rt::Arg::Val(cols), rt::Arg::Val(qstride), rt::Arg::Val(T), rt::Arg::Buf(xkb),
+                              rt::Arg::Buf(y16), rt::Arg::Buf(ylb)};
+        ASSERT_TRUE(dev->Launch(dev->Kernel("halo_gemm_q8r_f16_mixthl", &error), {(rows + 255) / 256, (T + 127) / 128},
+                                {256}, mb, &error))
+            << error;
+        ASSERT_TRUE(dev->Download(yb, 0, yb2.data(), yb2.size() * 4, &error) &&
+                    dev->Download(y16, 0, hb.data(), hb.size() * 2, &error) &&
+                    dev->Download(ylb, 0, hl.data(), hl.size() * 2, &error))
+            << error;
+        for (std::size_t i = 0; i < y.size(); ++i) {
+          ASSERT_EQ(std::bit_cast<std::uint32_t>(yb2[i]), std::bit_cast<std::uint32_t>(ya[i])) << "mixthl y " << i;
+          ASSERT_EQ(std::bit_cast<std::uint16_t>(hb[i]), std::bit_cast<std::uint16_t>(ha[i])) << "mixthl y16 " << i;
+          const _Float16 want = static_cast<_Float16>(ya[i] - static_cast<float>(ha[i]));
+          ASSERT_EQ(std::bit_cast<std::uint16_t>(hl[i]), std::bit_cast<std::uint16_t>(want)) << "mixthl ylo " << i;
+        }
+        dev->Free(xkb);
+        dev->Free(ylb);
       }
       for (auto* b : {&wb, &qs, &db, &pqs, &pdb, &xb, &nb, &yb, &y16, &rsb, &nwb}) dev->Free(*b);
       // Weights in fp16 as the kernel stages them, row-major (stream s, index i at row s h + i).
@@ -2526,6 +2681,25 @@ TEST(GpuKernels, GatedNormWaveEqualsBlock) {
       std::vector<std::uint16_t> a(n), b(n);
       ASSERT_TRUE(dev->Download(y1, 0, a.data(), n * 2, &error) && dev->Download(y2, 0, b.data(), n * 2, &error)) << error;
       ASSERT_EQ(b, a) << "mode " << mode;
+      // Stream R (--gdn-f16): fp16 o and z equal their widened fp32 copies through h128w, bit for bit.
+      std::vector<_Float16> o16(n), z16(n);
+      std::vector<float> ow(n), zw(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        o16[i] = static_cast<_Float16>(o[i]);
+        z16[i] = static_cast<_Float16>(z[i]);
+        ow[i] = static_cast<float>(o16[i]);
+        zw[i] = static_cast<float>(z16[i]);
+      }
+      auto owb = up(ow.data(), n * 4), zwb = up(zw.data(), n * 4), o16b = up(o16.data(), n * 2),
+           z16b = up(z16.data(), n * 2), y3 = up(nullptr, n * 2), y4 = up(nullptr, n * 2);
+      launch("halo_gated_norm_h128w", (rows + 7) / 8, 256,
+             {rt::Arg::Buf(owb), rt::Arg::Buf(wb), rt::Arg::Buf(zwb), rt::Arg::Buf(y3), rt::Arg::Val(rows),
+              rt::Arg::Val(1e-6f), rt::Arg::Val(mode)});
+      launch("halo_gated_norm_h128w_hh", (rows + 7) / 8, 256,
+             {rt::Arg::Buf(o16b), rt::Arg::Buf(wb), rt::Arg::Buf(z16b), rt::Arg::Buf(y4), rt::Arg::Val(rows),
+              rt::Arg::Val(1e-6f), rt::Arg::Val(mode)});
+      ASSERT_TRUE(dev->Download(y3, 0, a.data(), n * 2, &error) && dev->Download(y4, 0, b.data(), n * 2, &error)) << error;
+      ASSERT_EQ(b, a) << "hh mode " << mode;
       for (auto& x : owned) dev->Free(x);
     }, {.test_cases = 40});
   }

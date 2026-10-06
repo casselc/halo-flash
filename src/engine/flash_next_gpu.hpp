@@ -157,7 +157,11 @@ class FlashNextGpu {
   /// instead of bf16x3. Takes precedence over prefill_router_bf16x3_.
   /// 1: plain fp16; 2: weights split hi/lo (two WMMAs), fp16 `mh`; 3: fp16
   /// weights, fp32 `mixed` split hi/lo.
+  /// 4 (stream R): mode 3's numbers, with fp16 weights converted once and the activation's hi / lo halves
+  /// written by the mix epilogue (mh, ml), on 128 x 64 tiles (halo_gemm_h_hl_128x64).
   static inline int prefill_router_f16_ = 3;
+  /// Stream R study: the mode-4 router kernel's tile (0: 128 x 64, BK 64; 1: 128 x 64, BK 32; 2: 64 x 64).
+  static inline int prefill_router_tile_ = 0;
   /// Precision option (stream P): the small F32 projections over `mixed`
   /// (DeltaNet alpha/beta, shared-expert gate) on FP16 WMMA like the router
   /// option, instead of the fp32 tiled GEMM.
@@ -174,6 +178,11 @@ class FlashNextGpu {
   /// Precision option (stream P): DeltaNet qkv and z GEMM outputs in fp16,
   /// read as fp16 by the conv, the conv state advance and the gated norm.
   static inline bool prefill_gdn_io16_ = false;
+  /// Precision option (stream R): the whole DeltaNet data path in fp16 (implies prefill_gdn_io16_'s GEMMs):
+  /// the conv writes fp16 q/k/v, prep and scan read them (K and Q exact in fp16: 2 WMMAs a product), the
+  /// scan writes o in fp16, the one-wave gated norm reads fp16 o and z. 1: halo_gdn_c16_scanf (K^T
+  /// gathered), 2: halo_gdn_c16_scanft (K^T from a transposed copy).
+  static inline int prefill_gdn_f16_ = 0;
   /// Precision option (stream P): the chunk's hyper-connection residual
   /// streams stored in 16 bits (1: fp16, 2: bf16) instead of fp32; every
   /// residual reader and writer of the prefill takes the matching variant.
@@ -304,7 +313,7 @@ class FlashNextGpu {
     rt::Buffer pa, pb;  // PLE key and normalized rows
     rt::Buffer ipart;   // inject partial products [T][hc][rows]
     rt::Buffer rscale;  // per-row norm scale [T][hc] when combine_norm skipped writing xn
-    rt::Buffer xh, mh, lh;  // fp16 activations: per GEMM, the shared `mixed`, the mixer lo (mix_h16)  // grouped experts (hp, x16 fp16)
+    rt::Buffer xh, mh, lh, ml;  // ml: fp16 lo of `mixed` (router mode 4); fp16 activations: per GEMM, the shared `mixed`, the mixer lo (mix_h16)  // grouped experts (hp, x16 fp16)
     rt::Buffer bscores, vis, ascores;                // batched attention, kAttnSub tokens at a time
     rt::Buffer ublk, umask, ucount;                  // QSA unions of 4 tokens (halo_qsa_union4)
     rt::Buffer gdnprep;                              // chunked DeltaNet: per (head, 16-token chunk) halo_gdn_c16_prep
@@ -347,6 +356,7 @@ class FlashNextGpu {
   bool MixUp(const model::HcMixer& m, std::uint32_t T, std::string* error);
   bool Half(const rt::Buffer& x, const rt::Buffer& out, std::uint32_t n, std::string* error);
   bool MixedHalf(std::uint32_t T, std::string* error);
+  bool RouterHL(const model::LayerWeights& l);
   const rt::Buffer* MixedH() const;
   bool Bucket(std::uint32_t pairs, std::uint32_t E, std::string* error);
   bool GroupedMoeFits(const model::LayerWeights& l) const;
@@ -355,7 +365,10 @@ class FlashNextGpu {
                          bool fused_combine = false);
   bool MoeChunk(const model::LayerWeights& l, std::uint32_t tokens, std::string* error);
 
-std::unordered_set<const void*> moe_blocked_;  // tensors repacked K-blocked (prefill_moe_blocked_)
+std::unordered_set<const void*> moe_blocked_;
+  std::unordered_map<const void*, rt::Buffer> router16_;  // fp16 router weights (prefill_router_f16_ 4)
+  bool want_ml_ = false;
+  bool router_hl_ok_ = false;  // RouterHL held for this layer: mh / ml are the router's input  // the next mix epilogue also writes ml (the MoE-half mixer, router mode 4)  // tensors repacked K-blocked (prefill_moe_blocked_)
 
 rt::Buffer moe_blocked_tmp_;
 
