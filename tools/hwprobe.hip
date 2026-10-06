@@ -4,6 +4,7 @@
 //   halo_hwprobe keepalive [ms] [s] an empty marker every ms: keeps rocprofv3 instruction counters armed
 //   halo_hwprobe sweep [custom]   staged-read patterns as kernels issue them (feeds perf_model)
 //   halo_hwprobe rounds          dependent load rounds vs concurrency (feeds perf_model)
+//   halo_hwprobe pageloc [all|key|mem]  streams / pages / window per wave at fixed bytes in flight; GTT vs VRAM
 //   halo_hwprobe empty           cost of blocks that exit at once (grids sized for the most tiles)
 //   halo_hwprobe stream          the hyper-connection residual's DRAM traffic patterns
 //   halo_hwprobe clock           shader clock (in-kernel counters) vs load
@@ -994,6 +995,205 @@ void Counters() {
   CHECK(hipFree(out));
 }
 
+// ---- pageloc: concurrent pages / streams per wave at fixed bytes in flight -------------------------------
+// Every wave runs IT iterations; an iteration is P 16-byte loads a lane (512 P bytes a wave in flight, no
+// prefetch: the loop is not unrolled), split into K streams of b = 512 P / K bytes (lanes of one stream are
+// adjacent, so each stream's piece is one contiguous b-byte run). Wave-iteration u = wave * IT + i; the K pieces
+// of u lie in a window of Wb bytes: region u / q (q = Wb / (512 P) wave-iterations share one region),
+// address = base + region * rp + s * (Wb / K) + (u % q) * b. Wb = K rows of a row-major matrix when Wb = the wave's
+// bytes (the Q8 GEMV: K = 4 rows of 6144 bytes, Wb = 24 KB, IT = 12); K = 1 is a contiguous stream whatever Wb;
+// rp > Wb pads regions apart (more distinct pages and 2 MB fragments live at once, same bytes). Bytes per wave,
+// bytes in flight per wave and the instruction stream are the same for every K and Wb.
+template <int P>
+__global__ void __launch_bounds__(256) PageLocKernel(const char* g, std::uint32_t K, std::uint64_t Wb, std::uint32_t IT,
+                                                     std::uint64_t rp, std::uint64_t shift, float* sink,
+                                                     unsigned long long* clk) {
+  extern __shared__ float pl_lds[];
+  const std::uint32_t lane = threadIdx.x % 32;
+  const std::uint64_t wave = (blockIdx.x * std::uint64_t{blockDim.x} + threadIdx.x) / 32;
+  const std::uint32_t per = 32 * P / K;                  // 16-byte pieces a stream an iteration
+  const std::uint64_t b = 512ull * P / K, q = Wb / (512ull * P), ss = Wb / K;
+  std::uint64_t off[P];
+#pragma unroll
+  for (int p = 0; p < P; ++p) {
+    const std::uint32_t j = p * 32 + lane;
+    off[p] = (j / per) * ss + (j % per) * 16;
+  }
+  const bool timer = blockIdx.x == 0 && threadIdx.x == 0;
+  unsigned long long cyc = 0;
+  const unsigned long long r0 = wall_clock64();
+  int acc = 0;
+#pragma unroll 1
+  for (std::uint32_t i = 0; i < IT; ++i) {
+    const unsigned c0 = static_cast<unsigned>(clock64()) & 0xFFFFF;
+    const std::uint64_t u = wave * IT + i;
+    const char* at = g + shift + (u / q) * rp + (u % q) * b;
+    int4 v[P];
+#pragma unroll
+    for (int p = 0; p < P; ++p) v[p] = *reinterpret_cast<const int4*>(at + off[p]);
+#pragma unroll
+    for (int p = 0; p < P; ++p) acc += v[p].x ^ v[p].y ^ v[p].z ^ v[p].w;
+    if (timer) cyc += ((static_cast<unsigned>(clock64()) & 0xFFFFF) - c0) & 0xFFFFF;
+  }
+  if (timer) clk[0] += cyc, clk[1] += wall_clock64() - r0;
+  if (acc == 0x12345) sink[0] = acc + pl_lds[0];
+}
+
+struct PlCfg {
+  std::uint32_t K, NB, IT;
+  std::uint64_t Wb, rp;
+  std::uint32_t lds;
+};
+
+std::uint64_t SysfsU64(const char* f) {
+  char path[256];
+  std::snprintf(path, sizeof path, "/sys/class/drm/card0/device/%s", f);
+  FILE* h = std::fopen(path, "r");
+  unsigned long long v = 0;
+  if (h) {
+    if (std::fscanf(h, "%llu", &v) != 1) v = 0;
+    std::fclose(h);
+  }
+  return v;
+}
+
+// Returns GB/s (0 if the config does not fit); prints one row.
+double RunPageLoc(const PlCfg& c, const char* g, std::uint64_t B, const char* mem, float* sink, unsigned long long* clk) {
+  constexpr int P = 4;
+  const std::uint64_t bif = 512ull * P, waves = std::uint64_t{c.NB} * 8, q = c.Wb / bif;
+  const std::uint64_t rp = c.rp ? c.rp : c.Wb;
+  const std::uint64_t regions = (waves * c.IT + q - 1) / q, F = regions * rp;
+  const double bytes = double(waves) * c.IT * bif;
+  char wb[32], rps[32];
+  const auto human = [](char* o, std::uint64_t v) {
+    if (v >= (1ull << 20)) std::snprintf(o, 32, "%lluM", (unsigned long long)(v >> 20));
+    else std::snprintf(o, 32, "%lluK", (unsigned long long)(v >> 10));
+  };
+  human(wb, c.Wb), human(rps, rp);
+  if (c.Wb % bif || (32 * P) % c.K || F > B) {
+    std::printf("  %-5s K %2u Wb %5s rp %5s NB %4u lds %5u: does not fit (F %llu MB)\n", mem, c.K, wb, rps, c.NB, c.lds,
+                (unsigned long long)(F >> 20));
+    return 0;
+  }
+  // Fresh lines every launch: rotate by the footprint if the reuse distance is past the MALL, else shift
+  // inside the padding.
+  const std::uint64_t m = B / F;
+  int mode;
+  std::uint64_t shifts;
+  if ((m - 1) * F >= (64ull << 20)) mode = 0, shifts = m;
+  else if (rp / c.Wb >= 4) mode = 1, shifts = rp / c.Wb;
+  else mode = 2, shifts = std::max<std::uint64_t>(m, 1);
+  int n = 0;
+  const auto run = [&] {
+    const std::uint64_t k = n++ % shifts, shift = mode == 1 ? k * c.Wb : k * F;
+    hipLaunchKernelGGL(PageLocKernel<P>, c.NB, 256, c.lds, 0, g, c.K, c.Wb, c.IT, rp, shift, sink, clk);
+  };
+  for (int w = 0; w < 4; ++w) run();
+  CHECK(hipDeviceSynchronize());
+  CHECK(hipMemset(clk, 0, 16));
+  hipEvent_t e0, e1;
+  CHECK(hipEventCreate(&e0));
+  CHECK(hipEventCreate(&e1));
+  const int reps = 20;
+  CHECK(hipEventRecord(e0));
+  for (int r = 0; r < reps; ++r) run();
+  CHECK(hipEventRecord(e1));
+  CHECK(hipEventSynchronize(e1));
+  float ms;
+  CHECK(hipEventElapsedTime(&ms, e0, e1));
+  ms /= reps;
+  unsigned long long h[2];
+  CHECK(hipMemcpy(h, clk, 16, hipMemcpyDeviceToHost));
+  const double mhz = h[1] ? h[0] / (h[1] / 100.0) : 0;
+  const double gbs = bytes / (ms * 1e-3) / 1e9;
+  // concurrent pages: distinct 4 KB pages one wave-iteration touches (K pieces over Wb)
+  const std::uint64_t pages = std::min<std::uint64_t>(c.K, std::max<std::uint64_t>(1, c.Wb / 4096));
+  std::printf("  %-5s K %2u Wb %5s rp %5s NB %4u lds %5u  %8.1f us  %6.1f GB/s  clk %4.0f MHz  pages/wave-it %2llu  F %5llu MB%s\n",
+              mem, c.K, wb, rps, c.NB, c.lds, ms * 1e3, gbs, mhz, (unsigned long long)pages,
+              (unsigned long long)(F >> 20), mode == 2 ? "  (MALL reuse possible)" : "");
+  std::fflush(stdout);
+  CHECK(hipEventDestroy(e0));
+  CHECK(hipEventDestroy(e1));
+  return gbs;
+}
+
+// pageloc [set]: set = all | key | mem. GTT buffer 2 GB (hipMalloc past the 512 MB carve-out), VRAM buffer
+// 192 MB (hipMalloc first, while the carve-out has room); placement read from sysfs deltas.
+void PageLoc(const std::string& set) {
+  float* sink;
+  unsigned long long* clk;
+  CHECK(hipMalloc(&sink, 64));
+  CHECK(hipMalloc(&clk, 16));
+  const std::uint64_t KB = 1024, MB = KB * KB;
+  const std::uint64_t vb = 192 * MB, gb = 2048 * MB;
+  const bool want_mem = set == "all" || set == "mem" || set == "key";
+  char* vram = nullptr;
+  if (want_mem) {
+    const std::uint64_t v0 = SysfsU64("mem_info_vram_used"), t0 = SysfsU64("mem_info_gtt_used");
+    CHECK(hipMalloc(&vram, vb));
+    CHECK(hipMemset(vram, 1, vb));
+    CHECK(hipDeviceSynchronize());
+    std::printf("buffer A: hipMalloc %llu MB: vram_used +%lld MB, gtt_used +%lld MB\n", (unsigned long long)(vb >> 20),
+                (long long)(SysfsU64("mem_info_vram_used") - v0) / (1 << 20),
+                (long long)(SysfsU64("mem_info_gtt_used") - t0) / (1 << 20));
+  }
+  char* gtt;
+  const std::uint64_t v1 = SysfsU64("mem_info_vram_used"), t1 = SysfsU64("mem_info_gtt_used");
+  CHECK(hipMalloc(&gtt, gb));
+  CHECK(hipMemset(gtt, 1, gb));
+  CHECK(hipDeviceSynchronize());
+  std::printf("buffer B: hipMalloc %llu MB: vram_used +%lld MB, gtt_used +%lld MB\n", (unsigned long long)(gb >> 20),
+              (long long)(SysfsU64("mem_info_vram_used") - v1) / (1 << 20),
+              (long long)(SysfsU64("mem_info_gtt_used") - t1) / (1 << 20));
+  std::printf("pageloc: 8 waves a block, 2 KB in flight a wave (4 x 16 B a lane), IT 12 iterations a wave (24 KB);\n"
+              "  K streams a wave-iteration over a Wb window, regions rp apart; 20 timed launches after 4 warm-up\n");
+  const std::uint32_t L = 49152;  // the Q8 GEMV's 48 KB of LDS: 2 blocks a WGP, 40 resident
+  if (set == "all" || set == "key") {
+    std::printf("A. streams a wave x blocks (row-major rows packed: Wb = 24 KB = the wave's bytes; GEMV r4 = K 4 NB 80)\n");
+    const std::vector<std::uint32_t> nbs = set == "key" ? std::vector<std::uint32_t>{40, 80, 400}
+                                                        : std::vector<std::uint32_t>{16, 40, 80, 168, 400};
+    for (const std::uint32_t lds : {L, 0u})
+      for (const std::uint32_t nb : nbs)
+        for (const std::uint32_t k : {1u, 2u, 4u, 8u, 16u}) {
+          if (set == "key" && lds == 0 && nb != 80) continue;
+          RunPageLoc({k, nb, 12, 24 * KB, 0, lds}, gtt, gb, "gtt", sink, clk);
+        }
+    std::printf("B. window (K pieces of one wave-iteration spread over Wb; rows of Wb/K bytes)\n");
+    for (const std::uint32_t nb : {80u, 400u})
+      for (const std::uint32_t k : {2u, 4u, 16u})
+        for (const std::uint64_t w : {4 * KB, 24 * KB, 64 * KB, 2 * MB, 32 * MB}) {
+          if (set == "key" && (nb == 400 || k == 2)) continue;
+          RunPageLoc({k, nb, 12, w, 0, L}, gtt, gb, "gtt", sink, clk);
+        }
+    std::printf("C. regions padded apart (same bytes, more distinct 4 KB pages / 2 MB fragments live)\n");
+    for (const std::uint32_t nb : {40u, 80u})
+      for (const std::uint32_t k : {1u, 4u})
+        for (const std::uint64_t rp : {24 * KB, 64 * KB, 2 * MB}) {
+          if (set == "key" && nb == 40) continue;
+          RunPageLoc({k, nb, 12, 24 * KB, rp, L}, gtt, gb, "gtt", sink, clk);
+        }
+    std::printf("E. engine-like shapes (dual qkv+z: rows 2560 B, K 4, IT 5, 544 blocks; r4 2560x6144: K 4, 80 blocks)\n");
+    RunPageLoc({4, 544, 5, 10 * KB, 0, L}, gtt, gb, "gtt", sink, clk);
+    RunPageLoc({4, 80, 12, 24 * KB, 0, L}, gtt, gb, "gtt", sink, clk);
+    RunPageLoc({4, 160, 6, 12 * KB, 0, L}, gtt, gb, "gtt", sink, clk);  // the r4 shape with 2x the row groups (split-K 2)
+    RunPageLoc({16, 80, 12, 24 * KB, 0, L}, gtt, gb, "gtt", sink, clk);  // 16 rows a wave (WMMA-like)
+  }
+  if (want_mem) {
+    std::printf("D. memory type: the same patterns in a %llu MB VRAM (carve-out) buffer vs a %llu MB slice of the GTT buffer\n",
+                (unsigned long long)(vb >> 20), (unsigned long long)(vb >> 20));
+    for (const std::uint32_t nb : {80u, 400u})
+      for (const std::uint32_t k : {1u, 4u, 16u})
+        for (const auto& [mem, buf] : {std::pair<const char*, char*>{"vram", vram}, {"gtt", gtt}}) {
+          if (set == "key" && nb == 400) continue;
+          RunPageLoc({k, nb, 12, 24 * KB, 0, L}, buf, vb, mem, sink, clk);
+        }
+    for (const auto& [mem, buf] : {std::pair<const char*, char*>{"vram", vram}, {"gtt", gtt}})
+      RunPageLoc({4, 80, 12, 2 * MB, 0, L}, buf, vb, mem, sink, clk);
+  }
+  if (vram) CHECK(hipFree(vram));
+  CHECK(hipFree(gtt));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1009,6 +1209,7 @@ int main(int argc, char** argv) {
   else if (cmd == "empty") EmptyTiles();
   else if (cmd == "sweep") Sweep(argc, argv);
   else if (cmd == "rounds") Rounds();
+  else if (cmd == "pageloc") PageLoc(argc > 2 ? argv[2] : "all");
   else if (cmd == "keepalive") {  // keepalive [period_ms] [seconds]: see tools/pmc.sh
     const int period = argc > 2 ? std::atoi(argv[2]) : 10;
     const double secs = argc > 3 ? std::atof(argv[3]) : 3600.0;
