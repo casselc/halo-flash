@@ -864,6 +864,20 @@ measurement):**
 - **Sanity:** `--moe-topk 10` is bit-identical to no flag (prefill logits, greedy text);
   `--moe-topk 8` differs.
 
+**Second addendum, after arm A's short set failed and before the ablations below were
+scored.**
+- A moved short-set NLL by +0.045 (predicted +0.007). Two ablations, short set only, ask
+  where that comes from. Both are built by `halo_requant A --exclude`.
+  - **A-nohc:** A without the 194 hyper-connection mixer tensors, which stay Q8_0. halogen
+    keeps its HC weights at 6 bits, which hints they are sensitive.
+  - **A-proj:** A-nohc without the LM head as well, so only the DeltaNet, attention,
+    shared-expert and PLE projections are at 4 bits.
+- **Prediction:** A-nohc +0.020 (+0.010..+0.035); A-proj +0.015 (+0.007..+0.030).
+- **Use:**
+  - If A-proj passes the gate with a shift ≤ +0.010, rank 1 proceeds on the projections
+    (2.8 of the 4.1 GB saved), with the mixers and head at 8 or 6 bits.
+  - Otherwise every part of rank 1 needs calibrated rounding.
+
 ### Results
 
 Pending the GPU phase.

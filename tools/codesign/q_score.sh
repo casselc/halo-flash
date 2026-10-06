@@ -6,7 +6,7 @@ set -uo pipefail
 LOG=/data/halo-work/streams/LOG.md
 WT=/data/halo-work/wt-codesign
 BIN=/data/halo-work/codesign/bin/halo_score
-D=/home/chuck/opencode/src/ds4/gguf-tools/quality-testing/data
+D=${HALO_FIXTURES:-$HOME/opencode/src/ds4/gguf-tools/quality-testing/data}
 label=$1 model=$2 set=$3 start=$4 limit=$5; shift 5
 case $set in short) fix=$D/qwen38-flash-alibaba-100 ;; long) fix=$D/qwen38-flash-alibaba-long ;; *) exit 2 ;; esac
 out=/data/halo-work/codesign/scores/${label}_${set}_${start}.log

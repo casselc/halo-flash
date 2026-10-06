@@ -9,6 +9,7 @@
 //       Dense projections (every 2-D Q8_0 tensor but token_embd, routed
 //       experts excluded) and the LM head: 4.125-bit randomized-Hadamard
 //       code (lowbit::RotatedQ4Row), stored back as Q8_0.
+//   (A and D take --exclude a,b,...: skip tensors whose name contains any of these.)
 //   halo_requant D --model <shard-00001.gguf> --out <dir> [--layers 12-23]
 //       Routed experts of the layers: the exact 2-bit code (lowbit::Encode2Bit)
 //       in their own containers.
@@ -141,13 +142,14 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::string arm = argv[1];
-  std::string model, out_dir, layers = "12-23";
+  std::string model, out_dir, layers = "12-23", exclude;
   unsigned threads = 12;
   for (int i = 2; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
     if (a == "--model") model = argv[i + 1];
     else if (a == "--out") out_dir = argv[i + 1];
     else if (a == "--layers") layers = argv[i + 1];
+    else if (a == "--exclude") exclude = argv[i + 1];
     else if (a == "--threads") threads = static_cast<unsigned>(std::max(1, std::atoi(argv[i + 1])));
     else return std::fprintf(stderr, "unknown option %s\n", a.c_str()), 2;
   }
@@ -196,6 +198,12 @@ int main(int argc, char** argv) {
         return std::fprintf(stderr, "%s: cols %zu do not fit %s\n", name.c_str(), j.cols,
                             std::string(core::ToString(t.type)).c_str()), 1;
     }
+    // --exclude a,b,...: leave tensors whose name contains any of these untouched (ablations).
+    for (std::size_t p = 0; take && p < exclude.size();) {
+      const std::size_t q = std::min(exclude.find(',', p), exclude.size());
+      if (q > p && name.find(exclude.substr(p, q - p)) != std::string::npos) take = false;
+      p = q + 1;
+    }
     if (take && j.row_bytes == 0)
       return std::fprintf(stderr, "%s: no row size for %s\n", name.c_str(), std::string(core::ToString(t.type)).c_str()), 1;
     if (take) jobs.push_back(j);
@@ -208,6 +216,7 @@ int main(int argc, char** argv) {
   hdr << "# halo_requant arm " << arm;
   if (arm == "A") hdr << " code iq4nl-g=hadamard-block signs=fnv(name) container Q8_0";
   else hdr << " layers " << lo << "-" << hi << " code 2bit-6bit-scales";
+  if (!exclude.empty()) hdr << " exclude " << exclude;
   for (const auto& s : shards) {
     struct stat st{};
     if (stat(s.c_str(), &st) != 0) return std::fprintf(stderr, "cannot stat %s\n", s.c_str()), 1;

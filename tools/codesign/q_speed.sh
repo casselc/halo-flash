@@ -15,7 +15,7 @@ case $1 in
   prefill)  # ab_bench pins and unpins the clock itself
     timeout 840 python3 "$WT/tools/ab_bench.py" --model "$M" --prompt /data/halo-work/prose_1.txt \
       --warm /data/halo-work/prose_8888.txt --arm "k10=$B/halo_run" --arm "k8=$B/halo_run --moe-topk 8" \
-      --arm "k6=$B/halo_run --moe-topk 6" --rounds 3 --out "$S/ab_topk.json" > "$S/ab_topk.log" 2>&1 || rc=$?
+      --arm "k6=$B/halo_run --moe-topk 6" --rounds 4 --reps 3 --out "$S/ab_topk.json" > "$S/ab_topk.log" 2>&1 || rc=$?
     ;;
   decode)
     "$WT/tools/gpu_clock.sh" pin > /dev/null 2>&1
@@ -34,7 +34,7 @@ case $1 in
   sanity)  # --moe-topk 10 must equal no flag, bit for bit (prefill logits; greedy decode text)
     for a in none k10 k8; do
       f=(); [ $a = k10 ] && f=(--moe-topk 10); [ $a = k8 ] && f=(--moe-topk 8)
-      timeout 300 "$B/halo_run" --model "$M" --prefill-bench 1024 --reps 1 --logits-out "$S/logits_$a.bin" "${f[@]}" \
+      timeout 300 "$B/halo_run" --model "$M" --prefill-bench 1024 --max-context 4096 --reps 1 --logits-out "$S/logits_$a.bin" "${f[@]}" \
         > "$S/sanity_pf_$a.log" 2>&1 || rc=$?
       timeout 300 "$B/halo_run" --model "$M" --prompt "The capital of France is" --n 32 "${f[@]}" \
         > "$S/sanity_dec_$a.log" 2>&1 || rc=$?
@@ -42,8 +42,8 @@ case $1 in
     {
       cmp "$S/logits_none.bin" "$S/logits_k10.bin" && echo "prefill logits: k10 == none, identical"
       cmp -s "$S/logits_none.bin" "$S/logits_k8.bin" || echo "prefill logits: k8 differs from none (expected)"
-      diff <(grep -v -E "ms|tok/s| s$|load|toolchain|model:" "$S/sanity_dec_none.log") \
-           <(grep -v -E "ms|tok/s| s$|load|toolchain|model:" "$S/sanity_dec_k10.log") && echo "decode text: k10 == none"
+      diff <(grep -v -E "ms|tok/s|steps/s| s$|load|toolchain|model:|ready in" "$S/sanity_dec_none.log") \
+           <(grep -v -E "ms|tok/s|steps/s| s$|load|toolchain|model:|ready in" "$S/sanity_dec_k10.log") && echo "decode text: k10 == none"
     } > "$S/sanity_cmp.txt" 2>&1
     ;;
   iu4)
