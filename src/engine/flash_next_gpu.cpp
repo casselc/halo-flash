@@ -46,9 +46,13 @@ std::unique_ptr<FlashNextGpu> FlashNextGpu::Create(rt::Device& device, const mod
 }
 
 FlashNextGpu::~FlashNextGpu() {
-  for (auto& g : graphs_) dev_.FreeGraph(g);
-  for (auto& g : post_graphs_) dev_.FreeGraph(g);
-  dev_.FreeGraph(pre_graph_);
+  (void)dev_.Synchronize(nullptr);
+  for (auto& g : batch_graphs_) dev_.FreeGraph(g.graph);
+  for (auto& sp : sessions_)
+    if (sp) {
+      if (sp.get() == sessions_[bound_].get()) SwapBound(*sp);  // the bound state back into its shell
+      FreeSeq(*sp);
+    }
   dev_.FreeHost(ple_rows_host_);
   for (auto& [_, t] : tensors_) {
     dev_.Free(t.buf);
@@ -313,8 +317,6 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   ple_query_ = Scratch(D, error);
   ple_gated_ = Scratch(D, error);
   ple_norm_ = Scratch(D, error);
-  ple_history_ = Scratch(std::size_t{c.PleConvHistory()} * D, error);
-  if (ple_history_ && !dev_.Fill(ple_history_, 0, error)) return false;
   qkv_ = Scratch(c.SsmConvChannels(), error);
   conv_out_ = Scratch(c.SsmConvChannels(), error);
   z_ = Scratch(c.SsmValueDim(), error);
@@ -362,29 +364,12 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   }
   lora_tmp_ = Scratch(max_rank, error);
   lora_out_ = Scratch(std::max<std::size_t>({D, c.SsmConvChannels(), 2ull * c.AttentionQDim(), c.vocab_size}), error);
-  linear_.resize(c.num_layers);
-  attn_.resize(c.num_layers);
-  for (std::uint32_t l = 0; l < c.num_layers; ++l) {
-    if (c.IsLinearLayer(l)) {
-      auto& s = linear_[l];
-      s.conv = Scratch(std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels(), error);
-      s.state = Scratch(std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim, error);
-      if (!s.conv || !s.state || !dev_.Fill(s.conv, 0, error) || !dev_.Fill(s.state, 0, error)) return false;
-    } else {
-      auto& s = attn_[l];
-      s.k = Scratch(std::size_t{max_context} * c.AttentionKvDim(), error);
-      s.v = Scratch(std::size_t{max_context} * c.AttentionKvDim(), error);
-      s.index_k = Scratch(std::size_t{max_context} * c.indexer_head_dim, error);
-      s.block_k = Scratch((max_context / c.compress_ratio + 1) * std::size_t{c.indexer_head_dim}, error);
-      if (!s.k || !s.v || !s.index_k || !s.block_k) return false;
-      if (prefill_kv16_) {
-        const std::size_t halves = std::size_t{max_context} * c.AttentionKvDim();
-        s.k16 = Scratch((halves + 1) / 2, error);
-        s.v16 = Scratch((halves + 1) / 2, error);
-        if (!s.k16 || !s.v16) return false;
-      }
-    }
-  }
+  if (route_trace_) route_trace_buf_ = Scratch(std::size_t{c.num_layers} * c.num_experts_used, error);
+  // Session 0: allocated like every later session, then bound.
+  sessions_.push_back(std::make_unique<SeqState>());
+  if (!AllocSeq(*sessions_[0], error)) return false;
+  SwapBound(*sessions_[0]);
+  bound_ = 0;
   return dev_.Synchronize(error);
 }
 
@@ -596,8 +581,8 @@ bool FlashNextGpu::Attention(const model::LayerWeights& l, AttnState& s, std::st
   };
   const std::uint32_t ratio = c.compress_ratio, budget = c.indexer_top_k / ratio;
   const std::uint32_t max_blocks = max_context_ / ratio + 1;
-  return MatVec(l.attn_q, 0, mixed_, qg_, error) && MatVec(l.attn_k, 0, mixed_, k_, error) &&
-         MatVec(l.attn_v, 0, mixed_, v_, error) &&
+  return (skip_attn_proj_ || (MatVec(l.attn_q, 0, mixed_, qg_, error) && MatVec(l.attn_k, 0, mixed_, k_, error) &&
+                              MatVec(l.attn_v, 0, mixed_, v_, error))) &&
          Launch("halo_split_qgate", {nh}, {kBlock},
                 {rt::Arg::Buf(qg_), rt::Arg::Buf(q_), rt::Arg::Buf(gate_), rt::Arg::Val(hd)}, error) &&
          norm(q_, l.attn_q_norm, nh, hd) && norm(k_, l.attn_k_norm, nkv, hd) && rope(q_, nh, hd, kHaloPosition, 1) &&
@@ -633,7 +618,7 @@ bool FlashNextGpu::Attention(const model::LayerWeights& l, AttnState& s, std::st
                  rt::Arg::Buf(ctx_), rt::Arg::Buf(scores_), params, rt::Arg::Val(nh), rt::Arg::Val(nkv),
                  rt::Arg::Val(hd), rt::Arg::Val(max_context_)},
                 error) &&
-         MatVec(l.attn_out, 0, ctx_, block_out_, error);
+         (skip_attn_proj_ || MatVec(l.attn_out, 0, ctx_, block_out_, error));
 }
 
 bool FlashNextGpu::ExpertMatVec(const model::TensorRef& t, std::uint32_t slot, const rt::Buffer& x,
@@ -675,6 +660,11 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
               {rt::Arg::Buf(router_), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(expert_weights_),
                rt::Arg::Val(c.num_experts), rt::Arg::Val(c.num_experts_used)},
               error))
+    return false;
+  if (route_trace_ && route_trace_buf_ &&
+      !CopyFloats(rt::Buffer{static_cast<char*>(route_trace_buf_.device) + std::size_t{cur_layer_} * c.num_experts_used * 4,
+                             c.num_experts_used * 4, route_trace_buf_.handle},
+                  expert_ids_, c.num_experts_used, error))
     return false;
   // P3 fused path: every routed expert in three launches.
   const auto& gate = l.ffn_gate_exps;
@@ -818,6 +808,7 @@ bool FlashNextGpu::Record(Head head, std::string* error, int part) {
   const auto mix = [&](const model::HcMixer& m, bool inject) { return HcMix(m, inject, error); };
   for (std::uint32_t il = l_begin; il < l_end; ++il) {
     const auto& l = w_.layers[il];
+    cur_layer_ = il;
     if (c.IsPleLayer(il) && !Ple(l, error)) return false;
     if (!mix(l.hc_attn, true)) return false;
     if (l.linear ? !Linear(l, linear_[il], error) : !Attention(l, attn_[il], error)) return false;
@@ -872,6 +863,7 @@ bool FlashNextGpu::Run(std::int32_t token, Head head, const SampleRequest* reque
     if (error) *error = position_ >= max_context_ ? "context is full" : "token out of range";
     return false;
   }
+  if (!EnsureKv(position_ + 1, error)) return false;
   // Host side of the step: n-gram rows and the step parameters, uploaded
   // together; everything else is device work (captured once, replayed).
   model::NgramHistory history = ngram_history_;
@@ -985,6 +977,303 @@ bool FlashNextGpu::Run(std::int32_t token, Head head, const SampleRequest* reque
   return true;
 }
 
+// ---- P6 sessions -------------------------------------------------------------------------------------------
+
+struct FlashNextGpu::KvPage {
+  rt::Device& dev;
+  void* handle = nullptr;
+  KvPage(rt::Device& d, void* h) : dev(d), handle(h) {}
+  ~KvPage() { dev.ReleasePage(handle); }
+  KvPage(const KvPage&) = delete;
+  KvPage& operator=(const KvPage&) = delete;
+};
+
+void FlashNextGpu::SwapBound(SeqState& s) noexcept {
+  std::swap(linear_, s.linear);
+  std::swap(attn_, s.attn);
+  std::swap(ple_history_, s.ple_history);
+  std::swap(ngram_history_, s.ngram_history);
+  std::swap(position_, s.position);
+  for (int i = 0; i < 3; ++i) {
+    std::swap(graphs_[i], s.graphs[i]);
+    std::swap(post_graphs_[i], s.post_graphs[i]);
+  }
+  std::swap(pre_graph_, s.pre_graph);
+  std::swap(kv_, s.kv);
+}
+
+namespace {
+// Positions of slack mapped past the ones a step or chunk writes: tiled kernels may load (and mask) rows a
+// tile beyond the last valid one.
+constexpr std::uint32_t kKvSlackTokens = 512;
+}  // namespace
+
+bool FlashNextGpu::AllocSeq(SeqState& s, std::string* error) {
+  const auto& c = w_.config;
+  const std::size_t D = c.HcDim();
+  const auto alloc = [&](std::size_t floats, bool zero) {
+    rt::Buffer b = dev_.Alloc(std::max<std::size_t>(floats, 1) * 4, error);
+    if (b && zero && !dev_.Fill(b, 0, error)) dev_.Free(b);
+    return b;
+  };
+  s.ple_history = alloc(std::size_t{c.PleConvHistory()} * D, true);
+  if (!s.ple_history) return false;
+  s.linear.assign(c.num_layers, {});
+  s.attn.assign(c.num_layers, {});
+  const bool paged = dev_.PageBytes() > 0;
+  const auto region = [&](std::size_t row_bytes, std::uint32_t row_tokens, std::size_t capacity_bytes) -> rt::Buffer {
+    KvRegion r;
+    r.row_bytes = row_bytes;
+    r.row_tokens = row_tokens;
+    r.paged = paged;
+    r.va = paged ? dev_.ReserveRange(capacity_bytes, error) : dev_.Alloc(capacity_bytes, error);
+    if (!r.va) return {};
+    s.kv.push_back(std::move(r));
+    return s.kv.back().va;
+  };
+  for (std::uint32_t l = 0; l < c.num_layers; ++l) {
+    if (c.IsLinearLayer(l)) {
+      auto& ls = s.linear[l];
+      ls.conv = alloc(std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels(), true);
+      ls.state = alloc(std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim, true);
+      if (!ls.conv || !ls.state) return false;
+    } else {
+      auto& as = s.attn[l];
+      const std::size_t kv = c.AttentionKvDim(), idim = c.indexer_head_dim, mc = max_context_;
+      as.k = region(kv * 4, 1, mc * kv * 4);
+      as.v = region(kv * 4, 1, mc * kv * 4);
+      as.index_k = region(idim * 4, 1, mc * idim * 4);
+      as.block_k = region(idim * 4, c.compress_ratio, (mc / c.compress_ratio + 1) * idim * 4);
+      if (!as.k || !as.v || !as.index_k || !as.block_k) return false;
+      if (prefill_kv16_) {
+        const std::size_t halves = mc * kv;
+        as.k16 = region(kv * 2, 1, (halves + 1) / 2 * 4);
+        as.v16 = region(kv * 2, 1, (halves + 1) / 2 * 4);
+        if (!as.k16 || !as.v16) return false;
+      }
+    }
+  }
+  return true;
+}
+
+void FlashNextGpu::FreeSeq(SeqState& s) noexcept {
+  (void)dev_.Synchronize(nullptr);
+  for (auto& g : s.graphs) dev_.FreeGraph(g);
+  for (auto& g : s.post_graphs) dev_.FreeGraph(g);
+  dev_.FreeGraph(s.pre_graph);
+  for (auto& l : s.linear) {
+    dev_.Free(l.conv);
+    dev_.Free(l.state);
+  }
+  dev_.Free(s.ple_history);
+  for (auto& r : s.kv) {
+    if (r.paged) {
+      const std::size_t pb = dev_.PageBytes();
+      for (std::size_t j = 0; j < r.pages.size(); ++j) (void)dev_.UnmapPage(r.va, j * pb, nullptr);
+      r.pages.clear();  // the last holder releases each page
+      dev_.ReleaseRange(r.va);
+    } else {
+      dev_.Free(r.va);
+    }
+  }
+  s.kv.clear();
+  s.linear.clear();
+  s.attn.clear();
+}
+
+bool FlashNextGpu::EnsureKv(std::uint32_t tokens, std::string* error) {
+  const std::size_t pb = dev_.PageBytes();
+  const std::uint64_t want = std::min<std::uint64_t>(std::uint64_t{tokens} + kKvSlackTokens, max_context_);
+  for (auto& r : kv_) {
+    if (!r.paged) continue;
+    const std::size_t rows = (want + r.row_tokens - 1) / r.row_tokens + 1;  // +1: block_k's incomplete row
+    const std::size_t pages = std::min((rows * r.row_bytes + pb - 1) / pb, r.va.bytes / pb);
+    while (r.pages.size() < pages) {
+      void* h = dev_.CreatePage(error);
+      if (!h) return false;
+      auto page = std::make_shared<KvPage>(dev_, h);
+      if (!dev_.MapPage(r.va, r.pages.size() * pb, h, error)) return false;
+      r.pages.push_back(std::move(page));
+    }
+  }
+  return true;
+}
+
+bool FlashNextGpu::HasSession(SessionId id) const noexcept { return id < sessions_.size() && sessions_[id]; }
+
+std::uint32_t FlashNextGpu::SessionPositionOf(SessionId id) const {
+  return id == bound_ ? position_ : sessions_.at(id)->position;
+}
+
+bool FlashNextGpu::NewSession(SessionId* id, std::string* error) {
+  auto s = std::make_unique<SeqState>();
+  if (!AllocSeq(*s, error)) {
+    FreeSeq(*s);
+    return false;
+  }
+  *id = static_cast<SessionId>(sessions_.size());
+  sessions_.push_back(std::move(s));
+  return true;
+}
+
+bool FlashNextGpu::BindSession(SessionId id, std::string* error) {
+  if (!HasSession(id)) {
+    if (error) *error = "no such session";
+    return false;
+  }
+  if (id == bound_) return true;
+  SwapBound(*sessions_[bound_]);  // park the bound one
+  SwapBound(*sessions_[id]);
+  bound_ = id;
+  return true;
+}
+
+bool FlashNextGpu::DropSession(SessionId id, std::string* error) {
+  if (!HasSession(id) || id == bound_) {
+    if (error) *error = id == bound_ ? "cannot drop the bound session" : "no such session";
+    return false;
+  }
+  FreeSeq(*sessions_[id]);
+  sessions_[id].reset();
+  // Batch graphs that recorded its state.
+  for (auto it = batch_graphs_.begin(); it != batch_graphs_.end();)
+    if (std::find(it->sessions.begin(), it->sessions.end(), id) != it->sessions.end()) {
+      dev_.FreeGraph(it->graph);
+      it = batch_graphs_.erase(it);
+    } else {
+      ++it;
+    }
+  return true;
+}
+
+bool FlashNextGpu::ForkSession(SessionId src, SessionId* id, std::string* error) {
+  if (!HasSession(src)) {
+    if (error) *error = "no such session";
+    return false;
+  }
+  const auto& c = w_.config;
+  // The source's state as seen from outside the bound slot.
+  const bool src_bound = src == bound_;
+  SeqState& from = *sessions_[src];
+  if (src_bound) SwapBound(from);  // from now holds the bound state; swapped back below
+  auto to = std::make_unique<SeqState>();
+  bool ok = true;
+  const std::size_t D = c.HcDim();
+  const auto alloc_copy = [&](const rt::Buffer& b) {
+    rt::Buffer n = dev_.Alloc(b.bytes, error);
+    if (n && !CopyFloats(n, b, b.bytes / 4, error)) dev_.Free(n);
+    return n;
+  };
+  to->ple_history = alloc_copy(from.ple_history);
+  ok = static_cast<bool>(to->ple_history);
+  to->linear.assign(c.num_layers, {});
+  to->attn.assign(c.num_layers, {});
+  for (std::uint32_t l = 0; ok && l < c.num_layers; ++l)
+    if (c.IsLinearLayer(l)) {
+      to->linear[l].conv = alloc_copy(from.linear[l].conv);
+      to->linear[l].state = alloc_copy(from.linear[l].state);
+      ok = to->linear[l].conv && to->linear[l].state;
+    }
+  (void)D;
+  // KV: region by region, in AllocSeq's order (k, v, index_k, block_k[, k16, v16] per attention layer).
+  const std::size_t pb = dev_.PageBytes();
+  std::size_t ri = 0;
+  for (std::uint32_t l = 0; ok && l < c.num_layers; ++l) {
+    if (c.IsLinearLayer(l)) continue;
+    const auto& fa = from.attn[l];
+    auto& ta = to->attn[l];
+    ta.blocks = fa.blocks;
+    ta.valid16 = fa.valid16;
+    const std::size_t nkinds = prefill_kv16_ ? 6 : 4;
+    rt::Buffer* bufs[6] = {&ta.k, &ta.v, &ta.index_k, &ta.block_k, &ta.k16, &ta.v16};
+    // Rows no later step rewrites: positions below the source's position; complete QSA blocks; fp16 rows
+    // already converted.
+    const std::uint64_t immut[6] = {from.position, from.position, from.position, fa.blocks,
+                                    std::min(fa.valid16, from.position), std::min(fa.valid16, from.position)};
+    // Rows that hold data (copied when not shared): written positions, the incomplete block row.
+    const std::uint64_t written[6] = {from.position, from.position, from.position, std::uint64_t{fa.blocks} + 1,
+                                      fa.valid16, fa.valid16};
+    for (std::size_t k = 0; ok && k < nkinds; ++k, ++ri) {
+      const KvRegion& fr = from.kv[ri];
+      KvRegion tr;
+      tr.row_bytes = fr.row_bytes;
+      tr.row_tokens = fr.row_tokens;
+      tr.paged = fr.paged;
+      if (fr.paged) {
+        tr.va = dev_.ReserveRange(fr.va.bytes, error);
+        ok = static_cast<bool>(tr.va);
+        const std::size_t shared = immut[k] * fr.row_bytes / pb;  // whole pages below the immutable bound
+        for (std::size_t j = 0; ok && j < fr.pages.size(); ++j) {
+          if (j < shared) {
+            ok = dev_.MapPage(tr.va, j * pb, fr.pages[j]->handle, error);
+            if (ok) tr.pages.push_back(fr.pages[j]);
+          } else {
+            void* h = dev_.CreatePage(error);
+            ok = h != nullptr;
+            if (!ok) break;
+            auto page = std::make_shared<KvPage>(dev_, h);
+            ok = dev_.MapPage(tr.va, j * pb, h, error) &&
+                 CopyFloats(rt::Buffer{static_cast<char*>(tr.va.device) + j * pb, pb, nullptr},
+                            rt::Buffer{static_cast<char*>(fr.va.device) + j * pb, pb, nullptr}, pb / 4, error);
+            if (ok) tr.pages.push_back(std::move(page));
+          }
+        }
+      } else {
+        tr.va = dev_.Alloc(fr.va.bytes, error);
+        const std::size_t bytes = std::min<std::size_t>(written[k] * fr.row_bytes, fr.va.bytes);
+        ok = tr.va && CopyFloats(tr.va, fr.va, bytes / 4, error);
+      }
+      if (tr.va) {
+        *bufs[k] = tr.va;
+        to->kv.push_back(std::move(tr));
+      }
+    }
+  }
+  to->ngram_history = from.ngram_history;
+  to->position = from.position;
+  if (src_bound) SwapBound(from);
+  ok = ok && dev_.Synchronize(error);
+  if (!ok) {
+    FreeSeq(*to);
+    return false;
+  }
+  *id = static_cast<SessionId>(sessions_.size());
+  sessions_.push_back(std::move(to));
+  return true;
+}
+
+FlashNextGpu::SessionBytes FlashNextGpu::SessionMemory(SessionId id) const {
+  SessionBytes b;
+  const SeqState* s = id == bound_ ? nullptr : sessions_.at(id).get();
+  const auto& lin = s ? s->linear : linear_;
+  const auto& kv = s ? s->kv : kv_;
+  b.recurrent = (s ? s->ple_history : ple_history_).bytes;
+  for (const auto& l : lin) b.recurrent += l.conv.bytes + l.state.bytes;
+  const std::size_t pb = dev_.PageBytes();
+  for (const auto& r : kv) {
+    if (!r.paged) {
+      b.kv_mapped += r.va.bytes;
+      b.kv_exclusive += r.va.bytes;
+      continue;
+    }
+    for (const auto& p : r.pages) {
+      b.kv_mapped += pb;
+      if (p.use_count() == 1) b.kv_exclusive += pb;
+    }
+  }
+  return b;
+}
+
+bool FlashNextGpu::RouteTrace(std::vector<std::uint32_t>* ids, std::string* error) {
+  const auto& c = w_.config;
+  if (!route_trace_buf_) {
+    if (error) *error = "routing trace was not enabled before Create";
+    return false;
+  }
+  ids->resize(std::size_t{c.num_layers} * c.num_experts_used);
+  return dev_.Download(route_trace_buf_, 0, ids->data(), ids->size() * 4, error);
+}
+
 template <typename F>
 bool FlashNextGpu::ForEachState(F&& f) {
   const auto& c = w_.config;
@@ -1036,6 +1325,7 @@ bool FlashNextGpu::Restore(const Snapshot& snap, std::string* error) {
     if (error) *error = "snapshot is empty or from another device";
     return false;
   }
+  if (!EnsureKv(snap.position_, error)) return false;
   // Counts first: ForEachState sizes the KV copies from the restored position.
   position_ = snap.position_;
   for (std::size_t l = 0; l < attn_.size(); ++l) {

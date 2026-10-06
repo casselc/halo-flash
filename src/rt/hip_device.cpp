@@ -2,6 +2,8 @@
 // compatibility layer via LD_PRELOAD, which bench/p0 uses.
 #include <hip/hip_runtime_api.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -32,8 +34,26 @@ class HipDevice final : public Device {
       if (error) *error = "no HIP device";
       return false;
     }
-    return Ok(hipSetDevice(0), "hipSetDevice", error) &&
-           Ok(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), "hipStreamCreate", error);
+    if (!Ok(hipSetDevice(0), "hipSetDevice", error) ||
+        !Ok(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), "hipStreamCreate", error))
+      return false;
+    // Page mapping where the device supports it (HALO_NO_PAGING=1 forces the whole-range fallback).
+    int vmm = 0;
+    prop_.type = hipMemAllocationTypePinned;
+    prop_.location.type = hipMemLocationTypeDevice;
+    prop_.location.id = 0;
+    std::size_t g = 0;
+    if (std::getenv("HALO_NO_PAGING") == nullptr &&
+        hipDeviceGetAttribute(&vmm, hipDeviceAttributeVirtualMemoryManagementSupported, 0) == hipSuccess && vmm &&
+        hipMemGetAllocationGranularity(&g, &prop_, hipMemAllocationGranularityMinimum) == hipSuccess)
+    {
+      // The granule may be 4 KB: map in 2 MB pages. HALO_PAGE_BYTES overrides (tests use small pages so that
+      // short sequences span several).
+      const char* env = std::getenv("HALO_PAGE_BYTES");
+      const std::size_t want = env ? std::strtoull(env, nullptr, 0) : kPageTarget;
+      page_bytes_ = (std::max<std::size_t>(want, 1) + g - 1) / g * g;
+    }
+    return true;
   }
 
   Backend backend() const noexcept override { return Backend::kHip; }
@@ -50,6 +70,49 @@ class HipDevice final : public Device {
     if (b.device) (void)hipFree(b.device);
     b = {};
   }
+  // ---- P6 page mapping (HIP virtual memory management) ----
+  std::size_t PageBytes() const noexcept override { return page_bytes_; }
+  Buffer ReserveRange(std::size_t bytes, std::string* error) override {
+    Buffer b;
+    if (!page_bytes_) {
+      if (error) *error = "page mapping: not supported by this device";
+      return b;
+    }
+    const std::size_t n = (bytes + page_bytes_ - 1) / page_bytes_ * page_bytes_;
+    void* p = nullptr;
+    if (!Ok(hipMemAddressReserve(&p, n ? n : page_bytes_, 0, nullptr, 0), "hipMemAddressReserve", error)) return b;
+    b.device = p;
+    b.bytes = n ? n : page_bytes_;
+    return b;
+  }
+  void ReleaseRange(Buffer& b) noexcept override {
+    if (b.device) (void)hipMemAddressFree(b.device, b.bytes);
+    b = {};
+  }
+  void* CreatePage(std::string* error) override {
+    hipMemGenericAllocationHandle_t h{};
+    if (!Ok(hipMemCreate(&h, page_bytes_, &prop_, 0), "hipMemCreate", error)) return nullptr;
+    return reinterpret_cast<void*>(h);
+  }
+  void ReleasePage(void* page) noexcept override {
+    if (page) (void)hipMemRelease(reinterpret_cast<hipMemGenericAllocationHandle_t>(page));
+  }
+  bool MapPage(const Buffer& range, std::size_t offset, void* page, std::string* error) override {
+    if (offset % page_bytes_ != 0 || offset + page_bytes_ > range.bytes) return Bounds(error);
+    void* at = static_cast<char*>(range.device) + offset;
+    hipMemAccessDesc acc{};
+    acc.location = prop_.location;
+    acc.flags = hipMemAccessFlagsProtReadWrite;
+    return Ok(hipMemMap(at, page_bytes_, 0, reinterpret_cast<hipMemGenericAllocationHandle_t>(page), 0), "hipMemMap",
+              error) &&
+           Ok(hipMemSetAccess(at, page_bytes_, &acc, 1), "hipMemSetAccess", error);
+  }
+  bool UnmapPage(const Buffer& range, std::size_t offset, std::string* error) override {
+    if (offset % page_bytes_ != 0 || offset + page_bytes_ > range.bytes) return Bounds(error);
+    // Work queued on the stream may still read the page: drain it first.
+    return Synchronize(error) && Ok(hipMemUnmap(static_cast<char*>(range.device) + offset, page_bytes_), "hipMemUnmap", error);
+  }
+
   bool Upload(const Buffer& dst, std::size_t off, const void* src, std::size_t n, std::string* error) override {
     if (capturing_) return Capturing(error);
     if (off + n > dst.bytes) return Bounds(error);
@@ -158,6 +221,9 @@ class HipDevice final : public Device {
   }
   bool capturing_ = false;
   hipStream_t stream_ = nullptr;
+  static constexpr std::size_t kPageTarget = std::size_t{2} << 20;
+  hipMemAllocationProp prop_{};
+  std::size_t page_bytes_ = 0;
   // The device address of a module global holding at least `bytes`.
   bool Global(std::string_view name, std::size_t bytes, void** p, std::string* error) {
     hipDeviceptr_t d = nullptr;

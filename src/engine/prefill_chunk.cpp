@@ -1178,7 +1178,7 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
       if (error) *error = "token out of range";
       return false;
     }
-  if (!AllocChunk(error)) return false;
+  if (!AllocChunk(error) || !EnsureKv(position_ + T, error)) return false;
   // HALO_PREFILL_TIMING: host preparation, upload and device time per chunk.
   static const bool timing = std::getenv("HALO_PREFILL_TIMING") != nullptr;
   const auto t_start = std::chrono::steady_clock::now();

@@ -98,6 +98,19 @@ class Device {
   [[nodiscard]] virtual void* AllocHost(std::size_t bytes, std::string* error);
   virtual void FreeHost(void* p) noexcept;
 
+  /// Physical pages mapped into reserved virtual ranges (P6 KV paging). PageBytes() is the mapping
+  /// granularity, 0 when the backend cannot map pages (callers then allocate whole ranges with Alloc).
+  /// A range from ReserveRange has device addresses but no memory until pages are mapped into it; a page
+  /// may be mapped into several ranges at once (shared, read and written through any of them).
+  [[nodiscard]] virtual std::size_t PageBytes() const noexcept { return 0; }
+  [[nodiscard]] virtual Buffer ReserveRange(std::size_t bytes, std::string* error);
+  virtual void ReleaseRange(Buffer& range) noexcept;
+  [[nodiscard]] virtual void* CreatePage(std::string* error);
+  virtual void ReleasePage(void* page) noexcept;
+  /// Maps `page` at byte `offset` (a multiple of PageBytes) of `range`, readable and writable by kernels.
+  [[nodiscard]] virtual bool MapPage(const Buffer& range, std::size_t offset, void* page, std::string* error);
+  [[nodiscard]] virtual bool UnmapPage(const Buffer& range, std::size_t offset, std::string* error);
+
   /// Loads one HSACO code object; kernels are then looked up by name.
   [[nodiscard]] virtual bool LoadModule(std::span<const std::uint8_t> hsaco, std::string* error) = 0;
   [[nodiscard]] virtual KernelId Kernel(std::string_view name, std::string* error) = 0;

@@ -135,6 +135,13 @@ int main(int argc, char** argv) {
   // code object and record the N-th launch (from 0) of kernel NAME in the last prefill rep (docs/TRACING.md).
   std::string span_hsaco, span_out;
   std::string logits_out;  // --logits-out FILE: the last prefill's logits (fp32), for bitwise comparison of builds
+  std::string route_trace;
+  // --batch B: P6 batched decode of B sessions (prompts from --batch-prompts, comma-separated files, cycled with
+  // different lengths), --n steps; --device-sample 1 times greedy steps, else --batch-check 1 compares every
+  // entry's logits with the same session replayed alone.
+  std::uint32_t batch = 0;
+  std::string batch_prompts;
+  bool batch_check = false;  // --route-trace FILE: routed expert ids of every step ([layers][k] uint32)
   std::uint32_t span_sample = 1;
   bool eager = false, profile = false, device_sample = false;
   bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
@@ -202,6 +209,11 @@ int main(int argc, char** argv) {
     else if (a == "--decode-logits-out") decode_logits_out = argv[i + 1];
     else if (a == "--decode-attn-b") engine::FlashNextGpu::decode_attn_batched_ = std::string(argv[i + 1]) == "1";
     else if (a == "--decode-opt") engine::FlashNextGpu::decode_opt_ = static_cast<unsigned>(std::strtoul(argv[i + 1], nullptr, 0));
+    else if (a == "--route-trace") route_trace = argv[i + 1], engine::FlashNextGpu::route_trace_ = true;
+    else if (a == "--batch") batch = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--batch-prompts") batch_prompts = argv[i + 1];
+    else if (a == "--batch-check") batch_check = std::string(argv[i + 1]) == "1";
+    else if (a == "--batch-decode") engine::FlashNextGpu::batch_decode_ = std::string(argv[i + 1]) == "1";
     else if (a == "--decode-timing") decode_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--kernel-timing") kernel_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";
@@ -389,6 +401,109 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (batch > 0) {
+    if (!gpu) return std::fprintf(stderr, "--batch needs a GPU device\n"), 2;
+    std::vector<std::string> files;
+    for (std::size_t p = 0; p < batch_prompts.size();) {
+      const auto q = batch_prompts.find(',', p);
+      files.push_back(batch_prompts.substr(p, q == std::string::npos ? std::string::npos : q - p));
+      p = q == std::string::npos ? batch_prompts.size() : q + 1;
+    }
+    if (files.empty()) return std::fprintf(stderr, "--batch needs --batch-prompts\n"), 2;
+    using Sid = engine::FlashNextGpu::SessionId;
+    std::vector<Sid> sids(batch);
+    std::vector<std::vector<std::int32_t>> prompts(batch);
+    for (std::uint32_t b = 0; b < batch; ++b) {
+      std::ifstream f(files[b % files.size()]);
+      const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+      const auto enc = tok->Encode(text);
+      // Session b: its file's tokens, shortened by 7 b tokens so equal files still differ.
+      const std::size_t drop = std::min<std::size_t>(enc.size() - 1, 7 * (b / files.size()));
+      prompts[b].assign(enc.begin(), enc.end() - static_cast<std::ptrdiff_t>(drop));
+      if (b == 0) sids[b] = 0;
+      else if (!gpu->NewSession(&sids[b], &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      if (!gpu->BindSession(sids[b], &error) ||
+          !gpu->Prefill(std::span<const std::int32_t>(prompts[b]).first(prompts[b].size() - 1), {}, &error))
+        return std::fprintf(stderr, "prefill: %s\n", error.c_str()), 1;
+    }
+    if (!gpu->BindSession(0, &error)) return 1;
+    std::printf("batch %u: batched kernels %s\n", batch, gpu->BatchSupported() ? "yes" : gpu->BatchUnsupported().c_str());
+    static sampling::SamplingConfig greedy;
+    std::vector<std::int32_t> next(batch);
+    for (std::uint32_t b = 0; b < batch; ++b) next[b] = prompts[b].back();
+    std::vector<std::vector<std::int32_t>> fed(batch);
+    std::vector<std::vector<float>> logits(batch, std::vector<float>(device_sample ? 0 : c.vocab_size));
+    std::vector<std::vector<float>> all(batch);  // every step's logits per entry (check mode)
+    std::vector<engine::FlashNextGpu::SampleRequest> reqs(batch);
+    std::vector<engine::FlashNextGpu::SampleResult> res(batch);
+    std::vector<double> ms;
+    for (int step = 0; step < n; ++step) {
+      std::vector<engine::FlashNextGpu::BatchEntry> entries(batch);
+      for (std::uint32_t b = 0; b < batch; ++b) {
+        entries[b].session = sids[b];
+        entries[b].token = next[b];
+        if (device_sample) {
+          reqs[b] = {&greedy, {}, 0};
+          entries[b].sample = &reqs[b];
+          entries[b].result = &res[b];
+        } else {
+          entries[b].logits = logits[b];
+        }
+      }
+      if (decode_timing && step == 4 && !gpu->StartKernelTiming(1 << 22, &error))
+        return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      const auto st = std::chrono::steady_clock::now();
+      if (!gpu->StepBatch(entries, &error)) return std::fprintf(stderr, "batch step: %s\n", error.c_str()), 1;
+      if (step >= 4) ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - st).count());
+      for (std::uint32_t b = 0; b < batch; ++b) {
+        fed[b].push_back(next[b]);
+        if (device_sample) {
+          next[b] = res[b].token;
+        } else {
+          next[b] = static_cast<std::int32_t>(Argmax(logits[b]).best);
+          if (batch_check) all[b].insert(all[b].end(), logits[b].begin(), logits[b].end());
+        }
+      }
+    }
+    if (decode_timing) {
+      double span = 0, rate = 0, total = 0;
+      const auto times = gpu->StopKernelTiming(&span, &rate, &error);
+      const double steps = static_cast<double>(ms.size());
+      for (const auto& k : times) total += k.ms;
+      std::printf("batch kernel timing (eager, %.0f steps): kernels %.2f ms/step\n", steps, total / steps);
+      for (const auto& k : times)
+        std::printf("  %-58s %8.3f ms/step %5.1f%% %6.1f calls/step %8.1f us/call\n", k.key.c_str(), k.ms / steps,
+                    100 * k.ms / total, k.calls / steps, 1e3 * k.ms / k.calls);
+    }
+    if (!ms.empty()) {
+      std::sort(ms.begin(), ms.end());
+      const double med = ms[ms.size() / 2];
+      std::printf("batch %u steady: median %.2f ms/step, %.2f tok/s aggregate, %.2f tok/s per session, min %.2f, over %zu steps\n",
+                  batch, med, 1000.0 * batch / med, 1000.0 / med, ms.front(), ms.size());
+    }
+    for (std::uint32_t b = 0; b < batch && b < 4; ++b)
+      std::printf("session %u: %s\n", b, tok->Decode(std::vector<text::TokenId>(fed[b].begin() + 1, fed[b].end())).c_str());
+    if (batch_check && !device_sample) {
+      // Each session again, alone, from the same prompt: Prefill + Step with the same tokens.
+      std::size_t same = 0, total = 0;
+      for (std::uint32_t b = 0; b < batch; ++b) {
+        Sid solo;
+        if (!gpu->NewSession(&solo, &error) || !gpu->BindSession(solo, &error) ||
+            !gpu->Prefill(std::span<const std::int32_t>(prompts[b]).first(prompts[b].size() - 1), {}, &error))
+          return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+        std::vector<float> l(c.vocab_size);
+        for (std::size_t t = 0; t < fed[b].size(); ++t) {
+          if (!gpu->Step(fed[b][t], l, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+          ++total;
+          same += std::memcmp(l.data(), all[b].data() + t * c.vocab_size, c.vocab_size * 4) == 0;
+        }
+        if (!gpu->BindSession(0, &error) || !gpu->DropSession(solo, &error)) return 1;
+      }
+      std::printf("batch check: %zu of %zu entry-steps byte-identical to the session stepped alone%s\n", same, total,
+                  same == total ? " (EXACT)" : " (DIFFERS)");
+    }
+    return 0;
+  }
   std::unique_ptr<model::ReferenceModel> cpu;
   if (use_cpu) cpu = std::make_unique<model::ReferenceModel>(*weights, ngram.get(), max_context);
 
@@ -401,7 +516,9 @@ int main(int argc, char** argv) {
   std::vector<float> lc(c.vocab_size), lg(c.vocab_size);
   std::vector<text::TokenId> generated;
   std::vector<double> step_ms;  // decode steps after warm-up (graph capture etc.)
-  std::ofstream decode_logits;
+  std::ofstream decode_logits, route_out;
+  if (!route_trace.empty()) route_out.open(route_trace, std::ios::binary);
+  std::vector<std::uint32_t> route_ids;
   if (!decode_logits_out.empty()) decode_logits.open(decode_logits_out, std::ios::binary);
   std::size_t first_step = 0;
   if (prefill_prompt && ids.size() > 1) {
@@ -434,6 +551,10 @@ int main(int argc, char** argv) {
       lg[static_cast<std::size_t>(r.token)] = 1.0f;
     } else if (gpu && !gpu->Step(token, want ? std::span<float>(lg) : std::span<float>{}, &error)) {
       return std::fprintf(stderr, "gpu: %s\n", error.c_str()), 1;
+    }
+    if (route_out.is_open() && gpu) {  // [layers][k] uint32 per step, prompt steps included
+      if (!gpu->RouteTrace(&route_ids, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      route_out.write(reinterpret_cast<const char*>(route_ids.data()), static_cast<std::streamsize>(route_ids.size() * 4));
     }
     if (want && generated.size() >= 4) step_ms.push_back(
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - st).count());

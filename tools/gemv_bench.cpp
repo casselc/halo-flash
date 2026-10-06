@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <random>
 #include <string>
@@ -83,6 +84,37 @@ int main(int argc, char** argv) {
         });
         std::printf("%s %-20s %-22s %8.1f us  %6.1f GB/s\n", rt::BackendName(be), v.kernel, s.name, sec * 1e6,
                     bytes / sec / 1e9);
+      }
+      // P6 batched decode: the r4 / r2 kernels over NB columns (one weight read, NB dot products a row).
+      {
+        const bool r2 = s.rows < 2048;
+        auto xbb = d->Alloc(std::size_t{8} * s.cols * 4, &e), ybb = d->Alloc(std::size_t{8} * s.rows * 4, &e);
+        std::vector<float> xx(std::size_t{8} * s.cols);
+        for (std::size_t i = 0; i < xx.size(); ++i) xx[i] = std::sin(0.013f * static_cast<float>(i));
+        (void)d->Upload(xbb, 0, xx.data(), xx.size() * 4, &e);
+        for (std::uint32_t nb = 1; nb <= 8; ++nb) {
+          const std::string kn = std::string(r2 ? "halo_gemv_q8r_r2" : "halo_gemv_q8r_r4") +
+                                 (nb == 1 ? "" : "_b" + std::to_string(nb));
+          const auto k = d->Kernel(kn, &e);
+          const std::uint32_t per = r2 ? 16 : 32;
+          const double sec = time([&] {
+            const std::uint32_t c = next_copy++ % copies;
+            if (nb == 1) {
+              const rt::Arg a[] = {rt::Arg::Buf(qs, c * mat), rt::Arg::Buf(dd, c * (mat / 32) * 2), rt::Arg::Buf(xbb),
+                                   rt::Arg::Buf(ybb), rt::Arg::Val(s.rows), rt::Arg::Val(s.cols), rt::Arg::Val(s.cols)};
+              (void)d->Launch(k, {(s.rows + per - 1) / per}, {256}, a, &e);
+            } else {
+              const rt::Arg a[] = {rt::Arg::Buf(qs, c * mat), rt::Arg::Buf(dd, c * (mat / 32) * 2), rt::Arg::Buf(xbb),
+                                   rt::Arg::Buf(ybb), rt::Arg::Val(s.rows), rt::Arg::Val(s.cols), rt::Arg::Val(s.cols),
+                                   rt::Arg::Val(s.cols), rt::Arg::Val(s.rows)};
+              (void)d->Launch(k, {(s.rows + per - 1) / per}, {256}, a, &e);
+            }
+          });
+          std::printf("%s batch %-24s %-22s NB %u %8.1f us  %6.1f GB/s  %6.1f us/column\n", rt::BackendName(be),
+                      kn.c_str(), s.name, nb, sec * 1e6, bytes / sec / 1e9, sec * 1e6 / nb);
+        }
+        d->Free(xbb);
+        d->Free(ybb);
       }
       for (auto* b : {&rb, &qs, &dd}) d->Free(*b);
     }
