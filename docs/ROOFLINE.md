@@ -1011,3 +1011,13 @@ attention 40 vs 49, HC combine ~155 vs 145, DeltaNet ~144 vs ~130. The big dense
 
 About 75 of the ~100 ms are precision choices (fp16 or int8 activations where we keep fp32 or fp16 exact),
 i.e. quality-gate decisions, not kernel engineering; the exact candidate is the mix GEMM's split (~24).
+
+**Precision options (stream P, 2026-10-05, branch stream/precision).** The roles in the table above where gufo
+rounds more than we do, one flag each, gated by the quality sets (docs/BENCHMARKS.md, "Precision options")
+and an in-engine A/B (`ab_bench.py`, 4 rounds x 3 reps, pinned, prose_1 at 2048 tokens):
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| Router on plain fp16 WMMA (`halo_gemm_f32h_f16_k128`: fp32 W rounded to fp16 while staging, the fp16 `mh`; `--router-f16 1`) | -15..-20 kernel; quality neutral | router 40.7 -> 21.9 ms (-18.8); end to end -20.6 ms; long set **+0.0021 ± 0.0007** (9 of 12 cases worse) | no (quality) |
+| DeltaNet alpha/beta + shared-expert gate on the same kernel (`--small-f16`) | -18..-24 kernel; quality neutral | 27.9 -> 7.6 ms (-20.3, spreads 0.9 / 0.2); end to end -14.8 ms (inside ab_bench's spread rule: new spread 22.7); quality passes | yes (default on) |
+

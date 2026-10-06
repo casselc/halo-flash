@@ -64,6 +64,23 @@ No shift, at any prompt length up to 24K.
 cases. The gate (NLL ≤ 0.305, ≥ 91%) passes, and this matches the stepping
 builds above (0.2859-0.2864).
 
+### Precision options (stream P), 2026-10-05
+
+Changes that alter rounding, each behind a flag, scored against the unmodified build (45501ff
+plus per-case output in `halo_score`) with `halo_score --prefill 1` (the n-gram table not resident:
+the 79 GiB model plus its 28.8 GB left too little headroom next to the other stream's builds; the
+table's values are the same either way). Two baseline runs are bit-identical (20 short cases), so
+every difference below is the change itself. Gate, fixed before measuring: short set NLL ≤ 0.305,
+agreement ≥ 91%; paired by case, short mean ΔNLL ≤ +0.001 and mean − 2·SE ≤ 0, agreement drop ≤ 0.3
+pp; long mean ΔNLL ≤ +0.002, mean − 2·SE ≤ 0, no case worse by more than 0.02. Paired ΔNLL is the
+mean over cases of the per-case NLL difference ± its standard error.
+
+| Change (flag) | Short NLL / agreement | Short paired ΔNLL (up/down) | Long NLL / agreement | Long paired ΔNLL (up/down), worst case | Verdict |
+|---|---|---|---|---|---|
+| baseline | 0.286079 / 92.58% | — | 0.121277 / 97.26% | — | — |
+| Router on plain fp16 WMMA (`--router-f16 1`) | 0.285933 / 92.62% | −0.00058 ± 0.00043 (45/53) | 0.123398 / 97.00% | **+0.00213 ± 0.00072** (9/3), +0.0074 | fails (long) |
+| DeltaNet alpha/beta + shared-expert gate on fp16 WMMA (`--small-f16 1`) | 0.285613 / 92.60% | −0.00038 ± 0.00041 (44/54) | 0.122459 / 96.87% | +0.00118 ± 0.00105 (6/6), +0.0089 | **passes** (default on) |
+
 ### Greedy identity with gufo
 
 `halo_run --device hip` against `gufo prompt --raw -t 0 --speculative off`

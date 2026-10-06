@@ -135,6 +135,25 @@ class FlashNextGpu {
   /// The router GEMM on bf16 WMMA with hi/lo-split operands (~2^-15 per
   /// product) instead of fp32 VALU.
   static inline bool prefill_router_bf16x3_ = true;
+  /// Precision option (stream P): the router GEMM on plain FP16 WMMA (weights
+  /// rounded to fp16 while staging, the fp16 copy of `mixed`, fp32 sums)
+  /// instead of bf16x3. Takes precedence over prefill_router_bf16x3_.
+  /// 1: plain fp16; 2: weights split hi/lo (two WMMAs), fp16 `mh`; 3: fp16
+  /// weights, fp32 `mixed` split hi/lo.
+  static inline int prefill_router_f16_ = 0;
+  /// Precision option (stream P): the small F32 projections over `mixed`
+  /// (DeltaNet alpha/beta, shared-expert gate) on FP16 WMMA like the router
+  /// option, instead of the fp32 tiled GEMM.
+  static inline bool prefill_small_f16_ = true;
+  /// Precision option (stream P): the mix epilogue reads xn as the norm's fp16
+  /// K-blocked copy (xh) instead of rebuilding it in fp32 from the residual.
+  static inline bool prefill_mix_h16_ = false;
+  /// Precision option (stream P): the shared expert's gate and up as W8A8
+  /// (halo_gemm_q8a8_128x128, activations quantized per token and 32 values).
+  static inline bool prefill_shexp_w8a8_ = false;
+  /// Precision option (stream P): the mixers' down projection as W8A8
+  /// (halo_gemm_q8a8_160x64 over an int8 copy of xn written by combine_norm).
+  static inline bool prefill_down_w8a8_ = false;
   /// Attention of a chunk's tokens in batched launches (same arithmetic as
   /// stepping) instead of token by token.
   static inline bool prefill_batched_attention_ = true;
@@ -258,7 +277,7 @@ class FlashNextGpu {
     rt::Buffer pa, pb;  // PLE key and normalized rows
     rt::Buffer ipart;   // inject partial products [T][hc][rows]
     rt::Buffer rscale;  // per-row norm scale [T][hc] when combine_norm skipped writing xn
-    rt::Buffer xh, mh;  // fp16 activations: per GEMM, and the shared `mixed`  // grouped experts (hp, x16 fp16)
+    rt::Buffer xh, mh, lh;  // fp16 activations: per GEMM, the shared `mixed`, the mixer lo (mix_h16)  // grouped experts (hp, x16 fp16)
     rt::Buffer bscores, vis, ascores;                // batched attention, kAttnSub tokens at a time
     rt::Buffer ublk, umask, ucount;                  // QSA unions of 4 tokens (halo_qsa_union4)
     rt::Buffer gdnprep;                              // chunked DeltaNet: per (head, 16-token chunk) halo_gdn_c16_prep
@@ -282,6 +301,8 @@ class FlashNextGpu {
   /// y[T][rows] = W x[T][cols]: int8 GEMM for repacked Q8 (x quantized here),
   /// BF16 / F32 GEMMs, else the decode GEMV per token.
   /// x16: x already converted to fp16 rows (shared by several GEMMs), or null.
+  // An F32 projection of `mixed` on FP16 WMMA when prefill_small_f16_ allows it, else Gemm.
+  bool MixedGemmF16(const model::TensorRef& t, const rt::Buffer& y, std::uint32_t tokens, std::string* error);
   bool Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::Buffer& y, std::uint32_t tokens,
             std::string* error, const rt::Buffer* x16 = nullptr, bool x16_blocked = false);
   bool HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_t tokens, std::string* error, bool normed = false);
@@ -338,6 +359,7 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   std::unordered_map<const void*, PermutedUp> hc_up_perm_;
   bool mh_valid_ = false;
   bool xn_skipped_ = false;  // the last combine_norm wrote rscale instead of xn
+  bool xq_valid_ = false;    // the last combine_norm wrote the int8 copy of xn (prefill_down_w8a8_)
   rt::FileUploader* loader_ = nullptr;  ///< during Init: weights read from their files
   std::unordered_map<const void*, DevLora> lora_;
   std::unordered_map<std::string, rt::KernelId> kernels_;
