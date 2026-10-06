@@ -124,6 +124,15 @@ Median of 60 steady steps after warm-up (the "Capital of France" prompt).
 | + int8 expert activations | 47.4 ms (21.1 tok/s) | — |
 | + fused mixer, shared expert, DeltaNet block (66dae81) | **44.7 ms (22.4 tok/s)** | 64.0 ms (15.6 tok/s) |
 
+Main 56693d8 and stream D (2026-10-06, `halo_run --device-sample 1`, steady median of 76 steps; long context:
+`--prompt-file prose_long.txt --prefill-prompt 1`, 6,939 tokens prefilled first; ROOFLINE section 9):
+
+| Build | 5-token context | 6,939-token context |
+|---|---:|---:|
+| main 56693d8, default clock | 43.5 ms (23.0 tok/s) | 55.4 ms (18.1 tok/s) |
+| main 56693d8, clock pinned | 42.9 ms (23.3 tok/s) | 53.8 ms (18.6 tok/s) |
+| + batched decode attention (`halo_attention_select_b`, bit-identical), pinned | **42.6 ms (23.5 tok/s)** | **44.2 ms (22.6 tok/s)** |
+
 The commit message of 66dae81 quotes 46.7 and 84 ms; those were measured
 with a stale `halo_run` binary built before the fusions.
 
