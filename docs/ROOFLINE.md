@@ -992,3 +992,22 @@ trace (4.0 -> ~3.3 us would mean serial dequant is the ceiling). Then: GLM ranks
 (KS 32 two-deep ring) and a persistent 40-block grid; sol ranks balanced stream-K / persistent scheduling for the
 tail and doubts warp specialization on this hardware (VALU and WMMA serialize per SIMD). Both: skip split-K
 (fp32 partial traffic), int8 W8A8 changes numerics.
+| Few-row F32 projections with rows on threads (alpha + beta fused in one pass; bit-identical) | -19 | 28.0 -> 31.7 ms (rows128 0.55 ms per layer vs tiled 0.47; rows16 0.25 vs 0.23): one LDS read per FMA vs the tiled 4x4 outer product's 0.5 | no |
+
+**Against gufo (its 2-pass rocprofv3 profile, `/data/halo-work/gufo_prof`, vs `kt_head` at f1380a8), 2026-10-05.**
+Per 2048-token pass, gufo's kernels sum to 1354 ms. By role we are at or ahead: routed MoE 416 vs 455,
+attention 40 vs 49, HC combine ~155 vs 145, DeltaNet ~144 vs ~130. The big dense GEMMs are matched or better
+(qkv+z 181.0 vs 183.7; attention q/gate/k/v ~59 vs ~60; DeltaNet out 2560 x 6144 2.17 vs 2.10 ms a call). The
+~100 ms gap in the dense class is:
+
+| Role | gufo | ours | gap | why |
+|---|---|---|---|---|
+| Mix GEMM + epilogue | 60.0 + 23.7 | 108.1 | +24 | gufo: separate GEMM (0.64 ms) and vectorized epilogue kernel |
+| Small F32 projections (alpha, beta, shared-expert gate) | ~3.6 | 27.9 | +24 | gufo: fp16 WMMA; ours exact fp32 VALU |
+| Router (512 rows) | 17.6 | 39.5 | +22 | gufo: fp16; ours bf16x3 (fp32-like) |
+| Mixer down (`_mb`) | 46.3 | 59.9 | +14 | gufo: W8A8 (int8 activations) |
+| Shared-expert gate/up | 22.4 | 34.3 | +12 | gufo: W8A8 |
+| Attention out | 23.9 | ~30 | +6 | gufo: W8A8 (K-quant weights, int8 activations) |
+
+About 75 of the ~100 ms are precision choices (fp16 or int8 activations where we keep fp32 or fp16 exact),
+i.e. quality-gate decisions, not kernel engineering; the exact candidate is the mix GEMM's split (~24).
