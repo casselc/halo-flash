@@ -13,12 +13,25 @@ namespace {
 // Q8RowsDot / GemvQ8rMulti over NB columns. x is staged through LDS in chunks of `chunk` columns (a multiple of
 // kWarp * 16, so a lane's sequence of 16-value pieces is the single kernel's), for all columns at once.
 // Every thread of the block must call it (it synchronizes); `active` waves compute, the others only stage.
-template <int kRows, int NB>
+template <int kRows, int NB, bool kPrefetch = false>
 __device__ inline void Q8RowsDotB(const std::int8_t* qs, const std::uint16_t* d, const float* x, std::uint32_t xstride,
                                   float* lds, std::uint32_t chunk, std::uint32_t r0, bool active, std::uint32_t rows,
                                   std::uint32_t cols, std::uint32_t qstride, float (&out)[NB][kRows]) {
   const std::uint32_t lane = threadIdx.x % kWarp, nblk = cols / 32;
   float acc[NB][kRows] = {};
+  // kPrefetch: the next piece's weights are loaded before the current piece's arithmetic (one piece in flight a
+  // lane while computing); the arithmetic and its order are unchanged.
+  int4 qn[kRows];
+  float sn[kRows];
+  const auto load = [&](std::uint32_t c, int4 (&q)[kRows], float (&sc)[kRows]) {
+#pragma unroll
+    for (int k = 0; k < kRows; ++k) {
+      const std::uint32_t r = min(r0 + k, rows - 1);
+      q[k] = *reinterpret_cast<const int4*>(qs + static_cast<std::size_t>(r) * qstride + c);
+      sc[k] = F16(d[static_cast<std::size_t>(r) * nblk + c / 32]);
+    }
+  };
+  if (kPrefetch && active && lane * 16 < cols) load(lane * 16, qn, sn);
   for (std::uint32_t k0 = 0; k0 < cols; k0 += chunk) {
     const std::uint32_t n = min(chunk, cols - k0);
     __syncthreads();
@@ -30,11 +43,12 @@ __device__ inline void Q8RowsDotB(const std::int8_t* qs, const std::uint16_t* d,
     for (std::uint32_t c = k0 + lane * 16; c < k0 + n; c += kWarp * 16) {
       int4 q[kRows];
       float sc[kRows];
+      if (kPrefetch) {
 #pragma unroll
-      for (int k = 0; k < kRows; ++k) {
-        const std::uint32_t r = min(r0 + k, rows - 1);
-        q[k] = *reinterpret_cast<const int4*>(qs + static_cast<std::size_t>(r) * qstride + c);
-        sc[k] = F16(d[static_cast<std::size_t>(r) * nblk + c / 32]);
+        for (int k = 0; k < kRows; ++k) q[k] = qn[k], sc[k] = sn[k];
+        if (c + kWarp * 16 < cols) load(c + kWarp * 16, qn, sn);
+      } else {
+        load(c, q, sc);
       }
 #pragma unroll
       for (int b = 0; b < NB; ++b) {
@@ -60,19 +74,24 @@ __device__ inline void Q8RowsDotB(const std::int8_t* qs, const std::uint16_t* d,
 
 // LDS budget of the batched Q8 kernels: 12288 floats (48 KB), as halo_gemv_q8r_r4's staging.
 constexpr std::uint32_t kBatchLds = 12288;
-template <int NB>
+template <int NB, std::uint32_t kLds = kBatchLds>
 constexpr std::uint32_t BatchChunk() {
-  return (kBatchLds / NB) / (kWarp * 16) * (kWarp * 16);
+  return (kLds / NB) / (kWarp * 16) * (kWarp * 16) > 0 ? (kLds / NB) / (kWarp * 16) * (kWarp * 16) : kWarp * 16;
 }
 
-template <int kRows, int NB>
+template <int kRows, int NB, bool kPrefetch = false, std::uint32_t kLds = kBatchLds>
 __device__ inline void GemvQ8rB(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y,
                                 std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t xstride,
-                                std::uint32_t ystride) {
-  __shared__ float lds[kBatchLds];
-  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+                                std::uint32_t ystride, std::uint32_t groups) {
+  __shared__ float lds[kLds];
+  // Column groups of NB interleaved with the row blocks: neighbouring blocks read the same rows (cache hits).
+  const std::uint32_t bx = blockIdx.x / groups, g = blockIdx.x % groups;
+  x += g * NB * xstride;
+  y += g * NB * ystride;
+  const std::uint32_t r0 = (bx * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
   float out[NB][kRows];
-  Q8RowsDotB<kRows, NB>(qs, d, x, xstride, lds, BatchChunk<NB>(), r0, r0 < rows, rows, cols, qstride, out);
+  Q8RowsDotB<kRows, NB, kPrefetch>(qs, d, x, xstride, lds, BatchChunk<NB, kLds>(), r0, r0 < rows, rows, cols, qstride,
+                                   out);
   if (r0 >= rows || threadIdx.x % kWarp != 0) return;
 #pragma unroll
   for (int b = 0; b < NB; ++b)
@@ -111,35 +130,44 @@ __device__ inline void RowDotHoistedB(const float* row, const float* x, std::uin
 }  // namespace
 
 // The batched kernels, one per batch size (NB = 2..8). HALO_BATCH_KERNELS(name, body) instantiates them.
-#define HALO_FOR_NB(X) X(2) X(3) X(4) X(5) X(6) X(7) X(8)
+#define HALO_FOR_NB(X) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8)
 
 // halo_gemv_q8r_r4 / _r2.
-#define HALO_GEMV_B(NB)                                                                                              \
+#define HALO_GEMV_BV(NB, SUF, PF, LDS)                                                                               \
   extern "C" __global__ void __launch_bounds__(256)                                                                  \
-      halo_gemv_q8r_r4_b##NB(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y,                \
-                             std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t xstride,   \
-                             std::uint32_t ystride) {                                                                \
-    GemvQ8rB<4, NB>(qs, d, x, y, rows, cols, qstride, xstride, ystride);                                             \
+      halo_gemv_q8r_r4_b##NB##SUF(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y,           \
+                                  std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride,                     \
+                                  std::uint32_t xstride, std::uint32_t ystride, std::uint32_t groups) {              \
+    GemvQ8rB<4, NB, PF, LDS>(qs, d, x, y, rows, cols, qstride, xstride, ystride, groups);                            \
   }                                                                                                                  \
   extern "C" __global__ void __launch_bounds__(256)                                                                  \
-      halo_gemv_q8r_r2_b##NB(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y,                \
-                             std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t xstride,   \
-                             std::uint32_t ystride) {                                                                \
-    GemvQ8rB<2, NB>(qs, d, x, y, rows, cols, qstride, xstride, ystride);                                             \
+      halo_gemv_q8r_r2_b##NB##SUF(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y,           \
+                                  std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride,                     \
+                                  std::uint32_t xstride, std::uint32_t ystride, std::uint32_t groups) {              \
+    GemvQ8rB<2, NB, PF, LDS>(qs, d, x, y, rows, cols, qstride, xstride, ystride, groups);                            \
   }
+// Variants: plain; _p weights prefetched a piece ahead; _s 16 KB of LDS (more resident blocks); _ps both.
+#define HALO_GEMV_B(NB)                                                                                              \
+  HALO_GEMV_BV(NB, , false, kBatchLds) HALO_GEMV_BV(NB, _p, true, kBatchLds) HALO_GEMV_BV(NB, _s, false, 4096u)     \
+      HALO_GEMV_BV(NB, _ps, true, 4096u)
 HALO_FOR_NB(HALO_GEMV_B)
 #undef HALO_GEMV_B
+#undef HALO_GEMV_BV
 
 // halo_gemv_q8r_dual (DeltaNet qkv + z).
-#define HALO_DUAL_B(NB)                                                                                              \
-  extern "C" __global__ void __launch_bounds__(256) halo_gemv_q8r_dual_b##NB(                                       \
+#define HALO_DUAL_BV(NB, SUF, PF, LDS)                                                                                              \
+  extern "C" __global__ void __launch_bounds__(256) halo_gemv_q8r_dual_b##NB##SUF(                                       \
       const std::int8_t* q1, const std::uint16_t* d1, float* y1, std::uint32_t rows1, std::uint32_t qstride1,        \
       const std::int8_t* q2, const std::uint16_t* d2, float* y2, std::uint32_t rows2, std::uint32_t qstride2,        \
       const float* x, std::uint32_t cols, std::uint32_t blocks1, std::uint32_t xstride, std::uint32_t ystride1,      \
-      std::uint32_t ystride2) {                                                                                      \
-    __shared__ float lds[kBatchLds];                                                                                 \
-    const bool first = blockIdx.x < blocks1;                                                                         \
-    const std::uint32_t b = first ? blockIdx.x : blockIdx.x - blocks1;                                               \
+      std::uint32_t ystride2, std::uint32_t groups) {                                                                \
+    __shared__ float lds[LDS];                                                                                 \
+    const std::uint32_t bx = blockIdx.x / groups, grp = blockIdx.x % groups;                                         \
+    x += grp * NB * xstride;                                                                                         \
+    y1 += grp * NB * ystride1;                                                                                       \
+    y2 += grp * NB * ystride2;                                                                                       \
+    const bool first = bx < blocks1;                                                                                 \
+    const std::uint32_t b = first ? bx : bx - blocks1;                                                               \
     const std::int8_t* qs = first ? q1 : q2;                                                                         \
     const std::uint16_t* d = first ? d1 : d2;                                                                        \
     float* y = first ? y1 : y2;                                                                                      \
@@ -148,23 +176,31 @@ HALO_FOR_NB(HALO_GEMV_B)
     constexpr int kRows = 4;                                                                                         \
     const std::uint32_t r0 = (b * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;                               \
     float acc[NB][kRows];                                                                                            \
-    Q8RowsDotB<kRows, NB>(qs, d, x, xstride, lds, BatchChunk<NB>(), r0, r0 < rows, rows, cols, qstride, acc);       \
+    Q8RowsDotB<kRows, NB, PF>(qs, d, x, xstride, lds, BatchChunk<NB, LDS>(), r0, r0 < rows, rows, cols, qstride, acc);       \
     if (r0 >= rows || threadIdx.x % kWarp != 0) return;                                                              \
     _Pragma("unroll") for (int c = 0; c < NB; ++c) _Pragma("unroll") for (int k = 0; k < kRows; ++k) if (r0 + k <   \
                                                                                                           rows)      \
         y[c * ystride + r0 + k] = acc[c][k];                                                                         \
   }
+#define HALO_DUAL_B(NB)                                                                                              \
+  HALO_DUAL_BV(NB, , false, kBatchLds) HALO_DUAL_BV(NB, _p, true, kBatchLds) HALO_DUAL_BV(NB, _s, false, 4096u)     \
+      HALO_DUAL_BV(NB, _ps, true, 4096u)
 HALO_FOR_NB(HALO_DUAL_B)
 #undef HALO_DUAL_B
+#undef HALO_DUAL_BV
 
 // halo_matvec_f32_rowblock2_u (DeltaNet alpha and beta): a block per row; y strides are the outputs' strides.
 #define HALO_ROWBLOCK2_B(NB)                                                                                         \
   extern "C" __global__ void __launch_bounds__(256) halo_matvec_f32_rowblock2_u_b##NB(                              \
       const float* wa, const float* wb, const float* x, float* ya, float* yb, std::uint32_t rows,                    \
-      std::uint32_t cols, std::uint32_t xstride, std::uint32_t ystride) {                                            \
+      std::uint32_t cols, std::uint32_t xstride, std::uint32_t ystride, std::uint32_t groups) {                      \
     __shared__ float scratch[32];                                                                                    \
-    const bool a = blockIdx.x < rows;                                                                                \
-    const std::uint32_t r = a ? blockIdx.x : blockIdx.x - rows;                                                      \
+    const std::uint32_t bx = blockIdx.x / groups, grp = blockIdx.x % groups;                                         \
+    x += grp * NB * xstride;                                                                                         \
+    ya += grp * NB * ystride;                                                                                        \
+    yb += grp * NB * ystride;                                                                                        \
+    const bool a = bx < rows;                                                                                        \
+    const std::uint32_t r = a ? bx : bx - rows;                                                                      \
     float acc[NB];                                                                                                   \
     RowDotHoistedB<NB>((a ? wa : wb) + static_cast<std::size_t>(r) * cols, x, xstride, cols, acc);                   \
     _Pragma("unroll") for (int c = 0; c < NB; ++c) {                                                                 \
@@ -180,10 +216,14 @@ HALO_FOR_NB(HALO_ROWBLOCK2_B)
 #define HALO_ROUTER_B(NB)                                                                                            \
   extern "C" __global__ void __launch_bounds__(256) halo_router_rowblock_q8act_b##NB(                               \
       const float* w, const float* x, float* y, std::uint32_t rows, std::uint32_t cols, Q8Act* act,                  \
-      std::uint32_t xstride, std::uint32_t ystride) {                                                                \
+      std::uint32_t xstride, std::uint32_t ystride, std::uint32_t groups) {                                          \
     __shared__ float scratch[32];                                                                                    \
-    if (blockIdx.x < cols / 32 && threadIdx.x < kWarp) {                                                             \
-      const std::uint32_t lane = threadIdx.x, blk = blockIdx.x;                                                      \
+    const std::uint32_t bx = blockIdx.x / groups, grp = blockIdx.x % groups;                                         \
+    x += grp * NB * xstride;                                                                                         \
+    y += grp * NB * ystride;                                                                                         \
+    act += grp * NB;                                                                                                 \
+    if (bx < cols / 32 && threadIdx.x < kWarp) {                                                                     \
+      const std::uint32_t lane = threadIdx.x, blk = bx;                                                              \
       _Pragma("unroll") for (int c = 0; c < NB; ++c) {                                                               \
         const float v = x[c * xstride + blk * 32 + lane];                                                            \
         float amax = fabsf(v), sum = v;                                                                              \
@@ -204,7 +244,7 @@ HALO_FOR_NB(HALO_ROWBLOCK2_B)
         }                                                                                                            \
       }                                                                                                              \
     }                                                                                                                \
-    const std::uint32_t r = blockIdx.x;                                                                              \
+    const std::uint32_t r = bx;                                                                                      \
     if (r >= rows) return;                                                                                           \
     float acc[NB];                                                                                                   \
     RowDotHoistedB<NB>(w + static_cast<std::size_t>(r) * cols, x, xstride, cols, acc);                               \
@@ -317,6 +357,35 @@ __device__ inline float Q5_1Dot(const Q5_1Piece& w, const float* xs, std::uint32
   }
   return F16(static_cast<std::uint16_t>(w.hd.x & 0xFFFF)) * s + F16(static_cast<std::uint16_t>(w.hd.x >> 16)) * sx;
 }
+// The same with the 32 weights converted once (shared by an expert's pairs); identical values and sums.
+struct Q5_1Vals {
+  float lo[16], hi[16], d, m;
+};
+__device__ inline Q5_1Vals Q5_1Deq(const Q5_1Piece& w) {
+  Q5_1Vals v;
+  const std::uint32_t qh = w.hd.y;
+  std::uint8_t q[16];
+  *reinterpret_cast<uint2*>(q) = w.qa;
+  *reinterpret_cast<uint2*>(q + 8) = w.qb;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    v.lo[j] = static_cast<float>((q[j] & 0xF) | (((qh >> j) & 1) << 4));
+    v.hi[j] = static_cast<float>((q[j] >> 4) | (((qh >> (j + 16)) & 1) << 4));
+  }
+  v.d = F16(static_cast<std::uint16_t>(w.hd.x & 0xFFFF));
+  v.m = F16(static_cast<std::uint16_t>(w.hd.x >> 16));
+  return v;
+}
+__device__ inline float Q5_1DotV(const Q5_1Vals& v, const float* xs, std::uint32_t item) {
+  const float* x = xs + item * 32;
+  float s = 0, sx = 0;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    s += v.lo[j] * x[j] + v.hi[j] * x[16 + j];
+    sx += x[j] + x[16 + j];
+  }
+  return v.d * s + v.m * sx;
+}
 
 }  // namespace
 
@@ -398,10 +467,10 @@ HALO_FOR_NB(HALO_MOE_GU_B)
       for (std::uint32_t t = lane; t < kRows * per_row; t += kWarp) {                                                \
         const std::uint32_t k = t / per_row, i = t % per_row;                                                        \
         const std::uint32_t r = min(r0 + k, rows - 1);                                                               \
-        const Q5_1Piece p = Q5_1Load(w + r * row_bytes, i);                                                          \
+        const Q5_1Vals p = Q5_1Deq(Q5_1Load(w + r * row_bytes, i));                                                 \
         _Pragma("unroll") for (int j = 0; j < kG; ++j) {                                                             \
           if (g0 + j >= m) break;                                                                                    \
-          const float v = Q5_1Dot(p, xs[g0 + j], i);                                                                 \
+          const float v = Q5_1DotV(p, xs[g0 + j], i);                                                                 \
           _Pragma("unroll") for (int kk = 0; kk < kRows; ++kk) if (kk == static_cast<int>(k)) acc[j][kk] += v;      \
         }                                                                                                            \
       }                                                                                                              \
@@ -477,10 +546,14 @@ HALO_FOR_NB(HALO_MOE_DNQ8_B)
   extern "C" __global__ void __launch_bounds__(256) halo_shexp_gate_up_u_b##NB(                                     \
       const std::int8_t* gq, const std::uint16_t* gd, const std::int8_t* uq, const std::uint16_t* ud,                \
       const float* gate_inp, const float* x, float* h, float* sgate, std::uint32_t rows, std::uint32_t cols,         \
-      std::uint32_t qstride, std::uint32_t xstride, std::uint32_t hstride) {                                         \
+      std::uint32_t qstride, std::uint32_t xstride, std::uint32_t hstride, std::uint32_t groups) {                   \
     __shared__ float lds[kBatchLds];                                                                                 \
     __shared__ float scratch[32];                                                                                    \
-    if (blockIdx.x == 0) {                                                                                           \
+    const std::uint32_t bx = blockIdx.x / groups, grp = blockIdx.x % groups;                                         \
+    x += grp * NB * xstride;                                                                                         \
+    h += grp * NB * hstride;                                                                                         \
+    sgate += grp * NB;                                                                                               \
+    if (bx == 0) {                                                                                                   \
       float a[NB];                                                                                                   \
       RowDotHoistedB<NB>(gate_inp, x, xstride, cols, a);                                                             \
       _Pragma("unroll") for (int c = 0; c < NB; ++c) {                                                               \
@@ -489,7 +562,7 @@ HALO_FOR_NB(HALO_MOE_DNQ8_B)
       }                                                                                                              \
     }                                                                                                                \
     constexpr int kRows = 2;                                                                                         \
-    const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;                      \
+    const std::uint32_t r0 = (bx * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;                              \
     float g[NB][kRows], u[NB][kRows];                                                                                \
     Q8RowsDotB<kRows, NB>(gq, gd, x, xstride, lds, BatchChunk<NB>(), r0, r0 < rows, rows, cols, qstride, g);        \
     Q8RowsDotB<kRows, NB>(uq, ud, x, xstride, lds, BatchChunk<NB>(), r0, r0 < rows, rows, cols, qstride, u);        \
@@ -507,10 +580,16 @@ HALO_FOR_NB(HALO_SHEXP_GU_B)
   extern "C" __global__ void __launch_bounds__(256) halo_shexp_down_combine_u_b##NB(                                \
       const std::int8_t* dq, const std::uint16_t* dd, const float* hin, const float* sgate, const float* part,       \
       const float* weights, std::uint32_t slots, float* out, std::uint32_t rows, std::uint32_t cols,                 \
-      std::uint32_t qstride, std::uint32_t hstride, std::uint32_t ostride) {                                         \
+      std::uint32_t qstride, std::uint32_t hstride, std::uint32_t ostride, std::uint32_t groups) {                   \
     __shared__ float lds[kBatchLds];                                                                                 \
     constexpr int kRows = 4;                                                                                         \
-    const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;                      \
+    const std::uint32_t bx = blockIdx.x / groups, grp = blockIdx.x % groups;                                         \
+    hin += grp * NB * hstride;                                                                                       \
+    sgate += grp * NB;                                                                                               \
+    part += static_cast<std::size_t>(grp) * NB * slots * rows;                                                       \
+    weights += grp * NB * slots;                                                                                     \
+    out += grp * NB * ostride;                                                                                       \
+    const std::uint32_t r0 = (bx * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;                              \
     const std::uint32_t lane = threadIdx.x % kWarp;                                                                  \
     float y[NB][kRows];                                                                                              \
     Q8RowsDotB<kRows, NB>(dq, dd, hin, hstride, lds, BatchChunk<NB>(), r0, r0 < rows, rows, cols, qstride, y);      \
@@ -541,8 +620,16 @@ HALO_FOR_NB(HALO_SHEXP_DC_B)
       const float* res, const float* norm_w, const float* scale, const std::int8_t* dqs, const std::uint16_t* dd,    \
       const float* inject_w, float* xn, float* lo_part, float* inject_part, std::uint32_t hc, std::uint32_t h,       \
       std::uint32_t low_rank, std::uint32_t down_blocks, std::uint32_t qstride, std::uint32_t chunk,                 \
-      std::uint32_t parts) {                                                                                         \
+      std::uint32_t parts, std::uint32_t groups) {                                                                                         \
     __shared__ float xsc[NB * 1536];                                                                                 \
+    {                                                                                                                \
+      const std::uint32_t c0z = (blockIdx.x % groups) * NB; /* column group, interleaved with x */                                                  \
+      res += static_cast<std::size_t>(c0z) * hc * h;                                                                 \
+      scale += c0z * hc;                                                                                             \
+      xn += static_cast<std::size_t>(c0z) * hc * h;                                                                  \
+      lo_part += static_cast<std::size_t>(c0z) * parts * low_rank;                                                   \
+      inject_part += static_cast<std::size_t>(c0z) * parts * hc;                                                     \
+    }                                                                                 \
     __shared__ float scratch[32];                                                                                    \
     const std::uint32_t D = hc * h, ky = blockIdx.y, c0 = ky * chunk, c1 = min(D, c0 + chunk);                       \
     constexpr std::uint32_t kMax = 8;                                                                                \
@@ -561,12 +648,12 @@ HALO_FOR_NB(HALO_SHEXP_DC_B)
       }                                                                                                              \
     }                                                                                                                \
     __syncthreads();                                                                                                 \
-    if (blockIdx.x == 0)                                                                                             \
+    if (blockIdx.x / groups == 0)                                                                                             \
       _Pragma("unroll") for (int b = 0; b < NB; ++b) for (std::uint32_t i = c0 + threadIdx.x; i < c1;              \
                                                           i += blockDim.x) xn[b * D + i] = xsc[b * chunk + i - c0];  \
     const std::uint32_t lane = threadIdx.x % kWarp;                                                                  \
-    if (blockIdx.x >= down_blocks) {                                                                                 \
-      const std::uint32_t r = blockIdx.x - down_blocks;                                                              \
+    if (blockIdx.x / groups >= down_blocks) {                                                                                 \
+      const std::uint32_t r = blockIdx.x / groups - down_blocks;                                                              \
       const float* w = inject_w + static_cast<std::size_t>(r) * D;                                                   \
       float wv[kMax];                                                                                                \
       _Pragma("unroll") for (std::uint32_t j = 0; j < kMax; ++j) {                                                   \
@@ -585,7 +672,7 @@ HALO_FOR_NB(HALO_SHEXP_DC_B)
       return;                                                                                                        \
     }                                                                                                                \
     constexpr int kRows = 2;                                                                                         \
-    const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;                      \
+    const std::uint32_t r0 = (blockIdx.x / groups * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;                      \
     if (r0 >= low_rank) return;                                                                                      \
     const std::uint32_t nblk = D / 32;                                                                               \
     float acc[NB][kRows] = {};                                                                                       \
@@ -622,9 +709,17 @@ HALO_FOR_NB(HALO_MIX_A_B)
   extern "C" __global__ void __launch_bounds__(256) halo_hc_mix_b_u_b##NB(                                          \
       const float* lo_part, std::uint32_t parts, const float* inject_part, float* inject, std::uint32_t inject_rows, \
       const std::int8_t* uqs, const std::uint16_t* ud, const float* xn, float* mixed, std::uint32_t hc,              \
-      std::uint32_t h, std::uint32_t low_rank, std::uint32_t qstride) {                                              \
+      std::uint32_t h, std::uint32_t low_rank, std::uint32_t qstride, std::uint32_t groups) {                                              \
     __shared__ float ls[NB][512];                                                                                    \
-    const std::uint32_t i = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp;                                 \
+    {                                                                                                                \
+      const std::uint32_t c0z = (blockIdx.x % groups) * NB; /* column group, interleaved with x */                                                  \
+      lo_part += static_cast<std::size_t>(c0z) * parts * low_rank;                                                   \
+      inject_part += static_cast<std::size_t>(c0z) * parts * hc;                                                     \
+      inject += c0z * hc;                                                                                            \
+      xn += static_cast<std::size_t>(c0z) * hc * h;                                                                  \
+      mixed += c0z * h;                                                                                              \
+    }                                                                                    \
+    const std::uint32_t i = blockIdx.x / groups * (blockDim.x / kWarp) + threadIdx.x / kWarp;                                 \
     const std::uint32_t lane = threadIdx.x % kWarp, nblk = low_rank / 32, c = lane * 16;                             \
     const bool live = i < h && c < low_rank;                                                                         \
     constexpr std::uint32_t kMaxParts = 16;                                                                          \
@@ -641,7 +736,7 @@ HALO_FOR_NB(HALO_MIX_A_B)
           ls[b][j] = Silu(a / static_cast<float>(hc));                                                               \
         }                                                                                                            \
       }                                                                                                              \
-      if (blockIdx.x == 0 && threadIdx.x < inject_rows) {                                                            \
+      if (blockIdx.x / groups == 0 && threadIdx.x < inject_rows) {                                                            \
         const float* ip = inject_part + static_cast<std::size_t>(b) * parts * hc;                                    \
         float a = 0.0f;                                                                                              \
         for (std::uint32_t p = 0; p < parts; ++p) a += ip[p * hc + threadIdx.x];                                     \
@@ -681,3 +776,143 @@ HALO_FOR_NB(HALO_MIX_A_B)
   }
 HALO_FOR_NB(HALO_MIX_B_B)
 #undef HALO_MIX_B_B
+
+// ---- Per-session small kernels for NB entries in one launch (blockIdx.y = entry): the single kernels' bodies
+// verbatim, pointers offset to the entry's slice. ---------------------------------------------------------------
+extern "C" __global__ void halo_hc_norm_scales_u_y(const float* res, float* scale, std::uint32_t h, float eps, std::uint32_t hc) {
+  res += static_cast<std::size_t>(blockIdx.y) * hc * h;
+  scale += blockIdx.y * hc;
+
+  __shared__ float scratch[32];
+  const float* x = res + blockIdx.x * h;
+  constexpr std::uint32_t kMax = 16;  // h <= 16 * blockDim
+  float v[kMax];
+#pragma unroll
+  for (std::uint32_t j = 0; j < kMax; ++j) {
+    const std::uint32_t i = threadIdx.x + j * blockDim.x;
+    v[j] = i < h ? x[i] : 0.0f;
+  }
+  float ss = 0.0f;
+#pragma unroll
+  for (std::uint32_t j = 0; j < kMax; ++j)
+    if (threadIdx.x + j * blockDim.x < h) ss = __builtin_fmaf(v[j], v[j], ss);
+  ss = BlockSum(ss, scratch);
+  if (threadIdx.x == 0) scale[blockIdx.x] = 1.0f / sqrtf(ss / static_cast<float>(h) + eps);
+}
+extern "C" __global__ void halo_hc_combine_y(float* res, const float* out, const float* inject, std::uint32_t hc,
+                                           std::uint32_t h) {
+  res += static_cast<std::size_t>(blockIdx.y) * hc * h;
+  out += static_cast<std::size_t>(blockIdx.y) * h;
+  inject += blockIdx.y * hc;
+
+  for (std::uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < hc * h; idx += gridDim.x * blockDim.x) {
+    const std::uint32_t s = idx / h;
+    res[idx] += out[idx % h] * 2.0f * Sigmoid(inject[s] / static_cast<float>(hc));
+  }
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_router_topk_w_y(const float* logits, std::uint32_t* ids, float* weights, std::uint32_t n, std::uint32_t k, std::uint32_t lstride) {
+  logits += static_cast<std::size_t>(blockIdx.y) * lstride;
+  ids += blockIdx.y * k;
+  weights += blockIdx.y * k;
+
+  __shared__ float scratch[32];
+  __shared__ float prob[1024];
+  __shared__ float cv[8 * 16];
+  __shared__ std::uint32_t ci[8 * 16];
+  float mx = -INFINITY;
+  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) mx = fmaxf(mx, logits[i]);
+  mx = BlockMax(mx, scratch);
+  float den = 0.0f;
+  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+    prob[i] = expf(logits[i] - mx);
+    den += prob[i];
+  }
+  den = BlockSum(den, scratch);
+  for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) prob[i] /= den;
+  __syncthreads();
+  const std::uint32_t lane = threadIdx.x % kWarp, warp = threadIdx.x / kWarp, warps = blockDim.x / kWarp;
+  const auto better = [](float ov, std::uint32_t oi, float v, std::uint32_t at) {
+    return ov > v || (ov == v && oi < at);
+  };
+  // Stage 1: warp w's slice [w * seg, (w + 1) * seg); lane l holds slice[l], slice[l + 32], ... (<= 4 values).
+  const std::uint32_t seg = (n + warps - 1) / warps;
+  constexpr std::uint32_t kPer = 4;  // 1024 / 8 warps / 32 lanes
+  float lv[kPer];
+  std::uint32_t li[kPer];
+#pragma unroll
+  for (std::uint32_t m = 0; m < kPer; ++m) {
+    const std::uint32_t i = warp * seg + lane + m * kWarp;
+    const bool in = lane + m * kWarp < seg && i < n;
+    lv[m] = in ? prob[i] : -1.0f;
+    li[m] = in ? i : 0xFFFFFFFFu;
+  }
+  for (std::uint32_t r = 0; r < k; ++r) {
+    float v = -1.0f;
+    std::uint32_t at = 0xFFFFFFFFu;
+#pragma unroll
+    for (std::uint32_t m = 0; m < kPer; ++m)
+      if (lv[m] > v) {  // ascending index within the lane: the first max has the lowest index
+        v = lv[m];
+        at = li[m];
+      }
+    for (int o = kWarp / 2; o > 0; o >>= 1) {
+      const float ov = __shfl_xor(v, o, kWarp);
+      const std::uint32_t oi = __shfl_xor(at, o, kWarp);
+      if (better(ov, oi, v, at)) {
+        v = ov;
+        at = oi;
+      }
+    }
+#pragma unroll
+    for (std::uint32_t m = 0; m < kPer; ++m)
+      if (li[m] == at && at != 0xFFFFFFFFu) lv[m] = -1.0f;
+    if (lane == 0) {
+      cv[warp * k + r] = v;
+      ci[warp * k + r] = at;
+    }
+  }
+  __syncthreads();
+  if (warp != 0) return;
+  // Stage 2: warp 0 over the warps' candidates (lane l holds candidates l, l + 32, ...: <= 4).
+  const std::uint32_t nc = warps * k;
+  float cvl[kPer];
+  std::uint32_t cil[kPer];
+#pragma unroll
+  for (std::uint32_t m = 0; m < kPer; ++m) {
+    const std::uint32_t c = lane + m * kWarp;
+    cvl[m] = c < nc ? cv[c] : -1.0f;
+    cil[m] = c < nc ? ci[c] : 0xFFFFFFFFu;
+  }
+  float sum = 0.0f;
+  for (std::uint32_t slot = 0; slot < k; ++slot) {
+    float v = -1.0f;
+    std::uint32_t at = 0xFFFFFFFFu;
+#pragma unroll
+    for (std::uint32_t m = 0; m < kPer; ++m)
+      if (better(cvl[m], cil[m], v, at)) {
+        v = cvl[m];
+        at = cil[m];
+      }
+    for (int o = kWarp / 2; o > 0; o >>= 1) {
+      const float ov = __shfl_xor(v, o, kWarp);
+      const std::uint32_t oi = __shfl_xor(at, o, kWarp);
+      if (better(ov, oi, v, at)) {
+        v = ov;
+        at = oi;
+      }
+    }
+#pragma unroll
+    for (std::uint32_t m = 0; m < kPer; ++m)
+      if (cil[m] == at && at != 0xFFFFFFFFu) cvl[m] = -1.0f, cil[m] = 0xFFFFFFFFu;
+    if (lane == 0) {
+      ids[slot] = at;
+      weights[slot] = v;
+      sum += v;
+    }
+  }
+  if (lane == 0) {
+    sum = fmaxf(sum, 6.103515625e-5f);
+    for (std::uint32_t slot = 0; slot < k; ++slot) weights[slot] /= sum;
+  }
+}

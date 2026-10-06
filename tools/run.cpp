@@ -141,7 +141,10 @@ int main(int argc, char** argv) {
   // entry's logits with the same session replayed alone.
   std::uint32_t batch = 0;
   std::string batch_prompts;
-  bool batch_check = false;  // --route-trace FILE: routed expert ids of every step ([layers][k] uint32)
+  bool batch_check = false;
+  // --session-bench N: prefill N tokens (--prompt-file repeated), then time and size fork / bind / snapshot /
+  // restore / drop of that session (P6 design numbers).
+  std::uint32_t session_bench = 0;  // --route-trace FILE: routed expert ids of every step ([layers][k] uint32)
   std::uint32_t span_sample = 1;
   bool eager = false, profile = false, device_sample = false;
   bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
@@ -212,6 +215,7 @@ int main(int argc, char** argv) {
     else if (a == "--route-trace") route_trace = argv[i + 1], engine::FlashNextGpu::route_trace_ = true;
     else if (a == "--batch") batch = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--batch-prompts") batch_prompts = argv[i + 1];
+    else if (a == "--session-bench") session_bench = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--batch-check") batch_check = std::string(argv[i + 1]) == "1";
     else if (a == "--batch-decode") engine::FlashNextGpu::batch_decode_ = std::string(argv[i + 1]) == "1";
     else if (a == "--decode-timing") decode_timing = std::string(argv[i + 1]) == "1";
@@ -399,6 +403,68 @@ int main(int argc, char** argv) {
         std::printf("  %-28s %8.1f ms/prefill %6.1f%%  %8ld launches/prefill\n", name.c_str(), 1e3 * v.first / reps,
                     100 * v.first / total, v.second / reps);
     }
+    return 0;
+  }
+  if (session_bench > 0) {
+    if (!gpu) return std::fprintf(stderr, "--session-bench needs a GPU device\n"), 2;
+    std::string text = prompt;
+    if (!prompt_file.empty()) {
+      std::ifstream f(prompt_file);
+      text.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    const auto enc = tok->Encode(text);
+    if (enc.empty()) return std::fprintf(stderr, "empty prompt\n"), 2;
+    std::vector<std::int32_t> toks;
+    while (toks.size() < session_bench) toks.insert(toks.end(), enc.begin(), enc.end());
+    toks.resize(session_bench);
+    using clk = std::chrono::steady_clock;
+    const auto ms = [](clk::time_point a) { return std::chrono::duration<double, std::milli>(clk::now() - a).count(); };
+    auto t = clk::now();
+    if (!gpu->Prefill(toks, {}, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    if (!dev->Synchronize(&error)) return 1;
+    std::printf("session bench: %u tokens prefilled in %.0f ms (page %zu B)\n", session_bench, ms(t), dev->PageBytes());
+    const auto show = [&](const char* what, engine::FlashNextGpu::SessionId id) {
+      const auto m = gpu->SessionMemory(id);
+      std::printf("  %-26s recurrent %8.1f MB, KV mapped %8.1f MB, KV exclusive %8.1f MB\n", what, m.recurrent / 1e6,
+                  m.kv_mapped / 1e6, m.kv_exclusive / 1e6);
+    };
+    show("session 0", 0);
+    engine::FlashNextGpu::SessionId f1, f2;
+    t = clk::now();
+    if (!gpu->ForkSession(0, &f1, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    std::printf("  fork: %.2f ms\n", ms(t));
+    t = clk::now();
+    if (!gpu->ForkSession(0, &f2, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    std::printf("  fork again: %.2f ms\n", ms(t));
+    show("session 0 after 2 forks", 0);
+    show("fork", f1);
+    t = clk::now();
+    if (!gpu->BindSession(f1, &error)) return 1;
+    std::printf("  bind: %.3f ms\n", ms(t));
+    std::vector<float> lg(c.vocab_size);
+    t = clk::now();
+    if (!gpu->Step(toks[0], lg, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    std::printf("  first step of the fork (graph capture): %.1f ms\n", ms(t));
+    for (int i = 0; i < 3; ++i) {
+      t = clk::now();
+      if (!gpu->Step(toks[1 + i], lg, &error)) return 1;
+      std::printf("  step of the fork: %.1f ms\n", ms(t));
+    }
+    show("fork after 4 steps", f1);
+    auto snap = gpu->NewSnapshot(&error);
+    if (!snap) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    t = clk::now();
+    if (!gpu->Save(*snap, &error)) return 1;
+    std::printf("  Save (whole-state snapshot copy): %.2f ms\n", ms(t));
+    t = clk::now();
+    if (!gpu->Restore(*snap, &error)) return 1;
+    std::printf("  Restore: %.2f ms\n", ms(t));
+    if (!gpu->BindSession(0, &error)) return 1;
+    t = clk::now();
+    if (!gpu->DropSession(f1, &error) || !gpu->DropSession(f2, &error)) return 1;
+    std::printf("  drop 2 forks: %.2f ms\n", ms(t));
+    std::size_t fr = 0;
+    (void)fr;
     return 0;
   }
   if (batch > 0) {

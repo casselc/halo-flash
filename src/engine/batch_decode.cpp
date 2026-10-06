@@ -9,6 +9,7 @@
 // A captured batch graph bakes the sessions' state addresses, so graphs are cached per session list.
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include "engine/flash_next_gpu.hpp"
@@ -163,10 +164,32 @@ void FlashNextGpu::BatchEntryScope(std::uint32_t e, std::span<const SessionId> s
   }
 }
 
+namespace {
+// Columns per block for B entries: the largest divisor of B not above `target` (env HALO_BATCH_G_<kind>).
+std::uint32_t GroupCols(std::uint32_t B, std::uint32_t target) {
+  for (std::uint32_t g = std::min(B, std::max(target, 1u)); g > 1; --g)
+    if (B % g == 0) return g;
+  return 1;
+}
+std::uint32_t EnvOr(const char* name, std::uint32_t fallback) {
+  const char* v = std::getenv(name);
+  return v ? static_cast<std::uint32_t>(std::atoi(v)) : fallback;
+}
+}  // namespace
+
 bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, std::string* error) {
   const auto& c = w_.config;
   const auto B = static_cast<std::uint32_t>(sessions.size());
-  const std::string nb = "_b" + std::to_string(B);
+  const std::string nb = "_b" + std::to_string(B);  // routed experts: up to B pairs an expert
+  static const std::uint32_t g_gemv = EnvOr("HALO_BATCH_G_GEMV", 4), g_mix = EnvOr("HALO_BATCH_G_MIX", 1),
+                             g_small = EnvOr("HALO_BATCH_G_SMALL", 4);
+  const std::uint32_t G = GroupCols(B, g_gemv), NG = B / G, GM = GroupCols(B, g_mix), NGM = B / GM;
+  const std::uint32_t GS = GroupCols(B, g_small), NGS = B / GS;
+  static const std::string var = [] {
+    const char* v = std::getenv("HALO_BATCH_GEMV_VAR");
+    return std::string(v ? v : "");
+  }();
+  const std::string ng = "_b" + std::to_string(G), ngm = "_b" + std::to_string(GM), ngs = "_b" + std::to_string(GS);
   const std::uint32_t H = c.hidden_size, D = c.HcDim(), hc = c.hc_count, low = c.hc_low_rank, k = c.num_experts_used;
   const std::uint32_t chunk = (D / kHcParts + 511) / 512 * 512, parts = (D + chunk - 1) / chunk;
   const SessionId bound = bound_;
@@ -185,43 +208,41 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
     const auto& d = tensors_.at(t.data);
     const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
     const bool r2 = rows < 2048;
-    return Launch(((r2 ? "halo_gemv_q8r_r2" : "halo_gemv_q8r_r4") + nb).c_str(), {Blocks(rows, r2 ? 16 : 32)}, {256},
+    return Launch(((r2 ? "halo_gemv_q8r_r2" : "halo_gemv_q8r_r4") + ng + var).c_str(), {Blocks(rows, r2 ? 16 : 32) * NG},
+                  {256},
                   {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows),
-                   rt::Arg::Val(cols), rt::Arg::Val(d.qstride), rt::Arg::Val(xstride), rt::Arg::Val(ystride)},
+                   rt::Arg::Val(cols), rt::Arg::Val(d.qstride), rt::Arg::Val(xstride), rt::Arg::Val(ystride),
+                   rt::Arg::Val(NG)},
                   error);
   };
   const auto mix = [&](const model::HcMixer& m, bool inject) {
     const auto& dn = tensors_.at(m.down.data);
     const auto& upt = tensors_.at(m.up.data);
     const std::uint32_t down_blocks = Blocks(low, 16), inject_rows = inject ? hc : 0;
-    return each([&](std::uint32_t) {
-             return Launch(c.hidden_size <= 4096 ? "halo_hc_norm_scales_u" : "halo_hc_norm_scales", {hc}, {256},
-                           {rt::Arg::Buf(res_), rt::Arg::Buf(hc_scale_), rt::Arg::Val(c.hidden_size),
-                            rt::Arg::Val(c.rms_eps)},
-                           error);
-           }) &&
-           Launch(("halo_hc_mix_a_cu" + nb).c_str(), {down_blocks + inject_rows, parts}, {256},
+    return Launch("halo_hc_norm_scales_u_y", {hc, B}, {256},
+                  {rt::Arg::Buf(bb_.res), rt::Arg::Buf(bb_.scale), rt::Arg::Val(c.hidden_size), rt::Arg::Val(c.rms_eps),
+                   rt::Arg::Val(hc)},
+                  error) &&
+           Launch(("halo_hc_mix_a_cu" + ngm).c_str(), {(down_blocks + inject_rows) * NGM, parts}, {256},
                   {rt::Arg::Buf(bb_.res), rt::Arg::Buf(tensors_.at(m.norm.data).buf), rt::Arg::Buf(bb_.scale),
                    rt::Arg::Buf(dn.qs), rt::Arg::Buf(dn.d),
                    rt::Arg::Buf(inject ? tensors_.at(m.inject.data).buf : bb_.res), rt::Arg::Buf(bb_.xn),
                    rt::Arg::Buf(bb_.lo_part), rt::Arg::Buf(bb_.inject_part), rt::Arg::Val(hc), rt::Arg::Val(H),
                    rt::Arg::Val(low), rt::Arg::Val(down_blocks), rt::Arg::Val(dn.qstride), rt::Arg::Val(chunk),
-                   rt::Arg::Val(parts)},
+                   rt::Arg::Val(parts), rt::Arg::Val(NGM)},
                   error) &&
-           Launch(("halo_hc_mix_b_u" + nb).c_str(), {Blocks(H, 8)}, {256},
+           Launch(("halo_hc_mix_b_u" + ngm).c_str(), {Blocks(H, 8) * NGM}, {256},
                   {rt::Arg::Buf(bb_.lo_part), rt::Arg::Val(parts), rt::Arg::Buf(bb_.inject_part),
                    rt::Arg::Buf(bb_.inject), rt::Arg::Val(inject_rows), rt::Arg::Buf(upt.qs), rt::Arg::Buf(upt.d),
                    rt::Arg::Buf(bb_.xn), rt::Arg::Buf(bb_.mixed), rt::Arg::Val(hc), rt::Arg::Val(H), rt::Arg::Val(low),
-                   rt::Arg::Val(upt.qstride)},
+                   rt::Arg::Val(upt.qstride), rt::Arg::Val(NGM)},
                   error);
   };
   const auto combine = [&]() {
-    return each([&](std::uint32_t) {
-      return Launch("halo_hc_combine", {Blocks(D)}, {kBlock},
-                    {rt::Arg::Buf(res_), rt::Arg::Buf(block_out_), rt::Arg::Buf(inject_), rt::Arg::Val(hc),
-                     rt::Arg::Val(H)},
-                    error);
-    });
+    return Launch("halo_hc_combine_y", {Blocks(D), B}, {kBlock},
+                  {rt::Arg::Buf(bb_.res), rt::Arg::Buf(bb_.block_out), rt::Arg::Buf(bb_.inject), rt::Arg::Val(hc),
+                   rt::Arg::Val(H)},
+                  error);
   };
   const auto& emb = tensors_.at(w_.token_embd.data);
   bool ok = each([&](std::uint32_t) {
@@ -241,16 +262,17 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
       const auto& tz = tensors_.at(l.ssm_gate.data);
       const auto rq = static_cast<std::uint32_t>(l.ssm_qkv.rows), rz = static_cast<std::uint32_t>(l.ssm_gate.rows);
       const std::uint32_t b1 = Blocks(rq, 32), ch = c.SsmConvChannels(), kd = c.SsmKeyDim();
-      ok = Launch(("halo_gemv_q8r_dual" + nb).c_str(), {b1 + Blocks(rz, 32)}, {256},
+      ok = Launch(("halo_gemv_q8r_dual" + ng + var).c_str(), {(b1 + Blocks(rz, 32)) * NG}, {256},
                   {rt::Arg::Buf(tq.qs), rt::Arg::Buf(tq.d), rt::Arg::Buf(bb_.qkv), rt::Arg::Val(rq),
                    rt::Arg::Val(tq.qstride), rt::Arg::Buf(tz.qs), rt::Arg::Buf(tz.d), rt::Arg::Buf(bb_.z),
                    rt::Arg::Val(rz), rt::Arg::Val(tz.qstride), rt::Arg::Buf(bb_.mixed), rt::Arg::Val(H),
-                   rt::Arg::Val(b1), rt::Arg::Val(H), rt::Arg::Val(ch), rt::Arg::Val(c.SsmValueDim())},
+                   rt::Arg::Val(b1), rt::Arg::Val(H), rt::Arg::Val(ch), rt::Arg::Val(c.SsmValueDim()), rt::Arg::Val(NG)},
                   error) &&
-           Launch(("halo_matvec_f32_rowblock2_u" + nb).c_str(), {2 * c.ssm_num_v_heads}, {256},
+           Launch(("halo_matvec_f32_rowblock2_u" + ngs).c_str(), {2 * c.ssm_num_v_heads * NGS}, {256},
                   {rt::Arg::Buf(tensors_.at(l.ssm_alpha.data).buf), rt::Arg::Buf(tensors_.at(l.ssm_beta.data).buf),
                    rt::Arg::Buf(bb_.mixed), rt::Arg::Buf(bb_.alpha), rt::Arg::Buf(bb_.beta),
-                   rt::Arg::Val(c.ssm_num_v_heads), rt::Arg::Val(H), rt::Arg::Val(H), rt::Arg::Val(c.ssm_num_v_heads)},
+                   rt::Arg::Val(c.ssm_num_v_heads), rt::Arg::Val(H), rt::Arg::Val(H), rt::Arg::Val(c.ssm_num_v_heads),
+                   rt::Arg::Val(NGS)},
                   error) &&
            each([&](std::uint32_t) {
              auto& s = linear_[il];
@@ -293,16 +315,22 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
     const auto ff = static_cast<std::uint32_t>(gate.rows), E = c.num_experts;
     const auto rrows = static_cast<std::uint32_t>(l.router.rows);
     const bool down_q5_1 = down.type == core::GgmlType::kQ5_1;
-    ok = Launch(("halo_router_rowblock_q8act" + nb).c_str(), {std::max(rrows, H / 32)}, {256},
+    ok = Launch(("halo_router_rowblock_q8act" + ngs).c_str(), {std::max(rrows, H / 32) * NGS}, {256},
                 {rt::Arg::Buf(tensors_.at(l.router.data).buf), rt::Arg::Buf(bb_.mixed), rt::Arg::Buf(bb_.router),
-                 rt::Arg::Val(rrows), rt::Arg::Val(H), rt::Arg::Buf(bb_.q8act), rt::Arg::Val(H), rt::Arg::Val(rrows)},
+                 rt::Arg::Val(rrows), rt::Arg::Val(H), rt::Arg::Buf(bb_.q8act), rt::Arg::Val(H), rt::Arg::Val(rrows),
+                 rt::Arg::Val(NGS)},
                 error) &&
-         each([&](std::uint32_t) {
-           return Launch(E <= 1024 && k <= 16 ? "halo_router_topk_w" : "halo_router_topk", {1}, {kBlock},
-                         {rt::Arg::Buf(router_), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(expert_weights_),
-                          rt::Arg::Val(E), rt::Arg::Val(k)},
-                         error);
-         }) &&
+         (E <= 1024 && k <= 16
+              ? Launch("halo_router_topk_w_y", {1, B}, {kBlock},
+                       {rt::Arg::Buf(bb_.router), rt::Arg::Buf(bb_.ids), rt::Arg::Buf(bb_.wts), rt::Arg::Val(E),
+                        rt::Arg::Val(k), rt::Arg::Val(rrows)},
+                       error)
+              : each([&](std::uint32_t) {
+                  return Launch("halo_router_topk", {1}, {kBlock},
+                                {rt::Arg::Buf(router_), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(expert_weights_),
+                                 rt::Arg::Val(E), rt::Arg::Val(k)},
+                                error);
+                })) &&
          Launch("halo_moe_bucket_b", {1}, {128},
                 {rt::Arg::Buf(bb_.ids), rt::Arg::Val(B * k), rt::Arg::Buf(bb_.ucount), rt::Arg::Buf(bb_.uexp),
                  rt::Arg::Buf(bb_.unum), rt::Arg::Buf(bb_.upair)},
@@ -331,16 +359,17 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
     const auto& sd = tensors_.at(l.shexp_down.data);
     const std::uint32_t sff = c.shared_expert_ff, sffs = std::max(c.expert_ff, c.shared_expert_ff);
     ok = ok &&
-         Launch(("halo_shexp_gate_up_u" + nb).c_str(), {Blocks(sff, 16)}, {256},
+         Launch(("halo_shexp_gate_up_u" + ng).c_str(), {Blocks(sff, 16) * NG}, {256},
                 {rt::Arg::Buf(sg.qs), rt::Arg::Buf(sg.d), rt::Arg::Buf(su.qs), rt::Arg::Buf(su.d),
                  rt::Arg::Buf(tensors_.at(l.shexp_gate_inp.data).buf), rt::Arg::Buf(bb_.mixed), rt::Arg::Buf(bb_.eg),
                  rt::Arg::Buf(bb_.sgate), rt::Arg::Val(sff), rt::Arg::Val(H), rt::Arg::Val(sg.qstride), rt::Arg::Val(H),
-                 rt::Arg::Val(sffs)},
+                 rt::Arg::Val(sffs), rt::Arg::Val(NG)},
                 error) &&
-         Launch(("halo_shexp_down_combine_u" + nb).c_str(), {Blocks(H, 32)}, {256},
+         Launch(("halo_shexp_down_combine_u" + ng).c_str(), {Blocks(H, 32) * NG}, {256},
                 {rt::Arg::Buf(sd.qs), rt::Arg::Buf(sd.d), rt::Arg::Buf(bb_.eg), rt::Arg::Buf(bb_.sgate),
                  rt::Arg::Buf(bb_.moe_part), rt::Arg::Buf(bb_.wts), rt::Arg::Val(k), rt::Arg::Buf(bb_.block_out),
-                 rt::Arg::Val(H), rt::Arg::Val(sff), rt::Arg::Val(sd.qstride), rt::Arg::Val(sffs), rt::Arg::Val(H)},
+                 rt::Arg::Val(H), rt::Arg::Val(sff), rt::Arg::Val(sd.qstride), rt::Arg::Val(sffs), rt::Arg::Val(H),
+                 rt::Arg::Val(NG)},
                 error) &&
          combine();
   }
