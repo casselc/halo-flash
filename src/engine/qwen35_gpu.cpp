@@ -40,10 +40,11 @@ std::unique_ptr<Qwen35Gpu> Qwen35Gpu::Create(rt::Device& device, const model::Qw
 
 Qwen35Gpu::~Qwen35Gpu() {
   for (auto& [_, t] : tensors_) dev_.Free(t.buf);
-  for (auto& [_, l] : lora_) {
-    dev_.Free(l.a);
-    dev_.Free(l.b);
-  }
+  for (auto& [_, set] : adapters_)
+    for (auto& [__, l] : set) {
+      dev_.Free(l.a);
+      dev_.Free(l.b);
+    }
   for (auto& b : owned_) dev_.Free(b);
 }
 
@@ -89,7 +90,7 @@ bool Qwen35Gpu::MatVec(const model::TensorRef& t, const rt::Buffer& x, const rt:
   const rt::Arg args[] = {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows),
                           rt::Arg::Val(cols), rt::Arg::Val<std::uint64_t>(t.RowBytes())};
   if (!dev_.Launch(d.matvec, {Blocks(rows, kBlock / 32)}, {kBlock}, args, error)) return false;
-  if (auto it = lora_.find(t.data); it != lora_.end()) {
+  if (auto it = lora_ ? lora_->find(t.data) : AdapterSet::const_iterator{}; lora_ && it != lora_->end()) {
     const auto& l = it->second;
     const rt::Arg a_args[] = {rt::Arg::Buf(l.a), rt::Arg::Buf(x), rt::Arg::Buf(lora_tmp_), rt::Arg::Val(l.rank),
                               rt::Arg::Val(cols), rt::Arg::Val<std::uint64_t>(cols * 4ull)};
@@ -116,26 +117,8 @@ bool Qwen35Gpu::Init(const model::LoraAdapter* lora, std::uint32_t max_context, 
                           &L.ssm_beta, &L.ssm_dt, &L.ssm_a, &L.ssm_norm, &L.ssm_out, &L.attn_q, &L.attn_k, &L.attn_v,
                           &L.attn_out, &L.attn_q_norm, &L.attn_k_norm, &L.ffn_gate, &L.ffn_up, &L.ffn_down})
       if (!Upload(*t, error)) return false;
-  std::uint32_t max_rank = 1;
-  if (lora) {
-    for (const auto& [name, pair] : lora->pairs) {
-      // Find the base tensor with this name among the uploaded ones.
-      const model::TensorRef* base = nullptr;
-      for (auto& [_, t] : tensors_)
-        if (t.ref->name == name) base = t.ref;
-      if (!base) continue;  // adapter tensors outside this model's layers
-      DevLora l;
-      l.rank = static_cast<std::uint32_t>(pair.rank);
-      l.scale = lora->Scale(pair);
-      l.a = dev_.Alloc(pair.a.SizeBytes(), error);
-      l.b = dev_.Alloc(pair.b.SizeBytes(), error);
-      if (!l.a || !l.b || !dev_.Upload(l.a, 0, pair.a.data, pair.a.SizeBytes(), error) ||
-          !dev_.Upload(l.b, 0, pair.b.data, pair.b.SizeBytes(), error))
-        return false;
-      max_rank = std::max(max_rank, l.rank);
-      lora_.emplace(base->data, l);
-    }
-  }
+  const std::uint32_t max_rank = kMaxLoraRank;
+  if (lora && (!AddAdapter("default", *lora, error) || !SelectAdapter("default", error))) return false;
   const std::size_t H = c.hidden_size, F = c.ffn, nh = c.num_heads, nkv = c.num_kv_heads, hd = c.head_dim;
   const std::size_t widest =
       std::max({H, F, static_cast<std::size_t>(c.ConvChannels()), 2 * nh * hd, static_cast<std::size_t>(c.vocab_size)});
@@ -272,8 +255,7 @@ bool Qwen35Gpu::AllocChunk(std::string* error) {
   const auto& c = w_.config;
   const std::size_t T = kMaxChunk, H = c.hidden_size, F = c.ffn, nh = c.num_heads, nkv = c.num_kv_heads,
                     hd = c.head_dim;
-  std::uint32_t max_rank = 1;
-  for (const auto& [_, l] : lora_) max_rank = std::max(max_rank, l.rank);
+  const std::uint32_t max_rank = kMaxLoraRank;
   const std::size_t widest =
       std::max({H, F, static_cast<std::size_t>(c.ConvChannels()), 2 * nh * hd, std::size_t{c.ssm_num_v_heads}});
   auto& k = chunk_;
@@ -339,7 +321,7 @@ bool Qwen35Gpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::B
       if (!dev_.Launch(d.matvec, {Blocks(rows, kBlock / 32)}, {kBlock}, args, error)) return false;
     }
   }
-  if (auto it = lora_.find(t.data); it != lora_.end()) {
+  if (auto it = lora_ ? lora_->find(t.data) : AdapterSet::const_iterator{}; lora_ && it != lora_->end()) {
     const auto& l = it->second;
     if (!Launch("halo_gemm_f32_rows", {Blocks(l.rank, 8), tokens}, {kBlock},
                 {rt::Arg::Buf(l.a), rt::Arg::Buf(x), rt::Arg::Buf(chunk_.lora_tmp), rt::Arg::Val(l.rank),
@@ -353,6 +335,89 @@ bool Qwen35Gpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::B
                 {rt::Arg::Buf(y), rt::Arg::Buf(chunk_.lora_out), rt::Arg::Val(l.scale), rt::Arg::Val(rows * tokens)},
                 error))
       return false;
+  }
+  return true;
+}
+
+bool Qwen35Gpu::AddAdapter(const std::string& id, const model::LoraAdapter& lora, std::string* error) {
+  if (adapters_.contains(id)) {
+    if (error) *error = "adapter " + id + " is already resident";
+    return false;
+  }
+  AdapterSet set;
+  const auto release = [&] {
+    for (auto& [_, l] : set) {
+      dev_.Free(l.a);
+      dev_.Free(l.b);
+    }
+  };
+  for (const auto& [name, pair] : lora.pairs) {
+    // Find the base tensor with this name among the uploaded ones.
+    const model::TensorRef* base = nullptr;
+    for (auto& [_, t] : tensors_)
+      if (t.ref->name == name) base = t.ref;
+    if (!base) continue;  // adapter tensors outside this model's layers
+    if (pair.rank > kMaxLoraRank) {
+      release();
+      if (error) *error = "LoRA rank " + std::to_string(pair.rank) + " exceeds " + std::to_string(kMaxLoraRank);
+      return false;
+    }
+    DevLora l;
+    l.rank = static_cast<std::uint32_t>(pair.rank);
+    l.scale = lora.Scale(pair);
+    l.a = dev_.Alloc(pair.a.SizeBytes(), error);
+    l.b = dev_.Alloc(pair.b.SizeBytes(), error);
+    const bool ok = l.a && l.b && dev_.Upload(l.a, 0, pair.a.data, pair.a.SizeBytes(), error) &&
+                    dev_.Upload(l.b, 0, pair.b.data, pair.b.SizeBytes(), error);
+    set.emplace(base->data, l);
+    if (!ok) {
+      release();
+      return false;
+    }
+  }
+  adapters_.emplace(id, std::move(set));  // references to other sets stay valid
+  return dev_.Synchronize(error);
+}
+
+bool Qwen35Gpu::RemoveAdapter(const std::string& id) {
+  const auto it = adapters_.find(id);
+  if (it == adapters_.end()) return false;
+  for (auto& [_, l] : it->second) {
+    dev_.Free(l.a);
+    dev_.Free(l.b);
+  }
+  adapters_.erase(it);
+  if (selected_ == id) selected_.clear();
+  lora_ = selected_.empty() ? nullptr : &adapters_.at(selected_);
+  return true;
+}
+
+bool Qwen35Gpu::SelectAdapter(const std::string& id, std::string* error) {
+  if (id.empty()) {
+    selected_.clear();
+    lora_ = nullptr;
+    return true;
+  }
+  const auto it = adapters_.find(id);
+  if (it == adapters_.end()) {
+    if (error) *error = "no resident adapter " + id;
+    return false;
+  }
+  selected_ = id;
+  lora_ = &it->second;
+  return true;
+}
+
+bool Qwen35Gpu::PrefillToLayer(std::span<const std::int32_t> tokens, std::uint32_t layer, std::span<float> residual,
+                               std::string* error) {
+  const std::size_t H = w_.config.hidden_size;
+  if (layer > w_.config.num_layers || residual.size() != tokens.size() * H) {
+    if (error) *error = "PrefillToLayer: bad layer or residual size";
+    return false;
+  }
+  for (std::size_t i = 0; i < tokens.size(); i += kMaxChunk) {
+    const std::size_t n = std::min<std::size_t>(kMaxChunk, tokens.size() - i);
+    if (!PrefillChunk(tokens.subspan(i, n), residual.subspan(i * H, n * H), error, layer)) return false;
   }
   return true;
 }
@@ -371,7 +436,8 @@ bool Qwen35Gpu::Prefill(std::span<const std::int32_t> tokens, std::span<float> h
   return true;
 }
 
-bool Qwen35Gpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> hidden, std::string* error) {
+bool Qwen35Gpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> hidden, std::string* error,
+                             std::uint32_t stop_layer) {
   const auto& c = w_.config;
   const auto T = static_cast<std::uint32_t>(tokens.size());
   if (T == 0) return true;
@@ -407,6 +473,10 @@ bool Qwen35Gpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<flo
   };
   const auto buf = [&](const model::TensorRef& t) { return rt::Arg::Buf(tensors_.at(t.data).buf); };
   for (std::uint32_t l = 0; l < c.num_layers; ++l) {
+    if (l == stop_layer) {
+      position_ += T;
+      return dev_.Download(K.res, 0, hidden.data(), hidden.size() * sizeof(float), error);
+    }
     const auto& L = w_.layers[l];
     auto& S = layers_[l];
     if (!norm(K.res, L.attn_norm, K.xn, T, H)) return false;
@@ -507,6 +577,10 @@ bool Qwen35Gpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<flo
         !Launch("halo_add", {Blocks(std::size_t{T} * H)}, {kBlock},
                 {rt::Arg::Buf(K.res), rt::Arg::Buf(K.out), rt::Arg::Val(T * H)}, error))
       return false;
+  }
+  if (stop_layer == c.num_layers) {
+    position_ += T;
+    return dev_.Download(K.res, 0, hidden.data(), hidden.size() * sizeof(float), error);
   }
   if (!norm(K.res, w_.output_norm, K.xn, T, H)) return false;
   position_ += T;
