@@ -475,6 +475,14 @@ bool FlashNextGpu::AttentionChunk(const model::LayerWeights& l, AttnState& s, st
   // The q rows split, normalized and rotated in one pass (the batched path's rope then skips q).
   q_roped_ = prefill_q_fused_ && prefill_batched_attention_ && hd == 256 && c.rotary_dim <= hd &&
              c.rotary_dim % 2 == 0;
+  // The flash kernel (AttentionBatched's dense branch, same condition) reads the gate in place from qg.
+  {
+    const std::uint32_t budget_ = c.indexer_top_k / c.compress_ratio;
+    const bool wmma_ = prefill_wmma_attention_ && hd == 256 && nh % c.num_kv_heads == 0 && nh / c.num_kv_heads <= 16;
+    gate_in_qg_ = q_roped_ && prefill_gate_in_place_ && prefill_f16_out_ && F16Route(l.attn_out) && wmma_ &&
+                  prefill_mq_attention_ && prefill_fa_attention_ && prefill_kv16_ && s.k16 &&
+                  (position_ + T) / c.compress_ratio <= budget_;
+  }
   // k (with its cache append) and the indexer q: norm and rope in one pass each.
   kq_roped_ = q_roped_ && prefill_kq_fused_ && hd <= 256 && idim <= 256 && c.rotary_dim <= idim;
   const auto NormRope = [&](const rt::Buffer& x, const model::TensorRef& w, std::uint32_t heads, std::uint32_t dim,
@@ -489,7 +497,8 @@ bool FlashNextGpu::AttentionChunk(const model::LayerWeights& l, AttnState& s, st
       !Gemm(l.attn_k, ck_.mixed, ck_.k, T, error, MixedH()) || !Gemm(l.attn_v, ck_.mixed, ck_.v, T, error, MixedH()) || !Gemm(l.indexer_q, ck_.mixed, ck_.iq, T, error) ||
       !Gemm(l.indexer_k, ck_.mixed, ck_.ik, T, error) ||
       !(q_roped_ ? Launch("halo_split_qgate_norm_rope", {T * nh}, {hd},
-                          {rt::Arg::Buf(ck_.qg), rt::Arg::Buf(ck_.q), rt::Arg::Buf(ck_.gate_a),
+                          {rt::Arg::Buf(ck_.qg), rt::Arg::Buf(ck_.q),
+                           gate_in_qg_ ? rt::Arg::Val<std::uint64_t>(0) : rt::Arg::Buf(ck_.gate_a),
                            rt::Arg::Buf(tensors_.at(l.attn_q_norm.data).buf), rt::Arg::Val(c.rms_eps),
                            rt::Arg::Val(c.rotary_dim), rt::Arg::Val(position_), rt::Arg::Val(nh),
                            rt::Arg::Val(c.rope_theta)},
@@ -619,9 +628,15 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   {
     // The context in fp16 only when the out projection reads it that way.
     const bool ctx_half = prefill_f16_out_ && F16Route(l.attn_out);
+    if (gate_in_qg_ && !ctx_half) {
+      if (error) *error = "internal: gate left in qg but the attention kernel reads gate_a";
+      return false;
+    }
     return kv16_current() &&
-           Launch(ctx_half ? "halo_attention_fa_h" : "halo_attention_fa", {(T + 15) / 16, nkv * ((G + 3) / 4)}, {256},
-                  {rt::Arg::Buf(ck_.q), rt::Arg::Buf(s.k16), rt::Arg::Buf(s.v16), rt::Arg::Buf(ck_.gate_a),
+           Launch(gate_in_qg_ ? "halo_attention_fa_hg" : ctx_half ? "halo_attention_fa_h" : "halo_attention_fa",
+                  {(T + 15) / 16, nkv * ((G + 3) / 4)}, {256},
+                  {rt::Arg::Buf(ck_.q), rt::Arg::Buf(s.k16), rt::Arg::Buf(s.v16),
+                   rt::Arg::Buf(gate_in_qg_ ? ck_.qg : ck_.gate_a),
                    rt::Arg::Buf(ctx_half ? ck_.xh : ck_.ctx), rt::Arg::Buf(ck_.host, ck_.params_offset),
                    rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(T)},
                   error) &&

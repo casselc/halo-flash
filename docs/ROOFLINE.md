@@ -1070,4 +1070,8 @@ chunk), which is a precision change (stream P).
 | tok_moe reads the expert rows 16 bytes at a time: each thread sums 8 contiguous indices (same per-element order), the row goes through LDS to the per-stream mapping (`halo_hc_combine_norm_tok_moev`, `--moe-vec`) | -5..-12 | 87.7 -> 79.6 ms (-8.1); end to end -20.7 (significant) | yes |
 | k norm + RoPE + KV-cache append, and indexer-q norm + RoPE, one kernel each (`halo_norm_rope_rows`, `--kq-fused`) | -1.5..-2 | the five kernels 2.80 -> 2.24 ms (-0.56); end to end -2.9 (noise) | yes (marginal) |
 | DeltaNet gated norm one wave per row, 8 rows a block, no barriers; the block sum reproduced as (p0 + p2) + (p1 + p3) (`halo_gated_norm_h128w`, `--gated-wave`) | -2..-4 (0.73 ms a call vs ~0.6 floor) | 26.4 -> 20.4 ms (-6.0; 0.57 ms a call, at the floor); end to end -3.3 (noise) | yes |
+| Flash attention reads the gate in place from the q / gate projection rows; the q split no longer writes gate_a (`halo_attention_fa_hg`, `--gate-in-place`; only where the dense flash branch runs) | -2..-3 | split 11.25 -> 9.12 ms, fa +0.1 (-2.0 kernel); end to end -14.8 (within noise; the next GEMM's spread is ~20) | yes |
+
+Multi-chunk check for this set (control flow per chunk): all new flags on vs off give identical logits for 2048 tokens in
+512- and 768-token chunks, and for a 3485-token prompt in 2048-token chunks (second chunk on the QSA path, gate_a written).
 

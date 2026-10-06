@@ -355,7 +355,7 @@ extern "C" __global__ void __launch_bounds__(256)
   const std::uint32_t hd = blockDim.x, i = threadIdx.x;
   const float* src = qg + static_cast<std::size_t>(blockIdx.x) * 2 * hd;
   const float x = src[i];
-  gate[static_cast<std::size_t>(blockIdx.x) * hd + i] = src[hd + i];
+  if (gate) gate[static_cast<std::size_t>(blockIdx.x) * hd + i] = src[hd + i];  // null: read in place later
   float ss = 0.0f;
   ss += x * x;
   // Rounded here, as halo_rmsnorm's loop leaves it: without this the backend fuses x * x into WarpSum's
@@ -6773,7 +6773,7 @@ extern "C" __global__ void __launch_bounds__(256)
 //   grid (ceil(T / 16), num_kv_heads * ceil(G / 4)), block 256; head_dim 256.
 // OutT _Float16 (halo_attention_fa_h): the context leaves in fp16 for the out projection's FP16 GEMM, the same
 // bits a separate halo_f16_rows pass over the fp32 result gives (the fp32 value is rounded first).
-template <typename OutT>
+template <typename OutT, bool kGateQg = false>
 __device__ __forceinline__ void AttentionFa(const float* q, const _Float16* kc, const _Float16* vc, const float* gate,
                                             OutT* out, const std::uint32_t* params, std::uint32_t num_heads,
                                             std::uint32_t num_kv_heads, std::uint32_t tokens) {
@@ -6917,7 +6917,11 @@ __device__ __forceinline__ void AttentionFa(const float* q, const _Float16* kc, 
       const std::uint32_t t = qt0 + 2 * j + hi;
       if (t >= tokens) continue;
       const std::size_t idx = (static_cast<std::size_t>(t) * num_heads + h) * HD + half * 128 + dt * 16 + lane % 16;
-      float v = o[dt][j] / ml[wave][1][2 * j + hi] * Sigmoid(gate[idx]);
+      // kGateQg: the gate read in place from the q / gate projection rows ([t][head][q | gate], 2 HD apart).
+      const float gv = kGateQg ? gate[(static_cast<std::size_t>(t) * num_heads + h) * 2 * HD + HD + half * 128 +
+                                      dt * 16 + lane % 16]
+                               : gate[idx];
+      float v = o[dt][j] / ml[wave][1][2 * j + hi] * Sigmoid(gv);
       if constexpr (std::is_same_v<OutT, float>) {
         out[idx] = v;
       } else {
@@ -6937,6 +6941,13 @@ extern "C" __global__ void __launch_bounds__(256)
                         const std::uint32_t* params, std::uint32_t num_heads, std::uint32_t num_kv_heads,
                         std::uint32_t tokens) {
   AttentionFa<_Float16>(q, kc, vc, gate, out, params, num_heads, num_kv_heads, tokens);
+}
+// halo_attention_fa_h reading the gate from the projection output qg in place (split skips writing it).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_attention_fa_hg(const float* q, const _Float16* kc, const _Float16* vc, const float* qg, _Float16* out,
+                         const std::uint32_t* params, std::uint32_t num_heads, std::uint32_t num_kv_heads,
+                         std::uint32_t tokens) {
+  AttentionFa<_Float16, true>(q, kc, vc, qg, out, params, num_heads, num_kv_heads, tokens);
 }
 
 // halo_attention_wmma_mq's structure for QSA-selected keys: the 4 tokens of
