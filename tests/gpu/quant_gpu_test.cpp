@@ -2057,3 +2057,162 @@ TEST(GpuKernels, CombineNormEqualsSeparateKernels) {
     }, {.test_cases = 40});
   }
 }
+
+// P4: combine_norm with one block per token (four streams) against the
+// per-stream kernel, and with the MoE sum built inside (_tok_moe) against
+// halo_moe_combine_shared followed by the per-stream kernel: residual, fp16
+// streams (plain and K-blocked), row scales and inject partials bit for bit.
+// P4: halo_split_qgate_norm_rope against halo_split_qgate, halo_rmsnorm and
+// halo_rope_neox_rows: q and gate bit for bit.
+TEST(GpuKernels, SplitQgateNormRopeEqualsSeparateKernels) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      constexpr std::uint32_t hd = 256;
+      const auto T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 8}));
+      const auto heads = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 6}));
+      const auto rot = 2 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = hd / 2}));
+      const auto pos0 = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = 300000}));
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto vec = [&](std::size_t n, float amp) {
+        std::vector<float> v(n);
+        for (auto& x : v) { seed = seed * 1664525u + 1013904223u; x = amp * (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f); }
+        return v;
+      };
+      const std::size_t rows = std::size_t{T} * heads, n = rows * hd;
+      const auto qg = vec(2 * n, 8.0f), w = vec(hd, 3.0f);
+      const float theta = 10000000.0f;
+      std::vector<rt::Buffer> owned;
+      const auto up = [&](const void* p, std::size_t bytes) {
+        auto b = dev->Alloc(bytes, &error);
+        if (p) EXPECT_TRUE(dev->Upload(b, 0, p, bytes, &error));
+        owned.push_back(b);
+        return b;
+      };
+      auto qgb = up(qg.data(), 2 * n * 4), wb = up(w.data(), hd * 4), q1 = up(nullptr, n * 4), g1 = up(nullptr, n * 4),
+           q2 = up(nullptr, n * 4), g2 = up(nullptr, n * 4);
+      const auto launch = [&](const char* name, std::uint32_t grid, std::uint32_t block, std::initializer_list<rt::Arg> a) {
+        ASSERT_TRUE(dev->Launch(dev->Kernel(name, &error), {grid}, {block}, std::span<const rt::Arg>(a.begin(), a.size()),
+                                &error))
+            << name;
+      };
+      const auto R = static_cast<std::uint32_t>(rows);
+      launch("halo_split_qgate", R, 256, {rt::Arg::Buf(qgb), rt::Arg::Buf(q1), rt::Arg::Buf(g1), rt::Arg::Val(hd)});
+      launch("halo_rmsnorm", R, 256, {rt::Arg::Buf(q1), rt::Arg::Buf(wb), rt::Arg::Buf(q1), rt::Arg::Val(hd),
+                                      rt::Arg::Val(1e-6f), rt::Arg::Val<std::uint32_t>(0)});
+      launch("halo_rope_neox_rows", R, 64, {rt::Arg::Buf(q1), rt::Arg::Val(hd), rt::Arg::Val(rot), rt::Arg::Val(pos0),
+                                            rt::Arg::Val(heads), rt::Arg::Val(theta)});
+      launch("halo_split_qgate_norm_rope", R, hd,
+             {rt::Arg::Buf(qgb), rt::Arg::Buf(q2), rt::Arg::Buf(g2), rt::Arg::Buf(wb), rt::Arg::Val(1e-6f),
+              rt::Arg::Val(rot), rt::Arg::Val(pos0), rt::Arg::Val(heads), rt::Arg::Val(theta)});
+      std::vector<std::uint32_t> a1(n), a2(n), b1(n), b2(n);
+      ASSERT_TRUE(dev->Download(q1, 0, a1.data(), n * 4, &error) && dev->Download(q2, 0, a2.data(), n * 4, &error) &&
+                  dev->Download(g1, 0, b1.data(), n * 4, &error) && dev->Download(g2, 0, b2.data(), n * 4, &error))
+          << error;
+      std::size_t bad_rot = 0, bad_pass = 0;
+      for (std::size_t i = 0; i < n; ++i) {
+        ASSERT_EQ(b2[i], b1[i]) << "gate " << i;
+        if (a2[i] != a1[i]) ++((i % hd) < rot ? bad_rot : bad_pass);
+      }
+      ASSERT_EQ(bad_rot + bad_pass, 0u) << "rotated dims " << bad_rot << ", passed dims " << bad_pass << " (rot " << rot
+                                       << ", pos0 " << pos0 << ", T " << T << ", heads " << heads << ")";
+      for (auto& o : owned) dev->Free(o);
+    }, {.test_cases = 40});
+  }
+}
+
+TEST(GpuKernels, CombineNormTokEqualsRows) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      constexpr std::uint32_t hc = 4;
+      const auto h = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 80}));
+      const auto T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 12}));
+      const auto k = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 10}));
+      const auto irows = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 8}));
+      const bool blocked = (hc * h) % 64 == 0 && tc.draw(gs::booleans());
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto next = [&] { seed = seed * 1664525u + 1013904223u; return seed; };
+      const auto vec = [&](std::size_t n, float amp) {
+        std::vector<float> v(n);
+        for (auto& x : v) x = amp * (static_cast<float>(next() >> 8) / 16777216.0f - 0.5f);
+        return v;
+      };
+      const std::size_t n = std::size_t{T} * hc * h, P = std::size_t{T} * k;
+      const auto res = vec(n, 6.0f), inj = vec(std::size_t{T} * hc, 8.0f), w = vec(std::size_t{hc} * h, 2.0f),
+                 iw = vec(std::size_t{irows} * hc * h, 1.0f), mw = vec(P, 1.0f), sx = vec(std::size_t{T} * h, 3.0f),
+                 sg = vec(T, 6.0f), ypf = vec(P * h, 4.0f);
+      std::vector<_Float16> yp(ypf.size());
+      for (std::size_t i = 0; i < yp.size(); ++i) yp[i] = static_cast<_Float16>(ypf[i]);
+      std::vector<std::uint32_t> pos(P);
+      for (std::size_t i = 0; i < P; ++i) pos[i] = static_cast<std::uint32_t>((i * 7 + next() % 3) % P);
+      std::vector<rt::Buffer> owned;
+      const auto up = [&](const void* p, std::size_t bytes) {
+        auto b = dev->Alloc(bytes, &error);
+        if (p) EXPECT_TRUE(dev->Upload(b, 0, p, bytes, &error));
+        owned.push_back(b);
+        return b;
+      };
+      const auto launch = [&](const char* name, std::uint32_t grid, std::initializer_list<rt::Arg> a) {
+        ASSERT_TRUE(dev->Launch(dev->Kernel(name, &error), {grid}, {256}, std::span<const rt::Arg>(a.begin(), a.size()),
+                                &error))
+            << name;
+      };
+      auto ypb = up(yp.data(), yp.size() * 2), posb = up(pos.data(), P * 4), mwb = up(mw.data(), P * 4),
+           sxb = up(sx.data(), sx.size() * 4), sgb = up(sg.data(), sg.size() * 4), ob = up(nullptr, sx.size() * 4),
+           ib = up(inj.data(), inj.size() * 4), wb = up(w.data(), w.size() * 4), iwb = up(iw.data(), iw.size() * 4);
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_moe_combine_shared", &error), {(h + 255) / 256, T}, {256},
+                              std::initializer_list<rt::Arg>{rt::Arg::Buf(ypb), rt::Arg::Buf(posb), rt::Arg::Buf(mwb),
+                                                             rt::Arg::Buf(sxb), rt::Arg::Buf(sgb), rt::Arg::Buf(ob),
+                                                             rt::Arg::Val(k), rt::Arg::Val(h)},
+                              &error))
+          << error;
+      struct Out { rt::Buffer r, y16, sc, ip; };
+      const auto outs = [&] {
+        return Out{up(res.data(), n * 4), up(nullptr, n * 2), up(nullptr, std::size_t{T} * hc * 4),
+                   up(nullptr, std::size_t{T} * hc * irows * 4)};
+      };
+      const auto y16t = rt::Arg::Val(blocked ? T : 0u);
+      Out a = outs(), b = outs(), m = outs();
+      launch("halo_hc_combine_norm_rows", T * hc,
+             {rt::Arg::Buf(a.r), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Buf(wb), rt::Arg::Val<std::uint64_t>(0),
+              rt::Arg::Buf(a.y16), rt::Arg::Val(hc), rt::Arg::Val(h), rt::Arg::Val(1e-6f), rt::Arg::Buf(iwb),
+              rt::Arg::Buf(a.ip), rt::Arg::Val(irows), rt::Arg::Buf(a.sc), y16t});
+      launch("halo_hc_combine_norm_tok", T,
+             {rt::Arg::Buf(b.r), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Buf(wb), rt::Arg::Buf(b.y16),
+              rt::Arg::Val(h), rt::Arg::Val(1e-6f), rt::Arg::Buf(iwb), rt::Arg::Buf(b.ip), rt::Arg::Val(irows),
+              rt::Arg::Buf(b.sc), y16t});
+      launch("halo_hc_combine_norm_tok_moe", T,
+             {rt::Arg::Buf(m.r), rt::Arg::Buf(ypb), rt::Arg::Buf(posb), rt::Arg::Buf(mwb), rt::Arg::Buf(sxb),
+              rt::Arg::Buf(sgb), rt::Arg::Val(k), rt::Arg::Buf(ib), rt::Arg::Buf(wb), rt::Arg::Buf(m.y16),
+              rt::Arg::Val(h), rt::Arg::Val(1e-6f), rt::Arg::Buf(iwb), rt::Arg::Buf(m.ip), rt::Arg::Val(irows),
+              rt::Arg::Buf(m.sc), y16t});
+      const auto get32 = [&](const rt::Buffer& buf, std::size_t cnt) {
+        std::vector<std::uint32_t> v(cnt);
+        EXPECT_TRUE(dev->Download(buf, 0, v.data(), cnt * 4, &error)) << error;
+        return v;
+      };
+      const auto get16 = [&](const rt::Buffer& buf, std::size_t cnt) {
+        std::vector<std::uint16_t> v(cnt);
+        EXPECT_TRUE(dev->Download(buf, 0, v.data(), cnt * 2, &error)) << error;
+        return v;
+      };
+      const auto ra = get32(a.r, n), sa = get32(a.sc, std::size_t{T} * hc), pa = get32(a.ip, std::size_t{T} * hc * irows);
+      const auto ya = get16(a.y16, n);
+      for (const Out* o : {&b, &m}) {
+        const char* what = o == &b ? "tok" : "tok_moe";
+        EXPECT_EQ(get32(o->r, n), ra) << what << " residual";
+        EXPECT_EQ(get16(o->y16, n), ya) << what << " fp16 streams";
+        EXPECT_EQ(get32(o->sc, std::size_t{T} * hc), sa) << what << " row scales";
+        EXPECT_EQ(get32(o->ip, std::size_t{T} * hc * irows), pa) << what << " inject partials";
+      }
+      for (auto& o : owned) dev->Free(o);
+    }, {.test_cases = 40});
+  }
+}

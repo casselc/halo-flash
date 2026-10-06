@@ -1025,3 +1025,26 @@ i.e. quality-gate decisions, not kernel engineering; the exact candidate is the 
 - **DeltaNet scan:** gufo's row-split takes 1.42 ms plus a 0.6 ms epilogue, against our 2.03 ms. The
   DeltaNet gap is in conv / norm kernels, not the scan.
 - **Attention:** ours is faster (3.19 vs 3.46 ms).
+**2026-10-05 evening, stream E (exact efficiency; branch `stream/exact`).** Every row bit-identical (logits
+compared with `cmp` against the unmodified build; gpu_tests property tests bitwise). A/B: `tools/ab_bench.py`,
+4 rounds x 3 reps, pinned, 2048 tokens.
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| Routed + shared experts' sum built inside the next combine_norm, one block per token for all four streams (`halo_hc_combine_norm_tok_moe`; block_out's 21 MB write + read gone; gufo's HcCombineMoeF16 does the same) | -15..-26 (bytes: 336 MB at ~200 GB/s = 1.68 vs 2.16 ms a layer) | combine_norm (MoE half) + moe_combine_shared 53.1 + 46.1 -> 87.3 ms (-11.9 kernel; 1.86 ms a layer, ~180 GB/s, ATT 80% vmcnt); end to end -13.6 (within noise) | yes |
+| First build of the above: the shared `__device__` template body was not inlined (an ABI call: flat loads, 166-200 VGPRs, a branch per load) | — | 141 ms (3.0 ms a layer); `__forceinline__` fixed it (87 VGPRs, 16 waves) | fixed |
+| The same per-token kernel for the attention-half combine (`halo_hc_combine_norm_tok`, out read once instead of once per stream) | -2..-5 (L2 re-reads only) | 55.3 -> 56.9 ms | no (flag `--tok-combine`, off) |
+| Attention q: split, q norm and RoPE in one pass (`halo_split_qgate_norm_rope`; q written once instead of three times, ~200 MB a layer) | -9..-13 | split + norm + rope 22.6 -> 11.2 ms; end to end -14.5 (significant) | yes |
+| Shared expert gate/up (640 rows) on 64-row tiles (`_s`, 160 blocks) instead of three 256-row tiles (48 blocks, last half empty); stream P's finding | -5 (study: 0.405 -> 0.349 ms after writes) | 34.3 -> 24.9 ms (-9.4 kernel); end to end -17.5 (off arm spread 18) | yes |
+
+| Producers write the fp16 copy their FP16 GEMM reads instead of fp32 + `halo_f16_rows` (`halo_attention_fa_h` context, `halo_scale_silu_h` mixer lo, `halo_silu_mul_h` shared expert; PLE value GEMM reuses the key GEMM's copy); `--f16-out` | -8..-10 | conversions 4.42 + 1.90 + (lo) gone, producers +0.2..+0.5; kernel sum -7.3, end to end -5.5 (within noise, spreads 10) | yes |
+| tok_moe inject phase ablated (irows 0; timing only) | — | 87.4 -> 82.4 ms: the inject partials are ~5 ms of it | n/a |
+| Deferred n-gram read vs layer 0 (`HALO_PREFILL_TIMING`) | — | read 67-73 ms warm (155 cold) while layer 0 takes ~30: ~35 ms of GPU idle per 2048-token prefill, charged to the PLE `halo_f16_rows`. `halo_disk_bench`: 4K random reads saturate at ~217K IOPS from QD 16 (PCIe Gen3 x4): IOPS-bound, so the levers are a larger row cache or a Gen4 link, not kernels | open (policy) |
+
+| MoE down in 256-row blocks: two row tiles a wave, the activation stage and its barriers serve twice the rows (`MoeDown<RT>`; halogen's down runs 256 rows a workgroup and spends 10% at barriers vs our 29-34%) | -15..-23 | 133.2 -> 131.0 ms (-2.2; end to end within noise); bit-identical. ATT: barrier 23 -> 17%, but VGPRs 158 -> 240 (9 -> 6 waves) and VALU (dequant) 33 -> 38% with 30% VALU-stalled: the kernel is issue-bound on Q5_1 dequant once barriers shrink. The templated RT = 1 copy also lost 3 ms (166 VGPRs) | no (reverted) |
+| Gate/up compiled for 7 waves (`amdgpu_waves_per_eu(7)`, the same source) | -15..-25 (halogen at 210 VGPRs) | compiler reaches 216 VGPRs only with 167 spills: not run. Note: a second caller of `MoeGateUp` stops it being inlined (420 B scratch), and forcing inline gives 256 VGPRs instead of 241: register count here depends on inlining order | no |
+
+Exactness trap found on the way: with one element per thread, the backend fused the norm's `x * x` into
+WarpSum's first butterfly add (`v_fmac` across the `ds_bpermute`), a different rounding from `halo_rmsnorm`
+(whose loop keeps the product rounded). An empty `asm volatile("" : "+v"(ss))` keeps the rounding. A per-element
+bitwise property test against the separate kernels caught it (2-3 ulp in the norm scale, rows > 0 only).
