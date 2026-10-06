@@ -109,8 +109,11 @@ class FlashNextGpu {
   static inline bool prefill_tok_combine_ = false;  // attention half: 56.9 vs 55.3 ms per prefill, not kept
   /// ... which after the MoE block also builds the routed + shared experts' sum itself (_tok_moe).
   static inline bool prefill_moe_in_combine_ = true;
+  static inline bool prefill_moe_vec_ = true;  // ... reading the expert rows 16 bytes at a time (_tok_moev)
   /// Attention q: split, norm and rope in one kernel (halo_split_qgate_norm_rope, bit-identical).
   static inline bool prefill_q_fused_ = true;
+  static inline bool prefill_kq_fused_ = true;
+  static inline bool prefill_gated_wave_ = true;  // DeltaNet gated norm one wave per row (halo_gated_norm_h128w)  // k and indexer q: norm + rope (+ k cache append) in one kernel
   /// 64-row tiles (halo_gemm_q8r_f16_s) up to 640 rows instead of 512: the shared expert's 640-row gate/up
   /// otherwise take three 256-row tiles (the last half empty).
   static inline bool prefill_s640_ = true;
@@ -356,6 +359,7 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   bool moe_defer_ = false;    // the next SharedExpertChunk leaves the routed + shared sum to combine_norm
   bool moe_pending_ = false;  // ... and it did: block_out was not written
   bool q_roped_ = false;
+  bool kq_roped_ = false;     // ... and k (cache appended) and the indexer q from halo_norm_rope_rows
   bool lo_half_ = false;      // the mixer's SiLU pass already left lo in fp16 (in xh)      // this layer's q rows came out of halo_split_qgate_norm_rope
   rt::FileUploader* loader_ = nullptr;  ///< during Init: weights read from their files
   std::unordered_map<const void*, DevLora> lora_;

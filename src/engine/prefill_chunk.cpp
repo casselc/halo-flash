@@ -431,11 +431,17 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
                         rt::Arg::Val(vd)},
                        error)) &&
                     (F16Route(l.ssm_out)
-                         ? Launch("halo_gated_norm_h", {T * c.ssm_num_v_heads}, {128},
+                         ? (prefill_gated_wave_ && c.ssm_head_dim == 128
+                                ? Launch("halo_gated_norm_h128w", {(T * c.ssm_num_v_heads + 7) / 8}, {256},
+                                         {rt::Arg::Buf(ck_.gdn), rt::Arg::Buf(tensors_.at(l.ssm_norm.data).buf),
+                                          rt::Arg::Buf(ck_.z), rt::Arg::Buf(ck_.xh), rt::Arg::Val(T * c.ssm_num_v_heads),
+                                          rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(1)},
+                                         error)
+                                : Launch("halo_gated_norm_h", {T * c.ssm_num_v_heads}, {128},
                                   {rt::Arg::Buf(ck_.gdn), rt::Arg::Buf(tensors_.at(l.ssm_norm.data).buf),
                                    rt::Arg::Buf(ck_.z), rt::Arg::Buf(ck_.xh), rt::Arg::Val(c.ssm_head_dim),
                                    rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(1)},
-                                  error)
+                                  error))
                          : Launch("halo_gated_norm", {T * c.ssm_num_v_heads}, {128},
                                   {rt::Arg::Buf(ck_.gdn), rt::Arg::Buf(tensors_.at(l.ssm_norm.data).buf),
                                    rt::Arg::Buf(ck_.z), rt::Arg::Val(c.ssm_head_dim), rt::Arg::Val(c.rms_eps),
@@ -469,6 +475,16 @@ bool FlashNextGpu::AttentionChunk(const model::LayerWeights& l, AttnState& s, st
   // The q rows split, normalized and rotated in one pass (the batched path's rope then skips q).
   q_roped_ = prefill_q_fused_ && prefill_batched_attention_ && hd == 256 && c.rotary_dim <= hd &&
              c.rotary_dim % 2 == 0;
+  // k (with its cache append) and the indexer q: norm and rope in one pass each.
+  kq_roped_ = q_roped_ && prefill_kq_fused_ && hd <= 256 && idim <= 256 && c.rotary_dim <= idim;
+  const auto NormRope = [&](const rt::Buffer& x, const model::TensorRef& w, std::uint32_t heads, std::uint32_t dim,
+                            std::uint32_t nt, const rt::Buffer* cache) {
+    return Launch("halo_norm_rope_rows", {nt * heads}, {kBlock},
+                  {rt::Arg::Buf(x), rt::Arg::Buf(tensors_.at(w.data).buf), rt::Arg::Val(c.rms_eps), rt::Arg::Val(dim),
+                   rt::Arg::Val(c.rotary_dim), rt::Arg::Val(position_), rt::Arg::Val(heads), rt::Arg::Val(c.rope_theta),
+                   cache ? rt::Arg::Buf(*cache, std::size_t{position_} * heads * dim * 4) : rt::Arg::Val<std::uint64_t>(0)},
+                  error);
+  };
   if (!MixedHalf(T, error) || !Gemm(l.attn_q, ck_.mixed, ck_.qg, T, error, MixedH()) ||
       !Gemm(l.attn_k, ck_.mixed, ck_.k, T, error, MixedH()) || !Gemm(l.attn_v, ck_.mixed, ck_.v, T, error, MixedH()) || !Gemm(l.indexer_q, ck_.mixed, ck_.iq, T, error) ||
       !Gemm(l.indexer_k, ck_.mixed, ck_.ik, T, error) ||
@@ -482,8 +498,8 @@ bool FlashNextGpu::AttentionChunk(const model::LayerWeights& l, AttnState& s, st
                           {rt::Arg::Buf(ck_.qg), rt::Arg::Buf(ck_.q), rt::Arg::Buf(ck_.gate_a), rt::Arg::Val(hd)},
                           error) &&
                        norm(ck_.q, l.attn_q_norm, T * nh, hd)) ||
-      !norm(ck_.k, l.attn_k_norm, T * nkv, hd) ||
-      !norm(ck_.iq, l.indexer_q_norm, T * ih, idim))
+      !(kq_roped_ ? NormRope(ck_.k, l.attn_k_norm, nkv, hd, T, &s.k) : norm(ck_.k, l.attn_k_norm, T * nkv, hd)) ||
+      !(kq_roped_ ? NormRope(ck_.iq, l.indexer_q_norm, ih, idim, T, nullptr) : norm(ck_.iq, l.indexer_q_norm, T * ih, idim)))
     return false;
   if (prefill_batched_attention_) return AttentionBatched(l, s, T, error);
   for (std::uint32_t t = 0; t < T; ++t) {
@@ -562,7 +578,8 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
                   {rt::Arg::Buf(cache, std::size_t{pos0} * n * 4), rt::Arg::Buf(rows), rt::Arg::Val(T * n)}, error);
   };
   const std::uint32_t b0 = pos0 / ratio, nb = (pos0 + T - 1) / ratio - b0 + 1;
-  if ((!q_roped_ && !rope(ck_.q, nh, hd)) || !rope(ck_.k, nkv, hd) || !rope(ck_.iq, ih, idim) || !append(s.k, ck_.k, kvdim) ||
+  if ((!q_roped_ && !rope(ck_.q, nh, hd)) || (!kq_roped_ && (!rope(ck_.k, nkv, hd) || !rope(ck_.iq, ih, idim) ||
+                                                              !append(s.k, ck_.k, kvdim))) ||
       !append(s.v, ck_.v, kvdim) || !append(s.index_k, ck_.ik, idim) ||
       !Launch("halo_pool_blocks", {nb}, {128},
               {rt::Arg::Buf(s.index_k), rt::Arg::Buf(s.block_k), rt::Arg::Val(b0), rt::Arg::Val(ratio),
@@ -1019,7 +1036,8 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
       const auto norm = rt::Arg::Buf(tensors_.at(next.norm.data).buf), iw = rt::Arg::Buf(tensors_.at(next.inject.data).buf);
       const auto blocked = rt::Arg::Val(BlockedXh(next) ? T : 0u);
       if (moe)
-        return Launch("halo_hc_combine_norm_tok_moe", {T}, {kBlock},
+        return Launch(prefill_moe_vec_ && H % 8 == 0 ? "halo_hc_combine_norm_tok_moev" : "halo_hc_combine_norm_tok_moe",
+                      {T}, {kBlock},
                       {rt::Arg::Buf(ck_.res), rt::Arg::Buf(ck_.yp), rt::Arg::Buf(ck_.pos), rt::Arg::Buf(ck_.wts),
                        rt::Arg::Buf(ck_.ed), rt::Arg::Buf(ck_.sgate), rt::Arg::Val(c.num_experts_used),
                        rt::Arg::Buf(ck_.inject), norm, rt::Arg::Buf(ck_.xh), rt::Arg::Val(H), rt::Arg::Val(c.rms_eps),
