@@ -272,3 +272,62 @@ The workaround (in `lab/att_offline.cpp`):
 3. **bf16 (or f16) residual streams.** Their scatter-norm is 0.72 ms against our 1.03-1.14 ms at about half the bytes. Expected about -0.3 ms per call, about -25 ms per pp2048 over 94 calls.
    - Precision cost: f32 residual streams are part of our exactness guarantees. This needs a quality check, not just a speed test.
 4. **Attention and its small kernels:** not measured (time box).
+
+### Attention (2026-10-05, same harness)
+
+**Their default dense prefill kernel**, read statically from their host binary:
+- With no QSA selection, `HALOGEN_FA_TQ` defaults to 2, and with FA_VB=1, FA_RS=1, FA_OPT=5, FA_S21=1 and FA_LPT=1 the dispatch picks `k_attn_fa2<2,1,true,5,1,true>` (code object k003).
+- **Launch:** grid = 2 x ceil(T/32), block 768 (24 waves).
+- **Each workgroup:** one kv head and 32 query tokens (two 16-token tiles) x the 12 q heads that share that kv head, one wave per (tile, head).
+  - Workgroups take the token pairs in reverse order: the longest causal rows go first.
+  - K/V are staged in LDS once for all 12 heads.
+  - bf16 WMMA.
+- **Inputs:**
+  - q: bf16 [T][24 x 256], normalized and roped.
+  - The sigmoid gate is read in place from the fused q|gate projection rows, [T][24][q 256 | gate 256]. No separate split copy of the gate.
+  - k/v: bf16 [pos][2 x 256].
+- **Output:** bf16 [T][6144] with the gate applied.
+- **Args:**
+
+  | Offset | Field |
+  |---|---|
+  | 0x00 | q |
+  | 0x08 | k |
+  | 0x10 | v |
+  | 0x18 | kv row stride |
+  | 0x20 | q\|gate |
+  | 0x28 | out |
+  | 0x30 | params (position) |
+  | 0x38 | T |
+  | 0x3c | number of kv rows |
+  | 0x40 | 32-byte FaSel, null for dense |
+
+**Correctness.** Checked against a CPU causal softmax(qk/16)·v·sigmoid(gate) at T = 256: relative error 2e-3 (bf16 output). Against our `halo_attention_fa` on the same inputs: 3.4e-3.
+
+| Dense causal from position 0, isolated, pinned | Theirs | Ours (`halo_attention_fa`) |
+|---|---:|---:|
+| T = 2048 | **2.85 ms** | 3.20 ms (in-engine 3.30) |
+| T = 8192 | **36.3 ms** | 43.1 ms |
+
+Their 8K serving path may use QSA selection instead; this row is dense only.
+
+**Counters at T = 2048 (theirs / ours):**
+- VALU 76 M / 151 M; LDS 19 M / 45 M; SALU 8.9 M / 5.5 M.
+- Waves 3,072 / 6,144.
+- Fabric reads **1.72 GB / 0.29 GB**: theirs re-reads K/V from fabric far more.
+
+**ATT:**
+- Theirs (decoded offline): vmcnt 69%, lgkmcnt 10%, barrier 9%, VALU 9%. It is limited by K/V loads.
+- Ours: lgkmcnt 48%, vmcnt 18%, VALU 16%, LDS store 7%. LDS and fragment work dominates.
+
+**The small kernels around it (structure only, not timed):** one `k_qk_prep` launch per layer.
+- Grid T x 26: 24 q heads + 2 k heads, plus extra workgroups that write K/V rows into the cache.
+- It covers the q/k RMSNorm, the rope and the cache write in one kernel.
+- `k_attn_fa2` then reads the gate from the projection output directly.
+- So their attention block runs about two small launches where ours runs several (rope, q/k norm, qgate split, f16 K/V copy). I did not time `k_qk_prep`, because its 160-byte FdRows cache-row argument was not worth inferring in the time box.
+
+**What to try (predictions; decide in-engine):**
+1. **One workgroup per (kv head, 32 tokens) covering all 12 q heads that share the kv head.** Stage each K/V tile in LDS once for the 12 heads; issue the longest causal rows first. Their version halves VALU and LDS against ours.
+   - Expected about -0.35 ms per call at T = 2048 (12 layers: about -4 ms) and about -7 ms per call at 8K.
+   - Their kernel is then K/V-load-bound (1.7 GB of fabric reads). A version that keeps our lower K/V traffic might gain more than theirs shows.
+2. **Fuse the attention-side small kernels into one prep kernel** (q/k norm + rope + K/V cache write), and read the gate in place from the projection output. This targets part of our ~25 ms per prefill of small kernels. Size it with the per-kernel timing of those kernels, not from this note.
