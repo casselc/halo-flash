@@ -33,6 +33,9 @@ Observation GenerationObserver::ToObservation(const server::GenerationRecord& r)
   o.level = r.error.empty() ? "DEFAULT" : "ERROR";
   o.provider = "halo-flash";
   o.model = r.model;
+  o.variant_id = r.variant_id;
+  o.prompt_name = r.prompt_name;
+  o.prompt_version = r.prompt_version;
   o.input_tokens = r.prompt_tokens;
   o.output_tokens = r.completion_tokens;
   o.cached_tokens = r.cached_tokens;

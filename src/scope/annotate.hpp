@@ -90,6 +90,14 @@ class Annotator {
   /// content references.
   Outcome RecordObservation(Observation o, std::string_view input, std::string_view output);
 
+  /// A score fact with a caller-chosen id (an experiment derives it from the
+  /// run, item and attempt, so the fact is recognisable); fills the project
+  /// and, when zero, the event time.
+  Outcome RecordScore(struct Score s);
+  /// A trace fact as given (context for a trace the caller owns); fills the
+  /// project and, when zero, the times.
+  Outcome RecordTrace(TraceFact t);
+
   /// Steps begun and not yet ended.
   std::size_t OpenSteps() const;
 

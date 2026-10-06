@@ -102,6 +102,38 @@ and 99.95-99.97% are exact in fp16 (the rest have fp16-subnormal magnitudes): ro
 loses (almost) nothing. The plain-fp16 router's long-set loss came from rounding the activations; keeping them
 as an fp16 hi/lo pair (`--router-f16 3`) removes it (`/data/halo-work/streams/P/f16exact.py`).
 
+### Chunked-prefill test outliers on the small model (stream F), 2026-10-06
+
+`FlashNextGpu.ChunkedPrefillMatchesStepping` reported fp16-mode worst drift from stepping of 0.104 on main 19d80bb,
+against 0.0033 / 0.0042 in earlier runs. Not a regression and not a bug: the worst is a tail. Forcing fp16 mode over
+60 cases (213 checks): median 0.0023, 6 checks above 0.02, worst 0.134. Seven outliers (0.026-0.134) were replayed
+deterministically and compared with the CPU reference (`model::ReferenceModel`, fp32); each is one top-k choice
+near a tie that flipped in one engine:
+
+| Outlier | Engine that flipped | Choice | Gap at the flip | Engine vs reference: as run / reference with that one choice swapped |
+|---|---|---|---|---|
+| fp16, 19 tokens | stepping | router, layer 7 | 1.3e-3 (logit 0.28) | 0.0256 / 0.0021 |
+| fp16, 400 tokens | stepping | router, layer 5 | 3.6e-5 (logit 0.23) | 0.125 / 0.0028 |
+| fp16, 152 tokens | stepping | QSA block, layer 7 | 0.44 (score 18.4; block score read back 0.70 low) | 0.134 / 0.0027 |
+| fp16, 272 tokens | stepping | QSA block, layer 7 | 0.024 (score 34.9) | 0.073 / 0.0023 |
+| fp16, 594 tokens | stepping | router, layer 4 | 6.3e-4 (logit 0.12) | 0.044 / 0.0021 |
+| fp16, 6 tokens | fp16 prefill (`--router-f16 3`; 0.0025 with mode 0) | router, layer 3 | 1.4e-4 (logit 0.66) | 0.028 / 0.00056 |
+| int8, 82 tokens | int8 prefill (float-activation oracle) | QSA block, layer 7 | 0.055 (score 20.7) | 0.086 / 0.0026 |
+
+The stepped oracle flips because the test runs it with int8 expert activations (the decode default) in the fp16 and
+int8 modes: with float expert activations stepping matches the reference to 2.7e-7 on every replayed case and the
+fp16 prefill stays within 6e-4 of it (chunks of 1, 17 and 64 tokens, up to 594 tokens, across chunk boundaries).
+Pre-stream c95db3e gives the same stepped outliers on the same cases. Positive control: one changed token at a chunk
+boundary moves the chunked engine 0.07-0.11 from the reference, so the comparison sees a one-row error -- which is
+also why a near-tie flip between the chunked and split engines (the int8 case) is indistinguishable from one by an
+L2 bound alone. The test now prints how many checks exceed 0.01.
+
+Real model: the mechanism (top-k routing and QSA selection amplifying small arithmetic differences) is the same, and
+its cost is what the NLL gates above measure for int8 expert activations and `--router-f16 3`. No fp16 range
+problem was involved (all six precision options off left the stepped outliers unchanged, and `--res16 0` alone left
+the fp16-prefill flip in place), and no chunk-boundary or indexing error was found.
+Tools: `/data/halo-work/streams/F/` (replay and CPU-flip harness as a patch, cases, logs).
+
 ### Greedy identity with gufo
 
 `halo_run --device hip` against `gufo prompt --raw -t 0 --speculative off`

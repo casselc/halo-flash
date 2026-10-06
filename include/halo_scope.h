@@ -107,6 +107,129 @@ typedef struct {
 } halo_scope_stats;
 void halo_scope_get_stats(const halo_scope* scope, halo_scope_stats* stats);
 
+/* ===================== Datasets, evaluators and experiments =====================
+ *
+ * Langfuse-style evaluation (PLAN.md P12) over halo-scope's SQLite metadata
+ * database: versioned datasets that are immutable once frozen, versioned
+ * evaluators, and experiment runs that are resumable and idempotent (a run
+ * interrupted at any point continues where its durable checkpoints left
+ * off and never counts an item twice). The same operations are served over
+ * HTTP under /v1/scope/ by halo_serve --scope-dir.
+ *
+ * Return codes as above, plus HALO_SCOPE_INCOMPLETE (a run ended with items
+ * still failed; run again to retry them). JSON arguments are UTF-8 JSON
+ * texts; NULL means the default ("null" input/expected, "{}" metadata). */
+
+typedef struct halo_scope_evals halo_scope_evals;
+
+enum { HALO_SCOPE_INCOMPLETE = 2 };
+
+/* Opens (creating and migrating) the metadata database at `metadata_path`.
+ * `scope` (may be NULL; must outlive the handle) receives each experiment
+ * score as an llm_scores fact on the item's trace, plus the run context. */
+halo_scope_evals* halo_scope_evals_open(const char* metadata_path, halo_scope* scope, char* error, size_t error_size);
+void halo_scope_evals_close(halo_scope_evals* evals);
+
+int halo_scope_dataset_create(halo_scope_evals* evals, const char* name, const char* description,
+                              const char* metadata_json, char* error, size_t error_size);
+/* Adds or replaces (by id) an item in the dataset's draft, opening a draft
+ * copied from the latest frozen version when there is none. With item_id
+ * NULL a fresh id is generated and written to `new_id` (may be NULL). */
+int halo_scope_dataset_add_item(halo_scope_evals* evals, const char* dataset, const char* item_id,
+                                const char* input_json, const char* expected_json, const char* metadata_json,
+                                char new_id[HALO_SCOPE_ID_SIZE], char* error, size_t error_size);
+/* One item per line: {"id"?, "input", "expected_output"?, "metadata"?}; all
+ * lines or none. `count` (may be NULL) receives the number of items. */
+int halo_scope_dataset_import_jsonl(halo_scope_evals* evals, const char* dataset, const char* data, size_t size,
+                                    size_t* count, char* error, size_t error_size);
+/* Freezes the draft; writes its version and content hash (32 hex + NUL). */
+int halo_scope_dataset_freeze(halo_scope_evals* evals, const char* dataset, int64_t* version,
+                              char content_hash[33], char* error, size_t error_size);
+int halo_scope_dataset_archive(halo_scope_evals* evals, const char* dataset, char* error, size_t error_size);
+
+/* Appends an evaluator version. kind: exact, regex, json_schema, numeric,
+ * code, llm_judge or decider (configs: src/scope/evaluators.hpp). */
+int halo_scope_evaluator_create(halo_scope_evals* evals, const char* name, const char* kind, const char* config_json,
+                                int64_t* version, char* error, size_t error_size);
+
+/* Code evaluators: a `code` evaluator's {"hook": name} calls the function
+ * registered under that name, which reports through one of the setters
+ * (a result left unset reads as a failed evaluation). */
+typedef struct halo_scope_eval_result halo_scope_eval_result;
+typedef struct {
+  const char* run_id;
+  const char* item_id;
+  int attempt;
+  const char* input_json;
+  const char* expected_json;
+  const char* metadata_json;
+  const char* output; /* the target's output */
+  size_t output_size;
+} halo_scope_eval_input;
+typedef void (*halo_scope_eval_fn)(void* user, const halo_scope_eval_input* input, halo_scope_eval_result* result);
+void halo_scope_eval_set_numeric(halo_scope_eval_result* result, double value, const char* comment);
+void halo_scope_eval_set_boolean(halo_scope_eval_result* result, int value, const char* comment);
+void halo_scope_eval_set_categorical(halo_scope_eval_result* result, const char* value, const char* comment);
+/* A deterministic failure: recorded with the item, never averaged. */
+void halo_scope_eval_set_failed(halo_scope_eval_result* result, const char* error);
+/* A transient failure: the item is not committed and is retried later. */
+void halo_scope_eval_set_retry(halo_scope_eval_result* result, const char* error);
+/* `fn` may be called from several threads at once (run concurrency). */
+int halo_scope_evals_register_hook(halo_scope_evals* evals, const char* name, halo_scope_eval_fn fn, void* user);
+
+/* An in-process target (instead of an HTTP endpoint): receives the chat
+ * completion request the runner built and reports the output. */
+typedef struct halo_scope_target_reply halo_scope_target_reply;
+typedef struct {
+  const char* run_id;
+  const char* item_id;
+  const char* trace_id; /* record the generation under this trace */
+  int attempt;
+  const char* request_json; /* OpenAI chat completion body */
+} halo_scope_target_call;
+typedef void (*halo_scope_target_fn)(void* user, const halo_scope_target_call* call, halo_scope_target_reply* reply);
+void halo_scope_target_set_output(halo_scope_target_reply* reply, const char* text, size_t text_size,
+                                  const char* model, const char* finish_reason, uint64_t input_tokens,
+                                  uint64_t output_tokens);
+/* transient != 0: the item is retried on the next run; else it fails. */
+void halo_scope_target_set_error(halo_scope_target_reply* reply, int transient, const char* error);
+
+typedef struct {
+  const char* name;            /* unique per dataset; the same name and binding resumes */
+  const char* dataset;
+  int64_t dataset_version;     /* 0: the latest frozen version */
+  const char* target_json;     /* {"prompt"?: {"name", "version"|"label"}, "model", "variant"?, "params"?, "request"?, "endpoint"?} */
+  const char* evaluators;      /* comma-separated name[@version] (latest when omitted) */
+  int max_attempts;            /* 0: 3 */
+  int concurrency;             /* 0: 1 */
+  const char* endpoint;        /* OpenAI-compatible base URL (http://host:port) for the target and judges */
+  const char* decider_endpoint; /* serves /v1/systemone; NULL: endpoint */
+  halo_scope_target_fn target_fn; /* non-NULL: used instead of the endpoint for the target */
+  void* target_user;
+  void (*progress)(void* user, int64_t done, int64_t total, int64_t failed);
+  void* progress_user;
+} halo_scope_run_options;
+
+/* Creates (or resumes) and runs an experiment to the end; writes the run id.
+ * HALO_SCOPE_OK: every item done; HALO_SCOPE_INCOMPLETE: items failed (run
+ * again to retry); HALO_SCOPE_INVALID: refused (see `error`). */
+int halo_scope_run_experiment(halo_scope_evals* evals, const halo_scope_run_options* options,
+                              char run_id[HALO_SCOPE_ID_SIZE], char* error, size_t error_size);
+
+/* Paired comparison of score `score` between runs a and b, by item:
+ * delta = b - a. Undefined statistics are NaN (se for n < 2). */
+typedef struct {
+  uint64_t n, only_a, only_b, wins, losses, ties;
+  double mean_a, mean_b, mean_delta, se_delta;
+} halo_scope_comparison;
+int halo_scope_run_compare(halo_scope_evals* evals, const char* run_a, const char* run_b, const char* score,
+                           halo_scope_comparison* out, char* error, size_t error_size);
+
+/* The run, its progress and per-score summary as JSON. Writes at most
+ * `size` bytes (NUL-terminated) and the full length to `needed`. */
+int halo_scope_run_summary_json(halo_scope_evals* evals, const char* run_id, char* buffer, size_t size,
+                                size_t* needed);
+
 #ifdef __cplusplus
 }
 #endif
