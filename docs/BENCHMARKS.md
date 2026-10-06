@@ -134,6 +134,20 @@ problem was involved (all six precision options off left the stepped outliers un
 the fp16-prefill flip in place), and no chunk-boundary or indexing error was found.
 Tools: `/data/halo-work/streams/F/` (replay and CPU-flip harness as a patch, cases, logs).
 
+**Test redesign (stream F, after f9ab0f2).** Stepping now takes float expert activations in every mode, so "vs
+stepping" is the prefill's own error. The fp16 and int8 modes keep only a gross per-check cap (0.3) and judge the run:
+medians (fp16 5e-3 / split 1e-3, int8 8e-3 / 4e-3, from 300 calibration cases and ten 30-case runs whose run medians
+reached 2.6e-3 / 2.7e-4 and 3.2e-3 / 1.8e-3), and counts of jumps (> 0.02 vs stepping, > 0.005 vs a split) and argmax
+differences, which fail when less likely than 1e-4 under assumed rates of 15% and 3% (observed 4-8% and 0.3%).
+Exact mode keeps its 1e-4 per check and adds a median bound of 2.3e-7 (runs: 1.84-1.96e-7). Statistics count
+distinct cases only: Hegel repeated one case six times in 150. Main's Hegel failure at b35fb36 (int8, chunk 17, split
+0.075 at 197 tokens) replays, is a router flip in the split engine (layer 5, gap 1.2e-3 of 0.46; swapping it in the
+CPU reference brings the split engine to 3.5e-3), and passes. Positive controls (`HALO_TEST_PREFILL_PERTURB`): one
+wrong row at each interior chunk boundary fails on the split counts (fp16 12/38, int8 21/34) and the int8 split median;
+a 2-ulp signed perturbation of every prefill row's embedding fails exact mode's median (2.53e-7; 1 ulp passes); the
+noisy modes catch it only at 131072 ulps (1.6%; 16384 ulps, 0.2%, is below their noise). Ten fresh-database runs
+passed.
+
 ### Greedy identity with gufo
 
 `halo_run --device hip` against `gufo prompt --raw -t 0 --speculative off`

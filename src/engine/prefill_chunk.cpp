@@ -13,7 +13,9 @@
 //   expert routing and (for now) the routed experts.
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1246,6 +1248,8 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
     const std::uint32_t pos = position_ + t, n_kv = pos + 1, complete = n_kv / ratio;
     std::uint32_t params[kHaloStepParamCount] = {};
     params[kHaloToken] = static_cast<std::uint32_t>(tokens[t]);
+    if (prefill_test_perturb_ == 1 && t + 1 == T && logits.empty())  // a chunk boundary inside the prompt
+      params[kHaloToken] = (params[kHaloToken] + 1) % c.vocab_size;
     params[kHaloPosition] = pos;
     params[kHaloNkv] = n_kv;
     params[kHaloComplete] = complete;
@@ -1270,6 +1274,19 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
                              rt::Arg::Buf(ck_.host, ck_.params_offset), rt::Arg::Val(H),
                              rt::Arg::Val<std::uint64_t>(w_.token_embd.RowBytes())};
     if (!dev_.Launch(emb.embed_rows, {Blocks(H), T}, {kBlock}, eargs, error)) return false;
+  }
+  if (prefill_test_perturb_ == 2) {  // test only: every row's embedding moved by a few ulps (host round trip)
+    std::vector<float> e(std::size_t{T} * H);
+    if (!dev_.Synchronize(error) || !dev_.Download(ck_.embd, 0, e.data(), e.size() * sizeof(float), error)) return false;
+    // Up or down by element (a hashed sign), so the change is not a uniform scale that the first norm removes.
+    for (std::size_t i = 0; i < e.size(); ++i) {
+      if (e[i] == 0 || !std::isfinite(e[i])) continue;
+      const bool away = ((i % H) * 2654435761u >> 13) & 1;  // away from zero, or toward it (not past it)
+      const auto bits = std::bit_cast<std::uint32_t>(e[i]);
+      const std::uint32_t k = std::min<std::uint32_t>(prefill_test_ulps_, bits & 0x7fffffffu);
+      e[i] = std::bit_cast<float>(away ? bits + k : bits - k);
+    }
+    if (!dev_.Upload(ck_.embd, 0, e.data(), e.size() * sizeof(float), error)) return false;
   }
   if (timing_) Stamp("token embedding (per token)");
   if (!Launch(Rk("halo_broadcast_rows", Res16()).c_str(), {Blocks(std::size_t{T} * D)}, {kBlock},

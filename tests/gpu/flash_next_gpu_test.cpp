@@ -16,7 +16,9 @@
 #include <cstring>
 #include <fstream>
 #include <optional>
+#include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "core/gguf.hpp"
@@ -507,65 +509,6 @@ TEST(FlashNextGpu, SmallQuantizedModelRunsFastPathsAndMatchesReference) {
   engine::FlashNextGpu::int8_act_moe_ = saved;
 }
 
-// P4: chunked prefill (T-token GEMMs, row kernels, the DeltaNet chunk
-// kernels) against stepping, over generated interleavings of prefills
-// (crossing chunk boundaries: prefill_chunk_ is drawn small) and steps, in
-// three modes:
-// - exact projections (the decode GEMVs per token inside the chunk) with
-//   float expert activations: equal to stepping up to float order. Bound
-//   fixed in advance: relative L2 < 1e-4 and identical argmax everywhere.
-//   With int8 expert activations (the default) a 1e-7 float-order
-//   difference can flip one value's rounding, a discrete jump: on a
-//   16-token alphabet, where routing and QSA scores sit near ties, that
-//   measured up to 4e-4 against stepping while float activations stayed
-//   below 1e-6 on the same sequence (and stepping matched the CPU
-//   reference to 2e-7 either way). So the strict mode runs float.
-// - fp16 GEMMs (Q8_0 dequantized to fp16 while staging, fp16 activations,
-//   GpuQuant.Q8F16GemmMatchesDoubleSums; BF16 indexer projections on
-//   FP16 WMMA, F32 ones on the row GEMM; routed experts grouped by expert on
-//   FP16 WMMA, GpuQuant.GroupedExpertsMatchCpuReference; attention on FP16
-//   WMMA with an online softmax) and int8 GEMMs (activations
-//   quantized per token and 32 values): these change the arithmetic, so
-//   stepping is not their oracle. Two checks instead:
-//   * partition invariance, strict: every token's activations are
-//     quantized on their own, so a second engine that splits the same
-//     prompt at different points must agree to float order (relative L2
-//     < 1e-4, identical argmax). This catches row-offset, tail and stride
-//     errors in the GEMM plumbing, which noise cannot hide.
-//   * drift from stepping, reported, with only a gross-error cap (relative
-//     L2 < 0.5; a wrong row or a dropped scale moves logits by O(1)).
-//     History: bounds of 3e-2, then 0.1, were set before measuring and
-//     failed (0.033 on a one-token prefill, 0.112 after 92 tokens). A
-//     diagnostic then ran every projection both ways inside the engine: the
-//     int8 GEMM equalled the float GEMV on the same quantized activations
-//     to < 2e-7 for every shape, while quantization moved activations by
-//     ~0.55% per projection, and a rounding flip (a discrete jump) from
-//     1e-7 noise is amplified through the random model's layers and state,
-//     which is also why no strict int8-vs-float twin bound holds end to
-//     end. Whether int8 dense prefill is accurate enough is decided on the
-//     real model's NLL (halo_score), not here.
-//     The worst drift is a tail, not a level: in these modes the stepped
-//     oracle runs int8 expert activations too (logits 2-6e-3 from the CPU
-//     reference), and a top-k choice near a tie (the router's last chosen
-//     expert, or a QSA block at the budget) flips in one engine and not the
-//     other, moving that position's logits by 0.025-0.134. Stream F
-//     (2026-10-06) replayed seven outliers (0.026-0.134) against the CPU
-//     reference; swapping exactly one choice in the reference brought the
-//     outlying engine back to its noise floor (6e-4 to 3e-3) every time:
-//     five flips in stepping (router logit gaps 3.6e-5 to 1.3e-3 of
-//     ~0.25; QSA score gaps 0.024 of 34.9 and 0.44 of 18.4, the latter
-//     with one block's score read back 0.70 low), one router flip in fp16
-//     prefill (gap 1.4e-4 of 0.66, from --router-f16 3), one QSA flip in
-//     int8 prefill (gap 0.055 of 20.7). With float expert activations,
-//     stepping matched the reference to 2.7e-7 and the fp16 prefill stayed
-//     within 6e-4 of it on the same cases (chunks of 1 / 17 / 64, up to
-//     594 tokens); c95db3e, before the precision defaults, gave the same
-//     stepped outliers. About 3% of fp16-mode checks exceed 0.02, hence the
-//     count in the summary. A flip can also separate the chunked and split
-//     engines (0.086 in int8 mode once stepping took float activations), as
-//     large as a one-row error (0.07-0.11 for one changed token at a chunk
-//     boundary), so the split bound below cannot tell the two apart there.
-//   HALO_SMALL_QUANT_DIR  holds small-q.gguf
 // Chunks longer than the dense range (stream L): a chunk crossing the end of the dense positions runs its
 // prefix on the flash kernel and the rest on the QSA path from the same position, and the GEMMs whose
 // activations outgrow the MALL run on token slices, so long chunks give byte-identical logits to chunks of
@@ -637,6 +580,100 @@ TEST(FlashNextGpu, LongChunksMatchDenseRangeChunks) {
   }, {.test_cases = 6});
 }
 
+// P4: chunked prefill (T-token GEMMs, row kernels, the DeltaNet chunk
+// kernels) against stepping, over generated interleavings of prefills
+// (crossing chunk boundaries: prefill_chunk_ is drawn small) and steps, in
+// three modes:
+// - exact projections (the decode GEMVs per token inside the chunk) with
+//   float expert activations: equal to stepping up to float order. Bound
+//   fixed in advance: relative L2 < 1e-4 and identical argmax everywhere.
+//   With int8 expert activations (the default) a 1e-7 float-order
+//   difference can flip one value's rounding, a discrete jump: on a
+//   16-token alphabet, where routing and QSA scores sit near ties, that
+//   measured up to 4e-4 against stepping while float activations stayed
+//   below 1e-6 on the same sequence (and stepping matched the CPU
+//   reference to 2e-7 either way). So the strict mode runs float.
+// - fp16 GEMMs (Q8_0 dequantized to fp16 while staging, fp16 activations,
+//   GpuQuant.Q8F16GemmMatchesDoubleSums; BF16 indexer projections on
+//   FP16 WMMA, F32 ones on the row GEMM; routed experts grouped by expert on
+//   FP16 WMMA, GpuQuant.GroupedExpertsMatchCpuReference; attention on FP16
+//   WMMA with an online softmax) and int8 GEMMs (activations
+//   quantized per token and 32 values): these change the arithmetic, so
+//   stepping matches them only up to their own error. The stepped oracle
+//   takes float expert activations in every mode (2.7e-7 from the CPU
+//   reference), so "vs stepping" is the prefill's error; the chunked and
+//   split engines keep the defaults' int8 ones in their steps. Each check
+//   compares the chunked engine with stepping and with a second engine that
+//   splits the same prompt at a drawn point.
+//   Why no per-check bound: a top-k choice near a tie (the router's last
+//   expert, or a QSA block at the budget) flips in one engine and not the
+//   other and moves that position's logits by 0.02-0.13, as much as a
+//   one-row error. Stream F (2026-10-06) replayed eight such outliers
+//   against the CPU reference; swapping exactly one choice in it brought the
+//   outlying engine back to its noise floor (6e-4 to 3.5e-3) every time
+//   (router logit gaps 3.6e-5 to 1.3e-3 of ~0.25, QSA score gaps 0.024 to
+//   0.44 of ~20-35), in stepping (with int8 activations, as the oracle then
+//   ran), in the fp16 and int8 prefills and in the split engine; the last
+//   one is the failure main's Hegel run found at b35fb36 (int8, chunk 17,
+//   split 0.075 at 197 tokens: router layer 5, gap 1.2e-3 of 0.46).
+//   So in these modes:
+//   * per check, only gross breakage: relative L2 < kNoisyCap (0.3) vs
+//     stepping and vs the split;
+//   * over the run, statistics of the distinct cases (Hegel repeats some
+//     cases; one ran six times in 150): medians, once a mode has
+//     kMinForMedian distinct checks, and counts of jumps and argmax
+//     differences, which fail when less likely than kTailFloor (1e-4) under
+//     an assumed per-check rate (Binomial tail).
+//   Thresholds, from 300 cases before (f9ab0f2) and ten 30-case runs after
+//   merging b35fb36 (distinct checks; fp16 / int8):
+//   * median vs stepping: pooled 6.2e-4 / 2.8e-3; per run 5.9e-4..2.6e-3 /
+//     2.7e-3..3.2e-3 (fp16 steps carry the chunked engine's int8 decode,
+//     2.2e-3) -> bounds 5e-3 / 8e-3;
+//   * median vs a split: pooled 2.2e-4 / 9.7e-4, p90 2.9e-4 / 1.9e-3; per
+//     run up to 2.7e-4 / 1.8e-3 -> 1e-3 / 4e-3;
+//   * jumps vs stepping (> 0.02): 4.3% / 7.5% pooled, up to 23% in one run
+//     (5 of 22) -> rate 0.15 (fails at 14 of 30);
+//   * jumps vs a split (> 0.005): 1 of 298 pooled, up to 2 of 12 in a run ->
+//     rate 0.03 (fails at 7 of 30);
+//   * exact mode, median vs stepping: per run 1.84e-7..1.96e-7, worst check
+//     2.44e-7 -> 2.3e-7 (on HIP; another backend's float order may need
+//     its own).
+//   Positive controls (manual; FlashNextGpu::prefill_test_perturb_):
+//   HALO_TEST_PREFILL_PERTURB=row HALO_TEST_PREFILL_MODES=12 (the last row
+//   of every chunk but a call's final one embedded as the next token)
+//   fails on the split counts (fp16 12 of 38, int8 21 of 34 above 0.005;
+//   tails 7e-10 and 1e-14) and the int8 split median (7.3e-3); in exact
+//   mode the 1e-4 bound fails at once. HALO_TEST_PREFILL_PERTURB=ulps:N
+//   (every embedding element moved N ulps, toward or away from zero by
+//   column) fails exact mode's median from 2 ulps (2.53e-7; 1 ulp 2.03e-7
+//   passes) and the noisy modes' medians at 131072 ulps (1.6%: 1.1e-2 /
+//   1.2e-2); 16384 ulps (0.2%) passes there, below their noise.
+//   History: per-check bounds of 3e-2, then 0.1, for drift, then 0.05 for
+//   the split, were each set before measuring and each failed on a flip.
+//   Whether these modes are accurate enough is decided on the real model's
+//   NLL (halo_score), not here.
+//   HALO_SMALL_QUANT_DIR  holds small-q.gguf
+// P(X >= k) for X ~ Binomial(n, p).
+static double BinomialTail(std::size_t k, std::size_t n, double p) {
+  if (k == 0) return 1.0;
+  double below = 0;
+  for (std::size_t i = 0; i < k && i <= n; ++i)
+    below += std::exp(std::lgamma(n + 1.0) - std::lgamma(i + 1.0) - std::lgamma(n - i + 1.0) + i * std::log(p) +
+                      (n - i) * std::log1p(-p));
+  return std::max(0.0, 1.0 - below);
+}
+constexpr double kNoisyCap = 0.3;    // per check, fp16 / int8 modes
+constexpr double kJump = 0.02;        // vs stepping, a check above this counts as a jump
+constexpr double kSplitJump = 0.005;  // vs a split, likewise
+constexpr double kJumpRate = 0.15;    // assumed per-check rate of jumps (and argmax differences) vs stepping
+constexpr double kSplitRate = 0.03;   // ... and vs a split
+constexpr double kTailFloor = 1e-4;   // a count less likely than this under the assumed rate fails
+constexpr std::size_t kMinForMedian = 10;  // distinct checks a mode needs before its median is judged
+constexpr double kExactMedian = 2.3e-7;
+struct NoisyBounds {
+  double median, median_split;
+};
+constexpr NoisyBounds kNoisyBounds[2] = {{5e-3, 1e-3}, {8e-3, 4e-3}};  // fp16, int8
 TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
   const char* dir = std::getenv("HALO_SMALL_QUANT_DIR");
   if (!dir) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
@@ -660,14 +697,38 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
              saved_moe = E::int8_act_moe_, saved_grouped = E::prefill_grouped_moe_,
              saved_wmma_attn = E::prefill_wmma_attention_;
   const std::uint32_t saved_chunk = E::prefill_chunk_, saved_long = E::prefill_long_chunk_;
+  const int saved_perturb = E::prefill_test_perturb_, saved_ulps = E::prefill_test_ulps_;
+  // Positive controls (manual): HALO_TEST_PREFILL_PERTURB=row or ulps[:N] must make this test fail.
+  if (const char* pc = std::getenv("HALO_TEST_PREFILL_PERTURB")) {
+    const std::string v = pc;
+    E::prefill_test_perturb_ = v == "row" ? 1 : v.rfind("ulps", 0) == 0 ? 2 : 0;
+    if (v.size() > 5 && v[4] == ':') E::prefill_test_ulps_ = std::atoi(v.c_str() + 5);
+    std::printf("positive control: prefill perturbation %d (%d ulps)\n", E::prefill_test_perturb_, E::prefill_test_ulps_);
+  }
   enum Mode { kExact, kFloatGemm, kInt8Gemm, kModes };
   const char* names[kModes] = {"exact", "fp16 GEMMs", "int8 GEMMs"};
-  std::size_t compared[kModes] = {}, agreed[kModes] = {}, jumps[kModes] = {};
-  double worst[kModes] = {}, worst_split[kModes] = {};
+  std::vector<int> modes = {kExact, kFloatGemm, kInt8Gemm};
+  if (const char* m = std::getenv("HALO_TEST_PREFILL_MODES")) {  // positive controls: e.g. "12" (fp16 and int8 only)
+    modes.clear();
+    for (const char* q = m; *q; ++q) modes.push_back(*q - '0');
+  }
+  // Per check: relative L2 against stepping and against the split engine, and whether the argmax differed.
+  std::vector<double> rels[kModes], splits[kModes];
+  std::size_t missed[kModes] = {}, missed_split[kModes] = {};
+  // Hegel draws some cases more than once (one case ran six times in a 150-case run); the statistics count each
+  // distinct case once, keyed by its draws.
+  std::set<std::string> seen;
+  struct Check {
+    double rel, rel_split;
+    bool same, same_split;
+  };
   hegel::test([&](hegel::TestCase& tc) {
-    auto& dev = *devices[tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = devices.size() - 1}))];
-    const auto mode = static_cast<Mode>(tc.draw(gs::integers<int>({.min_value = 0, .max_value = kModes - 1})));
+    const auto dev_index = tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = devices.size() - 1}));
+    auto& dev = *devices[dev_index];
+    const auto mode = static_cast<Mode>(tc.draw(gs::sampled_from(modes)));
     E::prefill_exact_projections_ = mode == kExact;
+    // The chunked and split engines take the defaults' int8 expert activations in their steps; the stepped oracle
+    // always takes float ones (step_oracle), so "vs stepping" measures the prefill's own error.
     E::int8_act_moe_ = mode != kExact;
     E::prefill_grouped_moe_ = mode != kExact;  // fp16 expert GEMMs change the arithmetic
     E::prefill_wmma_attention_ = mode != kExact;  // and so does fp16 attention
@@ -682,6 +743,16 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
     auto stepped = E::Create(dev, *weights, ngram.get(), nullptr, kMaxContext, &error);
     ASSERT_TRUE(chunked && split && stepped) << error;
     std::vector<float> a(V), b(V), s(V);
+    std::string key = std::to_string(dev_index) + "/" + std::to_string(mode) + "/" +
+                      std::to_string(E::prefill_chunk_) + "/" + std::to_string(E::prefill_long_chunk_);
+    std::vector<Check> checks;
+    const auto step_oracle = [&](std::int32_t tok, std::span<float> out) {
+      const bool int8 = E::int8_act_moe_;
+      E::int8_act_moe_ = false;
+      const bool ok = stepped->Step(tok, out, &error);
+      E::int8_act_moe_ = int8;
+      return ok;
+    };
     const auto token = [&] {
       return tc.draw(gs::integers<int>({.min_value = 0, .max_value = 15})) == 0
                  ? static_cast<std::int32_t>(c.ple_eos_token)
@@ -689,20 +760,18 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
     };
     const auto check = [&](const char* what) {
       const double rel = RelL2(a, b.data()), rel_split = RelL2(a, s.data());
-      worst[mode] = std::max(worst[mode], rel);
-      worst_split[mode] = std::max(worst_split[mode], rel_split);
-      ++compared[mode];
-      jumps[mode] += rel > 0.01;  // mostly near-tie top-k flips in one engine (see above)
-      const bool same = Argmax(a.data(), V) == Argmax(b.data(), V);
-      agreed[mode] += same;
+      const bool same = Argmax(a.data(), V) == Argmax(b.data(), V), same_split = Argmax(a.data(), V) == Argmax(s.data(), V);
+      checks.push_back({rel, rel_split, same, same_split});
       const auto at = [&] { return std::string(what) + " at position " + std::to_string(chunked->Position()) + ", " + names[mode]; };
-      // A split changes the chunk sizes, and the fp16 / int8 modes pick kernels and roundings by chunk size. Worst
-      // split vs stepping over 30 cases (2026-10-06): before the precision defaults fp16 2.6e-4 / 4.2e-3, int8
-      // 2.0e-3 / 3.0e-2; with them fp16 1.8e-3 / 3.3e-3, int8 1.3e-2 / 1.4e-2. Exact mode splits bit-identically.
-      ASSERT_LT(rel_split, mode == kExact ? 1e-4 : 0.05) << "split " << at();
-      ASSERT_EQ(Argmax(a.data(), V), Argmax(s.data(), V)) << "split " << at();
-      ASSERT_LT(rel, mode == kExact ? 1e-4 : 0.5) << at();
-      if (mode == kExact) ASSERT_TRUE(same) << at();
+      if (mode == kExact) {  // float order only; a split is bit-identical
+        ASSERT_LT(rel_split, 1e-4) << "split " << at();
+        ASSERT_TRUE(same_split) << "split " << at();
+        ASSERT_LT(rel, 1e-4) << at();
+        ASSERT_TRUE(same) << at();
+      } else {  // per check only gross breakage; the rest is judged over the run (below)
+        ASSERT_LT(rel_split, kNoisyCap) << "split " << at();
+        ASSERT_LT(rel, kNoisyCap) << at();
+      }
     };
     const int ops = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 6}));
     bool prefilled = false;
@@ -712,26 +781,37 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
         if (chunked->Position() + n > kMaxContext) break;
         std::vector<std::int32_t> chunk(n);
         for (auto& tok : chunk) tok = token();
+        key += " P";
+        for (auto tok : chunk) key += " " + std::to_string(tok);
         ASSERT_TRUE(chunked->Prefill(chunk, a, &error)) << error;
         prefilled = true;
         // The same tokens as two prefills, cut at a drawn point.
         const auto cut = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = n - 1}));
+        key += " /" + std::to_string(cut);
         const std::span<const std::int32_t> all(chunk);
         if (cut > 0) ASSERT_TRUE(split->Prefill(all.first(cut), {}, &error)) << error;
         ASSERT_TRUE(split->Prefill(all.subspan(cut), s, &error)) << error;
         for (std::uint32_t j = 0; j < n; ++j)
-          ASSERT_TRUE(stepped->Step(chunk[j], j + 1 == n ? std::span<float>(b) : std::span<float>{}, &error)) << error;
+          ASSERT_TRUE(step_oracle(chunk[j], j + 1 == n ? std::span<float>(b) : std::span<float>{})) << error;
         check("prefill");
       } else {
         if (chunked->Position() >= kMaxContext) break;
         const auto tok = token();
+        key += " S " + std::to_string(tok);
         ASSERT_TRUE(chunked->Step(tok, a, &error)) << error;
         ASSERT_TRUE(split->Step(tok, s, &error)) << error;
-        ASSERT_TRUE(stepped->Step(tok, b, &error)) << error;
+        ASSERT_TRUE(step_oracle(tok, b)) << error;
         check("step after prefill");
       }
       ASSERT_EQ(chunked->Position(), stepped->Position());
     }
+    if (seen.insert(key).second)
+      for (const auto& k : checks) {
+        rels[mode].push_back(k.rel);
+        splits[mode].push_back(k.rel_split);
+        missed[mode] += !k.same;
+        missed_split[mode] += !k.same_split;
+      }
     if (prefilled) {
       EXPECT_EQ(chunked->LaunchedKernel("halo_gdn_prefill_d128_norm"), !E::prefill_split_gdn_ || mode == kExact);
       EXPECT_EQ(chunked->LaunchedKernel("halo_gemm_q8r_wmma_t"), mode == kInt8Gemm);
@@ -749,6 +829,8 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
       EXPECT_TRUE(wmma_attention || mode == kExact);
     }
   }, {.test_cases = 30});
+  E::prefill_test_perturb_ = saved_perturb;
+  E::prefill_test_ulps_ = saved_ulps;
   E::prefill_exact_projections_ = saved_exact;
   E::prefill_int8_gemm_ = saved_int8;
   E::prefill_f16_gemm_ = saved_f16;
@@ -757,8 +839,37 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
   E::prefill_chunk_ = saved_chunk;
   E::prefill_long_chunk_ = saved_long;
   E::prefill_wmma_attention_ = saved_wmma_attn;
-  for (int m = 0; m < kModes; ++m)
-    std::printf("%s: %zu compared, argmax agreed %zu, worst relative L2 vs stepping %.3g (%zu above 0.01), vs a split "
-                "prefill %.3g\n",
-                names[m], compared[m], agreed[m], worst[m], jumps[m], worst_split[m]);
+  const auto median = [](std::vector<double> v) {
+    if (v.empty()) return 0.0;
+    std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+    return v[v.size() / 2];
+  };
+  const auto above = [](const std::vector<double>& v, double t) {
+    return static_cast<std::size_t>(std::count_if(v.begin(), v.end(), [t](double x) { return x > t; }));
+  };
+  for (int m = 0; m < kModes; ++m) {
+    const std::size_t n = rels[m].size();
+    const double worst = n ? *std::max_element(rels[m].begin(), rels[m].end()) : 0,
+                 worst_split = n ? *std::max_element(splits[m].begin(), splits[m].end()) : 0;
+    std::printf("%s: %zu compared (distinct cases); vs stepping median %.3g, worst %.3g, %zu above %.2g, argmax differed %zu; vs a split "
+                "prefill median %.3g, worst %.3g, %zu above %.2g, argmax differed %zu\n",
+                names[m], n, median(rels[m]), worst, above(rels[m], kJump), kJump, missed[m], median(splits[m]),
+                worst_split, above(splits[m], kSplitJump), kSplitJump, missed_split[m]);
+    if (m == kExact) {
+      if (n >= kMinForMedian) EXPECT_LE(median(rels[m]), kExactMedian) << names[m] << ": median difference from stepping";
+      continue;
+    }
+    const auto& bound = kNoisyBounds[m - 1];
+    if (n >= kMinForMedian) {
+      EXPECT_LE(median(rels[m]), bound.median) << names[m] << ": median drift from stepping";
+      EXPECT_LE(median(splits[m]), bound.median_split) << names[m] << ": median split difference";
+    }
+    // Flips are rare and nearly independent per check; a systematic error raises a rate (the one-row positive
+    // control: 26-45% of checks vs stepping, 38-45% vs a split).
+    for (auto [count, rate, what] : {std::tuple{above(rels[m], kJump), kJumpRate, "checks above kJump vs stepping"},
+                                     std::tuple{missed[m], kJumpRate, "argmax differences vs stepping"},
+                                     std::tuple{above(splits[m], kSplitJump), kSplitRate, "checks above kSplitJump vs a split"},
+                                     std::tuple{missed_split[m], kSplitRate, "argmax differences vs a split"}})
+      EXPECT_GE(BinomialTail(count, n, rate), kTailFloor) << names[m] << ": " << count << " " << what << " of " << n;
+  }
 }
