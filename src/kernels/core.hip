@@ -5085,6 +5085,11 @@ extern "C" __global__ void halo_f16_perm_rows(const float* x, _Float16* y, std::
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) y[MoePerm(i)] = static_cast<_Float16>(x[i]);
 }
+// Stream R: the same permutation from the fp16 copy mh (mh = fp16(mixed): the same bits as above).
+extern "C" __global__ void halo_f16_perm_rows_h(const _Float16* x, _Float16* y, std::uint32_t n) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[MoePerm(i)] = x[i];
+}
 
 // out[t][i] = sum_s w[t][s] * yp[pos[t * k + s]][i], slots in order.
 //   grid (ceil(n / 256), T), block 256
@@ -7285,7 +7290,7 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
           }
           m[q] = acc / 4.0f;
         }
-        *reinterpret_cast<float4*>(y + static_cast<std::size_t>(t) * h + i) = make_float4(m[0], m[1], m[2], m[3]);
+        if (!kMixLo || y) *reinterpret_cast<float4*>(y + static_cast<std::size_t>(t) * h + i) = make_float4(m[0], m[1], m[2], m[3]);
         const halo_h2 lo = {static_cast<_Float16>(m[0]), static_cast<_Float16>(m[1])};
         const halo_h2 hi = {static_cast<_Float16>(m[2]), static_cast<_Float16>(m[3])};
         *reinterpret_cast<halo_h2*>(y16 + static_cast<std::size_t>(t) * h + i) = lo;

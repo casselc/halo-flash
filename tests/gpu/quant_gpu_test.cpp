@@ -1733,6 +1733,34 @@ TEST(GpuQuant, SplitOperandF16GemmsMatchSums) {
   }, {.test_cases = 30});
 }
 
+// Stream R: halo_f16_perm_rows_h over mh (= fp16(mixed)) writes halo_f16_perm_rows's output bit for bit.
+TEST(GpuQuant, PermRowsFromHalfEqualsFromFloat) {
+  std::string error;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &error);
+  if (!dev) GTEST_SKIP() << error;
+  ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+  hegel::test([&](hegel::TestCase& tc) {
+    const auto n = 256 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 400}));
+    std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+    std::vector<float> x(n);
+    for (auto& v : x) { seed = seed * 1664525u + 1013904223u; v = 64.0f * (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f); }
+    std::vector<_Float16> xh(n), a(n), b(n);
+    for (std::uint32_t i = 0; i < n; ++i) xh[i] = static_cast<_Float16>(x[i]);
+    auto xb = dev->Alloc(n * 4, &error), hb = dev->Alloc(n * 2, &error), ya = dev->Alloc(n * 2, &error),
+         yb = dev->Alloc(n * 2, &error);
+    ASSERT_TRUE(dev->Upload(xb, 0, x.data(), n * 4, &error) && dev->Upload(hb, 0, xh.data(), n * 2, &error)) << error;
+    const rt::Arg a1[] = {rt::Arg::Buf(xb), rt::Arg::Buf(ya), rt::Arg::Val(n)};
+    const rt::Arg a2[] = {rt::Arg::Buf(hb), rt::Arg::Buf(yb), rt::Arg::Val(n)};
+    ASSERT_TRUE(dev->Launch(dev->Kernel("halo_f16_perm_rows", &error), {(n + 255) / 256}, {256}, a1, &error) &&
+                dev->Launch(dev->Kernel("halo_f16_perm_rows_h", &error), {(n + 255) / 256}, {256}, a2, &error))
+        << error;
+    ASSERT_TRUE(dev->Download(ya, 0, a.data(), n * 2, &error) && dev->Download(yb, 0, b.data(), n * 2, &error)) << error;
+    for (std::uint32_t i = 0; i < n; ++i)
+      ASSERT_EQ(std::bit_cast<std::uint16_t>(b[i]), std::bit_cast<std::uint16_t>(a[i])) << i << " n " << n;
+    for (auto* p : {&xb, &hb, &ya, &yb}) dev->Free(*p);
+  }, {.test_cases = 20});
+}
+
 // Stream R (router mode 4): halo_gemm_h_hl_* over fp16 W and x given as fp16 hi / lo halves (rne(x),
 // rne(x - hi)) equal halo_gemm_f32_f16_x2 over fp32 W and x bit for bit (same products, same order per
 // output). rows % 128 == 0, cols % 64 == 0.

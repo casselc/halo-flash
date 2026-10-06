@@ -162,6 +162,8 @@ class FlashNextGpu {
   static inline int prefill_router_f16_ = 3;
   /// Stream R study: the mode-4 router kernel's tile (0: 128 x 64, BK 64; 1: 128 x 64, BK 32; 2: 64 x 64).
   static inline int prefill_router_tile_ = 0;
+  /// Stream R (exact, with router mode 4): the MoE-half mix epilogue skips the fp32 `mixed` nobody reads.
+  static inline bool prefill_mixed32_skip_ = true;
   /// Precision option (stream P): the small F32 projections over `mixed`
   /// (DeltaNet alpha/beta, shared-expert gate) on FP16 WMMA like the router
   /// option, instead of the fp32 tiled GEMM.
@@ -182,7 +184,7 @@ class FlashNextGpu {
   /// the conv writes fp16 q/k/v, prep and scan read them (K and Q exact in fp16: 2 WMMAs a product), the
   /// scan writes o in fp16, the one-wave gated norm reads fp16 o and z. 1: halo_gdn_c16_scanf (K^T
   /// gathered), 2: halo_gdn_c16_scanft (K^T from a transposed copy).
-  static inline int prefill_gdn_f16_ = 0;
+  static inline int prefill_gdn_f16_ = 1;
   /// Precision option (stream P): the chunk's hyper-connection residual
   /// streams stored in 16 bits (1: fp16, 2: bf16) instead of fp32; every
   /// residual reader and writer of the prefill takes the matching variant.
@@ -368,7 +370,8 @@ class FlashNextGpu {
 std::unordered_set<const void*> moe_blocked_;
   std::unordered_map<const void*, rt::Buffer> router16_;  // fp16 router weights (prefill_router_f16_ 4)
   bool want_ml_ = false;
-  bool router_hl_ok_ = false;  // RouterHL held for this layer: mh / ml are the router's input  // the next mix epilogue also writes ml (the MoE-half mixer, router mode 4)  // tensors repacked K-blocked (prefill_moe_blocked_)
+  bool router_hl_ok_ = false;
+  bool mixed32_dead_ = false;  // this layer's MoE half reads no fp32 `mixed` (RouterHL)  // RouterHL held for this layer: mh / ml are the router's input  // the next mix epilogue also writes ml (the MoE-half mixer, router mode 4)  // tensors repacked K-blocked (prefill_moe_blocked_)
 
 rt::Buffer moe_blocked_tmp_;
 
