@@ -39,6 +39,7 @@ class TextGenerator {
  public:
   struct Params {
     std::string prompt;  // fully rendered text (special tokens as text)
+    std::string variant;  // P10 variant ("" = base); the service only passes ones `variants` lists
     sampling::SamplingConfig sampling;
     std::uint32_t max_tokens = 0;
   };
@@ -90,6 +91,11 @@ struct ServiceOptions {
   /// Called when a generation starts and ends (optional), e.g. for the
   /// requests-running gauge.
   std::function<void(bool started)> on_activity;
+  /// P10 variants the generator serves. Listed by /v1/models as
+  /// "<model_id>:<name>"; a request naming any other variant (the
+  /// "variant" field or a "base:variant" model alias) is answered 404.
+  /// Unset: every variant is refused.
+  std::function<std::vector<std::string>()> variants;
   /// Ids and timestamps; tests pass deterministic ones.
   std::function<std::string()> new_id;
   std::function<std::int64_t()> now_s;

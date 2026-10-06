@@ -236,11 +236,11 @@ TEST(Variant, MergeLoraEqualsBasePlusScaledProduct) {
   for (std::size_t i = 0; i < W.size(); ++i) W[i] = static_cast<float>(i) * 0.25F;
   for (std::size_t i = 0; i < A.size(); ++i) A[i] = static_cast<float>(i) - 3.0F;
   for (std::size_t i = 0; i < B.size(); ++i) B[i] = 0.5F * static_cast<float>(i % 5);
-  model::TensorRef w{W.data(), core::GgmlType::kF32, 4, 6};
+  model::TensorRef w{W.data(), core::GgmlType::kF32, 4, 6, 1, 0, 0, {}};
   model::LoraPair p;
   p.rank = 2;
-  p.a = {A.data(), core::GgmlType::kF32, 4, 2};
-  p.b = {B.data(), core::GgmlType::kF32, 2, 6};
+  p.a = {A.data(), core::GgmlType::kF32, 4, 2, 1, 0, 0, {}};
+  p.b = {B.data(), core::GgmlType::kF32, 2, 6, 1, 0, 0, {}};
   const auto merged = model::MergeLora(w, p, 1.5F);
   for (std::size_t r = 0; r < 6; ++r)
     for (std::size_t c = 0; c < 4; ++c) {

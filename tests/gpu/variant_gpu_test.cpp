@@ -23,7 +23,10 @@
 #include <vector>
 
 #include "core/gguf.hpp"
+#include "core/json.hpp"
 #include "core/sha256.hpp"
+#include "decide/decider.hpp"
+#include "decide/systemone.hpp"
 #include "engine/qwen35_gpu.hpp"
 #include "model/qwen35.hpp"
 #include "model/variant.hpp"
@@ -251,4 +254,78 @@ TEST(VariantCpu, StepToLayerCapturesTheResidualEnteringALayer) {
   const double e = RelL2(got, want);
   std::printf("CPU trunk capture vs HF hidden_states: %.3g\n", e);
   EXPECT_LT(e, 1e-4);
+}
+
+// /v1/systemone variants: strands-decider's own LoRA and pointer head,
+// packaged as a manifest over Qwen3.5-2B-Base, are selected per request and
+// answer exactly like the decider as loaded; the base torso without a LoRA
+// (a head-only variant) answers differently; unknown variants are errors.
+//   HALO_DECIDER_MODELS_DIR  Qwen3.5-2B-Base-BF16.gguf + strands-decider-*.gguf
+TEST(VariantGpu, DeciderVariantsSelectedPerRequest) {
+  const char* dir = std::getenv("HALO_DECIDER_MODELS_DIR");
+  if (!dir) GTEST_SKIP() << "set HALO_DECIDER_MODELS_DIR";
+  namespace fs = std::filesystem;
+  const std::string d = dir;
+  std::string error;
+  auto decider = decide::StrandsDecider::Open({d + "/Qwen3.5-2B-Base-BF16.gguf", d + "/strands-decider-lora-f32.gguf",
+                                               d + "/strands-decider-head.gguf", d + "/strands-decider-tokenizer.gguf",
+                                               "hip"},
+                                              &error);
+  ASSERT_TRUE(decider) << error;
+  const std::vector<std::string> files = {d + "/Qwen3.5-2B-Base-BF16.gguf"};
+  const auto hash = model::BaseContentHash(files, &error);
+  ASSERT_TRUE(hash) << error;
+  const fs::path tmp = fs::path(testing::TempDir()) / "halo_decider_variants";
+  fs::remove_all(tmp);
+  const auto write_variant = [&](const std::string& name, bool with_lora) {
+    const fs::path vd = tmp / name;
+    fs::create_directories(vd);
+    model::VariantManifest m;
+    m.name = name;
+    m.base_architecture = "qwen35";
+    m.base_sha256 = *hash;
+    const auto add = [&](model::VariantPartKind kind, const std::string& src, const std::string& file) {
+      fs::copy_file(src, vd / file);
+      m.parts.push_back({kind, file, *core::Sha256File((vd / file).string(), &error), fs::file_size(vd / file)});
+    };
+    if (with_lora) add(model::VariantPartKind::kLora, d + "/strands-decider-lora-f32.gguf", "lora.gguf");
+    add(model::VariantPartKind::kPointerHead, d + "/strands-decider-head.gguf", "head.gguf");
+    EXPECT_TRUE(m.WriteFile((vd / "manifest.json").string(), &error)) << error;
+    return (vd / "manifest.json").string();
+  };
+  model::VariantRegistry reg(decider->torso_file(), *hash);
+  for (const auto& [name, lora] : {std::pair{"strands-copy", true}, std::pair{"head-only", false}}) {
+    const auto v = reg.Load(write_variant(name, lora), &error);
+    ASSERT_TRUE(v) << error;
+    ASSERT_TRUE(decider->AddVariant(v, &error)) << error;
+  }
+  EXPECT_FALSE(decider->AddVariant(reg.Find("head-only"), &error));
+  const auto body = json::Parse(
+      R"({"state": "The user asked for a refund twice and is now writing in capital letters.",
+          "questions": {"angry": {"type": "noul", "instructions": "Is the user angry?"},
+                        "next": {"type": "choice", "instructions": "What should the agent do next?",
+                                 "criteria": {"apologize": "apologize and refund", "upsell": "offer a new plan",
+                                              "escalate": "hand over to a human"}}}})",
+      &error);
+  ASSERT_TRUE(body) << error;
+  auto request = decide::ParseRequest(*body, &error);
+  ASSERT_TRUE(request) << error;
+  const auto answers = [&](const std::string& variant) {
+    auto r = *request;
+    r.variant = variant;
+    const auto out = decider->Evaluate(r, &error);
+    EXPECT_TRUE(out) << error;
+    return out ? json::DumpPython(*out->find("answers")) : std::string();
+  };
+  const auto plain = answers("");
+  EXPECT_EQ(answers("strands-copy"), plain);
+  const auto head_only = answers("head-only");
+  EXPECT_NE(head_only, plain);
+  EXPECT_EQ(answers(""), plain) << "selecting a variant must not change the default afterwards";
+  std::printf("decider: %s\nhead-only (base torso): %s\n", plain.c_str(), head_only.c_str());
+  auto r = *request;
+  r.variant = "missing";
+  EXPECT_FALSE(decider->Evaluate(r, &error));
+  EXPECT_NE(error.find("unknown variant"), std::string::npos);
+  fs::remove_all(tmp);
 }

@@ -150,7 +150,7 @@ class LastK {
   std::vector<float> params_;
   const float* output_norm_ = nullptr;
   model::TensorRef output_;  ///< LM head (may be the token embedding)
-  DenseWeight output_dense_;  ///< set when the LM head is F32 (else dequantized per chunk)
+  DenseWeight output_dense_;  ///< FP32 LM head rows (unset: dequantized per chunk)
   std::size_t head_norm_w_ = 0, head_norm_b_ = 0, head_w_ = 0, head_b_ = 0;
 };
 

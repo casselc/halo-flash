@@ -398,3 +398,26 @@ TEST(SystemOne, ScoreConfidenceEdges) {
   EXPECT_EQ(DeriveScoreConfidence(std::vector<double>{0.0, 0.0, 2.0}, 0.0), 1.0);
   EXPECT_EQ(DeriveScoreConfidence(std::vector<double>{1.0, 0.0, 1.0}, 0.0), 0.0);
 }
+
+TEST(SystemOne, VariantFieldAndModelAlias) {
+  const auto parse = [](const std::string& extra, std::string* error) {
+    std::string e;
+    auto body = halo::json::Parse(R"({"state": "s", "questions": {"q": {"type": "noul", "instructions": "is it?"}})" + extra + "}", &e);
+    EXPECT_TRUE(body) << e;
+    return halo::decide::ParseRequest(*body, error);
+  };
+  std::string error;
+  auto r = parse("", &error);
+  ASSERT_TRUE(r) << error;
+  EXPECT_EQ(r->variant, "");
+  r = parse(R"(, "variant": "triage-v1")", &error);
+  ASSERT_TRUE(r) << error;
+  EXPECT_EQ(r->variant, "triage-v1");
+  r = parse(R"(, "model": "strands-decider-latest:triage-v1")", &error);
+  ASSERT_TRUE(r) << error;
+  EXPECT_EQ(r->variant, "triage-v1");
+  EXPECT_EQ(r->model, "strands-decider-latest:triage-v1");
+  EXPECT_FALSE(parse(R"(, "model": "m:a", "variant": "b")", &error));
+  EXPECT_FALSE(parse(R"(, "variant": "a:b")", &error));
+  EXPECT_FALSE(parse(R"(, "variant": 3)", &error));
+}

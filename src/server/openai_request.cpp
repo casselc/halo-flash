@@ -1,5 +1,7 @@
 #include "server/openai_request.hpp"
 
+#include "model/variant.hpp"
+
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -160,6 +162,17 @@ bool ParseStop(Parser& p, GenerationRequest& r) {
 
 bool ParseCommon(Parser& p, GenerationRequest& r) {
   if (const Value* v = p.Get("model"); v && !p.String(*v, "model", &r.model)) return false;
+  if (const Value* v = p.Get("variant"); v && !v->is(Kind::kNull) && !p.String(*v, "variant", &r.variant)) return false;
+  if (!r.variant.empty() && !model::ValidVariantName(r.variant))
+    return p.Fail("variant", "variant names are 1-64 of [A-Za-z0-9._-]");
+  if (r.model.find(':') != std::string::npos) {
+    std::string why;
+    const auto alias = model::ParseModelAlias(r.model, &why);
+    if (!alias) return p.Fail("model", why);
+    if (!r.variant.empty() && r.variant != alias->variant)
+      return p.Fail("variant", "variant \"" + r.variant + "\" differs from the model alias \"" + r.model + "\"");
+    r.variant = alias->variant;
+  }
   if (const Value* v = p.Get("stream"); v && !p.Bool(*v, "stream", &r.stream)) return false;
   if (const Value* v = p.Get("user"); v && !p.String(*v, "user", &r.user)) return false;
   if (const Value* v = p.Get("parallel_tool_calls"); v && !p.Bool(*v, "parallel_tool_calls", &r.parallel_tool_calls))

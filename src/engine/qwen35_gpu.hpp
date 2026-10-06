@@ -63,6 +63,7 @@ class Qwen35Gpu {
   [[nodiscard]] bool SaveState(std::string* error);
   [[nodiscard]] bool RestoreState(std::string* error);
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
+  [[nodiscard]] std::uint32_t vocab_size() const noexcept { return w_.config.vocab_size; }
 
  private:
   struct DevTensor {

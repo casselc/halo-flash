@@ -96,6 +96,8 @@ struct ModelAlias {
 /// size, mtime and inode are unchanged, rewritten (best effort) otherwise.
 /// Hashing the 79 GB Flash-Next takes tens of seconds; the cache makes
 /// repeated loads free. The cache trusts local file metadata, not content.
+/// $HALO_HASH_CACHE_DIR, when set, holds the sidecars instead (named by
+/// the SHA-256 of the file's absolute path).
 [[nodiscard]] std::optional<std::string> BaseContentHashCached(std::span<const std::string> files,
                                                                std::string* error);
 

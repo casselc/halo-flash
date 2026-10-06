@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <set>
 
 #include "core/atomic_file.hpp"
@@ -254,7 +255,13 @@ std::optional<std::string> CachedFileHash(const std::string& path, std::string* 
   const std::string key = std::to_string(st.st_size) + " " +
                           std::to_string(static_cast<long long>(st.st_mtim.tv_sec) * 1000000000LL + st.st_mtim.tv_nsec) +
                           " " + std::to_string(st.st_ino);
-  const std::string sidecar = path + ".halo-sha256";
+  // $HALO_HASH_CACHE_DIR keeps sidecars out of read-only or shared model directories.
+  const char* cache_dir = std::getenv("HALO_HASH_CACHE_DIR");
+  const std::string sidecar =
+      cache_dir && *cache_dir
+          ? (std::filesystem::path(cache_dir) / (core::Sha256Hex(std::filesystem::absolute(path).string()) + ".halo-sha256"))
+                .string()
+          : path + ".halo-sha256";
   std::string text, ignored;
   if (core::ReadWholeFile(sidecar, &text, &ignored) && text.size() > 65 && text[64] == ' ') {
     std::string rest = text.substr(65);

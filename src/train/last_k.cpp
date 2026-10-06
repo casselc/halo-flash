@@ -184,7 +184,12 @@ std::unique_ptr<LastK> LastK::Create(const model::Qwen35Weights& w, const TailCo
   m->params_.assign(offset, 0.0F);
   m->output_norm_ = static_cast<const float*>(w.output_norm.data);
   m->output_ = w.output;
-  if (w.output.type == core::GgmlType::kF32) m->output_dense_ = DenseWeight::From(w.output);
+  // The LM head as FP32 rows once (2 GB on Qwen3.5-2B): dequantizing it per
+  // example costs more than the whole tail. Heads beyond 4 GB (none of the
+  // dense models) are dequantized per chunk instead.
+  if (cfg.head == HeadKind::kLm &&
+      (w.output.type == core::GgmlType::kF32 || w.output.rows * w.output.cols * sizeof(float) <= (4ull << 30)))
+    m->output_dense_ = DenseWeight::From(w.output);
   m->InitParams(0);
   return m;
 }

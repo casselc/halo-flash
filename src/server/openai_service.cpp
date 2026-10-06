@@ -1,5 +1,7 @@
 #include "server/openai_service.hpp"
 
+#include <algorithm>
+
 #include <chrono>
 #include <cstdio>
 #include <random>
@@ -103,7 +105,14 @@ HttpResponse OpenAiService::Models(const HttpRequest&) {
   m.set("created", Value::Int(0));
   m.set("owned_by", Value::String("halo-flash"));
   Value data = Value::MakeArray();
-  data.push(std::move(m));
+  data.push(m);
+  if (opt_.variants)
+    for (const auto& v : opt_.variants()) {
+      Value e = m;
+      e.set("id", Value::String(opt_.model_id + ":" + v));
+      e.set("parent", Value::String(opt_.model_id));
+      data.push(std::move(e));
+    }
   Value list = Value::MakeObject();
   list.set("object", Value::String("list"));
   list.set("data", std::move(data));
@@ -176,6 +185,11 @@ HttpResponse OpenAiService::GetResponse(const std::string& id) {
 
 HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value* prior) {
   if (req.model.empty()) req.model = opt_.model_id;
+  if (!req.variant.empty()) {
+    const auto names = opt_.variants ? opt_.variants() : std::vector<std::string>{};
+    if (std::find(names.begin(), names.end(), req.variant) == names.end())
+      return Error(404, {"model " + opt_.model_id + " has no variant \"" + req.variant + "\"", "model"});
+  }
   // The conversation: instructions (this request's only), stored turns, new input.
   Value conversation = Value::MakeArray();
   Value messages = Value::MakeArray();
@@ -229,7 +243,7 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
         builder.Add(parsed, events);
       }
     };
-    TextGenerator::Params params{run->prompt, run->req.sampling, run->req.max_tokens};
+    TextGenerator::Params params{run->prompt, run->req.variant, run->req.sampling, run->req.max_tokens};
     if (opt_.on_activity) opt_.on_activity(true);
     struct Done {
       const std::function<void(bool)>& f;

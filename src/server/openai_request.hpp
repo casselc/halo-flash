@@ -56,7 +56,10 @@ struct RequestDefaults {
 
 struct GenerationRequest {
   Api api = Api::kChat;
-  std::string model;
+  std::string model;  // as sent (echoed in responses), including a ":variant" alias
+  /// P10 variant: the "variant" field, or the suffix of a "base:variant"
+  /// model alias (both given must agree); "" = the base model.
+  std::string variant;
   // kChat and kResponses: template input. kCompletions: `prompt`.
   json::Value messages = json::Value::MakeArray();
   json::Value tools;  // null or an array of {"type": "function", "function": {...}}

@@ -51,6 +51,7 @@ class ScriptedGenerator : public TextGenerator {
     {
       std::lock_guard<std::mutex> lk(mu);
       prompts.push_back(p.prompt);
+      variants.push_back(p.variant);
       script = scripts.empty() ? "ok" : scripts.front();
       if (!scripts.empty()) scripts.erase(scripts.begin());
     }
@@ -71,7 +72,7 @@ class ScriptedGenerator : public TextGenerator {
     return r;
   }
   std::mutex mu;
-  std::vector<std::string> scripts, prompts;
+  std::vector<std::string> scripts, prompts, variants;
   std::size_t piece = 3;
   int delay_ms = 0;
   std::atomic<bool> stopped_early{false};
@@ -87,8 +88,9 @@ struct Recording : GenerationObserver {
 };
 
 struct Rig {
-  Rig() : server({}) {
+  explicit Rig(std::vector<std::string> variants = {}) : server({}) {
     ServiceOptions o;
+    if (!variants.empty()) o.variants = [variants] { return variants; };
     o.observer = &observed;
     int n = 0;
     o.new_id = [n]() mutable { return std::to_string(++n); };
@@ -365,3 +367,44 @@ TEST(OpenAiService, ReportsEachGenerationToTheObserver) {
   EXPECT_EQ(r.tool_names[0], "weather");
 }
 
+
+TEST(OpenAiService, VariantsAreSelectedPerRequestAndUnknownOnesRefused) {
+  Rig rig({"sentiment-ab", "tools-v2"});
+  const auto chat = [&](const std::string& extra) {
+    return Post(rig.server.port(), "POST", "/v1/chat/completions",
+                R"({"messages": [{"role": "user", "content": "hi"}])" + extra + "}");
+  };
+  // The "variant" field, the "base:variant" alias (echoed as sent), and both agreeing.
+  auto [s1, t1] = chat(R"(, "variant": "sentiment-ab")");
+  ASSERT_EQ(s1, 200) << t1;
+  auto [s2, t2] = chat(R"(, "model": "qwen3.8-flash-next:tools-v2")");
+  ASSERT_EQ(s2, 200) << t2;
+  EXPECT_EQ(J(t2).find("model")->str(), "qwen3.8-flash-next:tools-v2");
+  auto [s3, t3] = chat(R"(, "model": "m:tools-v2", "variant": "tools-v2")");
+  ASSERT_EQ(s3, 200) << t3;
+  auto [s4, t4] = chat("");
+  ASSERT_EQ(s4, 200) << t4;
+  EXPECT_EQ(rig.gen.variants, (std::vector<std::string>{"sentiment-ab", "tools-v2", "tools-v2", ""}));
+  // Unknown, conflicting and malformed variants never reach the generator.
+  auto [s5, t5] = chat(R"(, "variant": "missing")");
+  EXPECT_EQ(s5, 404) << t5;
+  EXPECT_EQ(J(t5).find("error")->find("param")->str(), "model");
+  EXPECT_EQ(chat(R"(, "model": "m:a", "variant": "b")").first, 400);
+  EXPECT_EQ(chat(R"(, "variant": "bad/name")").first, 400);
+  EXPECT_EQ(chat(R"(, "model": "m:")").first, 400);
+  auto [s6, t6] = Post(rig.server.port(), "POST", "/v1/completions", R"({"prompt": "x", "model": "m:missing"})");
+  EXPECT_EQ(s6, 404) << t6;
+  EXPECT_EQ(rig.gen.variants.size(), 4u);
+  // /v1/models lists the base and "<id>:<variant>".
+  const Value models = J(Post(rig.server.port(), "GET", "/v1/models", "").second);
+  std::vector<std::string> ids;
+  for (const auto& m : models.find("data")->items()) ids.push_back(m.find("id")->str());
+  EXPECT_EQ(ids, (std::vector<std::string>{"qwen3.8-flash-next", "qwen3.8-flash-next:sentiment-ab",
+                                           "qwen3.8-flash-next:tools-v2"}));
+  // Without a variant catalog every variant is refused.
+  Rig plain;
+  EXPECT_EQ(Post(plain.server.port(), "POST", "/v1/chat/completions",
+                 R"({"messages": [{"role": "user", "content": "hi"}], "variant": "sentiment-ab"})")
+                .first,
+            404);
+}
