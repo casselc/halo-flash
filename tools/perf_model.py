@@ -163,7 +163,8 @@ def per_call(pmc_dir):
     sums, ids = collections.defaultdict(lambda: collections.defaultdict(float)), collections.defaultdict(set)
     for d in passes:
         for r in csv.DictReader(open(os.path.join(d, "run_counter_collection.csv"))):
-            key = (r["Kernel_Name"].split("(")[0], int(r["Grid_Size"]) // int(r["Workgroup_Size"]))
+            name = r["Kernel_Name"].replace("(anonymous namespace)::", "")  # else C++ names cut at its "("
+            key = (name.split("(")[0], int(r["Grid_Size"]) // int(r["Workgroup_Size"]))
             sums[key][r["Counter_Name"]] += float(r["Counter_Value"])
             ids[(key, r["Counter_Name"])].add(r["Dispatch_Id"])
     return {k: {c: v / len(ids[(k, c)]) for c, v in cs.items()} for k, cs in sums.items()}

@@ -1011,3 +1011,17 @@ attention 40 vs 49, HC combine ~155 vs 145, DeltaNet ~144 vs ~130. The big dense
 
 About 75 of the ~100 ms are precision choices (fp16 or int8 activations where we keep fp32 or fp16 exact),
 i.e. quality-gate decisions, not kernel engineering; the exact candidate is the mix GEMM's split (~24).
+
+**gufo's kernels under ATT and counters (2026-10-05; `/data/halo-work/gufo_cmp`, per call at T 2048):**
+- **Mix:** gufo's fused mix GEMM (`DenseF16GEMMKernel<256,128,1,4,2,8,true>`) takes 0.54 ms and reads 61 MB.
+  Ours (`mixt`) takes 1.06 ms and reads 156 MB. gufo mixes from the **fp16** normalized copy, stored
+  row-major (contiguous), where ours rebuilds from the fp32 residual. That is a precision choice, and our
+  fp16 attempt read the K-blocked copy with 2-byte gathers, not contiguous rows.
+- **MoE combine:** gufo fuses it into the HC combine (`HcCombineMoeF16Kernel`): 1.28 ms against our
+  `moe_combine_shared` 0.79 + `combine_norm` 1.03 = 1.82 ms per MoE layer. Exact in principle, and
+  ~25 ms per prefill.
+- **Plain HC combine** is about equal (1.09 vs 1.03 ms), but under ATT it waits 84% in `vmcnt` against
+  our 44% `vmcnt` + 32% barrier.
+- **DeltaNet scan:** gufo's row-split takes 1.42 ms plus a 0.6 ms epilogue, against our 2.03 ms. The
+  DeltaNet gap is in conv / norm kernels, not the scan.
+- **Attention:** ours is faster (3.19 vs 3.46 ms).
