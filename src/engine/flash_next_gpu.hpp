@@ -114,6 +114,10 @@ class FlashNextGpu {
   static inline bool prefill_q_fused_ = true;
   static inline bool prefill_kq_fused_ = true;
   static inline bool prefill_gated_wave_ = true;
+  // halo_attention_wmma_qsel_w (wave-owned rows, the same bits) instead of qsel_h for QSA chunk attention.
+  static inline bool prefill_qsel_w_ = false;
+  // Probe (stream S): dense prefill GEMM weights pre-dequantized to fp16 once (the same values), *_w16 GEMMs.
+  static inline bool prefill_w16_ = false;
   static inline bool prefill_gate_in_place_ = true;  // flash attention reads the gate from qg (halo_attention_fa_hg)  // DeltaNet gated norm one wave per row (halo_gated_norm_h128w)  // k and indexer q: norm + rope (+ k cache append) in one kernel
   /// 64-row tiles (halo_gemm_q8r_f16_s) up to 640 rows instead of 512: the shared expert's 640-row gate/up
   /// otherwise take three 256-row tiles (the last half empty).
@@ -387,6 +391,8 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
     rt::Buffer qs, d;
   };
   std::unordered_map<const void*, PermutedUp> hc_up_perm_;
+  std::unordered_map<const void*, rt::Buffer> w16_, w16_perm_;  // prefill_w16_: fp16 weights by tensor (mix: permuted)
+  std::size_t w16_bytes_ = 0;
   bool mh_valid_ = false;
   bool xn_skipped_ = false;  // the last combine_norm wrote rscale instead of xn
   bool xq_valid_ = false;    // the last combine_norm wrote the int8 copy of xn (prefill_down_w8a8_)

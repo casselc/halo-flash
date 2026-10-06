@@ -173,6 +173,8 @@ int main(int argc, char** argv) {
     else if (a == "--moe-vec") engine::FlashNextGpu::prefill_moe_vec_ = std::string(argv[i + 1]) == "1";
     else if (a == "--kq-fused") engine::FlashNextGpu::prefill_kq_fused_ = std::string(argv[i + 1]) == "1";
     else if (a == "--gated-wave") engine::FlashNextGpu::prefill_gated_wave_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--qsel-w") engine::FlashNextGpu::prefill_qsel_w_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--w16") engine::FlashNextGpu::prefill_w16_ = std::string(argv[i + 1]) == "1";
     else if (a == "--gate-in-place") engine::FlashNextGpu::prefill_gate_in_place_ = std::string(argv[i + 1]) == "1";
     else if (a == "--banded-gemm") engine::FlashNextGpu::prefill_banded_gemm_ = std::string(argv[i + 1]) == "1";
     else if (a == "--reg-gemm") engine::FlashNextGpu::prefill_reg_gemm_ = std::string(argv[i + 1]) == "1";

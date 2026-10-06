@@ -1886,6 +1886,86 @@ TEST(GpuQuant, BandedQ8F16GemmIsBitIdentical) {
     }
 }
 
+// Probe (stream S, --w16): the dense GEMMs over weights pre-dequantized to fp16 (halo_q8r_to_f16) equal the
+// Q8 kernels bit for bit: the copy holds the values the staging computes, and the tiles and sums are the same.
+// Every _w16 kernel against its Q8 original; scales drawn over fp16's whole positive range, subnormal products
+// included; ragged token counts.
+TEST(GpuQuant, PreDequantizedF16GemmsAreBitIdentical) {
+  std::string error;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &error);
+  if (!dev) GTEST_SKIP() << error;
+  ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+  hegel::test([&](hegel::TestCase& tc) {
+    const int kind = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 5}));
+    // 0 l, 1 lr8 (rows % 2048), 2 s, 3 m, 4 mb (rows <= 320, K-blocked x), 5 mixth (cols 32, rows = 4 h)
+    const std::uint32_t rows = kind == 1   ? 2048
+                               : kind == 3 || kind == 4 ? 320
+                               : kind == 5 ? 1024
+                               : (kind == 0 ? 256 : 64) * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 12}));
+    const std::uint32_t cols = kind == 5 ? 32 : 128 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 6}));
+    const std::uint32_t T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 300}));
+    std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+    const auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    const std::uint32_t row_bytes = cols / 32 * 34;
+    std::vector<std::uint8_t> w(std::size_t{rows} * row_bytes);
+    for (auto& b : w) b = static_cast<std::uint8_t>(rnd());
+    for (std::size_t r = 0; r < rows; ++r)
+      for (std::size_t b = 0; b < cols / 32; ++b) {
+        const std::uint16_t h = static_cast<std::uint16_t>(1 + rnd() % 0x7BFF);  // every finite positive fp16
+        std::memcpy(w.data() + r * row_bytes + b * 34, &h, 2);
+      }
+    const float xs = kind == 5 ? 1.0f : 1.0f / 64;
+    std::vector<_Float16> x(std::size_t{T} * cols), xh(std::size_t{T} * rows);
+    for (auto& v : x) v = static_cast<_Float16>(xs * ((static_cast<float>(rnd() % 2001) - 1000.0f) / 500.0f));
+    for (auto& v : xh) v = static_cast<_Float16>((static_cast<float>(rnd() % 2001) - 1000.0f) / 500.0f);
+    std::vector<_Float16> xb(x.size());  // K-blocked [cols / 64][T][64] (mb)
+    if (kind == 4)
+      for (std::uint32_t t = 0; t < T; ++t)
+        for (std::uint32_t c = 0; c < cols; ++c) xb[(std::size_t{c / 64} * T + t) * 64 + c % 64] = x[std::size_t{t} * cols + c];
+    auto wb = dev->Alloc(w.size(), &error), qs = dev->Alloc(std::size_t{rows} * cols, &error),
+         db = dev->Alloc(std::size_t{rows} * (cols / 32) * 2, &error), w16 = dev->Alloc(std::size_t{rows} * cols * 2, &error),
+         x1 = dev->Alloc(x.size() * 2, &error), hb = dev->Alloc(xh.size() * 2, &error),
+         y1 = dev->Alloc(std::size_t{T} * rows * 4, &error), y2 = dev->Alloc(std::size_t{T} * rows * 4, &error),
+         h1 = dev->Alloc(std::size_t{T} * rows * 2, &error), h2 = dev->Alloc(std::size_t{T} * rows * 2, &error);
+    ASSERT_TRUE(wb && qs && db && w16 && x1 && hb && y1 && y2 && h1 && h2 && dev->Upload(wb, 0, w.data(), w.size(), &error) &&
+                dev->Upload(x1, 0, (kind == 4 ? xb : x).data(), x.size() * 2, &error) &&
+                dev->Upload(hb, 0, xh.data(), xh.size() * 2, &error))
+        << error;
+    const rt::Arg ra[] = {rt::Arg::Buf(wb), rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                          rt::Arg::Val(cols)};
+    ASSERT_TRUE(dev->Launch(dev->Kernel("halo_repack_q8_0", &error), {4096}, {256}, ra, &error)) << error;
+    const rt::Arg ca[] = {rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Buf(w16), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                          rt::Arg::Val(cols)};
+    ASSERT_TRUE(dev->Launch(dev->Kernel("halo_q8r_to_f16", &error), {(rows * cols / 16 + 255) / 256}, {256}, ca, &error))
+        << error;
+    const char* names[] = {"halo_gemm_q8r_f16_l", "halo_gemm_q8r_f16_lr8", "halo_gemm_q8r_f16_s",
+                           "halo_gemm_q8r_f16_m", "halo_gemm_q8r_f16_mb", "halo_gemm_q8r_f16_mixth"};
+    const rt::Dim3 grid = kind <= 1   ? rt::Dim3{(T + 127) / 128, rows / 256}
+                          : kind == 2 ? rt::Dim3{(T + 127) / 128, (rows + 63) / 64}
+                          : kind <= 4 ? rt::Dim3{(T + 63) / 64, 1}
+                                      : rt::Dim3{rows / 256, (T + 127) / 128};
+    for (const bool f16w : {false, true}) {
+      const std::string k = std::string(names[kind]) + (f16w ? "_w16" : "");
+      std::vector<rt::Arg> a = {rt::Arg::Buf(f16w ? w16 : qs), rt::Arg::Buf(db), rt::Arg::Buf(x1), rt::Arg::Buf(f16w ? y2 : y1),
+                                rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(cols), rt::Arg::Val(T)};
+      if (kind == 5) a.insert(a.end(), {rt::Arg::Buf(hb), rt::Arg::Buf(f16w ? h2 : h1)});
+      ASSERT_TRUE(dev->Launch(dev->Kernel(k.c_str(), &error), grid, {256}, a, &error)) << k << ": " << error;
+    }
+    const std::size_t ny = kind == 5 ? std::size_t{T} * (rows / 4) : std::size_t{T} * rows;
+    std::vector<float> a(ny), b(ny);
+    std::vector<_Float16> ah(ny), bh(ny);
+    ASSERT_TRUE(dev->Download(y1, 0, a.data(), ny * 4, &error) && dev->Download(y2, 0, b.data(), ny * 4, &error) &&
+                dev->Download(h1, 0, ah.data(), ny * 2, &error) && dev->Download(h2, 0, bh.data(), ny * 2, &error))
+        << error;
+    for (auto* buf : {&wb, &qs, &db, &w16, &x1, &hb, &y1, &y2, &h1, &h2}) dev->Free(*buf);
+    for (std::size_t i = 0; i < ny; ++i) {
+      ASSERT_EQ(std::bit_cast<std::uint32_t>(a[i]), std::bit_cast<std::uint32_t>(b[i]))
+          << names[kind] << " rows " << rows << " cols " << cols << " T " << T << " i " << i << ": " << a[i] << " vs " << b[i];
+      if (kind == 5) ASSERT_EQ(std::bit_cast<std::uint16_t>(ah[i]), std::bit_cast<std::uint16_t>(bh[i])) << "mixth y16 i " << i;
+    }
+  }, {.test_cases = 60});
+}
+
 TEST(GpuQuant, Q8F16GemmMatchesDoubleSums) {
   std::string error;
   const auto f16 = [](float v) { return static_cast<float>(static_cast<_Float16>(v)); };
