@@ -245,6 +245,12 @@ class FlashNextGpu {
   /// (A/B on device time); a lone-kernel bench understates this, running at
   /// ~950 MHz instead of ~2.7 GHz.
   static inline bool prefill_split_gdn_ = true;
+  /// Test only (positive controls for FlashNextGpu.ChunkedPrefillMatchesStepping): 1 embeds the last row of every
+  /// prefill chunk but a call's final one as the next token id (a one-row error at each chunk boundary inside the
+  /// prompt); 2 moves every element of every prefill row's token embedding by prefill_test_ulps_ ulps, away from or
+  /// toward zero by a hashed choice per column (a systematic tiny error). 0 (default): off.
+  static inline int prefill_test_perturb_ = 0;
+  static inline int prefill_test_ulps_ = 4;
   /// Runs `tokens` in order; `logits` (optional) receives the last position's.
   /// P4: in chunks of prefill_chunk_ tokens, the dense projections as T-token
   /// GEMMs and the rest row-batched or token by token (prefill_chunk.cpp);
