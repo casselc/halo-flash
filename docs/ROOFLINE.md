@@ -1048,3 +1048,16 @@ Exactness trap found on the way: with one element per thread, the backend fused 
 WarpSum's first butterfly add (`v_fmac` across the `ds_bpermute`), a different rounding from `halo_rmsnorm`
 (whose loop keeps the product rounded). An empty `asm volatile("" : "+v"(ss))` keeps the rounding. A per-element
 bitwise property test against the separate kernels caught it (2-3 ulp in the norm scale, rows > 0 only).
+
+**DeltaNet scan, exact restructure (stream E, 2026-10-05 night; prompted by halogen's fused scan at 0.76 ms/layer).**
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| Probe: the update's 16-bit K gathers (384 `ds_load_u16` a wave a chunk) replaced by contiguous 128-bit loads (wrong operands, timing only) | ceiling | scan3u 83.6 -> 66.2 ms: the gathers cost ~17 ms | n/a |
+| K hi / mid copied transposed into Q's LDS once Q S0 is done (two extra barriers a chunk), update reads them as 128-bit fragments; kl still gathered (`halo_gdn_c16_scan3ut`, bit-identical) | -6..-9 (2/3 of the probe, minus barriers) | 83.7 -> 81.3 ms (-2.4); end to end within noise. Spills 6 -> 15 at 256 VGPRs | no (reverted) |
+
+Why the exact side is capped: the 96 scan blocks must all be resident (5 per WGP: 5 x 24 KB of the 128 KB LDS), so a
+dedicated transposed K copy (12 KB) does not fit, and reusing Q's space costs two barriers a chunk on the serial
+chain. Fusing prep2 into the scan moves its per-chunk work onto that chain too. Moving the q/k L2 norm into the scan
+leaves the conv's bytes unchanged. Halogen's 0.76 ms comes mainly from an f16 state mirror (fewer WMMAs and splits per
+chunk), which is a precision change (stream P).
