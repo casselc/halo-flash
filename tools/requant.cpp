@@ -198,10 +198,11 @@ int main(int argc, char** argv) {
         return std::fprintf(stderr, "%s: cols %zu do not fit %s\n", name.c_str(), j.cols,
                             std::string(core::ToString(t.type)).c_str()), 1;
     }
-    // --exclude a,b,...: leave tensors whose name contains any of these untouched (ablations).
+    // --exclude a,=b,...: leave untouched the tensors whose name contains a, or is exactly b (ablations).
     for (std::size_t p = 0; take && p < exclude.size();) {
       const std::size_t q = std::min(exclude.find(',', p), exclude.size());
-      if (q > p && name.find(exclude.substr(p, q - p)) != std::string::npos) take = false;
+      const std::string pat = exclude.substr(p, q - p);  // "=name": that exact tensor; else a substring
+      if (!pat.empty() && (pat[0] == '=' ? name == pat.substr(1) : name.find(pat) != std::string::npos)) take = false;
       p = q + 1;
     }
     if (take && j.row_bytes == 0)

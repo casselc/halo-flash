@@ -661,9 +661,9 @@ points on Llama-3-8B) makes it a long shot.
 ## First experiment: results
 
 Arms A, B and D and the iu4 probe of section 5 (stream Q). Arm C belongs to stream P and is
-not covered here. **Status:** phase 1 done: the flag, the variant GGUFs, the probe, and the
-rules and predictions below, fixed before any GPU run. The GPU phase (scoring, timing, the
-probe) waits for stream P to finish.
+not covered here. **Status:** done. Phase 1 built the flag, the variant GGUFs, the probe, and the rules and
+predictions, fixed before any GPU run. The GPU phase measured everything (Results, at the
+end).
 
 ### What was built (phase 1, CPU and disk only)
 
@@ -880,7 +880,94 @@ scored.**
 
 ### Results
 
-Pending the GPU phase.
+Measured 2026-10-05/06 on d15bf6e (main 56693d8 merged plus this stream's flags).
+- **Baseline:** main defaults on the original weights.
+- **Scoring:** `halo_score --prefill 1`. Logs and `ab_topk.json` are in
+  `/data/halo-work/codesign/scores/`; the pairing is `tools/paired_nll.py`.
+- **The baseline reproduces stream P's cumulative row exactly:** short 0.286185 / 92.51%, long
+  0.121662 / 96.87%.
+- **Sanity:** `--moe-topk 10` gives prefill logits bit-identical to no flag, and the same greedy
+  text; `--moe-topk 8` changes the logits.
+- **Not run:** the arms against precision-off. The precision options pass the gate on their
+  own (BENCHMARKS), and every arm here changes NLL by 10-50x their effect.
+
+**Quality.** Shift = token-weighted paired NLL difference against the baseline; the per-case
+mean ± SE, cases up/down, is in parentheses.
+
+| Arm | Short NLL / agreement | Short shift (predicted) | Long NLL / agreement | Long shift | Gate |
+|---|---:|---:|---:|---:|---|
+| baseline | 0.2862 / 92.51% | — | 0.1217 / 96.87% | — | pass |
+| A: rotated 4.125-bit RTN, dense + head + mixers | 0.3311 / 89.53% | **+0.0449** (+0.042 ± 0.004, 90/8) (pred. +0.007) | 0.1554 / 94.77% | +0.0337 (+0.034 ± 0.010, 9/3) | **fail** |
+| A-nohc: A, mixers kept Q8_0 | 0.3237 / 90.00% | +0.0376 (pred. +0.020) | — | — | fail |
+| A-proj: A-nohc, LM head kept Q8_0 | 0.3148 / 90.70% | +0.0287 (pred. +0.015) | — | — | fail |
+| B, k = 8 | 0.2967 / 91.56% | **+0.0105** (+0.010 ± 0.003, 69/29) (pred. +0.008) | 0.1235 / 97.65% | +0.0019 (+0.002 ± 0.002, 8/4) | **pass** |
+| B, k = 6 | 0.3427 / 88.92% | **+0.0565** (+0.055 ± 0.005, 93/5) (pred. +0.030) | 0.1336 / 95.56% | +0.0120 (+0.012 ± 0.004, 9/3) | **fail** |
+| D: 2.5-bit RTN experts, layers 12-23 | 0.2999 / 91.88% | **+0.0137** (+0.013 ± 0.002, 77/21) (pred. +0.015) | 0.1277 / 95.70% | +0.0060 (+0.006 ± 0.003, 8/4) | pass |
+
+**Speed (arm B).** k = 8 and 6 against 10, on main defaults.
+
+| Measurement | Predicted | Measured |
+|---|---:|---:|
+| Prefill, 2048 tokens (ab_bench, 4 rounds × 3 reps, pinned; base 1281.0 ms) | k = 8 −15 (−5..−35), k = 6 −35 (−10..−70) ms; the phase-1 bytes-floor prediction was −5..−25 / −10..−50 | **k = 8 −78.8 ms (−6.2%), k = 6 −154.1 ms (−12.0%)**, both significant (1599 → 1704 / 1817 tok/s) |
+| Decode, `halo_run --device-sample 1`, median of 124 steady steps, 3 rounds, pinned (base 42.69 ms) | −1.4 / −2.8 ms | **−1.58 / −3.45 ms** (41.11 / 39.25 ms; rounds within 0.03 ms) |
+
+**iu4 probe** (`halo_hwprobe wmma`, pinned):
+- iu4 runs at **17.2 cycles per WMMA per SIMD, 109.5 TOP/s**: exactly 2x iu8 (34.0 cycles,
+  55.5 TOP/s) and f16.
+- The single-chain latency is 24 cycles, against 35 for the other types.
+- Like the other types, it does not overlap VALU: +4 FMAs per WMMA cost +4.7 cycles.
+- Predicted: 40% for 2x.
+
+**What the misses say.**
+- **A: the prediction was 6x too optimistic.**
+  - A 4-bit code with 0.086 relative error costs this model 0.045 nats per token without
+    calibration.
+  - The ablation splits the cost:
+    - DeltaNet, attention, shared-expert and PLE projections: +0.029;
+    - LM head: +0.009;
+    - hyper-connection mixers: +0.007.
+  - So no single component is the problem, and dropping one does not rescue the arm.
+  - The "rotations make 4-bit weight-only nearly free" evidence [P] comes from GPTQ-rounded
+    results; RTN with rotation is not enough here.
+- **B prefill: the kernel model was wrong, not just the floor.**
+  - The grouped expert kernels scale with pairs, not with weights streamed: gate/up 251 → 208
+    → 162 ms, down 133 → 111 → 86 ms (kernel-timed rep).
+  - So at prefill they are bound by per-pair work (tile setup, activation staging, WMMA), not
+    by the expert byte stream. Section 3's "co-bound at 174 GB/s" claim for prefill experts
+    does not hold for this kernel.
+  - This is a lead for the expert kernels themselves: the time per pair at a fixed expert
+    count is the target.
+- **B k = 6 is a cliff.** r = shift(6) / shift(8) = 5.4 (predicted 3-4). Its short-set loss
+  is 5x k = 8's for 2x the experts dropped.
+
+**Decisions, by the rules fixed above.**
+- **A: no-go for RTN; rank 1 needs calibrated rounding.**
+  - Next step: re-run A with GPTQ-style rounding. It needs one GPU pass to collect per-layer
+    input Hessians on calibration text, or QTIP-style codes. Then re-score before any 4-bit
+    GEMV work.
+  - If calibrated 4-bit still fails, try 5-6-bit dense. Even 6-bit (Q6_K-class) saves 1.6 of
+    the 4.5 GB of dense decode bytes.
+  - The A-proj row bounds what a projections-only rank 1 could keep: it fails too.
+- **B, k = 8: passes untrained** (short 0.2967 ≤ 0.305 and 91.56% ≥ 91%; long +0.0019 ≤
+  +0.010).
+  - It is ready to ship as an option for the speed (−6% prefill, −3.7% decode).
+  - The rule paired it with A, which failed, so whether k = 8 becomes a default is a separate
+    call. It uses 55% of the short-set NLL margin and 63% of the agreement margin, which then
+    leaves little room for any other lossy change (A, D, rank 4).
+- **B, k = 6: fails, and r = 5.4 ≥ 3 is the cliff case: don't fund k = 6 KD.**
+  - Rank 4b's KD budget, if spent at all, targets k = 8: to recover its +0.010, or to make room
+    for rank 4 under the gate.
+- **D: inconclusive.** The short-set shift is +0.0137, inside 0.010-0.030; the long set is
+  +0.006.
+  - The gate still passes with one quarter of the layers at 2.5-bit RTN, so rank 4's premise
+    is plausible but unproven.
+  - Run the one-band QAT pilot (layers 12-23, Block-AP, a few H100-hours) before the full
+    $0.3-3k. Extrapolated linearly, 2-bit RTN on all 48 layers would be about +0.055 and fail
+    the gate. So whether rank 4 is fundable depends on how much QAT recovers on the band.
+- **iu4: 2x, so W4A4 for the dense trunk goes on the list.**
+  - It is a longer shot than before: weight-only 4-bit RTN already costs +0.029-0.045 here,
+    and W4A4 adds activation error on top.
+  - It is worth a study only after calibrated W4 (the A re-run) is known to pass.
 
 ---
 

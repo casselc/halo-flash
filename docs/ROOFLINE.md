@@ -1116,3 +1116,12 @@ Not kept: plain fp16 router (long set), fp16-weight-split router (= plain), mixe
 (`halo_hc_combine_norm_tok_moev_r16` / `_rb`), bit-identical to the scalar `tok_moe` ones; with the precision options
 off, logits are bit-identical to the pre-stream baseline; gpu_tests 42 passed. ab_bench (4 rounds x 3 reps, pinned,
 prose_1 at 2048 tokens): precision options off 1406.3 ms, defaults **1279.7 ms (1600 tok/s), -126.7 ms, significant**.
+
+**Experts per token as an option (`--moe-topk N`, stream Q, CODESIGN first experiment arm B; not a default).**
+- ab_bench, 4 rounds x 3 reps, pinned, prose_1 at 2048 tokens, main defaults: 1281.0 ms at k = 10, k = 8
+  **-78.8 ms**, k = 6 **-154.1 ms**, both significant.
+- Predicted -15 / -35 from "experts stream every weight once whatever k is". Wrong: the grouped gate/up
+  (251 -> 208 -> 162 ms) and down (133 -> 111 -> 86 ms) scale with pairs. At prefill they are bound by per-pair work,
+  not by the expert byte stream, so time per pair is the lever in those kernels.
+- Decode -1.58 / -3.45 ms per token.
+- Quality: k = 8 passes the gate (short +0.0105), k = 6 fails (+0.0565). Default stays 10.
