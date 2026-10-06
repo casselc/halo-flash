@@ -20,7 +20,6 @@ constexpr std::size_t kPage = 4096;
 constexpr std::size_t kWorkers = 32;
 constexpr std::size_t kReadBatch = 8;
 constexpr std::size_t kBatchJobs = 1024;
-constexpr std::size_t kCacheBytes = 8 * 1024 * 1024;
 
 }  // namespace
 
@@ -76,7 +75,8 @@ NgramTable::~NgramTable() {
 
 std::unique_ptr<NgramTable> NgramTable::Open(
     int file_descriptor, std::uint64_t file_offset, std::uint64_t rows,
-    std::uint32_t row_dim, core::GgmlType type, std::string* error_msg) {
+    std::uint32_t row_dim, core::GgmlType type, std::string* error_msg,
+    std::size_t cache_bytes) {
   std::unique_ptr<NgramTable> t(new NgramTable());
   const std::size_t block = type == core::GgmlType::kIQ4_NL ? 32 : 1;
   const std::size_t block_bytes = type == core::GgmlType::kIQ4_NL ? 18
@@ -94,9 +94,11 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   t->type_ = type;
   t->row_dim_ = row_dim;
   t->row_bytes_ = row_dim / block * block_bytes;
-  t->cache_count_ = std::bit_floor(kCacheBytes / t->row_bytes_);
-  t->cache_entries_ = std::make_unique<CacheEntry[]>(t->cache_count_);
-  t->cache_rows_.resize(t->cache_count_ * t->row_bytes_);
+  t->cache_count_ = cache_bytes / t->row_bytes_;
+  if (t->cache_count_ != 0) {
+    t->cache_entries_ = std::make_unique<CacheEntry[]>(t->cache_count_);
+    t->cache_rows_.reset(new std::uint8_t[t->cache_count_ * t->row_bytes_]);
+  }
   t->rows_ = rows;
   t->base_offset_ = file_offset;
   // Direct I/O bypasses the page cache; the mapping used for the rest of the
@@ -141,16 +143,17 @@ bool NgramTable::ReadCached(std::uint32_t row, float* dst) {
   if (cache_count_ == 0) {
     return false;
   }
-  const std::size_t slot = (row * 2654435761U) & (cache_count_ - 1);
+  const std::size_t slot = static_cast<std::size_t>((std::uint64_t{row} * 2654435761U) % cache_count_);
   CacheEntry& entry = cache_entries_[slot];
   if (entry.busy.test_and_set(std::memory_order_acquire)) {
     return false;
   }
   const bool hit = entry.valid && entry.row == row;
   if (hit) {
-    DecodeRow(cache_rows_.data() + slot * row_bytes_, dst);
+    DecodeRow(cache_rows_.get() + slot * row_bytes_, dst);
   }
   entry.busy.clear(std::memory_order_release);
+  (hit ? cache_hits_ : cache_misses_).fetch_add(1, std::memory_order_relaxed);
   return hit;
 }
 
@@ -185,10 +188,10 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
   // bytes have to arrive.
   const std::size_t needed = (offset - begin) + row_bytes_;
   const std::size_t slot =
-      cache_count_ != 0 ? (row * 2654435761U) & (cache_count_ - 1) : 0;
+      cache_count_ != 0 ? static_cast<std::size_t>((std::uint64_t{row} * 2654435761U) % cache_count_) : 0;
   CacheEntry* entry = cache_count_ != 0 ? &cache_entries_[slot] : nullptr;
   std::uint8_t* cached =
-      entry != nullptr ? cache_rows_.data() + slot * row_bytes_ : nullptr;
+      entry != nullptr ? cache_rows_.get() + slot * row_bytes_ : nullptr;
   std::size_t got = 0;
   while (got < needed) {
     const ssize_t n = ::pread(fd_, base + got, length - got, begin + got);

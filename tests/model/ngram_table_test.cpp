@@ -88,7 +88,12 @@ TEST(NgramTable, GathersMatchDirectDecode) {
   hegel::test([](hegel::TestCase& tc) {
     auto file = MakeTable(tc);
     std::string error;
-    auto table = NgramTable::Open(file->fd, file->offset, file->rows, file->dim, file->type, &error);
+    // Cache: off, smaller than the table (collisions) or larger (every row fits).
+    const auto cache_kind = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 2}));
+    const std::size_t cache_bytes = cache_kind == 0   ? 0
+                                    : cache_kind == 1 ? NgramTable::kDefaultCacheBytes / 4096
+                                                      : 2 * file->rows * file->RowBytes() + 4096;
+    auto table = NgramTable::Open(file->fd, file->offset, file->rows, file->dim, file->type, &error, cache_bytes);
     ASSERT_TRUE(table) << error;
     const auto steps = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 12}));
     // From a drawn step on (or never), the table is resident in memory.
@@ -127,6 +132,30 @@ TEST(NgramTable, GathersMatchDirectDecode) {
       }
     }
   }, {.test_cases = 60});
+}
+
+// A cache larger than the table serves a repeated small gather from memory:
+// the second read of the same rows counts only hits, and returns the same values.
+TEST(NgramTable, CacheServesRepeatedRows) {
+  hegel::test([](hegel::TestCase& tc) {
+    auto file = MakeTable(tc);
+    std::string error;
+    auto table = NgramTable::Open(file->fd, file->offset, file->rows, file->dim, file->type, &error,
+                                  4 * file->rows * file->RowBytes() + 4096);
+    ASSERT_TRUE(table) << error;
+    const auto n = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 32}));
+    std::vector<std::uint32_t> rows(n);
+    for (auto& r : rows)
+      r = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = static_cast<std::uint32_t>(file->rows - 1)}));
+    std::vector<float> a(n * file->dim), b(n * file->dim);
+    ASSERT_TRUE(table->Read(rows, a));
+    const auto before = table->Stats();
+    ASSERT_TRUE(table->Read(rows, b));
+    const auto after = table->Stats();
+    ASSERT_EQ(after.misses, before.misses) << "every row was cached by the first read";
+    ASSERT_GT(after.hits, before.hits);
+    ASSERT_EQ(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)), 0);
+  }, {.test_cases = 40});
 }
 
 TEST(NgramTable, RejectsUnsupportedFormats) {

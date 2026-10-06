@@ -45,11 +45,29 @@ public:
   NgramTable(const NgramTable&) = delete;
   NgramTable& operator=(const NgramTable&) = delete;
 
+  /// Default size of the cache of compressed rows (direct-mapped by row hash).
+  static constexpr std::size_t kDefaultCacheBytes = std::size_t{8} << 20;
+
   /// Borrows the bound GGUF descriptor during Open; retains its own handle.
+  /// `cache_bytes` sizes the in-memory cache of compressed rows read from
+  /// disk (whole rows; 0 disables it). Until
+  /// the NVMe link runs at full speed a few GB of cache hide most of the
+  /// per-prefill read (tools default to 4 GiB: --ngram-cache-gb).
   [[nodiscard]] static std::unique_ptr<NgramTable> Open(
       int file_descriptor, std::uint64_t file_offset, std::uint64_t rows,
       std::uint32_t row_dim, core::GgmlType type,
-      std::string* error_msg = nullptr);
+      std::string* error_msg = nullptr,
+      std::size_t cache_bytes = kDefaultCacheBytes);
+
+  /// Row lookups served from the cache and from disk since Open.
+  struct CacheStats {
+    std::uint64_t hits{0}, misses{0};
+    std::size_t bytes{0};
+  };
+  [[nodiscard]] CacheStats Stats() const noexcept {
+    return {cache_hits_.load(std::memory_order_relaxed), cache_misses_.load(std::memory_order_relaxed),
+            cache_count_ * row_bytes_};
+  }
 
   /// Gathers `rows.size()` rows into `out` (rows.size() * row_dim floats).
   /// Duplicate ids are read once. Returns false on any failed read.
@@ -95,8 +113,9 @@ private:
     bool valid{false};
   };
   std::unique_ptr<CacheEntry[]> cache_entries_;
-  std::vector<std::uint8_t> cache_rows_;
+  std::unique_ptr<std::uint8_t[]> cache_rows_;  // uninitialized: pages commit as rows fill
   std::size_t cache_count_{0};
+  std::atomic<std::uint64_t> cache_hits_{0}, cache_misses_{0};
 
   int fd_{-1};
   bool direct_{false};
