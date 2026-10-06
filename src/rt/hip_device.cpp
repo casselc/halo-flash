@@ -57,6 +57,12 @@ class HipDevice final : public Device {
               "hipMemcpyHtoD", error) &&
            Synchronize(error);
   }
+  bool UploadAsync(const Buffer& dst, std::size_t off, const void* src, std::size_t n, std::string* error) override {
+    if (capturing_) return Capturing(error);
+    if (off + n > dst.bytes) return Bounds(error);
+    return Ok(hipMemcpyHtoDAsync(static_cast<char*>(dst.device) + off, const_cast<void*>(src), n, stream_),
+              "hipMemcpyHtoDAsync", error);
+  }
   bool Download(const Buffer& src, std::size_t off, void* dst, std::size_t n, std::string* error) override {
     if (capturing_) return Capturing(error);
     if (off + n > src.bytes) return Bounds(error);

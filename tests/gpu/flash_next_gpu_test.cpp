@@ -488,11 +488,17 @@ TEST(FlashNextGpu, SmallQuantizedModelRunsFastPathsAndMatchesReference) {
         ASSERT_EQ(Argmax(got.data(), V), Argmax(w, V)) << "int8 " << int8 << " position " << i;
       }
       if (int8) EXPECT_LT(RelL2(all, want[1].data()), 0.1 * RelL2(want[1], want[0].data()));
+      // A fast path counts with any of its bit-identical decode variants (FlashNextGpu::decode_opt_).
+      const auto launched = [&](const std::string& k) {
+        for (const char* suffix : {"", "_c", "_cu", "_u", "_r", "_g"})
+          if (gpu->LaunchedKernel(k + suffix)) return true;
+        return false;
+      };
       for (const char* k : {"halo_gemv_q8r_r2", "halo_gemv_q8r_r4", "halo_moe_down_q5_1_r4", "halo_moe_down_q8r_r4",
                              "halo_hc_mix_a", "halo_hc_mix_b", "halo_shexp_gate_up",
                              "halo_gemv_q8r_dual", "halo_gdn_step_d128_norm", "halo_matvec_f32_rowblock2"})
-        EXPECT_TRUE(gpu->LaunchedKernel(k)) << k;
-      EXPECT_EQ(gpu->LaunchedKernel("halo_moe_gate_up_q4_k_dot"), int8);
+        EXPECT_TRUE(launched(k)) << k;
+      EXPECT_EQ(launched("halo_moe_gate_up_q4_k_dot"), int8);
       EXPECT_EQ(gpu->LaunchedKernel("halo_moe_gate_up_q4_k_s2"), !int8);
       std::printf("%s int8 %d: worst relative L2 %.3g\n", rt::BackendName(dev->backend()), int8, worst);
     }

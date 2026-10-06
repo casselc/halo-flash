@@ -86,6 +86,12 @@ class Device {
                                     std::string* error) = 0;
   [[nodiscard]] virtual bool Download(const Buffer& src, std::size_t offset, void* dst, std::size_t bytes,
                                       std::string* error) = 0;
+  /// Stream-ordered upload that may return before the copy is done: the source must stay unchanged until the
+  /// next Synchronize / Download. Default: the synchronous Upload.
+  [[nodiscard]] virtual bool UploadAsync(const Buffer& dst, std::size_t offset, const void* src, std::size_t bytes,
+                                         std::string* error) {
+    return Upload(dst, offset, src, bytes, error);
+  }
   [[nodiscard]] virtual bool Fill(const Buffer& dst, std::uint8_t value, std::string* error) = 0;
   /// Host memory the backend can copy from at full speed (pinned where the
   /// runtime supports it), 4096-byte aligned. Default: plain aligned memory.

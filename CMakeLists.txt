@@ -226,7 +226,7 @@ if(HALO_BUILD_TESTS)
   target_compile_definitions(decide_tests PRIVATE
     HALO_DECIDE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/decide/data")
   if(HALO_GPU)
-    halo_test(gpu_tests tests/gpu/qwen35_gpu_test.cpp tests/gpu/quant_gpu_test.cpp tests/gpu/flash_next_gpu_test.cpp tests/gpu/select_gpu_test.cpp tests/gpu/sample_gpu_test.cpp
+    halo_test(gpu_tests tests/gpu/qwen35_gpu_test.cpp tests/gpu/quant_gpu_test.cpp tests/gpu/flash_next_gpu_test.cpp tests/gpu/select_gpu_test.cpp tests/gpu/decode2_gpu_test.cpp tests/gpu/sample_gpu_test.cpp
       tests/gpu/flash_next_generator_test.cpp)
     target_link_libraries(gpu_tests PRIVATE halo_gpu)
     target_link_libraries(decide_tests PRIVATE halo_gpu)
