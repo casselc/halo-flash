@@ -26,8 +26,9 @@
 //                own by default); the reply must contain a JSON object
 //                {"score": ..., "reasoning"?: ...}. The judge's model, prompt
 //                version, trace id and raw reply are kept with the score.
-//   decider      {question, state?, endpoint?, model?, threshold?}
-//                POST /v1/systemone with the question (strands-decider schema)
+//   decider      {question: {name, type, instructions, criteria?}, state?, endpoint?, model?, threshold?}
+//                POST /v1/systemone with the question (strands-decider schema:
+//                questions keyed by name)
 //                over a state (default {input, output, expected}; a string
 //                state is a template). noul: NUMERIC P(true), or BOOLEAN with
 //                threshold; score: NUMERIC level; choice: CATEGORICAL.

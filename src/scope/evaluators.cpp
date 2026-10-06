@@ -274,8 +274,12 @@ EvalOutcome Decider(const EvaluatorDef& def, const Value& c, const EvalContext& 
   }
   Value body = Value::MakeObject();
   body.set("state", std::move(state));
-  Value qs = Value::MakeArray();
-  qs.push(q);
+  // The strands-decider schema keys questions by name.
+  Value spec = Value::MakeObject();
+  for (const auto& [k, v] : q.members())
+    if (k != "name") spec.set(k, v);
+  Value qs = Value::MakeObject();
+  qs.set(qname, std::move(spec));
   body.set("questions", std::move(qs));
   if (const std::string model = Str(c, "model"); !model.empty()) body.set("model", Value::String(model));
   const std::string trace = EvaluatorTraceId(x.run_id, x.item->id, x.attempt, def.name);

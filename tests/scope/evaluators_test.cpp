@@ -10,6 +10,7 @@
 #include <string>
 
 #include "eval_fakes.hpp"
+#include "decide/systemone.hpp"
 #include "scope/evaluators.hpp"
 #include "scope/json_schema.hpp"
 #include "scope_env.hpp"
@@ -265,7 +266,9 @@ TEST(ScopeEvaluators, JudgeRecordsEverythingNeededToAuditAScore) {
 TEST(ScopeEvaluators, DeciderReadsTypedAnswers) {
   std::string answer;
   FakePoster poster([&](const std::string& p, const Value& body, const halo::scope::testing::Recorded&) {
-    if (p != "/v1/systemone" || !body.find("questions") || !body.find("state")) return HttpResult{true, 422, "{}", ""};
+    // Validated by the server's own request parser, as /v1/systemone does.
+    std::string why;
+    if (p != "/v1/systemone" || !decide::ParseRequest(body, &why)) return HttpResult{true, 422, "{\"detail\": \"" + why + "\"}", ""};
     return HttpResult{true, 200, answer, ""};
   });
   auto store = Store();
@@ -281,20 +284,20 @@ TEST(ScopeEvaluators, DeciderReadsTypedAnswers) {
   EXPECT_EQ(o.row.data_type, "NUMERIC");
   EXPECT_DOUBLE_EQ(*o.row.value, 0.83);
   EXPECT_EQ(o.row.raw_output, answer);
-  o = RunEvaluator({"dec", 1, "decider", R"({"question": {"name": "correct", "type": "noul"}, "threshold": 0.9})"}, c.ctx, env);
+  o = RunEvaluator({"dec", 1, "decider", R"({"question": {"name": "correct", "type": "noul", "instructions": "Is the output correct?"}, "threshold": 0.9})"}, c.ctx, env);
   EXPECT_EQ(o.row.data_type, "BOOLEAN");
   EXPECT_EQ(*o.row.value, 0);
   answer = R"({"answers": {"tone": {"type": "choice", "choice": "polite", "confidence": 0.9}}})";
-  o = RunEvaluator({"dec", 1, "decider", R"({"question": {"name": "tone", "type": "choice"}})"}, c.ctx, env);
+  o = RunEvaluator({"dec", 1, "decider", R"({"question": {"name": "tone", "type": "choice", "instructions": "Tone?", "criteria": {"polite": null, "rude": null}}})"}, c.ctx, env);
   EXPECT_EQ(o.row.data_type, "CATEGORICAL");
   EXPECT_EQ(o.row.string_value, "polite");
   answer = R"({"answers": {"q": {"type": "score", "score": 3.5, "confidence": 0.4}}})";
-  o = RunEvaluator({"dec", 1, "decider", R"({"question": {"name": "q", "type": "score"}, "state": "Answer: {{output}}"})"}, c.ctx, env);
+  o = RunEvaluator({"dec", 1, "decider", R"({"question": {"name": "q", "type": "score", "instructions": "Quality?", "criteria": ["bad", "ok", "good", "great"]}, "state": "Answer: {{output}}"})"}, c.ctx, env);
   EXPECT_EQ(*o.row.value, 3.5);
   std::string err;
   auto sent = *json::Parse(poster.requests().back().body, &err);
   EXPECT_EQ(sent.find("state")->str(), "Answer: Yes, it is.");
   answer = R"({"answers": {}})";
-  EXPECT_EQ(RunEvaluator({"dec", 1, "decider", R"({"question": {"name": "q", "type": "score"}})"}, c.ctx, env).status,
+  EXPECT_EQ(RunEvaluator({"dec", 1, "decider", R"({"question": {"name": "q", "type": "score", "instructions": "Quality?", "criteria": ["bad", "good"]}})"}, c.ctx, env).status,
             EvalOutcome::Status::kFailed);
 }
