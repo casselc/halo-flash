@@ -303,8 +303,8 @@ EvalOutcome Decider(const EvaluatorDef& def, const Value& c, const EvalContext& 
   const Value* a = ans ? ans->find(qname) : nullptr;
   const std::string model = v ? Str(*v, "model", Str(c, "model", "strands-decider")) : "";
   if (!a) return with_raw(EvalOutcome::Failed(dt, "no answer for question " + qname), model);
-  char comment[96];
-  std::snprintf(comment, sizeof comment, "confidence %.4f", Num(*a, "confidence", 0));
+  char comment[96] = "";
+  if (a->find("confidence")) std::snprintf(comment, sizeof comment, "confidence %.4f", Num(*a, "confidence", 0));
   if (qtype == "choice") return with_raw(EvalOutcome::Categorical(Str(*a, "choice"), comment), model);
   if (qtype == "score") return with_raw(EvalOutcome::Numeric(Num(*a, "score", 0), comment), model);
   const double p = Num(*a, "noul", 0);
