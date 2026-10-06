@@ -4,7 +4,9 @@ Each adapted file says so in its header; full license texts are in licenses/.
 - gufo (Copyright (c) 2026 gufo contributors): src/core/gguf.{hpp,cpp},
   src/core/quant.{hpp,cpp}, the BPE merge loop in src/text/tokenizer.cpp,
   src/model/{config,weights,ngram,cpu_ops,reference}.{hpp,cpp},
-  src/core/sampling.{hpp,cpp} (without its JSON grammar constraint), and parts of
+  src/core/sampling.{hpp,cpp} (without its JSON grammar constraint), src/engine/mtp_sampling.hpp and
+  src/engine/mtp_policy.hpp (from gufo src/models/qwen38_flash_next/, MTP proposal / verification and the
+  draft-length controller), and parts of
   src/text/chat_template.cpp (from gufo src/models/qwen/chat_template.cpp: the
   Qwen3.8 prompt strings, Python-style trimming) and src/text/tool_call_parser.cpp
   (from gufo src/cli/serve/openai_chat.cpp: parameter framing, held tag prefixes,
