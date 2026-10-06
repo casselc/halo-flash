@@ -384,28 +384,15 @@ TEST(GpuSelect, QsaUnionAttentionMatchesSelectKernel) {
                             rt::Arg::Buf(pb), rt::Arg::Buf(ub), rt::Arg::Buf(mb), rt::Arg::Buf(cb), rt::Arg::Val(max_u),
                             rt::Arg::Val(ratio), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(T)};
       ASSERT_TRUE(dev->Launch(dev->Kernel("halo_attention_wmma_qsel_h", &error), {nkv, groups}, {256}, ha, &error)) << error;
-      // The wave-owned-rows variant (halo_attention_wmma_qsel_w): the same arithmetic in another schedule, so
-      // the same bits as qsel_h.
-      auto o4 = dev->Alloc(q.size() * 4, &error);
-      ASSERT_TRUE(o4) << error;
-      const rt::Arg wwa[] = {rt::Arg::Buf(qb), rt::Arg::Buf(k16b), rt::Arg::Buf(v16b), rt::Arg::Buf(gb), rt::Arg::Buf(o4),
-                             rt::Arg::Buf(pb), rt::Arg::Buf(ub), rt::Arg::Buf(mb), rt::Arg::Buf(cb), rt::Arg::Val(max_u),
-                             rt::Arg::Val(ratio), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(T)};
-      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_attention_wmma_qsel_w", &error), {nkv, groups}, {192}, wwa, &error)) << error;
-      std::vector<float> want(q.size()), got(q.size()), got16(q.size()), gotw(q.size());
+      std::vector<float> want(q.size()), got(q.size()), got16(q.size());
       ASSERT_TRUE(dev->Download(o1, 0, want.data(), want.size() * 4, &error) &&
                   dev->Download(o2, 0, got.data(), got.size() * 4, &error) &&
-                  dev->Download(o3, 0, got16.data(), got16.size() * 4, &error) &&
-                  dev->Download(o4, 0, gotw.data(), gotw.size() * 4, &error))
+                  dev->Download(o3, 0, got16.data(), got16.size() * 4, &error))
           << error;
-      for (auto* b : {&qb, &gb, &kb, &vb, &sb, &pb, &o1, &o2, &sc, &ub, &mb, &cb, &k16b, &v16b, &o3, &o4}) dev->Free(*b);
+      for (auto* b : {&qb, &gb, &kb, &vb, &sb, &pb, &o1, &o2, &sc, &ub, &mb, &cb, &k16b, &v16b, &o3}) dev->Free(*b);
       for (std::size_t i = 0; i < got.size(); ++i)
         ASSERT_EQ(std::bit_cast<std::uint32_t>(got16[i]), std::bit_cast<std::uint32_t>(got[i]))
             << "fp16-cache variant " << i << ": " << got16[i] << " vs " << got[i];
-      for (std::size_t i = 0; i < got.size(); ++i)
-        ASSERT_EQ(std::bit_cast<std::uint32_t>(gotw[i]), std::bit_cast<std::uint32_t>(got16[i]))
-            << "qsel_w " << i << ": " << gotw[i] << " vs qsel_h " << got16[i] << " (G " << G << " T " << T << " k " << k
-            << " pos0 " << pos0 << ")";
       for (std::uint32_t t = 0; t < T; ++t) {
         double d = 0, m = 0;
         for (std::size_t i = std::size_t{t} * nh * hd; i < std::size_t{t + 1} * nh * hd; ++i) {

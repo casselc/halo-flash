@@ -141,50 +141,6 @@ bool FlashNextGpu::AllocChunk(std::string* error) {
           return false;
         hc_up_perm_.emplace(t.data, p);
       }
-  // Probe: fp16 copies of the dense prefill weights on the FP16 route (the values the GEMMs dequantize to).
-  if (prefill_w16_ && w16_.empty()) {
-    const auto convert = [&](const rt::Buffer& qs, const rt::Buffer& dd, std::uint32_t rows, std::uint32_t cols,
-                             std::uint32_t qstride, rt::Buffer* out) {
-      const std::size_t bytes = std::size_t{rows} * cols * 2;
-      *out = dev_.Alloc(bytes, error);
-      if (!*out) return false;
-      owned_.push_back(*out);
-      w16_bytes_ += bytes;
-      return Launch("halo_q8r_to_f16", {Blocks(std::size_t{rows} * cols / 16)}, {kBlock},
-                    {rt::Arg::Buf(qs), rt::Arg::Buf(dd), rt::Arg::Buf(*out), rt::Arg::Val(rows), rt::Arg::Val(cols),
-                     rt::Arg::Val(qstride)},
-                    error);
-    };
-    const auto add = [&](const model::TensorRef& t) {
-      if (!t.data || w16_.contains(t.data) || !tensors_.contains(t.data) || !F16Route(t) || t.cols % 32 != 0) return true;
-      const auto& d = tensors_.at(t.data);
-      rt::Buffer b;
-      if (!convert(d.qs, d.d, static_cast<std::uint32_t>(t.rows), static_cast<std::uint32_t>(t.cols), d.qstride, &b))
-        return false;
-      w16_.emplace(t.data, b);
-      return true;
-    };
-    for (const auto& l : w_.layers) {
-      for (const auto* t : {&l.ssm_qkv, &l.ssm_gate, &l.ssm_out, &l.attn_q, &l.attn_k, &l.attn_v, &l.attn_out,
-                            &l.shexp_gate, &l.shexp_up, &l.shexp_down, &l.ple_key, &l.ple_value, &l.hc_attn.down,
-                            &l.hc_ffn.down})
-        if (!add(*t)) return false;
-      for (const auto* m : {&l.hc_attn, &l.hc_ffn}) {
-        const auto it = hc_up_perm_.find(m->up.data);
-        if (it == hc_up_perm_.end() || w16_perm_.contains(m->up.data)) continue;
-        const auto& d = tensors_.at(m->up.data);
-        rt::Buffer b;
-        if (!convert(it->second.qs, it->second.d, static_cast<std::uint32_t>(m->up.rows),
-                     static_cast<std::uint32_t>(m->up.cols), d.qstride, &b))
-          return false;
-        w16_perm_.emplace(m->up.data, b);
-      }
-    }
-    for (const auto* t : {&w_.hc_head.down, &w_.hc_head.up})
-      if (!add(*t)) return false;
-    std::fprintf(stderr, "w16 probe: %.2f GiB of fp16 weights (%zu tensors, %zu permuted)\n",
-                 static_cast<double>(w16_bytes_) / (1u << 30), w16_.size(), w16_perm_.size());
-  }
   if (!dev_.Synchronize(error)) return false;
   k.cap = static_cast<std::uint32_t>(T);
   ck_ready_ = true;
@@ -262,15 +218,12 @@ bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt
     if (!x16 && !Half(x, ck_.xh, T * cols, error)) return false;
     // Large tiles walk in bands of 8 row tiles when they divide evenly.
     const bool banded = !tall && !small && prefill_banded_gemm_ && (rows / 256) % 8 == 0 && rows % 256 == 0;
-    const std::string name = tall    ? (x16 && x16_blocked ? "halo_gemm_q8r_f16_mb" : "halo_gemm_q8r_f16_m")
-                             : small ? "halo_gemm_q8r_f16_s"
-                             : banded ? (prefill_reg_gemm_ ? "halo_gemm_q8r_f16_lr8" : "halo_gemm_q8r_f16_lg8")
-                                      : "halo_gemm_q8r_f16_l";
-    const auto w16 = w16_.find(t.data);
-    const bool use16 = w16 != w16_.end() && name != "halo_gemm_q8r_f16_lg8";
-    return Launch(use16 ? (name + "_w16").c_str() : name.c_str(),
+    return Launch(tall    ? (x16 && x16_blocked ? "halo_gemm_q8r_f16_mb" : "halo_gemm_q8r_f16_m")
+                  : small ? "halo_gemm_q8r_f16_s"
+                  : banded ? (prefill_reg_gemm_ ? "halo_gemm_q8r_f16_lr8" : "halo_gemm_q8r_f16_lg8")
+                           : "halo_gemm_q8r_f16_l",
                   {(T + bn - 1) / bn, (rows + bm - 1) / bm}, {256},
-                  {rt::Arg::Buf(use16 ? w16->second : d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(x16 ? *x16 : ck_.xh), rt::Arg::Buf(y),
+                  {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(x16 ? *x16 : ck_.xh), rt::Arg::Buf(y),
                    rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride), rt::Arg::Val(T)},
                   error);
   }
@@ -398,10 +351,8 @@ bool FlashNextGpu::MixUp(const model::HcMixer& m, std::uint32_t T, std::string* 
     // Precision option: the epilogue reads the norm's fp16 K-blocked copy of xn (still in xh).
     if (mix_h)
       return (lo_half || Half(ck_.lo, ck_.lh, T * low, error)) &&
-             Launch(w16_perm_.contains(m.up.data) ? "halo_gemm_q8r_f16_mixth_w16" : "halo_gemm_q8r_f16_mixth",
-                    {(rows + 255) / 256, (T + 127) / 128}, {256},
-                    {rt::Arg::Buf(w16_perm_.contains(m.up.data) ? w16_perm_.at(m.up.data) : it->second.qs),
-                     rt::Arg::Buf(it->second.d), rt::Arg::Buf(ck_.lh),
+             Launch("halo_gemm_q8r_f16_mixth", {(rows + 255) / 256, (T + 127) / 128}, {256},
+                    {rt::Arg::Buf(it->second.qs), rt::Arg::Buf(it->second.d), rt::Arg::Buf(ck_.lh),
                      rt::Arg::Buf(ck_.mixed), rt::Arg::Val(rows), rt::Arg::Val(low), rt::Arg::Val(dt.qstride),
                      rt::Arg::Val(T), rt::Arg::Buf(ck_.xh), rt::Arg::Buf(ck_.mh)},
                     error);
@@ -803,9 +754,7 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
                          rt::Arg::Val(max_blocks), rt::Arg::Val(n), rt::Arg::Buf(ck_.ublk), rt::Arg::Buf(ck_.umask),
                          rt::Arg::Buf(ck_.ucount), rt::Arg::Val(max_u)},
                         error) &&
-                     Launch(kv16 ? (prefill_qsel_w_ ? "halo_attention_wmma_qsel_w" : "halo_attention_wmma_qsel_h")
-                                 : "halo_attention_wmma_qsel",
-                            {nkv, (n + 3) / 4}, {kv16 && prefill_qsel_w_ ? 192u : 256u},
+                     Launch(kv16 ? "halo_attention_wmma_qsel_h" : "halo_attention_wmma_qsel", {nkv, (n + 3) / 4}, {256},
                             {rt::Arg::Buf(ck_.q, std::size_t{t0} * qdim * 4), rt::Arg::Buf(kv16 ? s.k16 : s.k),
                              rt::Arg::Buf(kv16 ? s.v16 : s.v),
                              rt::Arg::Buf(ck_.gate_a, std::size_t{t0} * qdim * 4),
