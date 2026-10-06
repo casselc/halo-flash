@@ -64,6 +64,43 @@ No shift, at any prompt length up to 24K.
 cases. The gate (NLL ≤ 0.305, ≥ 91%) passes, and this matches the stepping
 builds above (0.2859-0.2864).
 
+### Precision options (stream P), 2026-10-05
+
+Changes that alter rounding, each behind a flag, scored against the unmodified build (45501ff
+plus per-case output in `halo_score`) with `halo_score --prefill 1` (the n-gram table not resident:
+the 79 GiB model plus its 28.8 GB left too little headroom next to the other stream's builds; the
+table's values are the same either way). Two baseline runs are bit-identical (20 short cases), so
+every difference below is the change itself. Gate, fixed before measuring: short set NLL ≤ 0.305,
+agreement ≥ 91%; paired by case, short mean ΔNLL ≤ +0.001 and mean − 2·SE ≤ 0, agreement drop ≤ 0.3
+pp; long mean ΔNLL ≤ +0.002, mean − 2·SE ≤ 0, no case worse by more than 0.02. Paired ΔNLL is the
+mean over cases of the per-case NLL difference ± its standard error.
+
+| Change (flag) | Short NLL / agreement | Short paired ΔNLL (up/down) | Long NLL / agreement | Long paired ΔNLL (up/down), worst case | Verdict |
+|---|---|---|---|---|---|
+| baseline | 0.286079 / 92.58% | — | 0.121277 / 97.26% | — | — |
+| Router on plain fp16 WMMA (`--router-f16 1`) | 0.285933 / 92.62% | −0.00058 ± 0.00043 (45/53) | 0.123398 / 97.00% | **+0.00213 ± 0.00072** (9/3), +0.0074 | fails (long) |
+| Router, weights split hi/lo, fp16 activations (`--router-f16 2`) | bit-identical to `--router-f16 1` on every case (the weights are exact in fp16, see below) | | | | fails (long) |
+| Router, fp16 weights, fp32 activations split hi/lo (`--router-f16 3`) | 0.286079 / 92.55% | −0.00026 ± 0.00040 (48/50) | 0.121366 / 97.26% | +0.00009 ± 0.00057 (8/4), +0.0027 | **passes** (default) |
+| DeltaNet alpha/beta + shared-expert gate on fp16 WMMA (`--small-f16 1`) | 0.285613 / 92.60% | −0.00038 ± 0.00041 (44/54) | 0.122459 / 96.87% | +0.00118 ± 0.00105 (6/6), +0.0089 | **passes** (default on) |
+| Mix epilogue reads the norm's fp16 K-blocked xn (`--mix-h16 1`) | 0.285795 / 92.58% | −0.00024 ± 0.00041 (46/52) | 0.122384 / 97.52% | +0.00111 ± 0.00076 (7/5), +0.0046 | **passes** (default on) |
+| Mixer down as W8A8 (`--down-w8a8 1`) | 0.285805 / 92.62% | −0.00029 ± 0.00048 (49/49) | 0.122210 / 97.65% | +0.00095 ± 0.00109 (7/5), +0.0120 | passes (not kept: no speed gain) |
+| DeltaNet qkv / z written in fp16, read by conv, state advance, gated norm (`--gdn-io16 1`; paired against the kept set of a3ac848, short 0.286147 / 92.53%, long 0.121658 / 97.52%) | 0.286039 / 92.58% | −0.00043 ± 0.00094 (39/59; worst +0.074) | 0.121563 / 97.65% | −0.00010 ± 0.00077 (6/6), +0.0056 | passes (not kept: no speed gain) |
+| Residual streams in fp16 (`--res16 1`; paired against the kept set of 8a18bf3, short 0.285504 / 92.64%, long 0.122071 / 97.00%) | 0.285031 / 92.47% | −0.00011 ± 0.00042 (49/49) | 0.121496 / 97.78% | −0.00058 ± 0.00068 (5/7), +0.0027 | **passes** (default on) |
+| Residual streams in bf16 (`--res16 2`, same baseline; short set not run: fp16 measured the same speed) | — | — | 0.123549 / 97.26% | +0.00147 ± 0.00102 (9/3), +0.0063 | long within the rule, not chosen |
+| DeltaNet scan with fp16 two-way splits (`--gdn-scan-h 1`; paired against the merged kept set, short 0.285504 / 92.64%, long 0.122071 / 97.00%) | 0.285501 / 92.51% | +0.00036 ± 0.00045 (47/51) | 0.122639 / 97.39% | +0.00056 ± 0.00091 (7/5), +0.0060 | **passes** (default on) |
+| Shared-expert gate/up as W8A8 (`--shexp-w8a8 1`) | 0.285309 / 92.60% | −0.00081 ± 0.00093 (56/42) | 0.121921 / 97.26% | +0.00064 ± 0.00095 (7/5), +0.0058 | passes (kept, then turned off after merging stream E's `_s` tiles: no speed gain left) |
+
+**Cumulative, everything kept** (stream/precision after merging main: `--router-f16 3`, `--small-f16`, `--mix-h16`,
+`--res16 1`, `--gdn-scan-h`), paired against the original baseline: short 0.286185 / 92.51% (paired
++0.000015 ± 0.000453, 56/42, agreement −0.07 pp), long 0.121673 / 96.87% (paired +0.00039 ± 0.00072, 6/6, worst case
++0.0053, agreement −0.39 pp): passes the same gate. Speed (`ab_bench.py`, 4 rounds, pinned, 2048 tokens, against main
+4ad6410): 1433.2 -> 1295.1 ms, **-138.1 ms (-9.6%), significant** (1429 -> 1581 tok/s).
+
+The F32 router, DeltaNet alpha/beta and shared-expert gate weights hold exact bf16 values (all of them),
+and 99.95-99.97% are exact in fp16 (the rest have fp16-subnormal magnitudes): rounding these weights to fp16
+loses (almost) nothing. The plain-fp16 router's long-set loss came from rounding the activations; keeping them
+as an fp16 hi/lo pair (`--router-f16 3`) removes it (`/data/halo-work/streams/P/f16exact.py`).
+
 ### Greedy identity with gufo
 
 `halo_run --device hip` against `gufo prompt --raw -t 0 --speculative off`

@@ -91,6 +91,14 @@ int main(int argc, char** argv) {
     else if (a == "--start") start = std::atoi(argv[i + 1]);
     else if (a == "--moe-topk") moe_topk = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";
+    else if (a == "--small-f16") engine::FlashNextGpu::prefill_small_f16_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--mix-h16") engine::FlashNextGpu::prefill_mix_h16_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--shexp-w8a8") engine::FlashNextGpu::prefill_shexp_w8a8_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--down-w8a8") engine::FlashNextGpu::prefill_down_w8a8_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--gdn-io16") engine::FlashNextGpu::prefill_gdn_io16_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--res16") engine::FlashNextGpu::prefill_res16_ = std::atoi(argv[i + 1]);
+    else if (a == "--gdn-scan-h") engine::FlashNextGpu::prefill_gdn_scan_h_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--router-f16") engine::FlashNextGpu::prefill_router_f16_ = std::atoi(argv[i + 1]);
     else if (a == "--ngram-cache-gb") ngram_cache_gb = std::atof(argv[i + 1]);
     else if (a == "--prefill-int8") engine::FlashNextGpu::prefill_int8_gemm_ = std::string(argv[i + 1]) == "1";
     else return std::fprintf(stderr, "unknown option %s\n", a.c_str()), 2;
@@ -207,6 +215,7 @@ int main(int argc, char** argv) {
     }
     std::int32_t prev = static_cast<std::int32_t>(ids.back());
     double case_nll = 0;
+    const std::size_t aligned0 = aligned, agree0 = agree;
     for (std::size_t j = 0; j < target.size(); ++j) {
       if (!step(prev, logits)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
       case_nll -= LogSoftmaxAt(logits, target[j]);
@@ -221,9 +230,11 @@ int main(int argc, char** argv) {
     targets += target.size();
     ++cases;
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::printf("%s  prompt %4zu  targets %3zu  nll %.4f%s   | running nll %.6f  agreement %.2f%%  (%.0f s)\n",
+    std::printf("%s  prompt %4zu  targets %3zu  nll %.4f%s   | running nll %.6f  agreement %.2f%%  (%.0f s)"
+                "  case_sum %.9f agree %zu/%zu\n",
                 id.c_str(), ids.size(), target.size(), case_nll / target.size(), is_aligned ? "" : "  (misaligned)",
-                nll / targets, aligned ? 100.0 * agree / aligned : 0.0, secs);
+                nll / targets, aligned ? 100.0 * agree / aligned : 0.0, secs, case_nll, agree - agree0,
+                aligned - aligned0);
     std::fflush(stdout);
   }
   std::printf("cases %zu, target tokens %zu, aligned %zu (%zu misaligned cases)\nNLL %.6f   API top-token agreement %.2f%%\n",

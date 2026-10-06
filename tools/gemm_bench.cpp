@@ -295,6 +295,116 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if (argc > 1 && std::string(argv[1]) == "q8a8study") {
+    // Stream P: W8A8 (halo_gemm_q8a8_*) against the FP16-route GEMMs at one
+    // shape, warm / cold / after 96 MB of writes, plus a spot check of the
+    // W8A8 results against host sums of the same int8 operands.
+    auto d = rt::Device::Create(rt::Backend::kHip, &e);
+    if (!d || !d->LoadModule(kernels::CoreHsaco(), &e)) return std::printf("%s\n", e.c_str()), 1;
+    const std::uint32_t rows = argc > 2 ? std::atoi(argv[2]) : 320, cols = argc > 3 ? std::atoi(argv[3]) : 10240,
+                        T = argc > 4 ? std::atoi(argv[4]) : 2048;
+    const std::uint32_t nblk = cols / 32;
+    const std::size_t row_bytes = std::size_t{nblk} * 34;
+    std::vector<std::uint8_t> w(std::size_t{rows} * row_bytes);
+    std::mt19937 g(5);
+    for (auto& b : w) b = static_cast<std::uint8_t>(g());
+    for (std::size_t r = 0; r < rows; ++r)
+      for (std::size_t b = 0; b < nblk; ++b) {
+        const std::uint16_t hv = 0x2000 | (g() & 0x3FF);
+        std::memcpy(w.data() + r * row_bytes + b * 34, &hv, 2);
+      }
+    std::vector<std::uint16_t> xh(std::size_t{T} * cols);
+    for (auto& v : xh) v = static_cast<std::uint16_t>(0x3000 | (g() & 0x3FF));
+    std::vector<std::int8_t> xq(std::size_t{T} * cols);  // K-blocked [cols / 64][T][64]
+    for (auto& v : xq) v = static_cast<std::int8_t>(static_cast<int>(g() % 255) - 127);
+    std::vector<float> xd(std::size_t{nblk} * T);  // [cols / 32][T]
+    for (auto& v : xd) v = 0.001f + 0.01f * static_cast<float>(g() % 1000) / 1000.0f;
+    auto wb = d->Alloc(w.size(), &e), qs = d->Alloc(std::size_t{rows} * cols, &e),
+         db = d->Alloc(std::size_t{rows} * nblk * 2, &e), xb = d->Alloc(xh.size() * 2, &e),
+         xqb = d->Alloc(xq.size(), &e), xdb = d->Alloc(xd.size() * 4, &e), yb = d->Alloc(std::size_t{T} * rows * 4, &e);
+    (void)d->Upload(wb, 0, w.data(), w.size(), &e);
+    (void)d->Upload(xb, 0, xh.data(), xh.size() * 2, &e);
+    (void)d->Upload(xqb, 0, xq.data(), xq.size(), &e);
+    (void)d->Upload(xdb, 0, xd.data(), xd.size() * 4, &e);
+    const rt::Arg ra[] = {rt::Arg::Buf(wb), rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                          rt::Arg::Val(cols)};
+    (void)d->Launch(d->Kernel("halo_repack_q8_0", &e), {4096}, {256}, ra, &e);
+    struct V {
+      const char* kernel;
+      std::uint32_t bm, bn;
+      bool a8;
+    };
+    const V variants[] = {
+        {"halo_gemm_q8r_f16_m", 320, 64, false},   {"halo_gemm_q8r_f16_mb", 320, 64, false},
+        {"halo_gemm_q8r_f16_l", 256, 128, false},  {"halo_gemm_q8r_f16_s", 64, 128, false},
+        {"halo_gemm_q8a8_320x64", 320, 64, true},  {"halo_gemm_q8a8_160x64", 160, 64, true},
+        {"halo_gemm_q8a8_128x128", 128, 128, true}, {"halo_gemm_q8a8_256x128", 256, 128, true},
+        {"halo_gemm_q8a8_128x64", 128, 64, true},
+    };
+    std::printf("shape %u x %u, T %u (%.1f GFLOP)\n", rows, cols, T, 2.0 * rows * cols * T / 1e9);
+    auto fb = d->Alloc(96ull << 20, &e);
+    for (const auto& v : variants) {
+      if (!v.a8 && std::string(v.kernel) == "halo_gemm_q8r_f16_m" && cols < 4096) continue;
+      const auto k = d->Kernel(v.kernel, &e);
+      if (!k) {
+        std::printf("%-28s missing\n", v.kernel);
+        continue;
+      }
+      std::vector<rt::Arg> a;
+      if (v.a8)
+        a = {rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Buf(xqb), rt::Arg::Buf(xdb), rt::Arg::Buf(yb),
+             rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(cols), rt::Arg::Val(T)};
+      else
+        a = {rt::Arg::Buf(qs), rt::Arg::Buf(db), rt::Arg::Buf(xb), rt::Arg::Buf(yb), rt::Arg::Val(rows),
+             rt::Arg::Val(cols), rt::Arg::Val(cols), rt::Arg::Val(T)};
+      const rt::Dim3 grid{(T + v.bn - 1) / v.bn, (rows + v.bm - 1) / v.bm, 1};
+      for (int r = 0; r < 10; ++r) (void)d->Launch(k, grid, {256}, a, &e);
+      (void)d->Synchronize(&e);
+      const int reps = 50;
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < reps; ++r) (void)d->Launch(k, grid, {256}, a, &e);
+      (void)d->Synchronize(&e);
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+      double dirty = 0;
+      for (int r = 0; r < 20; ++r) {
+        (void)d->Fill(fb, static_cast<std::uint8_t>(r), &e);
+        (void)d->Synchronize(&e);
+        const auto c0 = std::chrono::steady_clock::now();
+        (void)d->Launch(k, grid, {256}, a, &e);
+        (void)d->Synchronize(&e);
+        dirty += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+      }
+      dirty /= 20;
+      double maxrel = 0;
+      if (v.a8) {  // spot check against host sums of the same operands
+        std::vector<std::int8_t> qh(std::size_t{rows} * cols);
+        std::vector<std::uint16_t> dh(std::size_t{rows} * nblk);
+        std::vector<float> yh(std::size_t{T} * rows);
+        (void)d->Download(qs, 0, qh.data(), qh.size(), &e);
+        (void)d->Download(db, 0, dh.data(), dh.size() * 2, &e);
+        (void)d->Download(yb, 0, yh.data(), yh.size() * 4, &e);
+        for (int s = 0; s < 64; ++s) {
+          const std::uint32_t r = g() % rows, t = g() % T;
+          double want = 0, mag = 0;
+          for (std::uint32_t b = 0; b < nblk; ++b) {
+            long isum = 0;
+            for (std::uint32_t c = b * 32; c < b * 32 + 32; ++c)
+              isum += long(qh[std::size_t{r} * cols + c]) * xq[(std::size_t{c / 64} * T + t) * 64 + c % 64];
+            _Float16 dw;
+            std::memcpy(&dw, &dh[std::size_t{r} * nblk + b], 2);
+            const double p = double(isum) * double(static_cast<float>(dw)) * xd[std::size_t{b} * T + t];
+            want += p;
+            mag += std::fabs(p);
+          }
+          maxrel = std::max(maxrel, std::fabs(yh[std::size_t{t} * rows + r] - want) / (mag + 1e-30));
+        }
+      }
+      std::printf("%-28s grid %4ux%u  warm %7.3f ms (%5.1f TOPS)  after-writes %7.3f ms%s", v.kernel, grid.x, grid.y,
+                  ms, 2.0 * rows * cols * T / ms / 1e9, dirty, v.a8 ? "" : "\n");
+      if (v.a8) std::printf("  check max rel %.2e\n", maxrel);
+    }
+    return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "mixstudy") {
     // The mixer's fused up-projection + mix (rebuild form, as in prefill:
     // xn rebuilt from res, rscale and the norm gammas) at its real shape,
