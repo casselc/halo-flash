@@ -843,6 +843,27 @@ operands 4-bit, confirmed in the device assembly.
     Still a long shot: 4 points on Llama-3-8B.
   - **≤ 1.2x:** close the item.
 
+**Addendum before the GPU phase (main 56693d8 merged as d15bf6e, still before any
+measurement):**
+- **Baseline.** Every arm, quality and speed, is paired against the original UD-Q4_K_XL on
+  the same binary with **main's defaults**: the precision options on (`--res16 1`,
+  `--mix-h16`, `--router-f16 3`, `--small-f16`, `--gdn-scan-h`). That is the configuration a
+  shipped arm would run in. Arms A, B and D run with the same defaults; only the weights or
+  `--moe-topk` differ.
+- **Expected baseline** (BENCHMARKS, P's cumulative row): short 0.2855-0.2865 at ~92.5%; long
+  0.1215-0.1230.
+- **Arm B prefill, re-predicted from the kernel model rather than the bytes floor.**
+  - The grouped expert kernels stream every expert once per layer whatever k is. Each expert
+    still gets one 64-pair tile (n ≈ 40 / 32 / 24 tokens at k = 10 / 8 / 6). They run at
+    101-126 GB/s, latency-bound (ROOFLINE).
+  - Only the WMMA sub-tiles (3 → 2 → 2 of 16) and the combine (~48 ms, linear in k) shrink.
+  - Prediction: k = 8 −15 ms (−5..−35), k = 6 −35 ms (−10..−70) on the 1280 ms pinned
+    prefill.
+- **Decode prediction unchanged:** −1.4 / −2.8 ms per token. The expert GEMVs are
+  bandwidth-bound and their bytes are linear in k.
+- **Sanity:** `--moe-topk 10` is bit-identical to no flag (prefill logits, greedy text);
+  `--moe-topk 8` differs.
+
 ### Results
 
 Pending the GPU phase.
