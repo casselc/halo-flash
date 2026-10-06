@@ -164,6 +164,10 @@ int main(int argc, char** argv) {
     else if (a == "--ple-overlap") engine::FlashNextGpu::prefill_ple_overlap_ = std::string(argv[i + 1]) == "1";
     else if (a == "--fa-attention") engine::FlashNextGpu::prefill_fa_attention_ = std::string(argv[i + 1]) == "1";
     else if (a == "--fused-moe-combine") engine::FlashNextGpu::prefill_fused_moe_combine_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--tok-combine") engine::FlashNextGpu::prefill_tok_combine_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--moe-in-combine") engine::FlashNextGpu::prefill_moe_in_combine_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--q-fused") engine::FlashNextGpu::prefill_q_fused_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--s640") engine::FlashNextGpu::prefill_s640_ = std::string(argv[i + 1]) == "1";
     else if (a == "--banded-gemm") engine::FlashNextGpu::prefill_banded_gemm_ = std::string(argv[i + 1]) == "1";
     else if (a == "--reg-gemm") engine::FlashNextGpu::prefill_reg_gemm_ = std::string(argv[i + 1]) == "1";
     else if (a == "--blocked-xh") engine::FlashNextGpu::prefill_blocked_xh_ = std::string(argv[i + 1]) == "1";

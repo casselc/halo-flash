@@ -331,6 +331,45 @@ extern "C" __global__ void halo_split_qgate(const float* qg, float* q, float* ga
   }
 }
 
+// halo_split_qgate, the q rows' halo_rmsnorm (shared gamma) and
+// halo_rope_neox_rows in one pass: q is written once, normalized and rotated,
+// instead of written, read and rewritten twice (~200 MB per 2048-token
+// layer). The same operations in the same order: the norm's per-thread
+// square (one element per thread at hd == blockDim), BlockSum,
+// (x * scale) * w, then RopeNeox's arithmetic on those fp32 values.
+//   grid (T * heads), block hd (== 256); token t = blockIdx.x / heads at pos0 + t.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_split_qgate_norm_rope(const float* qg, float* q, float* gate, const float* w, float eps,
+                               std::uint32_t rotary_dim, std::uint32_t pos0, std::uint32_t heads, float theta) {
+  __shared__ float scratch[32], v[256];
+  const std::uint32_t hd = blockDim.x, i = threadIdx.x;
+  const float* src = qg + static_cast<std::size_t>(blockIdx.x) * 2 * hd;
+  const float x = src[i];
+  gate[static_cast<std::size_t>(blockIdx.x) * hd + i] = src[hd + i];
+  float ss = 0.0f;
+  ss += x * x;
+  // Rounded here, as halo_rmsnorm's loop leaves it: without this the backend fuses x * x into WarpSum's
+  // first butterfly add (one fma across the shuffle), a different rounding.
+  __asm__ volatile("" : "+v"(ss));
+  ss = BlockSum(ss, scratch);
+  const float scale = 1.0f / sqrtf(ss / static_cast<float>(hd) + eps);
+  v[i] = x * scale * w[i];
+  __syncthreads();
+  float* out = q + static_cast<std::size_t>(blockIdx.x) * hd;
+  const std::uint32_t half = rotary_dim / 2;
+  const std::uint32_t pos = pos0 + blockIdx.x / heads;
+  if (i < half) {
+    const float freq = powf(theta, -2.0f * static_cast<float>(i) / static_cast<float>(rotary_dim));
+    const float angle = static_cast<float>(pos) * freq;
+    const float c = cosf(angle), s = sinf(angle);
+    const float a = v[i], b = v[i + half];
+    out[i] = a * c - b * s;
+    out[i + half] = a * s + b * c;
+  } else if (i >= rotary_dim) {
+    out[i] = v[i];
+  }
+}
+
 // Causal depthwise conv over the last `kern` projections, then SiLU; shifts
 // the history (state holds kern-1 rows, oldest first).
 extern "C" __global__ void halo_conv_step(const float* in, float* state, const float* w, float* out,
@@ -3347,6 +3386,158 @@ extern "C" __global__ void __launch_bounds__(256)
     }
   }
   HALO_SPAN_END(5);  // inject partials done (end)
+}
+
+// halo_hc_combine_norm_rows for hc = 4 with one block per token (all four
+// streams), xn skipped (rscale), y16 and the inject partials required. Each
+// thread keeps the indices i = threadIdx.x + k * 256 of every stream, so its
+// sums run in the same order as the per-stream kernel's, and the four
+// BlockSums (and the inject reductions) share their barriers. The block's
+// out row is loaded once instead of once per stream.
+// kMoe: out is not read but built here, as halo_moe_combine_shared builds it
+// (out[i] = sum_s mw[t k + s] * yp[pos[t k + s]][i], slots in order, then
+// + sigmoid(sg[t]) * sx[t][i]): the routed and shared experts' sum is never
+// written to memory and read back (21 MB each way per layer at 2048 tokens).
+//   grid (T), block 256; h <= 2560, irows <= 8.
+template <bool kMoe>
+__device__ __forceinline__ void HcCombineNormTok(float* res, const float* out, const _Float16* yp, const std::uint32_t* pos,
+                                 const float* mw, const float* sx, const float* sg, std::uint32_t k,
+                                 const float* inject, const float* w_all, _Float16* y16, std::uint32_t h, float eps,
+                                 const float* iw, float* ipart, std::uint32_t irows, float* rscale,
+                                 std::uint32_t y16_tokens) {
+  constexpr std::uint32_t HC = 4, KPT = 10, NT = 256, NW = NT / kWarp;
+  __shared__ float red[HC][NW], sums[HC], part[HC][8][NW];
+  const std::uint32_t t = blockIdx.x, tid = threadIdx.x, lane = tid % kWarp, warp = tid / kWarp;
+  float vals[HC][KPT], o[KPT];
+#pragma unroll
+  for (std::uint32_t st = 0; st < HC; ++st)
+#pragma unroll
+    for (std::uint32_t kk = 0; kk < KPT; ++kk) {
+      const std::uint32_t i = tid + kk * NT;
+      vals[st][kk] = i < h ? res[(static_cast<std::size_t>(t) * HC + st) * h + i] : 0.0f;
+    }
+  if constexpr (kMoe) {
+#pragma unroll
+    for (std::uint32_t kk = 0; kk < KPT; ++kk) o[kk] = 0.0f;
+    for (std::uint32_t s = 0; s < k; ++s) {
+      const float ws = mw[t * k + s];
+      const _Float16* yr = yp + static_cast<std::size_t>(pos[t * k + s]) * h;
+      _Float16 yv[KPT];
+#pragma unroll
+      for (std::uint32_t kk = 0; kk < KPT; ++kk) {
+        const std::uint32_t i = tid + kk * NT;
+        yv[kk] = i < h ? yr[i] : static_cast<_Float16>(0.0f);
+      }
+#pragma unroll
+      for (std::uint32_t kk = 0; kk < KPT; ++kk)
+        if (tid + kk * NT < h) o[kk] += ws * static_cast<float>(yv[kk]);
+    }
+    const float gs = Sigmoid(sg[t]);
+#pragma unroll
+    for (std::uint32_t kk = 0; kk < KPT; ++kk) {
+      const std::uint32_t i = tid + kk * NT;
+      if (i < h) o[kk] += gs * sx[static_cast<std::size_t>(t) * h + i];
+    }
+  } else {
+#pragma unroll
+    for (std::uint32_t kk = 0; kk < KPT; ++kk) {
+      const std::uint32_t i = tid + kk * NT;
+      o[kk] = i < h ? out[static_cast<std::size_t>(t) * h + i] : 0.0f;
+    }
+  }
+#pragma unroll
+  for (std::uint32_t st = 0; st < HC; ++st) {
+    const float a = 2.0f * Sigmoid(inject[t * HC + st] / static_cast<float>(HC));
+    float ss = 0.0f;
+#pragma unroll
+    for (std::uint32_t kk = 0; kk < KPT; ++kk) {
+      const std::uint32_t i = tid + kk * NT;
+      if (i < h) {
+        const float x = vals[st][kk] + o[kk] * a;
+        res[(static_cast<std::size_t>(t) * HC + st) * h + i] = x;
+        vals[st][kk] = x;
+        ss += x * x;
+      }
+    }
+    // BlockSum's two stages for the four streams, with one barrier.
+    const float wsum = WarpSum(ss);
+    if (lane == 0) red[st][warp] = wsum;
+  }
+  __syncthreads();
+  if (warp == 0) {
+#pragma unroll
+    for (std::uint32_t st = 0; st < HC; ++st) {
+      const float v = WarpSum(lane < NW ? red[st][lane] : 0.0f);
+      if (lane == 0) sums[st] = v;
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (std::uint32_t st = 0; st < HC; ++st) {
+    const float scale = 1.0f / sqrtf(sums[st] / static_cast<float>(h) + eps);
+    if (tid == 0) rscale[t * HC + st] = scale;
+    const float* w = w_all + static_cast<std::size_t>(st) * h;
+#pragma unroll
+    for (std::uint32_t kk = 0; kk < KPT; ++kk) {
+      const std::uint32_t i = tid + kk * NT;
+      o[kk] = i < h ? w[i] : 0.0f;
+    }
+#pragma unroll
+    for (std::uint32_t kk = 0; kk < KPT; ++kk) {
+      const std::uint32_t i = tid + kk * NT;
+      vals[st][kk] = vals[st][kk] * scale * o[kk];
+      if (i < h)
+        y16[y16_tokens ? XhBlocked(t, st * h + i, y16_tokens) : (static_cast<std::size_t>(t) * HC + st) * h + i] =
+            static_cast<_Float16>(vals[st][kk]);
+    }
+  }
+#pragma unroll
+  for (std::uint32_t st = 0; st < HC; ++st) {
+    float ip[8] = {};
+#pragma unroll
+    for (std::uint32_t r = 0; r < 8; ++r) {
+      if (r >= irows) break;
+      const float* iwr = iw + static_cast<std::size_t>(r) * HC * h + static_cast<std::size_t>(st) * h;
+#pragma unroll
+      for (std::uint32_t kk = 0; kk < KPT; ++kk) {
+        const std::uint32_t i = tid + kk * NT;
+        o[kk] = i < h ? iwr[i] : 0.0f;
+      }
+#pragma unroll
+      for (std::uint32_t kk = 0; kk < KPT; ++kk)
+        if (tid + kk * NT < h) ip[r] += vals[st][kk] * o[kk];
+    }
+#pragma unroll
+    for (std::uint32_t r = 0; r < 8; ++r) {
+      if (r >= irows) break;
+      const float wsum = WarpSum(ip[r]);
+      if (lane == 0) part[st][r][warp] = wsum;
+    }
+  }
+  __syncthreads();
+  // Warp r finishes inject row r of every stream (BlockSum's second stage).
+  if (warp < irows) {
+#pragma unroll
+    for (std::uint32_t st = 0; st < HC; ++st) {
+      const float sum = WarpSum(lane < NW ? part[st][warp][lane] : 0.0f);
+      if (lane == 0) ipart[(static_cast<std::size_t>(t) * HC + st) * irows + warp] = sum;
+    }
+  }
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_combine_norm_tok(float* res, const float* out, const float* inject, const float* w_all, _Float16* y16,
+                             std::uint32_t h, float eps, const float* iw, float* ipart, std::uint32_t irows,
+                             float* rscale, std::uint32_t y16_tokens) {
+  HcCombineNormTok<false>(res, out, nullptr, nullptr, nullptr, nullptr, nullptr, 0, inject, w_all, y16, h, eps, iw,
+                          ipart, irows, rscale, y16_tokens);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_combine_norm_tok_moe(float* res, const _Float16* yp, const std::uint32_t* pos, const float* mw,
+                                 const float* sx, const float* sg, std::uint32_t k, const float* inject,
+                                 const float* w_all, _Float16* y16, std::uint32_t h, float eps, const float* iw,
+                                 float* ipart, std::uint32_t irows, float* rscale, std::uint32_t y16_tokens) {
+  HcCombineNormTok<true>(res, nullptr, yp, pos, mw, sx, sg, k, inject, w_all, y16, h, eps, iw, ipart, irows, rscale,
+                         y16_tokens);
 }
 
 // inject[t][r] = sum over streams s (in order) of ipart[(t * hc + s) * irows + r].
