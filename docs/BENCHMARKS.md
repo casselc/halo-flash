@@ -84,6 +84,9 @@ mean over cases of the per-case NLL difference ± its standard error.
 | DeltaNet alpha/beta + shared-expert gate on fp16 WMMA (`--small-f16 1`) | 0.285613 / 92.60% | −0.00038 ± 0.00041 (44/54) | 0.122459 / 96.87% | +0.00118 ± 0.00105 (6/6), +0.0089 | **passes** (default on) |
 | Mix epilogue reads the norm's fp16 K-blocked xn (`--mix-h16 1`) | 0.285795 / 92.58% | −0.00024 ± 0.00041 (46/52) | 0.122384 / 97.52% | +0.00111 ± 0.00076 (7/5), +0.0046 | **passes** (default on) |
 | Mixer down as W8A8 (`--down-w8a8 1`) | 0.285805 / 92.62% | −0.00029 ± 0.00048 (49/49) | 0.122210 / 97.65% | +0.00095 ± 0.00109 (7/5), +0.0120 | passes (not kept: no speed gain) |
+| DeltaNet qkv / z written in fp16, read by conv, state advance, gated norm (`--gdn-io16 1`; paired against the kept set of a3ac848, short 0.286147 / 92.53%, long 0.121658 / 97.52%) | 0.286039 / 92.58% | −0.00043 ± 0.00094 (39/59; worst +0.074) | 0.121563 / 97.65% | −0.00010 ± 0.00077 (6/6), +0.0056 | passes (not kept: no speed gain) |
+| Residual streams in fp16 (`--res16 1`; paired against the kept set of 8a18bf3, short 0.285504 / 92.64%, long 0.122071 / 97.00%) | 0.285031 / 92.47% | −0.00011 ± 0.00042 (49/49) | 0.121496 / 97.78% | −0.00058 ± 0.00068 (5/7), +0.0027 | **passes** (default on) |
+| Residual streams in bf16 (`--res16 2`, same baseline; short set not run: fp16 measured the same speed) | — | — | 0.123549 / 97.26% | +0.00147 ± 0.00102 (9/3), +0.0063 | long within the rule, not chosen |
 | Shared-expert gate/up as W8A8 (`--shexp-w8a8 1`) | 0.285309 / 92.60% | −0.00081 ± 0.00093 (56/42) | 0.121921 / 97.26% | +0.00064 ± 0.00095 (7/5), +0.0058 | **passes** (default on) |
 
 The F32 router, DeltaNet alpha/beta and shared-expert gate weights hold exact bf16 values (all of them),

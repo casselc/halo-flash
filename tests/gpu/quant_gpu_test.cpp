@@ -1208,6 +1208,14 @@ TEST(GpuKernels, DeltaNetPrefillEqualsDecodeSteps) {
                 rt::Arg::Val(vd)});
         close4(get(out9, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "c16 scan3u output");
         close4(get(gs9, gst.size()), get(gs5, gst.size()), "c16 scan3u recurrent state");
+        // halo_gdn_c16_scanh (precision option: fp16 two-way K S0, Q S0 and update) on the same prep, same bound.
+        auto gs10 = up(gst), out10 = zeros(std::size_t{T} * vd);
+        launch("halo_gdn_c16_scanh", {2, nv}, {128},
+               {rt::Arg::Buf(conv2), rt::Arg::Buf(conv2, kd * 4ull), rt::Arg::Buf(conv2, 2ull * kd * 4), rt::Arg::Buf(prep7),
+                rt::Arg::Buf(gs10), rt::Arg::Buf(out10), rt::Arg::Val(nk), rt::Arg::Val(T), rt::Arg::Val(ch), rt::Arg::Val(ch),
+                rt::Arg::Val(vd)});
+        close4(get(out10, std::size_t{T} * vd), get(out5, std::size_t{T} * vd), "c16 scanh output");
+        close4(get(gs10, gst.size()), get(gs5, gst.size()), "c16 scanh recurrent state");
         // prep2 (cpb chunks a block, prefetched) writes the same prep as prep.
         for (const std::uint32_t cpb : {1u, 2u, 3u}) {
           auto prep2 = zeros(std::size_t{nv} * nch * 576);

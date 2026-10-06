@@ -173,7 +173,10 @@ class FlashNextGpu {
   /// Precision option (stream P): the chunk's hyper-connection residual
   /// streams stored in 16 bits (1: fp16, 2: bf16) instead of fp32; every
   /// residual reader and writer of the prefill takes the matching variant.
-  static inline int prefill_res16_ = 0;
+  static inline int prefill_res16_ = 1;
+  /// Precision option (stream P): the chunked DeltaNet scan with fp16 two-way splits for K S0, Q S0
+  /// and the update (halo_gdn_c16_scanh) instead of scan3u's bf16 three-way.
+  static inline bool prefill_gdn_scan_h_ = false;
   /// Attention of a chunk's tokens in batched launches (same arithmetic as
   /// stepping) instead of token by token.
   static inline bool prefill_batched_attention_ = true;
