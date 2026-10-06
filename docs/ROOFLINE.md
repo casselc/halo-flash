@@ -1020,4 +1020,5 @@ and an in-engine A/B (`ab_bench.py`, 4 rounds x 3 reps, pinned, prose_1 at 2048 
 |---|---|---|---|
 | Router on plain fp16 WMMA (`halo_gemm_f32h_f16_k128`: fp32 W rounded to fp16 while staging, the fp16 `mh`; `--router-f16 1`) | -15..-20 kernel; quality neutral | router 40.7 -> 21.9 ms (-18.8); end to end -20.6 ms; long set **+0.0021 ± 0.0007** (9 of 12 cases worse) | no (quality) |
 | DeltaNet alpha/beta + shared-expert gate on the same kernel (`--small-f16`) | -18..-24 kernel; quality neutral | 27.9 -> 7.6 ms (-20.3, spreads 0.9 / 0.2); end to end -14.8 ms (inside ab_bench's spread rule: new spread 22.7); quality passes | yes (default on) |
+| Mix epilogue reads xn as combine_norm's fp16 K-blocked copy, one 8-byte load per (token, stream) and lane, float4 / half2 stores (`halo_gemm_q8r_f16_mixth`, `--mix-h16`; coordinator's candidate from gufo's ATT: gufo mixes from fp16 xn) | -10..-25 kernel (the earlier fp16 probe, with per-element gathers, was +10) | mix 107.9 -> 71.9 ms (-36.0); end to end **-36.0 ms, significant** (spreads 10.9 / 1.8); max \|Δlogit\| 0.57 of 16.8 on prose_1, same argmax; quality passes | yes (default on) |
 

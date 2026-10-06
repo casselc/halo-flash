@@ -147,7 +147,7 @@ class FlashNextGpu {
   static inline bool prefill_small_f16_ = true;
   /// Precision option (stream P): the mix epilogue reads xn as the norm's fp16
   /// K-blocked copy (xh) instead of rebuilding it in fp32 from the residual.
-  static inline bool prefill_mix_h16_ = false;
+  static inline bool prefill_mix_h16_ = true;
   /// Precision option (stream P): the shared expert's gate and up as W8A8
   /// (halo_gemm_q8a8_128x128, activations quantized per token and 32 values).
   static inline bool prefill_shexp_w8a8_ = false;

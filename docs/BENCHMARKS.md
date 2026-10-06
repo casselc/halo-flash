@@ -80,6 +80,7 @@ mean over cases of the per-case NLL difference ± its standard error.
 | baseline | 0.286079 / 92.58% | — | 0.121277 / 97.26% | — | — |
 | Router on plain fp16 WMMA (`--router-f16 1`) | 0.285933 / 92.62% | −0.00058 ± 0.00043 (45/53) | 0.123398 / 97.00% | **+0.00213 ± 0.00072** (9/3), +0.0074 | fails (long) |
 | DeltaNet alpha/beta + shared-expert gate on fp16 WMMA (`--small-f16 1`) | 0.285613 / 92.60% | −0.00038 ± 0.00041 (44/54) | 0.122459 / 96.87% | +0.00118 ± 0.00105 (6/6), +0.0089 | **passes** (default on) |
+| Mix epilogue reads the norm's fp16 K-blocked xn (`--mix-h16 1`) | 0.285795 / 92.58% | −0.00024 ± 0.00041 (46/52) | 0.122384 / 97.52% | +0.00111 ± 0.00076 (7/5), +0.0046 | **passes** (default on) |
 
 ### Greedy identity with gufo
 
