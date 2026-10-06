@@ -1373,3 +1373,20 @@ slices); (4) select256 at 71 us a call writes 4 MB of visible lists that only `u
 into the union (bitmaps straight from the radix threshold) ~-8 ms; (5) decode: `halo_qsa_select` (1024 threads,
 serial digit walk) runs 12 times a decode step, ~28 us each at 7K: the 256-thread kernel would save ~0.25 ms a
 token (stream D2's area, not changed here).
+
+## 12. 2026-10-06 (stream M, branch `stream/sessions-mtp`): batched decode (P6)
+
+Design and memory tables: docs/SESSIONS.md. Pinned, graphs, 4 prompts (300-1,000 tokens), `halo_run --batch B
+--device-sample 1`; every row byte-identical per entry to the session stepped alone (`--batch-check 1`).
+
+| Change | Predicted | Measured (ms/step B=2 / 4 / 8) | Kept |
+|---|---|---|---|
+| v1: weight kernels with NB columns in-block (one weight read), grouped experts across sessions, per-session kernels once per entry | ~50 / ~75 / ~123 (dense x1.08/1.25/1.7, experts by measured union, 4.3 ms per entry) | 55.6 / 90.7 / 165.8 | yes (base) |
+| Lone-kernel probe of the NB-column Q8 GEMV (`halo_gemv_bench`) | t(NB8)/t(1) 1.25-1.5 | 2.5-3.9 (VALU / latency at ~950 MHz) | (probe) |
+| v2: norm scales, combine, top-k one launch for all entries (grid y); Q5_1 down converts weights once per expert; mixers one column per block; GEMV column groups (G 4) interleaved with row blocks | B8 -46, B4 -19 | 52.9 / 80.3 / 137.2 (-3 / -10 / -29): the Q5_1 down did not move (bandwidth by union, not dequant), mixers -6 | yes |
+| GEMV column groups G 1 / 2 / 4 / 8 at B=8 | G 4 best by ~15% on the GEMVs | 146.4 / 139.9 / 138.3 / 153.2 | G 4 (B4: G 2) |
+| GEMV weights prefetched a piece ahead (`_p`) | -3..-6 at B8 | +4.3 (B8), +3.0 (B4) | no |
+| GEMV with 16 KB LDS (`_s`, more resident blocks) | -2..-5 | -2.9 (B8), within noise at B4 | option (`HALO_BATCH_GEMV_VAR=_s`), not default |
+| Mixer columns interleaved with row blocks instead of grid z | -5..-10 at B8 | -0.3 | kept (harmless) |
+
+Remaining at B=8 (eager): experts 46 (union bandwidth, expected), mixers 23, dense GEMVs ~35, per-entry ~20.

@@ -310,6 +310,13 @@ not one-off checks:
   - batched runs produce logits and tokens identical to isolated runs (gufo and ds4 both enforce this);
   - C2–C8 aggregate at least gufo's;
   - shared-prefix restore under 1 s.
+- **Status (2026-10-06, stream M; docs/SESSIONS.md).**
+  - Session pool with fork / bind / drop; KV in 2 MB pages mapped on demand and shared copy-on-write between
+    forks (HIP VMM). Fork or shared-prefix restore: 17-29 ms at 2K-32K. Byte-identical to main.
+  - Batched decode for up to 8 sessions, byte-identical per entry to the session stepped alone (and the single
+    path to main): 27.0 / 37.8 / 49.8 / 59.6 tok/s aggregate at B = 1 / 2 / 4 / 8. **Below gufo's C2-C8**
+    (43.4 / 69.4 / 101.6): exact per-column fp32 chains cost 1.7-2.3x the single kernels' time at B = 8.
+  - Not done: radix prefix cache and disk tier, prefill interleaved with decode, server / C ABI binding.
 
 **P7 — C ABI and server.**
 - **`halo_flash.h`** covers:
