@@ -2124,6 +2124,108 @@ TEST(GpuKernels, SplitQgateNormRopeEqualsSeparateKernels) {
   }
 }
 
+// P4: halo_norm_rope_rows against halo_rmsnorm, halo_rope_neox_rows and the cache copy: bit for bit.
+TEST(GpuKernels, NormRopeEqualsSeparateKernels) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      const auto d = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 8}));
+      const auto T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 8}));
+      const auto heads = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 6}));
+      const auto rot = 2 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = d / 2}));
+      const auto pos0 = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = 300000}));
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto vec = [&](std::size_t n, float amp) {
+        std::vector<float> v(n);
+        for (auto& x : v) { seed = seed * 1664525u + 1013904223u; x = amp * (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f); }
+        return v;
+      };
+      const std::size_t n = std::size_t{T} * heads * d;
+      const auto x = vec(n, 8.0f), w = vec(d, 3.0f);
+      std::vector<rt::Buffer> owned;
+      const auto up = [&](const void* p, std::size_t bytes) {
+        auto b = dev->Alloc(bytes, &error);
+        if (p) EXPECT_TRUE(dev->Upload(b, 0, p, bytes, &error));
+        owned.push_back(b);
+        return b;
+      };
+      auto x1 = up(x.data(), n * 4), x2 = up(x.data(), n * 4), wb = up(w.data(), d * 4), c1 = up(nullptr, n * 4),
+           c2 = up(nullptr, n * 4);
+      const auto launch = [&](const char* name, std::uint32_t grid, std::uint32_t block, std::initializer_list<rt::Arg> a) {
+        ASSERT_TRUE(dev->Launch(dev->Kernel(name, &error), {grid}, {block}, std::span<const rt::Arg>(a.begin(), a.size()),
+                                &error))
+            << name;
+      };
+      const auto R = static_cast<std::uint32_t>(std::size_t{T} * heads);
+      launch("halo_rmsnorm", R, 256, {rt::Arg::Buf(x1), rt::Arg::Buf(wb), rt::Arg::Buf(x1), rt::Arg::Val(d),
+                                      rt::Arg::Val(1e-6f), rt::Arg::Val<std::uint32_t>(0)});
+      launch("halo_rope_neox_rows", R, 64, {rt::Arg::Buf(x1), rt::Arg::Val(d), rt::Arg::Val(rot), rt::Arg::Val(pos0),
+                                            rt::Arg::Val(heads), rt::Arg::Val(1e7f)});
+      launch("halo_copy", static_cast<std::uint32_t>((n + 255) / 256), 256,
+             {rt::Arg::Buf(c1), rt::Arg::Buf(x1), rt::Arg::Val(static_cast<std::uint32_t>(n))});
+      launch("halo_norm_rope_rows", R, 256,
+             {rt::Arg::Buf(x2), rt::Arg::Buf(wb), rt::Arg::Val(1e-6f), rt::Arg::Val(d), rt::Arg::Val(rot),
+              rt::Arg::Val(pos0), rt::Arg::Val(heads), rt::Arg::Val(1e7f), rt::Arg::Buf(c2)});
+      std::vector<std::uint32_t> a1(n), a2(n), b1(n), b2(n);
+      ASSERT_TRUE(dev->Download(x1, 0, a1.data(), n * 4, &error) && dev->Download(x2, 0, a2.data(), n * 4, &error) &&
+                  dev->Download(c1, 0, b1.data(), n * 4, &error) && dev->Download(c2, 0, b2.data(), n * 4, &error))
+          << error;
+      ASSERT_EQ(a2, a1) << "rows (d " << d << ", rot " << rot << ")";
+      ASSERT_EQ(b2, b1) << "cache";
+      for (auto& o : owned) dev->Free(o);
+    }, {.test_cases = 40});
+  }
+}
+
+// P4: halo_gated_norm_h128w (one wave per row) against halo_gated_norm_h: bit for bit, both modes.
+TEST(GpuKernels, GatedNormWaveEqualsBlock) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      constexpr std::uint32_t d = 128;
+      const auto rows = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 70}));
+      const auto mode = tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = 1}));
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto vec = [&](std::size_t n, float amp) {
+        std::vector<float> v(n);
+        for (auto& x : v) { seed = seed * 1664525u + 1013904223u; x = amp * (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f); }
+        return v;
+      };
+      const std::size_t n = std::size_t{rows} * d;
+      const auto o = vec(n, 8.0f), z = vec(n, 10.0f), w = vec(d, 3.0f);
+      std::vector<rt::Buffer> owned;
+      const auto up = [&](const void* p, std::size_t bytes) {
+        auto b = dev->Alloc(bytes, &error);
+        if (p) EXPECT_TRUE(dev->Upload(b, 0, p, bytes, &error));
+        owned.push_back(b);
+        return b;
+      };
+      auto ob = up(o.data(), n * 4), zb = up(z.data(), n * 4), wb = up(w.data(), d * 4), y1 = up(nullptr, n * 2),
+           y2 = up(nullptr, n * 2);
+      const auto launch = [&](const char* name, std::uint32_t grid, std::uint32_t block, std::initializer_list<rt::Arg> a) {
+        ASSERT_TRUE(dev->Launch(dev->Kernel(name, &error), {grid}, {block}, std::span<const rt::Arg>(a.begin(), a.size()),
+                                &error))
+            << name;
+      };
+      launch("halo_gated_norm_h", rows, 128, {rt::Arg::Buf(ob), rt::Arg::Buf(wb), rt::Arg::Buf(zb), rt::Arg::Buf(y1),
+                                              rt::Arg::Val(d), rt::Arg::Val(1e-6f), rt::Arg::Val(mode)});
+      launch("halo_gated_norm_h128w", (rows + 7) / 8, 256,
+             {rt::Arg::Buf(ob), rt::Arg::Buf(wb), rt::Arg::Buf(zb), rt::Arg::Buf(y2), rt::Arg::Val(rows),
+              rt::Arg::Val(1e-6f), rt::Arg::Val(mode)});
+      std::vector<std::uint16_t> a(n), b(n);
+      ASSERT_TRUE(dev->Download(y1, 0, a.data(), n * 2, &error) && dev->Download(y2, 0, b.data(), n * 2, &error)) << error;
+      ASSERT_EQ(b, a) << "mode " << mode;
+      for (auto& x : owned) dev->Free(x);
+    }, {.test_cases = 40});
+  }
+}
+
 TEST(GpuKernels, CombineNormTokEqualsRows) {
   std::string error;
   for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
@@ -2179,7 +2281,7 @@ TEST(GpuKernels, CombineNormTokEqualsRows) {
                    up(nullptr, std::size_t{T} * hc * irows * 4)};
       };
       const auto y16t = rt::Arg::Val(blocked ? T : 0u);
-      Out a = outs(), b = outs(), m = outs();
+      Out a = outs(), b = outs(), m = outs(), mv = outs();
       launch("halo_hc_combine_norm_rows", T * hc,
              {rt::Arg::Buf(a.r), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Buf(wb), rt::Arg::Val<std::uint64_t>(0),
               rt::Arg::Buf(a.y16), rt::Arg::Val(hc), rt::Arg::Val(h), rt::Arg::Val(1e-6f), rt::Arg::Buf(iwb),
@@ -2193,6 +2295,12 @@ TEST(GpuKernels, CombineNormTokEqualsRows) {
               rt::Arg::Buf(sgb), rt::Arg::Val(k), rt::Arg::Buf(ib), rt::Arg::Buf(wb), rt::Arg::Buf(m.y16),
               rt::Arg::Val(h), rt::Arg::Val(1e-6f), rt::Arg::Buf(iwb), rt::Arg::Buf(m.ip), rt::Arg::Val(irows),
               rt::Arg::Buf(m.sc), y16t});
+      if (h % 8 == 0)
+        launch("halo_hc_combine_norm_tok_moev", T,
+               {rt::Arg::Buf(mv.r), rt::Arg::Buf(ypb), rt::Arg::Buf(posb), rt::Arg::Buf(mwb), rt::Arg::Buf(sxb),
+                rt::Arg::Buf(sgb), rt::Arg::Val(k), rt::Arg::Buf(ib), rt::Arg::Buf(wb), rt::Arg::Buf(mv.y16),
+                rt::Arg::Val(h), rt::Arg::Val(1e-6f), rt::Arg::Buf(iwb), rt::Arg::Buf(mv.ip), rt::Arg::Val(irows),
+                rt::Arg::Buf(mv.sc), y16t});
       const auto get32 = [&](const rt::Buffer& buf, std::size_t cnt) {
         std::vector<std::uint32_t> v(cnt);
         EXPECT_TRUE(dev->Download(buf, 0, v.data(), cnt * 4, &error)) << error;
@@ -2205,8 +2313,9 @@ TEST(GpuKernels, CombineNormTokEqualsRows) {
       };
       const auto ra = get32(a.r, n), sa = get32(a.sc, std::size_t{T} * hc), pa = get32(a.ip, std::size_t{T} * hc * irows);
       const auto ya = get16(a.y16, n);
-      for (const Out* o : {&b, &m}) {
-        const char* what = o == &b ? "tok" : "tok_moe";
+      for (const Out* o : {&b, &m, &mv}) {
+        if (o == &mv && h % 8 != 0) continue;
+        const char* what = o == &b ? "tok" : o == &m ? "tok_moe" : "tok_moev";
         EXPECT_EQ(get32(o->r, n), ra) << what << " residual";
         EXPECT_EQ(get16(o->y16, n), ya) << what << " fp16 streams";
         EXPECT_EQ(get32(o->sc, std::size_t{T} * hc), sa) << what << " row scales";

@@ -7,6 +7,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <bit>
 #include <cstdint>
 #include <type_traits>
 
@@ -354,7 +355,7 @@ extern "C" __global__ void __launch_bounds__(256)
   const std::uint32_t hd = blockDim.x, i = threadIdx.x;
   const float* src = qg + static_cast<std::size_t>(blockIdx.x) * 2 * hd;
   const float x = src[i];
-  gate[static_cast<std::size_t>(blockIdx.x) * hd + i] = src[hd + i];
+  if (gate) gate[static_cast<std::size_t>(blockIdx.x) * hd + i] = src[hd + i];  // null: read in place later
   float ss = 0.0f;
   ss += x * x;
   // Rounded here, as halo_rmsnorm's loop leaves it: without this the backend fuses x * x into WarpSum's
@@ -376,6 +377,44 @@ extern "C" __global__ void __launch_bounds__(256)
     out[i + half] = a * s + b * c;
   } else if (i >= rotary_dim) {
     out[i] = v[i];
+  }
+}
+
+// halo_rmsnorm (shared gamma, d <= 256) then halo_rope_neox_rows on the same rows in one pass, rows of `heads`
+// heads per token at pos0 + blockIdx.x / heads; with cache, the rotated row is also written there (the KV
+// cache append). The same operations as the separate kernels (one element per thread, as halo_rmsnorm's
+// 256-thread loop sees it).  grid (T * heads), block 256
+extern "C" __global__ void __launch_bounds__(256)
+    halo_norm_rope_rows(float* x, const float* w, float eps, std::uint32_t d, std::uint32_t rotary_dim,
+                        std::uint32_t pos0, std::uint32_t heads, float theta, float* cache) {
+  __shared__ float scratch[32], v[256];
+  const std::uint32_t i = threadIdx.x;
+  float* row = x + static_cast<std::size_t>(blockIdx.x) * d;
+  const float xi = i < d ? row[i] : 0.0f;
+  float ss = 0.0f;
+  if (i < d) ss += xi * xi;
+  __asm__ volatile("" : "+v"(ss));  // rounded as halo_rmsnorm's loop leaves it (no fma into WarpSum)
+  ss = BlockSum(ss, scratch);
+  const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
+  if (i < d) v[i] = xi * scale * w[i];
+  __syncthreads();
+  const std::uint32_t half = rotary_dim / 2, pos = pos0 + blockIdx.x / heads;
+  float* crow = cache ? cache + static_cast<std::size_t>(blockIdx.x) * d : nullptr;
+  if (i < half) {
+    const float freq = powf(theta, -2.0f * static_cast<float>(i) / static_cast<float>(rotary_dim));
+    const float angle = static_cast<float>(pos) * freq;
+    const float c = cosf(angle), sn = sinf(angle);
+    const float a = v[i], b = v[i + half];
+    const float r0 = a * c - b * sn, r1 = a * sn + b * c;
+    row[i] = r0;
+    row[i + half] = r1;
+    if (crow) {
+      crow[i] = r0;
+      crow[i + half] = r1;
+    }
+  } else if (i >= rotary_dim && i < d) {
+    row[i] = v[i];
+    if (crow) crow[i] = v[i];
   }
 }
 
@@ -3416,7 +3455,7 @@ extern "C" __global__ void __launch_bounds__(256)
 // + sigmoid(sg[t]) * sx[t][i]): the routed and shared experts' sum is never
 // written to memory and read back (21 MB each way per layer at 2048 tokens).
 //   grid (T), block 256; h <= 2560, irows <= 8.
-template <bool kMoe>
+template <bool kMoe, bool kVec = false>
 __device__ __forceinline__ void HcCombineNormTok(float* res, const float* out, const _Float16* yp, const std::uint32_t* pos,
                                  const float* mw, const float* sx, const float* sg, std::uint32_t k,
                                  const float* inject, const float* w_all, _Float16* y16, std::uint32_t h, float eps,
@@ -3433,7 +3472,43 @@ __device__ __forceinline__ void HcCombineNormTok(float* res, const float* out, c
       const std::uint32_t i = tid + kk * NT;
       vals[st][kk] = i < h ? res[(static_cast<std::size_t>(t) * HC + st) * h + i] : 0.0f;
     }
-  if constexpr (kMoe) {
+  if constexpr (kMoe && kVec) {
+    // The expert sum with 16-byte loads: a thread sums 8 contiguous indices (each index's slots in order, then
+    // the shared expert: the same operations per element), the row goes through LDS, and each thread then
+    // takes its own indices tid + kk * 256 as above. (2-byte loads: 100 per thread for 10 slots.)
+    __shared__ __attribute__((aligned(16))) float orow[KPT * NT];
+    const float gs = Sigmoid(sg[t]);
+    for (std::uint32_t u = tid; u * 8 < h; u += NT) {
+      const std::uint32_t i0 = u * 8;
+      float a[8] = {};
+      uint4 nxt = *reinterpret_cast<const uint4*>(yp + static_cast<std::size_t>(pos[t * k]) * h + i0);
+      for (std::uint32_t s = 0; s < k; ++s) {
+        const uint4 cur = nxt;
+        const float ws = mw[t * k + s];
+        if (s + 1 < k) nxt = *reinterpret_cast<const uint4*>(yp + static_cast<std::size_t>(pos[t * k + s + 1]) * h + i0);
+        const std::uint32_t w4[4] = {cur.x, cur.y, cur.z, cur.w};
+#pragma unroll
+        for (std::uint32_t e = 0; e < 8; ++e) {
+          const _Float16 y = std::bit_cast<_Float16>(static_cast<std::uint16_t>(w4[e / 2] >> (16 * (e % 2))));
+          a[e] += ws * static_cast<float>(y);
+        }
+      }
+      const float4 x0 = *reinterpret_cast<const float4*>(sx + static_cast<std::size_t>(t) * h + i0);
+      const float4 x1 = *reinterpret_cast<const float4*>(sx + static_cast<std::size_t>(t) * h + i0 + 4);
+      const float xs[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+      for (std::uint32_t e = 0; e < 8; ++e) {
+        a[e] += gs * xs[e];
+        orow[i0 + e] = a[e];
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (std::uint32_t kk = 0; kk < KPT; ++kk) {
+      const std::uint32_t i = tid + kk * NT;
+      o[kk] = i < h ? orow[i] : 0.0f;
+    }
+  } else if constexpr (kMoe) {
 #pragma unroll
     for (std::uint32_t kk = 0; kk < KPT; ++kk) o[kk] = 0.0f;
     for (std::uint32_t s = 0; s < k; ++s) {
@@ -3556,6 +3631,15 @@ extern "C" __global__ void __launch_bounds__(256)
   HcCombineNormTok<true>(res, nullptr, yp, pos, mw, sx, sg, k, inject, w_all, y16, h, eps, iw, ipart, irows, rscale,
                          y16_tokens);
 }
+// The same with the expert rows read 16 bytes at a time (h % 8 == 0; bit-identical).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_combine_norm_tok_moev(float* res, const _Float16* yp, const std::uint32_t* pos, const float* mw,
+                                  const float* sx, const float* sg, std::uint32_t k, const float* inject,
+                                  const float* w_all, _Float16* y16, std::uint32_t h, float eps, const float* iw,
+                                  float* ipart, std::uint32_t irows, float* rscale, std::uint32_t y16_tokens) {
+  HcCombineNormTok<true, true>(res, nullptr, yp, pos, mw, sx, sg, k, inject, w_all, y16, h, eps, iw, ipart, irows,
+                               rscale, y16_tokens);
+}
 
 // inject[t][r] = sum over streams s (in order) of ipart[(t * hc + s) * irows + r].
 //   grid (ceil(T * irows / 256))
@@ -3620,6 +3704,41 @@ extern "C" __global__ void halo_gated_norm_h(const float* o, const float* w, con
   for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) {
     const float g = mode == 0 ? Silu(zv[i]) : Sigmoid(zv[i]);
     y16[static_cast<std::size_t>(blockIdx.x) * d + i] = static_cast<_Float16>(ov[i] * scale * w[i] * g);
+  }
+}
+
+// halo_gated_norm_h for d == 128 with one wave per row (8 rows a block, no barriers). Lane L holds elements
+// L + 32 w; the sum of squares reproduces the 128-thread kernel's: each w's WarpSum is that warp's, and
+// BlockSum's second stage over 4 partials (and zeros) is (p0 + p2) + (p1 + p3).
+//   grid (ceil(rows / 8)), block 256
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gated_norm_h128w(const float* o, const float* w, const float* z, _Float16* y16, std::uint32_t rows, float eps,
+                          std::uint32_t mode) {
+  constexpr std::uint32_t d = 128;
+  const std::uint32_t lane = threadIdx.x % kWarp, r = blockIdx.x * 8 + threadIdx.x / kWarp;
+  if (r >= rows) return;
+  const float* ov = o + static_cast<std::size_t>(r) * d;
+  const float* zv = z + static_cast<std::size_t>(r) * d;
+  float x[4], zz[4], p[4];
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    x[q] = ov[lane + 32 * q];
+    zz[q] = zv[lane + 32 * q];
+  }
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    float sq = 0.0f;
+    sq += x[q] * x[q];
+    __asm__ volatile("" : "+v"(sq));  // rounded, as the 128-thread kernel's loop leaves it
+    p[q] = WarpSum(sq);
+  }
+  const float ss = (p[0] + p[2]) + (p[1] + p[3]);
+  const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    const std::uint32_t i = lane + 32 * q;
+    const float g = mode == 0 ? Silu(zz[q]) : Sigmoid(zz[q]);
+    y16[static_cast<std::size_t>(r) * d + i] = static_cast<_Float16>(x[q] * scale * w[i] * g);
   }
 }
 
@@ -6654,7 +6773,7 @@ extern "C" __global__ void __launch_bounds__(256)
 //   grid (ceil(T / 16), num_kv_heads * ceil(G / 4)), block 256; head_dim 256.
 // OutT _Float16 (halo_attention_fa_h): the context leaves in fp16 for the out projection's FP16 GEMM, the same
 // bits a separate halo_f16_rows pass over the fp32 result gives (the fp32 value is rounded first).
-template <typename OutT>
+template <typename OutT, bool kGateQg = false>
 __device__ __forceinline__ void AttentionFa(const float* q, const _Float16* kc, const _Float16* vc, const float* gate,
                                             OutT* out, const std::uint32_t* params, std::uint32_t num_heads,
                                             std::uint32_t num_kv_heads, std::uint32_t tokens) {
@@ -6798,7 +6917,11 @@ __device__ __forceinline__ void AttentionFa(const float* q, const _Float16* kc, 
       const std::uint32_t t = qt0 + 2 * j + hi;
       if (t >= tokens) continue;
       const std::size_t idx = (static_cast<std::size_t>(t) * num_heads + h) * HD + half * 128 + dt * 16 + lane % 16;
-      float v = o[dt][j] / ml[wave][1][2 * j + hi] * Sigmoid(gate[idx]);
+      // kGateQg: the gate read in place from the q / gate projection rows ([t][head][q | gate], 2 HD apart).
+      const float gv = kGateQg ? gate[(static_cast<std::size_t>(t) * num_heads + h) * 2 * HD + HD + half * 128 +
+                                      dt * 16 + lane % 16]
+                               : gate[idx];
+      float v = o[dt][j] / ml[wave][1][2 * j + hi] * Sigmoid(gv);
       if constexpr (std::is_same_v<OutT, float>) {
         out[idx] = v;
       } else {
@@ -6818,6 +6941,13 @@ extern "C" __global__ void __launch_bounds__(256)
                         const std::uint32_t* params, std::uint32_t num_heads, std::uint32_t num_kv_heads,
                         std::uint32_t tokens) {
   AttentionFa<_Float16>(q, kc, vc, gate, out, params, num_heads, num_kv_heads, tokens);
+}
+// halo_attention_fa_h reading the gate from the projection output qg in place (split skips writing it).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_attention_fa_hg(const float* q, const _Float16* kc, const _Float16* vc, const float* qg, _Float16* out,
+                         const std::uint32_t* params, std::uint32_t num_heads, std::uint32_t num_kv_heads,
+                         std::uint32_t tokens) {
+  AttentionFa<_Float16, true>(q, kc, vc, qg, out, params, num_heads, num_kv_heads, tokens);
 }
 
 // halo_attention_wmma_mq's structure for QSA-selected keys: the 4 tokens of
