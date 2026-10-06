@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <random>
@@ -459,9 +460,17 @@ int CmdEval(int argc, char** argv) {
   train::ThreadPool pool(Threads(argc, argv));
   struct Result {
     double loss = 0;
-    std::uint64_t correct = 0, exact = 0, positions = 0;
+    std::uint64_t correct = 0, exact = 0, positions = 0, label_correct = 0;
     double seconds = 0;
   };
+  // LM head: the answer's first token among the dataset's distinct first
+  // completion tokens (e.g. " A" / " B"), a fair measure for a base model
+  // that would phrase the answer differently.
+  std::vector<std::int32_t> labels;
+  for (const auto& ex : d->examples)
+    if (!ex.lm_targets.empty() &&
+        std::find(labels.begin(), labels.end(), ex.lm_targets[0].second) == labels.end())
+      labels.push_back(ex.lm_targets[0].second);
   const auto run = [&](const std::string& adapter, bool classifier_ok) -> std::optional<Result> {
     Result r;
     const auto t0 = std::chrono::steady_clock::now();
@@ -470,7 +479,14 @@ int CmdEval(int argc, char** argv) {
       res.resize(ex.tokens.size() * H);
       if (!residual(adapter, ex.tokens, res)) return std::nullopt;
       train::Example e{res, static_cast<std::uint32_t>(ex.tokens.size()), ex.lm_targets, ex.label, ex.label_position};
-      const auto l = head->Forward(e, pool);
+      train::Probe probe;
+      const auto l = head->Forward(e, pool, &probe);
+      if (hc.head == train::HeadKind::kLm && !ex.lm_targets.empty() && labels.size() > 1) {
+        std::int32_t best = labels[0];
+        for (auto t : labels)
+          if (probe.logits[static_cast<std::size_t>(t)] > probe.logits[static_cast<std::size_t>(best)]) best = t;
+        r.label_correct += best == ex.lm_targets[0].second;
+      }
       if (l.count != ex.LossCount()) {
         if (!classifier_ok) return r;
         error = "head failed";
@@ -500,6 +516,7 @@ int CmdEval(int argc, char** argv) {
        {std::tuple{"accuracy", var->correct / double(var->positions), base ? base->correct / double(base->positions) : NAN,
                    var->positions},
         std::tuple{"exact_match", var->exact / n, base ? base->exact / n : NAN, std::uint64_t(n)},
+        std::tuple{"label_accuracy", var->label_correct / n, base ? base->label_correct / n : NAN, std::uint64_t(n)},
         std::tuple{"loss", var->loss / double(var->positions), base ? base->loss / double(base->positions) : NAN,
                    var->positions}}) {
     train::EvalReport r;
