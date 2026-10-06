@@ -132,7 +132,8 @@ Main 56693d8 and stream D (2026-10-06, `halo_run --device-sample 1`, steady medi
 |---|---:|---:|
 | main 56693d8, default clock | 43.5 ms (23.0 tok/s) | 55.4 ms (18.1 tok/s) |
 | main 56693d8, clock pinned | 42.9 ms (23.3 tok/s) | 53.8 ms (18.6 tok/s) |
-| + batched decode attention (`halo_attention_select_b`, bit-identical), pinned | **42.6 ms (23.5 tok/s)** | **44.2 ms (22.6 tok/s)** |
+| + batched decode attention (`halo_attention_select_b`, bit-identical), pinned | 42.6 ms (23.5 tok/s) | 44.2 ms (22.6 tok/s) |
+| Stream D2 (`--decode-opt`, all bit-identical; ROOFLINE section 10), pinned, final A/B vs main 19d80bb's 42.73 / 44.25 | **36.9 ms (27.1 tok/s)** | **39.0 ms (25.7 tok/s)** |
 
 The commit message of 66dae81 quotes 46.7 and 84 ms; those were measured
 with a stale `halo_run` binary built before the fusions.
