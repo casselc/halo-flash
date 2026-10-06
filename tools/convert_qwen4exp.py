@@ -23,7 +23,8 @@ _original = qwen4exp.Qwen4ExpTextModel.set_gguf_parameters
 def _set_gguf_parameters(self):
     types = self.hparams.get("layer_types")
     if types:
-        self.hparams["layer_types"] = ["full_attention" if t == "indexed_attention" else t for t in types]
+        # transformers 5.16 says "qwen_sparse_attention": every non-linear type is the sparse attention layer.
+        self.hparams["layer_types"] = ["full_attention" if t != "linear_attention" else t for t in types]
     return _original(self)
 
 
