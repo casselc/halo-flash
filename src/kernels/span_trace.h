@@ -31,6 +31,7 @@ enum HaloSpanTag : std::uint8_t {
   kSpanGemmQ8rF16 = 3,   // GemmQ8rF16 (every kernel built on it)
   kSpanMoeDown = 4,      // MoeDown (halo_moe_down_grouped_*)
   kSpanMoeGateUp = 5,    // MoeGateUp (halo_moe_gate_up_grouped_*)
+  kSpanQsel = 6,         // halo_attention_wmma_qsel_h
 };
 
 #ifdef HALO_TRACE

@@ -144,7 +144,8 @@ def main():
     # the real Flash-Next config.json says "full_attention", which is the only
     # value llama.cpp's converter recognizes (anything else silently writes
     # zero QSA compression ratios). Match the real checkpoint.
-    cfg["layer_types"] = ["full_attention" if t == "indexed_attention" else t
+    # (transformers 5.16 writes "qwen_sparse_attention": every non-linear type maps.)
+    cfg["layer_types"] = ["full_attention" if t != "linear_attention" else t
                           for t in cfg["layer_types"]]
     json.dump(cfg, open(os.path.join(hf_dir, "config.json"), "w"), indent=2)
     save_file(checkpoint_state(model, config), os.path.join(hf_dir, "model.safetensors"),

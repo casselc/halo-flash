@@ -8302,7 +8302,10 @@ extern "C" __global__ void __launch_bounds__(256)
                              std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t tokens) {
   constexpr std::uint32_t HD = 256, QT = 4, KC = 32, QR = HD + 8, VR = HD + 8, PR = KC + 8, MR = 48;
   __shared__ __attribute__((aligned(16))) _Float16 Qs[MR * QR];
-  __shared__ __attribute__((aligned(16))) _Float16 Vs[KC * VR];
+  // V transposed, [key / 16][dim][key % 16] (+32 bytes between the halves: their banks differ), so a P . V
+  // fragment is 32 contiguous bytes instead of 16 two-byte gathers.
+  constexpr std::uint32_t VH = HD * 16 + 16;
+  __shared__ __attribute__((aligned(16))) _Float16 Vt[2 * VH];
   __shared__ __attribute__((aligned(16))) _Float16 Ps[MR * PR];
   // The chunk's K, staged once for every scoring wave; its space is reused
   // for the scores once all waves have read it.
@@ -8311,6 +8314,7 @@ extern "C" __global__ void __launch_bounds__(256)
   static_assert(sizeof(float) * MR * KC <= sizeof(_Float16) * KC * VR, "scores fit the K tile");
   __shared__ float mrow[MR], lrow[MR], alpha[MR];
   __shared__ std::uint32_t nkv[QT];
+  HALO_SPAN_BEGIN(kSpanQsel, 5 * 260 + 8);  // 5 a chunk (union <= 4 x 2048 + 16 keys: 257 chunks) + 3 + anchors
   const std::uint32_t g = blockIdx.x, t0 = blockIdx.y * QT, G = num_heads / num_kv_heads;
   const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
   const std::uint32_t rows = QT * G, rtiles = (rows + 15) / 16;
@@ -8320,10 +8324,29 @@ extern "C" __global__ void __launch_bounds__(256)
   const std::uint8_t* um = umask + static_cast<std::size_t>(blockIdx.y) * max_u;
   // Key j of the union: position ub[j / ratio] * ratio + j % ratio.
   const auto pos_of = [&](std::uint32_t j) { return ub[j / ratio] * ratio + j % ratio; };
-  for (std::uint32_t i = tid; i < MR * HD; i += blockDim.x) {
-    const std::uint32_t r = i / HD, d = i % HD, tq = r / G, h = r % G;
-    const bool live = r < rows && t0 + tq < tokens;
-    Qs[r * QR + d] = static_cast<_Float16>(live ? q[(static_cast<std::size_t>(t0 + tq) * num_heads + g * G + h) * HD + d] : 0.0f);
+  // Q: a row per wave at a time, 8 values a lane; every row's loads issued before any is converted (a
+  // per-element loop with runtime divides and one load round per iteration took 26 us of a 480 us wave).
+  {
+    float4 qa[MR / 8][2];
+#pragma unroll
+    for (std::uint32_t i = 0; i < MR / 8; ++i) {
+      const std::uint32_t r = wave + 8 * i, tq = r / G, h = r % G;
+      const bool live = r < rows && t0 + tq < tokens;
+      const float* src = q + (static_cast<std::size_t>(t0 + tq) * num_heads + g * G + h) * HD + lane * 8;
+      qa[i][0] = live ? *reinterpret_cast<const float4*>(src) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      qa[i][1] = live ? *reinterpret_cast<const float4*>(src + 4) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+#pragma unroll
+    for (std::uint32_t i = 0; i < MR / 8; ++i) {
+      _Float16* dst = Qs + (wave + 8 * i) * QR + lane * 8;
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        dst[4 * e] = static_cast<_Float16>(qa[i][e].x);
+        dst[4 * e + 1] = static_cast<_Float16>(qa[i][e].y);
+        dst[4 * e + 2] = static_cast<_Float16>(qa[i][e].z);
+        dst[4 * e + 3] = static_cast<_Float16>(qa[i][e].w);
+      }
+    }
   }
   if (tid < MR) {
     mrow[tid] = -INFINITY;
@@ -8339,7 +8362,6 @@ extern "C" __global__ void __launch_bounds__(256)
   std::uint32_t pend = 0;
   for (std::uint32_t i = 0; i < QT; ++i) pend = max(pend, nkv[i]);
   const auto pos_in = [&](std::uint32_t j) { return min(pos_of(min(j, n - 1)), pend - 1); };
-  const auto live_at = [&](std::uint32_t j) { return j < n && pos_of(min(j, n - 1)) < pend; };
   // P . V work: wave owns dim tiles 2 * (wave % 8) .. + 1 for every row tile.
   halo_v8f acc[3][2] = {};
   // Only LDS is shared between the waves: LDS-only barriers keep the next
@@ -8354,37 +8376,78 @@ extern "C" __global__ void __launch_bounds__(256)
   // K and V of the next chunk in flight as fp16 (the fp16 cache copy: half
   // the bytes and registers of fp32), 16 bytes = 8 values per load.
   constexpr std::uint32_t KP = KC * HD / 8 / 256;  // uint4 per thread per chunk, each of K and V
+  // Piece p of a thread: key wave + 8 p, values lane * 8 ... The union's bookkeeping is read a chunk ahead,
+  // one key per lane, as raw values (the per-piece reads of the list were dependent load
+  // rounds in both the staging and the prefetch).
+  struct Idx {
+    std::uint32_t c, ul, ua, m;
+  };
+  const auto fetch = [&](std::uint32_t c) {
+    const std::uint32_t ja = min(c + lane, n - 1);
+    return Idx{c, ub[(min(c, n - 1) + lane) / ratio], ub[ja / ratio], um[ja / ratio]};
+  };
+  const std::uint32_t plast = n > 0 ? min(pos_of(n - 1), pend - 1) : 0;
+  const auto pos_l = [&](const Idx& x) {  // pos_in(min(c, n - 1) + lane)
+    const std::uint32_t j = min(x.c, n - 1) + lane;
+    return j < n ? min(x.ul * ratio + j % ratio, pend - 1) : plast;
+  };
+  const auto pos_a = [&](const Idx& x) { return x.ua * ratio + min(x.c + lane, n - 1) % ratio; };
+  const std::uint32_t swave = __builtin_amdgcn_readfirstlane(wave);
   uint4 rk[KP], rv[KP];
-  const auto load_kv = [&](std::uint32_t c) {
+  const auto load_kv = [&](const Idx& x) {
+    const std::uint32_t pl = pos_l(x);
 #pragma unroll
     for (std::uint32_t p = 0; p < KP; ++p) {
-      const std::uint32_t i = tid + p * 256, j = i / (HD / 8), d = (i % (HD / 8)) * 8;
-      const std::size_t at = (static_cast<std::size_t>(pos_in(c + j)) * num_kv_heads + g) * HD + d;
+      const std::uint32_t j = swave + 8 * p;
+      const std::size_t at =
+          (static_cast<std::size_t>(__builtin_amdgcn_readlane(pl, j)) * num_kv_heads + g) * HD + lane * 8;
       rk[p] = *reinterpret_cast<const uint4*>(kc + at);
-      rv[p] = *reinterpret_cast<const uint4*>(vc + at);
+      // V: lane = key, values (wave + 8 p) * 8 .. (the transposed stores of a wave are 2 x 32 contiguous bytes)
+      rv[p] = *reinterpret_cast<const uint4*>(vc + (static_cast<std::size_t>(pl) * num_kv_heads + g) * HD + j * 8);
     }
   };
-  if (n > 0) load_kv(0);
+  Idx cur{}, nxt{};
+  if (n > 0) {
+    cur = fetch(0);
+    nxt = fetch(KC);
+    load_kv(cur);
+  }
+  HALO_SPAN(1);  // Q staged, first chunk's loads issued
   for (std::uint32_t c0 = 0; c0 < n; c0 += KC) {
-    barrier();  // previous chunk's Ks (scores) / Vs / Ps reads done
+    barrier();  // previous chunk's Ks (scores) / Vt / Ps reads done
+    HALO_SPAN(2);  // chunk start
+    const std::uint32_t lives = __builtin_amdgcn_ballot_w32(c0 + lane < n && pos_a(cur) < pend);
 #pragma unroll
     for (std::uint32_t p = 0; p < KP; ++p) {
-      const std::uint32_t i = tid + p * 256, j = i / (HD / 8), d = (i % (HD / 8)) * 8;
-      const bool live = live_at(c0 + j);
+      const std::uint32_t j = swave + 8 * p, d = lane * 8;
+      const bool live = (lives >> j) & 1u;
       *reinterpret_cast<uint4*>(Ks + j * VR + d) = live ? rk[p] : make_uint4(0, 0, 0, 0);
-      *reinterpret_cast<uint4*>(Vs + j * VR + d) = live ? rv[p] : make_uint4(0, 0, 0, 0);
+      const uint4 w = (lives >> lane) & 1u ? rv[p] : make_uint4(0, 0, 0, 0);
+      _Float16* vdst = Vt + (lane / 16) * VH + j * 8 * 16 + lane % 16;
+      const std::uint32_t wv[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const halo_h2 h2 = AsH2(wv[e]);
+        vdst[(2 * e) * 16] = h2.x;
+        vdst[(2 * e + 1) * 16] = h2.y;
+      }
     }
-    load_kv(min(c0 + KC, n - 1));  // next chunk, in flight during the work below
-    barrier();                     // Ks, Vs complete
+    const std::uint32_t kpa = pos_a(cur), kma = cur.m;  // this chunk's keys, one a lane
+    load_kv(nxt);  // next chunk, in flight during the work below
+    cur = nxt;
+    if (c0 + 2 * KC < n) nxt = fetch(c0 + 2 * KC);
+    barrier();                     // Ks, Vt complete
+    HALO_SPAN(3);                  // staged
     // Scores: wave -> (row tile wave / 2, key tile wave % 2), up to 6 waves.
     const std::uint32_t rt = wave / 2, kt = wave % 2;
     const std::uint32_t kj = c0 + kt * 16 + lane % 16;
-    const std::uint32_t kp = pos_of(min(kj, n - 1)), km = um[min(kj, n - 1) / ratio];
+    const std::uint32_t kp = __shfl(kpa, kt * 16 + lane % 16, 32), km = __shfl(kma, kt * 16 + lane % 16, 32);
     halo_v8f s = {};
     if (rt < rtiles)
       for (std::uint32_t k0 = 0; k0 < HD; k0 += 16)
         s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(LdsFrag(&Qs[(rt * 16 + lane % 16) * QR + k0]),
                                                        LdsFrag(&Ks[(kt * 16 + lane % 16) * VR + k0]), s);
+    HALO_SPAN(4);  // score WMMAs issued
     barrier();  // every wave's Ks reads done: the scores overwrite it
     if (rt < rtiles) {
 #pragma unroll
@@ -8396,6 +8459,7 @@ extern "C" __global__ void __launch_bounds__(256)
       }
     }
     barrier();
+    HALO_SPAN(5);  // scores in LDS
     // Online softmax: 4 threads per row (192 of 256), 8 keys each.
     if (tid < MR * 4) {
       const std::uint32_t row = tid / 4, part = tid % 4;
@@ -8419,6 +8483,7 @@ extern "C" __global__ void __launch_bounds__(256)
       }
     }
     barrier();
+    HALO_SPAN(6);  // softmax done
 #pragma unroll
     for (std::uint32_t r = 0; r < 3; ++r) {  // fully unrolled: acc stays in registers
       if (r >= rtiles) break;
@@ -8431,15 +8496,28 @@ extern "C" __global__ void __launch_bounds__(256)
 #pragma unroll
         for (int dt = 0; dt < 2; ++dt) {
           const std::uint32_t d = (wave * 2 + dt) * 16 + lane % 16;
-          halo_v16h b;
-#pragma unroll
-          for (int i = 0; i < 16; ++i) b[i] = Vs[(kk + i) * VR + d];
-          acc[r][dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[r][dt]);
+          acc[r][dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, LdsFrag(&Vt[(kk / 16) * VH + d * 16]), acc[r][dt]);
         }
       }
     }
   }
   __syncthreads();
+  HALO_SPAN(7);  // last chunk's P . V done
+  // Every gate value loaded before any output is formed (one memory round, not one per element: the
+  // per-element loop took 26 us of a 480 us wave).
+  float gv[3][2][8];
+#pragma unroll
+  for (std::uint32_t r = 0; r < 3; ++r)
+#pragma unroll
+    for (int dt = 0; dt < 2; ++dt)
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint32_t row = r * 16 + 2 * j + lane / 16, tq = row / G, h = row % G;
+        const bool ok = r < rtiles && row < rows && t0 + tq < tokens;
+        const std::uint32_t d = (wave * 2 + dt) * 16 + lane % 16;
+        const std::size_t idx = (static_cast<std::size_t>(t0 + tq) * num_heads + g * G + h) * HD + d;
+        gv[r][dt][j] = ok ? gate[idx] : 0.0f;
+      }
 #pragma unroll
   for (std::uint32_t r = 0; r < 3; ++r)
 #pragma unroll
@@ -8450,8 +8528,9 @@ extern "C" __global__ void __launch_bounds__(256)
         if (r >= rtiles || row >= rows || t0 + tq >= tokens) continue;
         const std::uint32_t d = (wave * 2 + dt) * 16 + lane % 16;
         const std::size_t idx = (static_cast<std::size_t>(t0 + tq) * num_heads + g * G + h) * HD + d;
-        out[idx] = acc[r][dt][j] / lrow[row] * Sigmoid(gate[idx]);
+        out[idx] = acc[r][dt][j] / lrow[row] * Sigmoid(gv[r][dt][j]);
       }
+  HALO_SPAN_END(8);  // outputs stored
 }
 
 // F32 GEMM for few rows (<= 16: the mixer's 4-row inject, the shared

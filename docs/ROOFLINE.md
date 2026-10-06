@@ -1173,6 +1173,44 @@ Remaining decode levers, by size (short context, ms/token): the hyper-connection
 is not possible before the token is known; overlapping it with the LM head and sampling would need the token
 earlier); attention at long context after this change ~1.9 at 7K (floor ~0.5).
 
+**Stream S (exact efficiency 2, branch `stream/exact2`, 2026-10-06).** 8K = 8192 tokens of prose_long + prose_8888
+(`streams/S/prose_10k.txt`; prose_8888 alone is 3485 tokens), pinned, kernel timing of the last rep.
+
+*Long-prompt attention.* Span trace of `halo_attention_wmma_qsel_h` (launch 130 of 144, sample 7): waves live
+480 us, 102 chunks of 32 keys at ~4.0 us (P.V + barrier 1.02, staging 0.76, scores 0.71, score write + barriers 0.73,
+softmax 0.70), plus a 26.6 us prologue and a 26.2 us epilogue; ATT: barrier 45.7%, lgkmcnt 20.0%, vmcnt 18.1%,
+WMMA 0.9%. Every row bit-identical (8K and 2048 logits `cmp`, property test bitwise):
+
+| Change | Predicted | Measured (qsel_h per 8K prefill, 144 calls) | Kept |
+|---|---|---|---|
+| Q staged a row per wave, all loads first; the gate loads batched before the outputs | -40..-50 | 460.0 -> 424.6 ms | yes |
+| `halo_attention_wmma_qsel_w`: 6 waves own their rows (wave = row tile x key tile for scores, x dim half for P.V), scores swapped between the pair through LDS, qsel_h's softmax replayed in registers (DPP sequential 8-key sums), V transposed, Q/K swizzled to fit 64 KB; 3 barriers a chunk instead of 5 | -150..-210 | first build 662 ms; after the next row's fix 520 ms (3.61 ms a call vs 2.95): slower | no (642bd91) |
+| The union list (ublk / umask) read a chunk ahead, one key per lane, raw values (each staged piece and each prefetch address re-read it: dependent load rounds a chunk; found in qsel_w's trace: 2.2 of 5.6 us a chunk in vmcnt) | not written before measuring | 424.6 -> 396.0 ms | yes |
+| V staged transposed ([key/16][dim][key%16]): P.V fragments are 32 bytes instead of 16 two-byte gathers | -20..-35 | 396.0 -> 386.3 ms | yes |
+
+Why qsel_w lost (trace after the list fix not taken; first-build trace): its score phase took 1.5 us for 16 WMMAs a
+wave at 3 waves/SIMD (0.57 us of issue; qsel_h's took 0.71 with the same chain), lgkmcnt 33.8%: six waves at
+256 VGPRs, the duplicated softmax and the exchange add LDS round trips that the five-barrier kernel's 8 waves
+overlapped. Same lesson as `fa`: owning rows removes barriers but not the LDS-latency-bound fragment traffic.
+Halogen's sparse path (`k_sel_tilemask` + `k_attn_fa2` with a tile mask) was not run: its FaSel layout is not known.
+
+End to end, merged main 5e5466e vs this branch (ab_bench, 4 rounds x 3 reps, pinned): 8192 tokens, ab_bench's device
+metric (it keeps the last `device` line of each rep, i.e. the last 2048-token chunk, positions 6144-8191)
+1346.7 -> 1324.0 ms, **-22.7 ms, significant** (spreads 8.0 / 5.2); over the whole 8K prefill the kernel-timed rep
+gives qsel_h 460.4 -> 386.7 ms (-73.7, spread 0.6). 2048 tokens (qsel_h does not run): 1243.7 -> 1245.3, +1.7
+within noise. Logits byte-identical to main at 8K and 2048 (`logits_main_5e5466e.bin`); gpu_tests 45 passed.
+
+*Dense GEMMs over pre-dequantized fp16 weights (probe `--w16`, 642bd91, removed).* The fp16 copy holds the values
+the staging computes (fp16(q x scale) by the same fp16 operations; q x scale itself is not always representable),
+so all `_w16` GEMMs are bit-identical (property test over the whole fp16 scale range; 2048 logits identical).
+6.67 GiB more (400 tensors). At 2048 tokens, kernel ms (Q8 -> fp16 weights): lr8 qkv 110.8 -> 138.8, lr8 z
+66.6 -> 84.5, lr8 q/gate 43.2 -> 54.8, `_l` 119.5 -> 136.9, `_mb` 57.3 -> 90.4, mixth 69.1 -> 66.3, `_s` 30.1 -> 28.9;
+dense GEMMs 496.5 -> 600.5 ms (+104), prefill 1.275 -> 1.376 s. Predicted -12..-30. The dequantization is not
+on the critical path; the doubled weight bytes and the prefetch registers (lr8 6 -> 5 waves/SIMD) are. Against
+gufo's profile (per call, 2048 tokens): qkv + z 4.84 vs 5.15 ms (16384 x 2560 fused), q/gate/k/v 4.07 vs 4.62,
+mix + epilogue 0.72 vs 0.89; the remaining dense-class gap is the mixer down (`_mb` 0.60 vs W8A8 0.50) and
+attention out, both precision choices (W8A8), not dequantization.
+
 **Precision options, second round (stream R, 2026-10-06, branch stream/precision2).** Same gate and A/B protocol as
 stream P (`ab_bench.py`, 4 rounds x 3 reps, pinned, prose_1 at 2048 tokens; quality: docs/BENCHMARKS.md).
 
