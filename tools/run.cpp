@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <chrono>
 #include <fstream>
+#include <random>
 #include <iterator>
 #include <map>
 #include <cmath>
@@ -144,7 +145,15 @@ int main(int argc, char** argv) {
   bool batch_check = false;
   // --session-bench N: prefill N tokens (--prompt-file repeated), then time and size fork / bind / snapshot /
   // restore / drop of that session (P6 design numbers).
-  std::uint32_t session_bench = 0;  // --route-trace FILE: routed expert ids of every step ([layers][k] uint32)
+  std::uint32_t session_bench = 0;
+  // --mtp-model FILE --mtp-prompts a,b,c: P5 acceptance measurement. Per prompt: pass 1 decodes --n tokens AR
+  // (greedy, or sampled at --mtp-temp T) and keeps every target distribution; pass 2 replays the sequence
+  // token by token and at every position drafts --mtp-depth tokens with the MTP block (greedy: the block's own
+  // argmax chain, exact acceptance; sampled: the chain teacher-forced on the target path, acceptance
+  // sum_x min(p, q) per depth). --mtp-check N compares the first N draft logits with the CPU reference.
+  std::string mtp_model, mtp_prompts, mtp_out;
+  std::uint32_t mtp_depth = 4, mtp_check = 0;
+  double mtp_temp = 0;  // --route-trace FILE: routed expert ids of every step ([layers][k] uint32)
   std::uint32_t span_sample = 1;
   bool eager = false, profile = false, device_sample = false;
   bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
@@ -217,6 +226,12 @@ int main(int argc, char** argv) {
     else if (a == "--batch") batch = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--batch-prompts") batch_prompts = argv[i + 1];
     else if (a == "--session-bench") session_bench = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--mtp-model") mtp_model = argv[i + 1];
+    else if (a == "--mtp-prompts") mtp_prompts = argv[i + 1];
+    else if (a == "--mtp-depth") mtp_depth = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--mtp-temp") mtp_temp = std::atof(argv[i + 1]);
+    else if (a == "--mtp-check") mtp_check = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--mtp-out") mtp_out = argv[i + 1];
     else if (a == "--batch-check") batch_check = std::string(argv[i + 1]) == "1";
     else if (a == "--batch-decode") engine::FlashNextGpu::batch_decode_ = std::string(argv[i + 1]) == "1";
     else if (a == "--decode-timing") decode_timing = std::string(argv[i + 1]) == "1";
@@ -466,6 +481,153 @@ int main(int argc, char** argv) {
     std::printf("  drop 2 forks: %.2f ms\n", ms(t));
     std::size_t fr = 0;
     (void)fr;
+    return 0;
+  }
+  if (!mtp_model.empty()) {
+    if (!gpu) return std::fprintf(stderr, "--mtp-model needs a GPU device\n"), 2;
+    auto mreader = core::GgufReader::OpenFile(mtp_model, &error);
+    if (!mreader) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    auto mtp = model::MtpWeights::Bind(*mreader, c, &error);
+    if (!mtp) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    if (!gpu->LoadMtp(*mtp, &error)) return std::fprintf(stderr, "LoadMtp: %s\n", error.c_str()), 1;
+    const std::uint32_t K = std::max(1u, mtp_depth);
+    const std::size_t V = c.vocab_size;
+    std::vector<std::string> files;
+    for (std::size_t p = 0; p < mtp_prompts.size();) {
+      const auto q = mtp_prompts.find(',', p);
+      files.push_back(mtp_prompts.substr(p, q == std::string::npos ? std::string::npos : q - p));
+      p = q == std::string::npos ? mtp_prompts.size() : q + 1;
+    }
+    std::mt19937_64 rng(12345);
+    const auto probs = [&](const float* l, std::vector<double>& p) {  // softmax at mtp_temp (> 0)
+      p.resize(V);
+      double mx = -1e300, sum = 0;
+      for (std::size_t i = 0; i < V; ++i) mx = std::max(mx, static_cast<double>(l[i]));
+      for (std::size_t i = 0; i < V; ++i) sum += p[i] = std::exp((l[i] - mx) / mtp_temp);
+      for (auto& x : p) x /= sum;
+    };
+    const auto argmax = [&](const float* l) { return static_cast<std::int32_t>(std::max_element(l, l + V) - l); };
+    std::ofstream out;
+    if (!mtp_out.empty()) out.open(mtp_out, std::ios::app);
+    double t_head_sum = 0, t_base_sum = 0;
+    std::size_t t_head_n = 0, t_base_n = 0, t_chain_n = 0;
+    double t_chain_sum = 0;
+    for (const auto& file : files) {
+      std::ifstream f(file);
+      const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+      const auto enc = tok->Encode(text, true);
+      std::vector<std::int32_t> toks(enc.begin(), enc.end());
+      const std::size_t L = toks.size();
+      // Pass 1: AR decode, every generated position's target logits kept.
+      if (!gpu->Reset(&error)) return 1;
+      if (L > 1 && !gpu->Prefill(std::span<const std::int32_t>(toks).first(L - 1), {}, &error))
+        return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      std::vector<float> tl(static_cast<std::size_t>(n) * V);  // tl[g]: logits after the step at position L-1+g
+      std::vector<double> p;
+      for (int g = 0; g < n; ++g) {
+        float* lg = tl.data() + static_cast<std::size_t>(g) * V;
+        if (!gpu->Step(toks.back(), std::span<float>(lg, V), &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+        std::int32_t next = argmax(lg);
+        if (mtp_temp > 0) {
+          probs(lg, p);
+          double u = std::uniform_real_distribution<double>(0, 1)(rng), cum = 0;
+          for (std::size_t i = 0; i < V; ++i)
+            if ((cum += p[i]) > u) {
+              next = static_cast<std::int32_t>(i);
+              break;
+            }
+        }
+        toks.push_back(next);
+      }
+      // Pass 2: replay token by token; MTP base step at every position, drafts at generated positions.
+      if (!gpu->Reset(&error)) return 1;
+      gpu->MtpRewind(0);
+      std::unique_ptr<model::ReferenceModel> ref;
+      if (mtp_check > 0) ref = std::make_unique<model::ReferenceModel>(*weights, ngram.get(), mtp_check + 1);
+      std::vector<std::vector<float>> q(K, std::vector<float>(V));
+      std::vector<float> hidden, cpu_l(V);
+      // greedy: hits[j] = positions whose drafts 1..j+1 all matched; sampled: sum over positions of prod alpha
+      std::vector<double> chain(K, 0.0), cond_num(K, 0.0), cond_den(K, 0.0);
+      std::size_t positions = 0;
+      using clk = std::chrono::steady_clock;
+      for (std::size_t t = 0; t + 1 < toks.size(); ++t) {
+        if (!gpu->Step(toks[t], {}, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+        const std::size_t g0 = t + 1 >= L ? t + 1 - L : SIZE_MAX;  // tl index of the step at position t
+        // Drafts only where the targets of all K depths are known: q_j vs tl[g0 + j].
+        const bool draft = t + 1 >= L && g0 + K < static_cast<std::size_t>(n);
+        const bool check = t < mtp_check;
+        static const bool mtp_timing = std::getenv("HALO_MTP_TIMING") != nullptr;
+        if (mtp_timing && t == 20 && !gpu->StartKernelTiming(1 << 20, &error)) return 1;
+        if (!dev->Synchronize(&error)) return 1;  // the trunk step's time is not the draft block's
+        auto st = clk::now();
+        if (mtp_timing && t == 30) {
+          double span = 0, rate = 0;
+          const auto times = gpu->StopKernelTiming(&span, &rate, &error);
+          for (const auto& k : times)
+            std::printf("  mtp-timing %-58s %8.3f ms/10 steps %6.1f calls\n", k.key.c_str(), k.ms, double(k.calls));
+        }
+        if (!gpu->MtpStep(toks[t + 1], true, draft || check ? std::span<float>(q[0]) : std::span<float>{}, &error))
+          return std::fprintf(stderr, "mtp: %s\n", error.c_str()), 1;
+        const double ms = std::chrono::duration<double, std::milli>(clk::now() - st).count();
+        if (draft || check) t_head_sum += ms, ++t_head_n;
+        else t_base_sum += ms, ++t_base_n;
+        if (check) {
+          if (!gpu->TrunkHidden(&hidden, &error) ||
+              !ref->MtpStep(*mtp, toks[t + 1], hidden, cpu_l, nullptr, &error))
+            return std::fprintf(stderr, "check: %s\n", error.c_str()), 1;
+          double d = 0, m = 0;
+          for (std::size_t i = 0; i < V; ++i) d += (q[0][i] - cpu_l[i]) * double(q[0][i] - cpu_l[i]), m += cpu_l[i] * double(cpu_l[i]);
+          std::printf("mtp check position %zu: relL2 %.3g, argmax gpu %d cpu %d\n", t, std::sqrt(d / m), argmax(q[0].data()),
+                      argmax(cpu_l.data()));
+        }
+        if (!draft) continue;
+        const std::uint32_t base = gpu->MtpPosition();
+        std::vector<std::int32_t> d(K);
+        d[0] = argmax(q[0].data());
+        for (std::uint32_t j = 1; j < K; ++j) {
+          const std::int32_t in = mtp_temp > 0 ? toks[t + 1 + j] : d[j - 1];
+          const auto sc = clk::now();
+          if (!gpu->MtpStep(in, false, q[j], &error)) return std::fprintf(stderr, "mtp: %s\n", error.c_str()), 1;
+          t_chain_sum += std::chrono::duration<double, std::milli>(clk::now() - sc).count(), ++t_chain_n;
+          d[j] = argmax(q[j].data());
+        }
+        gpu->MtpRewind(base);
+        ++positions;
+        double run = 1;
+        for (std::uint32_t j = 0; j < K; ++j) {
+          double a;
+          if (mtp_temp > 0) {
+            std::vector<double> pq;
+            probs(tl.data() + (g0 + 1 + j) * V, p);
+            probs(q[j].data(), pq);
+            a = 0;
+            for (std::size_t i = 0; i < V; ++i) a += std::min(p[i], pq[i]);
+          } else {
+            a = d[j] == toks[t + 2 + j] ? 1.0 : 0.0;
+          }
+          if (mtp_temp > 0 || run > 0) cond_num[j] += a, cond_den[j] += 1;  // greedy: given drafts 1..j matched
+          run *= a;
+          chain[j] += run;
+        }
+      }
+      std::string name = file.substr(file.find_last_of('/') + 1);
+      std::printf("mtp %s %s: %zu prompt tokens, %d generated, %zu draft positions\n", name.c_str(),
+                  mtp_temp > 0 ? ("T=" + std::to_string(mtp_temp)).c_str() : "greedy", L, n, positions);
+      double e = 1;
+      for (std::uint32_t j = 0; j < K; ++j) {
+        e += chain[j] / static_cast<double>(positions);
+        std::printf("  depth %u: conditional acceptance %.3f (%.0f of %.0f), P(drafts 1..%u accepted) %.3f, E[tokens/cycle | depth %u] %.3f\n",
+                    j + 1, cond_num[j] / std::max(1.0, cond_den[j]), cond_num[j], cond_den[j], j + 1,
+                    chain[j] / static_cast<double>(positions), j + 1, e);
+        if (out.is_open())
+          out << name << ' ' << (mtp_temp > 0 ? mtp_temp : 0.0) << ' ' << j + 1 << ' ' << cond_num[j] << ' ' << cond_den[j]
+              << ' ' << chain[j] << ' ' << positions << '\n';
+      }
+      std::printf("  text: %s\n", tok->Decode(std::vector<text::TokenId>(toks.begin() + static_cast<std::ptrdiff_t>(L), toks.end())).c_str());
+    }
+    std::printf("mtp chained draft step (eager, with head, download): %.2f ms (%zu)\n", t_chain_sum / std::max<std::size_t>(1, t_chain_n), t_chain_n);
+    std::printf("mtp step (eager): with head %.2f ms (%zu), headless %.2f ms (%zu)\n", t_head_sum / std::max<std::size_t>(1, t_head_n),
+                t_head_n, t_base_sum / std::max<std::size_t>(1, t_base_n), t_base_n);
     return 0;
   }
   if (batch > 0) {
