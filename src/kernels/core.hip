@@ -804,6 +804,82 @@ extern "C" __global__ void halo_attention_select(const float* q, const float* kc
                                                  std::uint32_t num_kv_heads, std::uint32_t hd, std::uint32_t max_n) {
   AttentionSelect(q, kc, vc, gate, visible, out, scores, params, num_heads, num_kv_heads, hd, max_n);
 }
+// Decode: halo_attention_select's arithmetic in the same order (bit-identical), with its loads batched. The serial
+// kernel walks the visible positions one dependent load at a time (1 ms a layer at 7K context: 24 blocks, each
+// thread's V sum waiting on one load per position). Here q sits in LDS, a key row is read as float4s eight at a
+// time, and the V sum reads 16 positions' values before folding them in order; the scores and the visible list
+// come through LDS in tiles. Each thread still owns its key rows (phase 1) and its output dimension (phase 3), so
+// every dot product and sum keeps its order. hd % 32 == 0, hd <= blockDim.x <= 256. grid (num_heads), block 256
+extern "C" __global__ void __launch_bounds__(256)
+    halo_attention_select_b(const float* q, const float* kc, const float* vc, const float* gate,
+                            const std::uint32_t* visible, float* out, float* scores, const std::uint32_t* params,
+                            std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t hd,
+                            std::uint32_t max_n) {
+  constexpr std::uint32_t kTile = 1024, kV = 16;
+  __shared__ float scratch[32];
+  __shared__ __attribute__((aligned(16))) float qs[256];
+  __shared__ float tsc[kTile];
+  __shared__ std::uint32_t tvis[kTile];
+  const std::uint32_t n = params[kHaloNVisible];
+  const std::uint32_t h = blockIdx.x, kvh = h / (num_heads / num_kv_heads);
+  const float* qh = q + h * hd;
+  for (std::uint32_t i = threadIdx.x; i < hd; i += blockDim.x) qs[i] = qh[i];
+  __syncthreads();
+  float* sc = scores + static_cast<std::size_t>(h) * max_n;
+  const float scale = 1.0f / sqrtf(static_cast<float>(hd));
+  const std::size_t stride = static_cast<std::size_t>(num_kv_heads) * hd;
+  const float4* q4 = reinterpret_cast<const float4*>(qs);
+  float mx = -INFINITY;
+  for (std::uint32_t j = threadIdx.x; j < n; j += blockDim.x) {
+    const float4* kp = reinterpret_cast<const float4*>(kc + visible[j] * stride + kvh * hd);
+    float dot = 0.0f;
+    for (std::uint32_t c = 0; c < hd / 4; c += 8) {
+      float4 kk[8];
+#pragma unroll
+      for (int u = 0; u < 8; ++u) kk[u] = kp[c + u];
+#pragma unroll
+      for (int u = 0; u < 8; ++u) {
+        const float4 qq = q4[c + u];
+        dot += qq.x * kk[u].x;
+        dot += qq.y * kk[u].y;
+        dot += qq.z * kk[u].z;
+        dot += qq.w * kk[u].w;
+      }
+    }
+    sc[j] = dot * scale;
+    mx = fmaxf(mx, sc[j]);
+  }
+  mx = BlockMax(mx, scratch);
+  float den = 0.0f;
+  for (std::uint32_t j = threadIdx.x; j < n; j += blockDim.x) {
+    sc[j] = expf(sc[j] - mx);
+    den += sc[j];
+  }
+  den = BlockSum(den, scratch);
+  __syncthreads();
+  const std::uint32_t i = threadIdx.x;
+  const float* vb = vc + kvh * hd + (i < hd ? i : 0);
+  float acc = 0.0f;
+  for (std::uint32_t j0 = 0; j0 < n; j0 += kTile) {
+    const std::uint32_t cnt = min(kTile, n - j0);
+    for (std::uint32_t t = threadIdx.x; t < cnt; t += blockDim.x) {
+      tsc[t] = sc[j0 + t];
+      tvis[t] = visible[j0 + t];
+    }
+    __syncthreads();
+    std::uint32_t t = 0;
+    for (; t + kV <= cnt; t += kV) {
+      float v[kV];
+#pragma unroll
+      for (std::uint32_t u = 0; u < kV; ++u) v[u] = vb[tvis[t + u] * stride];
+#pragma unroll
+      for (std::uint32_t u = 0; u < kV; ++u) acc += tsc[t + u] * v[u];
+    }
+    for (; t < cnt; ++t) acc += tsc[t] * vb[tvis[t] * stride];
+    __syncthreads();
+  }
+  if (i < hd) out[h * hd + i] = acc / den * Sigmoid(gate[h * hd + i]);
+}
 // P4: token t = blockIdx.y; visible lists `max_n` apart, scores
 // num_heads * max_n apart. grid (num_heads, T)
 extern "C" __global__ void halo_attention_select_rows(const float* q, const float* kc, const float* vc,

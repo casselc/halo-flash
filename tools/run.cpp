@@ -126,6 +126,11 @@ int main(int argc, char** argv) {
   int n = 16, prefill_bench = 0, reps = 3;
   std::string prefill_file, prefill_warm;
   bool kernel_timing = false;  // --kernel-timing 1: sync-free per-kernel times of the last prefill rep
+  // Decode measurement: --prompt-file F (raw text prompt), --prefill-prompt 1 (all but the prompt's last token
+  // through Prefill, then stepping), --decode-logits-out F (every decode step's logits, fp32, appended),
+  // --decode-timing 1 (sync-free per-kernel times of the steady decode steps; eager launches).
+  std::string prompt_file, decode_logits_out;
+  bool prefill_prompt = false, decode_timing = false;
   // --span-hsaco FILE --span-kernel NAME --span-occurrence N --span-out FILE [--span-sample N]: load the traced
   // code object and record the N-th launch (from 0) of kernel NAME in the last prefill rep (docs/TRACING.md).
   std::string span_hsaco, span_out;
@@ -187,6 +192,11 @@ int main(int argc, char** argv) {
     else if (a == "--qsel") engine::FlashNextGpu::prefill_qsel_attention_ = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill-chunk") engine::FlashNextGpu::prefill_chunk_ = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--router-bf16x3") engine::FlashNextGpu::prefill_router_bf16x3_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--prompt-file") prompt_file = argv[i + 1];
+    else if (a == "--prefill-prompt") prefill_prompt = std::string(argv[i + 1]) == "1";
+    else if (a == "--decode-logits-out") decode_logits_out = argv[i + 1];
+    else if (a == "--decode-attn-b") engine::FlashNextGpu::decode_attn_batched_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--decode-timing") decode_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--kernel-timing") kernel_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";
     else if (a == "--ngram-cache-gb") ngram_cache_gb = std::atof(argv[i + 1]);
@@ -374,14 +384,35 @@ int main(int argc, char** argv) {
   std::unique_ptr<model::ReferenceModel> cpu;
   if (use_cpu) cpu = std::make_unique<model::ReferenceModel>(*weights, ngram.get(), max_context);
 
+  if (!prompt_file.empty()) {
+    std::ifstream f(prompt_file);
+    prompt.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+  }
   std::vector<text::TokenId> ids = tok->Encode(prompt);
   std::printf("prompt: %zu tokens\n", ids.size());
   std::vector<float> lc(c.vocab_size), lg(c.vocab_size);
   std::vector<text::TokenId> generated;
   std::vector<double> step_ms;  // decode steps after warm-up (graph capture etc.)
+  std::ofstream decode_logits;
+  if (!decode_logits_out.empty()) decode_logits.open(decode_logits_out, std::ios::binary);
+  std::size_t first_step = 0;
+  if (prefill_prompt && ids.size() > 1) {
+    if (!gpu || cpu) return std::fprintf(stderr, "--prefill-prompt needs a GPU-only run\n"), 2;
+    const std::vector<std::int32_t> head(ids.begin(), ids.end() - 1);
+    const auto tp = std::chrono::steady_clock::now();
+    if (!gpu->Prefill(head, {}, &error)) return std::fprintf(stderr, "prefill: %s\n", error.c_str()), 1;
+    std::printf("prefill %zu prompt tokens: %.3f s\n", head.size(),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count());
+    first_step = ids.size() - 1;
+  }
+  bool timing_on = false;
   const auto ts = std::chrono::steady_clock::now();
   double worst = 0;
-  for (std::size_t step = 0; step < ids.size() + static_cast<std::size_t>(n) - 1; ++step) {
+  for (std::size_t step = first_step; step < ids.size() + static_cast<std::size_t>(n) - 1; ++step) {
+    if (decode_timing && !timing_on && generated.size() == 4) {  // after warm-up, as step_ms
+      if (!gpu->StartKernelTiming(1 << 20, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      timing_on = true;
+    }
     const auto token = static_cast<std::int32_t>(step < ids.size() ? ids[step] : generated.back());
     const bool want = step + 1 >= ids.size();
     if (cpu && !cpu->Step(token, want ? std::span<float>(lc) : std::span<float>{}, {}, &error))
@@ -411,6 +442,8 @@ int main(int argc, char** argv) {
       line = " cpu " + std::to_string(ct.best) + (ct.best == top.best ? "" : " DIFFERS") + " relL2 " +
              std::to_string(rel);
     }
+    if (decode_logits.is_open())
+      decode_logits.write(reinterpret_cast<const char*>(lg.data()), static_cast<std::streamsize>(lg.size() * sizeof(float)));
     generated.push_back(top.best);
     const auto piece = tok->Decode(std::span<const text::TokenId>(&generated.back(), 1));
     std::printf("%3zu  %6u  margin %7.3f%s  %s\n", generated.size(), top.best, top.margin, line.c_str(),
@@ -418,6 +451,17 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
   }
   const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
+  if (timing_on) {
+    double span = 0, rate = 0, total = 0;
+    const auto times = gpu->StopKernelTiming(&span, &rate, &error);
+    const double steps = static_cast<double>(step_ms.size());
+    for (const auto& k : times) total += k.ms;
+    std::printf("decode kernel timing (sync-free, eager, %.0f steps): span %.1f ms, kernels %.2f ms/step\n", steps,
+                span, total / steps);
+    for (const auto& k : times)
+      std::printf("  %-58s %8.3f ms/step %5.1f%% %6.1f calls/step %8.1f us/call\n", k.key.c_str(), k.ms / steps,
+                  100 * k.ms / total, k.calls / steps, 1e3 * k.ms / k.calls);
+  }
   if (!step_ms.empty()) {
     std::sort(step_ms.begin(), step_ms.end());
     std::printf("steady decode: median %.2f ms/step (%.2f tok/s), min %.2f ms, over %zu steps\n",

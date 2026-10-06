@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <tuple>
 #include <vector>
 
 #include "kernels/core_hsaco.hpp"
@@ -500,5 +501,74 @@ TEST(GpuSelect, MultiTokenDenseAttentionMatchesSelectKernel) {
                                           << " G " << G << " nkv " << nkv;
       }
     }, {.test_cases = 40});
+  }
+}
+
+// Decode: the batched-load attention (halo_attention_select_b) against the serial kernel
+// (halo_attention_select): the same arithmetic in the same order, so outputs and scores must match bit for bit.
+// Head dim 32 .. 256 (multiples of 32), G 1 .. 16 query heads per KV head, 1 .. 3000 visible positions (one to
+// three 1024-position tiles, ragged 16-position batches), repeated and random positions.
+TEST(GpuSelect, BatchedDecodeAttentionIsBitIdentical) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      const std::uint32_t hd = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 8}));
+      const std::uint32_t nkv = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 3}));
+      const std::uint32_t G = tc.draw(gs::sampled_from(std::vector<std::uint32_t>{1, 2, 12, 16}));
+      const std::uint32_t nh = nkv * G;
+      const std::uint32_t max_n = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 3000}));
+      const std::uint32_t n = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = max_n}));
+      const std::uint32_t ctx = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 4000}));
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return static_cast<float>(seed >> 8) / 16777216.0f - 0.5f; };
+      const float amp = tc.draw(gs::sampled_from(std::vector<float>{0.5f, 2.0f, 8.0f, 30.0f}));
+      std::vector<float> q(std::size_t{nh} * hd), gate(q.size()), k(std::size_t{ctx} * nkv * hd), v(k.size());
+      for (auto& x : q) x = amp * rnd();
+      for (auto& x : gate) x = 4 * rnd();
+      for (auto& x : k) x = amp * rnd();
+      for (auto& x : v) x = rnd();
+      std::vector<std::uint32_t> visible(max_n), params(16, 0);
+      params[kHaloNVisible] = n;
+      for (std::uint32_t j = 0; j < n; ++j) {
+        seed = seed * 1664525u + 1013904223u;
+        visible[j] = (seed >> 8) % ctx;
+      }
+      auto qb = dev->Alloc(q.size() * 4, &error), gb = dev->Alloc(gate.size() * 4, &error),
+           kb = dev->Alloc(k.size() * 4, &error), vb = dev->Alloc(v.size() * 4, &error),
+           sb = dev->Alloc(visible.size() * 4, &error), pb = dev->Alloc(params.size() * 4, &error),
+           o1 = dev->Alloc(q.size() * 4, &error), o2 = dev->Alloc(q.size() * 4, &error),
+           s1 = dev->Alloc(std::size_t{nh} * max_n * 4, &error), s2 = dev->Alloc(std::size_t{nh} * max_n * 4, &error);
+      ASSERT_TRUE(qb && gb && kb && vb && sb && pb && o1 && o2 && s1 && s2) << error;
+      ASSERT_TRUE(dev->Upload(qb, 0, q.data(), q.size() * 4, &error) &&
+                  dev->Upload(gb, 0, gate.data(), gate.size() * 4, &error) &&
+                  dev->Upload(kb, 0, k.data(), k.size() * 4, &error) && dev->Upload(vb, 0, v.data(), v.size() * 4, &error) &&
+                  dev->Upload(sb, 0, visible.data(), visible.size() * 4, &error) &&
+                  dev->Upload(pb, 0, params.data(), params.size() * 4, &error))
+          << error;
+      for (auto [name, o, s] : {std::tuple{"halo_attention_select", &o1, &s1}, std::tuple{"halo_attention_select_b", &o2, &s2}}) {
+        const rt::Arg ra[] = {rt::Arg::Buf(qb), rt::Arg::Buf(kb), rt::Arg::Buf(vb), rt::Arg::Buf(gb), rt::Arg::Buf(sb),
+                              rt::Arg::Buf(*o), rt::Arg::Buf(*s), rt::Arg::Buf(pb), rt::Arg::Val(nh), rt::Arg::Val(nkv),
+                              rt::Arg::Val(hd), rt::Arg::Val(max_n)};
+        ASSERT_TRUE(dev->Launch(dev->Kernel(name, &error), {nh}, {256}, ra, &error)) << error;
+      }
+      std::vector<float> want(q.size()), got(q.size()), sw(std::size_t{nh} * max_n), sg(sw.size());
+      ASSERT_TRUE(dev->Download(o1, 0, want.data(), want.size() * 4, &error) &&
+                  dev->Download(o2, 0, got.data(), got.size() * 4, &error) &&
+                  dev->Download(s1, 0, sw.data(), sw.size() * 4, &error) &&
+                  dev->Download(s2, 0, sg.data(), sg.size() * 4, &error))
+          << error;
+      for (auto* b : {&qb, &gb, &kb, &vb, &sb, &pb, &o1, &o2, &s1, &s2}) dev->Free(*b);
+      for (std::size_t i = 0; i < want.size(); ++i)
+        ASSERT_EQ(std::bit_cast<std::uint32_t>(got[i]), std::bit_cast<std::uint32_t>(want[i]))
+            << rt::BackendName(backend) << " out " << i << " n " << n << " hd " << hd << " G " << G;
+      for (std::uint32_t h = 0; h < nh; ++h)
+        for (std::uint32_t j = 0; j < n; ++j)
+          ASSERT_EQ(std::bit_cast<std::uint32_t>(sg[std::size_t{h} * max_n + j]),
+                    std::bit_cast<std::uint32_t>(sw[std::size_t{h} * max_n + j]))
+              << rt::BackendName(backend) << " score h " << h << " j " << j;
+    }, {.test_cases = 60});
   }
 }
