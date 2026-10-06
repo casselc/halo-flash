@@ -209,6 +209,7 @@ if(HALO_BUILD_TESTS)
     tests/core/quant_test.cpp
     tests/core/lowbit_test.cpp
     tests/core/json_test.cpp
+    tests/core/mtp_sampling_test.cpp
     tests/core/sampling_test.cpp)
   target_compile_definitions(core_tests PRIVATE
     HALO_CORE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/core/data")
