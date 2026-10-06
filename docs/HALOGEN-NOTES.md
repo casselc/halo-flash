@@ -190,3 +190,85 @@ Not done in the time box: their DeltaNet chunked kernels and the HC combine.
 The workaround (in `lab/att_offline.cpp`):
 1. Take the instruction listing from TheRock's LLVM 24 `llvm-objdump`.
 2. Feed the raw `.att` files to `librocprof-trace-decoder` directly, with an ISA callback over that listing.
+
+### DeltaNet, its conv and norm, and the HC scatter-norm (2026-10-05, same harness)
+
+**Which path is their default (static reading of their host binary, not run):**
+- The `HALOGEN_DN_FUSED` getenv defaults to 1, which selects `k_dn_fused16<0,false,false,false>` (code object k002).
+- `HALOGEN_FLASH_CONV_TB` = 1 selects `k_conv1d_silu_tb<16>`.
+- `HALOGEN_DN_NORM_W` = 1 selects `k_rmsnorm_gated_w`.
+- The older multi-kernel chunk path (`k_dnc_prep/ut/att/scan*`, k001) remains behind flags.
+- **Caveat:** the `k_hc_scatter_norm` launch site exists, but I did not trace whether it is on the default prefill path.
+
+**`k_dn_fused16`: the whole chunked recurrence in one kernel**
+- **Layout:** one 256-thread workgroup (8 waves) per v-head, 48 workgroups.
+- **Per v-head, it:**
+  - walks T in 16-token chunks;
+  - reads bf16 q/k/v straight from the post-conv `[T][10240]` rows;
+  - applies the q/k L2 norm and the 1/sqrt(128) scale itself (3 `v_rsq`; no separate norm kernel or pass);
+  - keeps the 128x128 f32 state on-chip, mirroring it to f16 for f16 WMMA (about 232 WMMA per chunk per head);
+  - writes the bf16 output `[T][6144]` and the final state.
+- **Args (136 bytes):**
+
+  | Offset | Field |
+  |---|---|
+  | 0x00 | qkv |
+  | 0x08 | g [T][48] |
+  | 0x10 | beta [T][48] |
+  | 0x18 | state |
+  | 0x20 | slot index |
+  | 0x28 | state offset |
+  | 0x30 | out |
+  | 0x38 | T |
+  | 0x40-0x87 | probe and snapshot pointers |
+
+- **Checked against a CPU gated delta rule** (S *= exp(g); S += k ⊗ beta (v − kᵀS); o = qᵀS / sqrt(128)), 3 heads, T = 256:
+  - output relative error 1.7e-3 (bf16 output);
+  - state relative error 3e-4.
+
+| Per DeltaNet layer, T = 2048, isolated, pinned | Theirs | Ours |
+|---|---:|---:|
+| Conv | `k_conv1d_silu_tb<16>` 0.43 ms (bf16 in/out, no norm) | `halo_conv_l2norm_prefill8` 0.83 ms (f32, norm fused) |
+| Chunk prep + scan | `k_dn_fused16` **0.76 ms** | `halo_gdn_c16_prep2` 0.35 + `halo_gdn_c16_scan3u` 1.97 = 2.32 ms |
+| Gated RMSNorm | `k_rmsnorm_gated_w` 0.33 ms | `halo_gated_norm_h` 0.70 ms |
+| Total | **1.52 ms** | **3.86 ms** (x36 layers: 55 vs 139 ms) |
+
+**Counters per call (theirs / ours):**
+- Recurrence (their fused kernel / our prep2 + scan3u):
+  - VALU 44.6 M / 166 M; LDS 6.8 M / 32 M.
+  - Fabric reads 51 / 201 MB.
+  - Waves 384 / 896.
+- Our scan3u runs at 256 VGPRs. It builds its WMMA fragments from 384 static `ds_load_u16_d16(_hi)` gathers plus 88 `ds_bpermute`; theirs uses `ds_load_b128` fragment loads.
+- Conv: theirs moves 48 MB read / 21 MB written (bf16); ours 87 / 41 MB (f32).
+- Gated norm:
+  - Theirs: 50 MB read, 98 K waves (one wave per 128-wide row, 8 rows per workgroup).
+  - Ours: 101 MB read (f32 o and z), 393 K waves (one row per 128-thread block).
+
+**ATT:**
+- Their fused kernel (decoded offline): barrier 42%, lgkmcnt 21%, VALU 27%, WMMA 2.3%, vmcnt 1%.
+  - The 8 waves of a head synchronize every chunk; memory is not the limit.
+  - With 48 workgroups, most SIMDs hold at most one of its waves.
+- Our scan3u: VALU 45%, lgkmcnt 27%, vmcnt 12%, barrier 5%.
+
+**HC scatter-norm.** `k_hc_scatter_norm<false>`: one 256-thread workgroup per (token, stream) row of 2560.
+- Each row: stream += coef[t,s] x block_out[t], in bf16 and written in place.
+- Then RMS over the 2560 and x (1 + w), written as a bf16 normalized copy.
+- The divisor is 2560, so this normalizes each stream separately.
+- 0.72 ms at T = 2048 (the `<true>` variant 0.75 ms). Ours: `halo_hc_combine_norm_rows` 1.03-1.14 ms in-engine.
+- Counters: 53 MB read, 41 MB written.
+- Their residual streams are bf16 [T][4][2560]; ours are f32 [T][10240], with an f16 copy for the GEMMs.
+- Their mixer GEMMs are hipBLASLt (times in the plan table above). Their prefill dense GEMMs are also hipBLASLt bf16 from the tuned plan (10240 x 2560: 2.79 ms against our lr8 3.04), so I ran no kernel of theirs for them.
+
+### What to try in our own design (predictions; decide in-engine)
+1. **Fuse prep and scan into one kernel per v-head** (8 waves).
+   - Keep the f32 state on-chip with an f16 mirror for WMMA.
+   - Use `ds_load_b128` fragment loads instead of 16-bit LDS gathers.
+   - Fold the q/k L2 norm into the kernel, so the conv kernel no longer normalizes.
+   - Expected: about -1.5 ms per DeltaNet layer (2.32 → ~0.8), about -50 ms per pp2048 over 36 layers.
+   - Their kernel is barrier-bound with under one wave per SIMD, so a 2-way v split per head (as ours does) might still help on top. Measure.
+2. **bf16/f16 inputs and outputs for the conv and the gated norm, and one wave per norm row.**
+   - Expected: conv -0.4 ms, gated norm -0.35 ms per layer, about -27 ms per pp2048.
+   - Our f32 conv output feeds the scan, so this comes with item 1.
+3. **bf16 (or f16) residual streams.** Their scatter-norm is 0.72 ms against our 1.03-1.14 ms at about half the bytes. Expected about -0.3 ms per call, about -25 ms per pp2048 over 94 calls.
+   - Precision cost: f32 residual streams are part of our exactness guarantees. This needs a quality check, not just a speed test.
+4. **Attention and its small kernels:** not measured (time box).
