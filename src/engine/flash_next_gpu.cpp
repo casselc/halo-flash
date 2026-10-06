@@ -582,7 +582,9 @@ bool FlashNextGpu::Attention(const model::LayerWeights& l, AttnState& s, std::st
          Launch("halo_qsa_select", {1}, {1024},
                 {rt::Arg::Buf(block_scores_), rt::Arg::Buf(visible_), params, rt::Arg::Val(budget), rt::Arg::Val(ratio)},
                 error) &&
-         Launch("halo_attention_select", {nh}, {kBlock},
+         Launch(decode_attn_batched_ && hd % 32 == 0 && hd <= kBlock && kBlock <= 256 ? "halo_attention_select_b"
+                                                                                    : "halo_attention_select",
+                {nh}, {kBlock},
                 {rt::Arg::Buf(q_), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v), rt::Arg::Buf(gate_), rt::Arg::Buf(visible_),
                  rt::Arg::Buf(ctx_), rt::Arg::Buf(scores_), params, rt::Arg::Val(nh), rt::Arg::Val(nkv),
                  rt::Arg::Val(hd), rt::Arg::Val(max_context_)},

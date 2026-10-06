@@ -62,6 +62,8 @@ class FlashNextGpu {
   static inline bool repack_q8_ = true;
   static inline bool block_gemv_ = true;  ///< P3 Q4_K / Q5_1 GEMVs
   static inline bool fused_moe_ = true;   ///< P3 routed experts in three launches
+  /// Decode attention with batched loads (halo_attention_select_b; bit-identical to halo_attention_select).
+  static inline bool decode_attn_batched_ = true;
   static inline bool small_row_kernels_ = true;  ///< P3 block-per-row F32 matvec for few rows
   /// P3 expert gate+up with int8 activations (llama.cpp-style Q8_1); false
   /// keeps the float kernel. A quality-gated choice (docs/BENCHMARKS.md).

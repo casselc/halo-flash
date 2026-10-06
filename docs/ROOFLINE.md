@@ -1116,3 +1116,59 @@ Not kept: plain fp16 router (long set), fp16-weight-split router (= plain), mixe
 (`halo_hc_combine_norm_tok_moev_r16` / `_rb`), bit-identical to the scalar `tok_moe` ones; with the precision options
 off, logits are bit-identical to the pre-stream baseline; gpu_tests 42 passed. ab_bench (4 rounds x 3 reps, pinned,
 prose_1 at 2048 tokens): precision options off 1406.3 ms, defaults **1279.7 ms (1600 tok/s), -126.7 ms, significant**.
+
+## 9. 2026-10-06 (stream D, branch `stream/decode`): decode, the K-blocked expert layout, and attention
+
+Measured on main 56693d8 with `halo_run --device-sample 1` (steady median of 76 steps after 4 warm-up steps)
+and `--decode-timing 1` (sync-free per-kernel stamps, eager: ~2.5 ms/step more than graphs). Long context:
+`--prompt-file prose_long.txt --prefill-prompt 1` (6,939 tokens prefilled, then stepping).
+
+| Context | ms/step (tok/s), default clock | kernel sum (eager) |
+|---|---:|---:|
+| 5 tokens ("The capital of France is") | 43.5 (23.0) | 46.2 |
+| 6,939 tokens | 55.4 (18.1) | 58.1 |
+
+**Classification (short context, per step).** Bytes per call against the call time:
+
+| Kernel | ms/step | calls | GB/s | Gap to ~220 GB/s |
+|---|---:|---:|---:|---:|
+| `gemv_q8r_dual` (DeltaNet qkv + z, 44.6 MB) | 7.24 | 36 | 222 | 0 |
+| `moe_gate_up_q4_k_dot` (10 experts, 18.4 MB) | 6.07 | 47 | 143 | 2.1 |
+| `gemv_q8r_r4`, 80 blocks (2560 x 6144 out projections, 16.7 MB) | 5.08 | 49 | 161 | 1.4 |
+| `hc_mix_a` (320 x 10240 down + inject, 3.7 MB) | 3.60 | 96 | 99 | 2.0 |
+| `moe_down_q5_1_r4` (12.3 MB) | 3.27 | 43 | 162 | 0.9 |
+| LM head (`gemv_q8r_r4`, 7760 blocks, 676 MB) | 2.80 | 1 | 242 | 0 |
+| `hc_mix_b` (10240 x 320 up, 3.5 MB) | 2.69 | 97 | 126 | 1.2 |
+| F32 router (`matvec_f32_rowblock`, 5.2 MB) | 1.79 | 48 | 141 | 0.6 |
+| small kernels (norm scales, combines, top-k at 15.8 us, rope, norms, copies; < 16 us each) | ~3.5 | ~600 | — | most of it |
+| host gap between steps (n-gram row read + upload + launch; charged to `halo_broadcast`) | ~1.0 | 1 | — | ~1 |
+| `attention_select` at 5 tokens / **at 6,939 tokens** | 0.35 / **12.39** | 12 | — | **~11 at 7K** |
+
+At long context one kernel takes over: `halo_attention_select` (24 blocks, one per head, 17 VGPRs) walks the ~2K
+visible positions one dependent load at a time; 1,033 us a call.
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| Q4_K gate/up experts K-blocked for **decode** (`halo_moe_gate_up_q4_kb_dot`: the `_dot` kernel reading the blocked layout, same sums, outputs bit-identical over 51 id sets; patch `/data/halo-work/streams/D/blocked_decode_and_attn.diff`) | 0 ± 0.3 ms/token (-0.3..+0.5): a decode block already reads two contiguous 23 KB runs; the blocked layout only shortens them to 2.3 KB | `halo_hwprobe sweep` at DRAM size (4000 blocks, 184 MB): row-major 224.5 / 232.3 GB/s, blocked 229.2 / 231.5: the pattern costs nothing at these run lengths. Kernel (gemv_bench, 3 rounds): 114.9 -> 123.1 us (+7%), ~+0.4 ms/token in engine. Prefill on current main (ab_bench 4 x 3, pinned): gate/up 249.8 -> 237.3 ms (-12.5), end to end -16.3 ms within noise (spreads 10.7 / 17.3) | **no** |
+| Decode attention with batched loads (`halo_attention_select_b`: q in LDS, key rows as 8 float4 at a time, the V sum reading 16 positions before folding them in order, scores and visible list through 1024-entry LDS tiles; every dot product and sum in the original order, 51 VGPRs; `--decode-attn-b`, default on) | 1,033 -> 100-250 us a call at 7K; step -8.5..-10.5 ms at 7K, noise at 5 tokens | 1,033 -> 162 us a call (kernel sum 58.1 -> 47.6 ms/step); pinned A/B 53.75 -> 44.22 ms/step at 7K (below). Logits bit-identical over 80 decode steps at 7K context (flag 0 vs 1), tokens identical; property test bitwise vs the serial kernel | **yes** |
+
+Decode A/B of the kept change (`--decode-attn-b 0` vs `1`, same binary, interleaved, 3 rounds, clock pinned,
+steady median of 76 steps): 6,939-token context **53.75 -> 44.22 ms/step (-9.5 ms, 18.6 -> 22.6 tok/s)**, spreads
+0.03 / 0.02; 5-token context 42.93 -> 42.64 (-0.3), spreads 0.01. Predicted -8.5..-10.5 at 7K, noise at 5 tokens.
+Exactness: decode logits bitwise equal over 80 steps at 7K context; every pre-existing kernel's ISA is identical to
+main 56693d8's (only constant-table offsets move), so `--decode-attn-b 0` is main's decode; greedy tokens and
+printed margins equal main's binary over 80 steps; prefill logits (prose_1, 2048) equal main defaults'
+(`logits_pmerge_def.bin`); gpu_tests 43 passed, plus the small-quant engine tests.
+
+Why the blocked layout is not kept: it would have to replace the row-major experts (two copies do not fit), so
+decode would pay +0.4 ms a token for -12.5 ms a 2,048-token prefill: it breaks even at ~30 decoded tokens a
+prefill, and the prefill gain is inside end-to-end noise. Decode's gate/up gap (143 vs ~220 GB/s) is not the read
+pattern: the sweep reads both patterns at ~230 GB/s. Its likely causes (not yet probed): each of the 400 blocks
+quantizes the activations before issuing any weight load (a serial prologue per block generation) and the
+~110 us kernel's ramp and tail.
+
+Remaining decode levers, by size (short context, ms/token): the hyper-connection mixers' two kernels at
+99 / 126 GB/s (~3.2); ~600 small launches (~3.5, fusion: section 5's list); MoE gate/up prologue (~2.1); the
+80-block 2560-row GEMVs at 161 GB/s (~1.4, more row groups or split-K); host gap ~1 (prefetching the n-gram rows
+is not possible before the token is known; overlapping it with the LM head and sampling would need the token
+earlier); attention at long context after this change ~1.9 at 7K (floor ~0.5).
