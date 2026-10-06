@@ -94,6 +94,11 @@ class FlashNextGpu {
   /// this and the context when first needed). Large chunks let each routed
   /// expert see enough tokens to reuse its weights.
   static inline std::uint32_t prefill_chunk_ = 2048;
+  /// A prompt longer than prefill_chunk_ is prefilled in chunks of this many tokens instead (0: off). The chunk
+  /// buffers grow to it on the first such prompt (~4.3 GB more at 8192), so short prompts never pay for it. With
+  /// prefill_gemm_slice_ and prefill_dense_prefix_ the logits are bit-identical to 2048-token chunks; at 8K
+  /// tokens the prefill is ~370 ms (7%) faster (stream L, docs/ROOFLINE.md section 11).
+  static inline std::uint32_t prefill_long_chunk_ = 8192;
   /// GEMMs whose per-token cost rises with the token count (their activations stop fitting the MALL past
   /// ~2048 tokens: `_l`, `_s`, the router and the small fp32 projections) run on slices of this many tokens
   /// when a chunk is longer (0: never). Per-token results do not depend on the slicing.
@@ -360,7 +365,9 @@ class FlashNextGpu {
   bool ck_ready_ = false;
   std::vector<std::uint8_t> ck_host_;
   bool ChunkSupported() const;
-  bool AllocChunk(std::string* error);
+  /// Chunk buffers for `tokens`-token chunks (capped at the context); grows them when they hold fewer.
+  bool AllocChunk(std::uint32_t tokens, std::string* error);
+  void FreeChunk();
   // pre_emb: this chunk's n-gram rows already read (by the previous chunk's
   // prefetch); after_prep(history) runs once the chunk's host data is
   // uploaded, with the n-gram history after its tokens (for the next

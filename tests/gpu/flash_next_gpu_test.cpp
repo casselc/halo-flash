@@ -595,10 +595,11 @@ TEST(FlashNextGpu, LongChunksMatchDenseRangeChunks) {
   const std::uint32_t max_context = 3 * R + 256;
   using E = engine::FlashNextGpu;
   struct Restore {
-    std::uint32_t chunk = E::prefill_chunk_, slice = E::prefill_gemm_slice_;
+    std::uint32_t chunk = E::prefill_chunk_, slice = E::prefill_gemm_slice_, long_chunk = E::prefill_long_chunk_;
     bool prefix = E::prefill_dense_prefix_;
     ~Restore() {
       E::prefill_chunk_ = chunk;
+      E::prefill_long_chunk_ = long_chunk;
       E::prefill_gemm_slice_ = slice;
       E::prefill_dense_prefix_ = prefix;
     }
@@ -614,6 +615,7 @@ TEST(FlashNextGpu, LongChunksMatchDenseRangeChunks) {
     }
     const auto run = [&](std::uint32_t chunk, std::uint32_t slice, std::vector<float>& logits, std::vector<float>& next) {
       E::prefill_chunk_ = chunk;
+      E::prefill_long_chunk_ = 0;  // the chunk under test, not the long-prompt one
       E::prefill_gemm_slice_ = slice;
       E::prefill_dense_prefix_ = true;
       auto e = E::Create(dev, *weights, ngram.get(), nullptr, max_context, &error);
@@ -657,7 +659,7 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
              saved_f16 = E::prefill_f16_gemm_,
              saved_moe = E::int8_act_moe_, saved_grouped = E::prefill_grouped_moe_,
              saved_wmma_attn = E::prefill_wmma_attention_;
-  const std::uint32_t saved_chunk = E::prefill_chunk_;
+  const std::uint32_t saved_chunk = E::prefill_chunk_, saved_long = E::prefill_long_chunk_;
   enum Mode { kExact, kFloatGemm, kInt8Gemm, kModes };
   const char* names[kModes] = {"exact", "fp16 GEMMs", "int8 GEMMs"};
   std::size_t compared[kModes] = {}, agreed[kModes] = {}, jumps[kModes] = {};
@@ -672,6 +674,9 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
     E::prefill_int8_gemm_ = mode == kInt8Gemm;
     E::prefill_f16_gemm_ = mode == kFloatGemm;
     E::prefill_chunk_ = tc.draw(gs::sampled_from(std::vector<std::uint32_t>{1, 17, 64, 256}));
+    // Long prompts on larger chunks: the buffers grow on the first prefill longer than prefill_chunk_, possibly
+    // mid-session after short prefills and steps.
+    E::prefill_long_chunk_ = tc.draw(gs::sampled_from(std::vector<std::uint32_t>{0, 4 * E::prefill_chunk_, 300}));
     auto chunked = E::Create(dev, *weights, ngram.get(), nullptr, kMaxContext, &error);
     auto split = E::Create(dev, *weights, ngram.get(), nullptr, kMaxContext, &error);
     auto stepped = E::Create(dev, *weights, ngram.get(), nullptr, kMaxContext, &error);
@@ -750,6 +755,7 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
   E::int8_act_moe_ = saved_moe;
   E::prefill_grouped_moe_ = saved_grouped;
   E::prefill_chunk_ = saved_chunk;
+  E::prefill_long_chunk_ = saved_long;
   E::prefill_wmma_attention_ = saved_wmma_attn;
   for (int m = 0; m < kModes; ++m)
     std::printf("%s: %zu compared, argmax agreed %zu, worst relative L2 vs stepping %.3g (%zu above 0.01), vs a split "

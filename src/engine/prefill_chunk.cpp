@@ -46,10 +46,34 @@ std::string Rk(const char* base, int res16) {
 int Res16() { return FlashNextGpu::prefill_exact_projections_ ? 0 : FlashNextGpu::prefill_res16_; }
 }  // namespace
 
-bool FlashNextGpu::AllocChunk(std::string* error) {
-  if (ck_ready_) return true;
+void FlashNextGpu::FreeChunk() {
+  auto& k = ck_;
+  std::vector<rt::Buffer*> bufs = {&k.res, &k.xn, &k.lo, &k.gate, &k.mixed, &k.inject, &k.block_out, &k.embd, &k.xq,
+                                   &k.xd, &k.host, &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg, &k.q,
+                                   &k.gate_a, &k.k, &k.v, &k.ctx, &k.iq, &k.ik, &k.router, &k.ids, &k.wts, &k.eg,
+                                   &k.eu, &k.ed, &k.sgate, &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp,
+                                   &k.x16, &k.bcounts, &k.bbase, &k.pa, &k.pb, &k.ipart, &k.rscale, &k.xh, &k.mh,
+                                   &k.lh, &k.ml, &k.bscores, &k.vis, &k.ascores, &k.ublk, &k.umask, &k.ucount,
+                                   &k.gdnprep};
+  for (rt::Buffer* b : bufs) {
+    if (!*b) continue;
+    std::erase_if(owned_, [&](const rt::Buffer& o) { return o.device == b->device; });
+    dev_.Free(*b);
+  }
+  ck_ = ChunkBuffers{};
+  ck_ready_ = false;
+}
+
+bool FlashNextGpu::AllocChunk(std::uint32_t tokens, std::string* error) {
+  const std::uint32_t want = std::max<std::uint32_t>(1, std::min(tokens, max_context_));
+  if (ck_ready_ && ck_.cap >= want) return true;
+  if (ck_ready_) {
+    // Growing (a long prompt after short ones): the buffers hold no state between Prefill calls.
+    if (!dev_.Synchronize(error)) return false;
+    FreeChunk();
+  }
   const auto& c = w_.config;
-  const std::size_t T = std::max<std::uint32_t>(1, std::min(prefill_chunk_, max_context_)), H = c.hidden_size,
+  const std::size_t T = want, H = c.hidden_size,
                     D = c.HcDim();
   const std::size_t qdim = c.AttentionQDim(), kvdim = c.AttentionKvDim(), vd = c.SsmValueDim();
   const std::size_t max_cols = std::max({D, H, qdim, vd, std::size_t{c.shared_expert_ff}, std::size_t{c.hc_low_rank}});
@@ -1178,7 +1202,7 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
       if (error) *error = "token out of range";
       return false;
     }
-  if (!AllocChunk(error)) return false;
+  if (!AllocChunk(prefill_chunk_, error)) return false;
   // HALO_PREFILL_TIMING: host preparation, upload and device time per chunk.
   static const bool timing = std::getenv("HALO_PREFILL_TIMING") != nullptr;
   const auto t_start = std::chrono::steady_clock::now();
