@@ -35,6 +35,7 @@
 #include "core/gguf.hpp"
 #include "core/sampling.hpp"
 #include "engine/flash_next_gpu.hpp"
+#include "engine/mtp_policy.hpp"
 #include "model/ngram.hpp"
 #include "model/reference.hpp"
 #include "model/weights.hpp"
@@ -158,6 +159,10 @@ int main(int argc, char** argv) {
   // arithmetic on the dequantized sidecar weights) on those hiddens, greedy chains at the first N draft positions,
   // acceptance against the same tokens, and agreement with the GPU's drafts.
   std::string mtp_dump, mtp_cpu_replay;
+  // --spec 1 --mtp-model F [--mtp-vocab V] --mtp-prompts a,b: per prompt, --n tokens greedy AR (StepSample) and
+  // greedy speculative (SpecStep; --spec-depth K fixed, -1 adaptive), outputs compared token for token, timed.
+  bool spec = false, spec_skip_ar = false;
+  int spec_depth = -1;
   std::uint32_t mtp_cpu_n = 40;  // --mtp-vocab FILE: int32 ids of the trimmed draft head
   // --wmma-probe a.bin,b.bin (route traces): PROBE ONLY. Per B = 1..8, six decode steps (eager, kernel timing on)
   // each followed by the batch-shaped WMMA probe kernels for B columns; routing of the B columns drawn from the
@@ -249,6 +254,9 @@ int main(int argc, char** argv) {
     else if (a == "--mtp-check") mtp_check = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--mtp-out") mtp_out = argv[i + 1];
     else if (a == "--mtp-vocab") mtp_vocab = argv[i + 1];
+    else if (a == "--spec") spec = std::string(argv[i + 1]) == "1";
+    else if (a == "--spec-depth") spec_depth = std::atoi(argv[i + 1]);
+    else if (a == "--spec-skip-ar") spec_skip_ar = std::string(argv[i + 1]) == "1";
     else if (a == "--mtp-dump") mtp_dump = argv[i + 1];
     else if (a == "--mtp-cpu-replay") mtp_cpu_replay = argv[i + 1];
     else if (a == "--mtp-cpu-n") mtp_cpu_n = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
@@ -666,6 +674,85 @@ int main(int argc, char** argv) {
     if (!gpu->LoadMtp(*mtp, &error)) return std::fprintf(stderr, "LoadMtp: %s\n", error.c_str()), 1;
     const std::uint32_t K = std::max(1u, mtp_depth);
     const std::size_t V = c.vocab_size;
+    if (spec) {
+      if (!mtp_vocab.empty()) {
+        std::ifstream f(mtp_vocab, std::ios::binary | std::ios::ate);
+        std::vector<std::int32_t> sub(static_cast<std::size_t>(f.tellg()) / 4);
+        f.seekg(0);
+        f.read(reinterpret_cast<char*>(sub.data()), static_cast<std::streamsize>(sub.size() * 4));
+        if (!gpu->SetDraftVocab(sub, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      }
+      std::vector<std::string> sfiles;
+      for (std::size_t p = 0; p < mtp_prompts.size();) {
+        const auto q = mtp_prompts.find(',', p);
+        sfiles.push_back(mtp_prompts.substr(p, q == std::string::npos ? std::string::npos : q - p));
+        p = q == std::string::npos ? mtp_prompts.size() : q + 1;
+      }
+      using clk = std::chrono::steady_clock;
+      static sampling::SamplingConfig greedy;
+      double ar_ms_all = 0, sp_ms_all = 0;
+      std::size_t ar_n_all = 0, sp_n_all = 0, all_same = 1;
+      for (const auto& file : sfiles) {
+        std::ifstream f(file);
+        const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        const auto enc = tok->Encode(text, true);
+        const std::vector<std::int32_t> toks(enc.begin(), enc.end());
+        const auto prompt = std::span<const std::int32_t>(toks).first(toks.size() - 1);
+        std::vector<std::int32_t> ar, sp;
+        double ar_ms = 0, sp_ms = 0;
+        if (!spec_skip_ar) {  // AR, draft block off
+          if (!gpu->MtpTrack(false, &error) || !gpu->Reset(&error) || !gpu->Prefill(prompt, {}, &error)) return 1;
+          std::int32_t t = toks.back();
+          for (int i = 0; i < n; ++i) {
+            engine::FlashNextGpu::SampleResult r;
+            const auto st = clk::now();
+            if (!gpu->StepSample(t, {&greedy, {}, 0}, &r, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+            if (i >= 4) ar_ms += std::chrono::duration<double, std::milli>(clk::now() - st).count();
+            ar.push_back(t = r.token);
+          }
+        }
+        // Speculative.
+        if (!gpu->Reset(&error) || !gpu->MtpTrack(true, &error) || !gpu->Prefill(prompt, {}, &error))
+          return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+        engine::MtpLengthController policy(engine::kMaxMtpDraftTokens);
+        std::int32_t t = toks.back();
+        std::size_t drafted = 0, accepted = 0, cycles = 0, timed = 0;
+        std::vector<std::size_t> hist_acc(engine::kMaxMtpDraftTokens + 2, 0);
+        while (static_cast<int>(sp.size()) < n) {
+          const std::uint32_t budget = static_cast<std::uint32_t>(n - static_cast<int>(sp.size()));
+          const std::uint32_t k = spec_depth >= 0 ? std::min<std::uint32_t>(spec_depth, budget - 1)
+                                                  : policy.Choose(budget > 0 ? budget - 1 : 0);
+          engine::FlashNextGpu::SpecResult r;
+          const auto st = clk::now();
+          if (!gpu->SpecStep(t, k, nullptr, &r, &error)) return std::fprintf(stderr, "spec: %s\n", error.c_str()), 1;
+          const double ms = std::chrono::duration<double, std::milli>(clk::now() - st).count();
+          if (sp.size() >= 4) sp_ms += ms, timed += r.tokens.size();
+          if (r.drafted) policy.Observe(r.accepted, r.drafted), drafted += r.drafted, accepted += r.accepted, ++hist_acc[r.accepted];
+          else policy.ObserveArToken();
+          ++cycles;
+          for (auto x : r.tokens) sp.push_back(x);
+          t = r.tokens.back();
+        }
+        sp.resize(static_cast<std::size_t>(n));
+        const std::string name = file.substr(file.find_last_of('/') + 1);
+        std::size_t same = 0;
+        for (std::size_t i = 0; i < ar.size(); ++i) same += i < sp.size() && ar[i] == sp[i];
+        const bool exact = !spec_skip_ar && same == ar.size();
+        if (!spec_skip_ar && !exact) all_same = 0;
+        const double ar_tok = ar_ms > 0 ? 1000.0 * (n - 4) / ar_ms : 0, sp_tok = sp_ms > 0 ? 1000.0 * timed / sp_ms : 0;
+        std::printf("spec %s: %zu prompt tokens, %d generated; %s; AR %.2f tok/s, MTP %.2f tok/s (%.3fx); %zu cycles, "
+                    "drafted %zu accepted %zu (%.3f), tokens/cycle %.3f\n",
+                    name.c_str(), toks.size(), n,
+                    spec_skip_ar ? "AR skipped" : (exact ? "IDENTICAL to AR" : ("DIFFERS at " + std::to_string(same)).c_str()),
+                    ar_tok, sp_tok, ar_tok > 0 ? sp_tok / ar_tok : 0.0, cycles, drafted, accepted,
+                    drafted ? double(accepted) / drafted : 0.0, double(n) / cycles);
+        ar_ms_all += ar_ms, sp_ms_all += sp_ms, ar_n_all += n - 4, sp_n_all += timed;
+      }
+      std::printf("spec total: AR %.2f tok/s, MTP %.2f tok/s, %s\n", ar_ms_all > 0 ? 1000.0 * ar_n_all / ar_ms_all : 0,
+                  sp_ms_all > 0 ? 1000.0 * sp_n_all / sp_ms_all : 0,
+                  spec_skip_ar ? "AR skipped" : (all_same ? "all IDENTICAL to AR" : "SOME DIFFER"));
+      return 0;
+    }
     std::vector<std::int32_t> sub;  // trimmed draft vocabulary (empty: full)
     if (!mtp_vocab.empty()) {
       std::ifstream f(mtp_vocab, std::ios::binary | std::ios::ate);

@@ -971,6 +971,12 @@ bool FlashNextGpu::Run(std::int32_t token, Head head, const SampleRequest* reque
     result->token = static_cast<std::int32_t>(out.token);
     result->rng = out.rng;
   }
+  if (mtp_track_ && bound_ == mtp_owner_) {
+    // The draft block follows: its pending base step (last position's hidden, this token), then this step's
+    // hidden becomes the pending one.
+    if (MtpPending() && !MtpRun(token, &mtp_hpend_, {}, error)) return false;
+    if ((position_ == 0 || mtp_pos_ == position_) && !CopyFloats(mtp_hpend_, res_, c.HcDim(), error)) return false;
+  }
   ngram_history_ = history;
   for (auto& s : attn_) s.blocks = complete;
   ++position_;
@@ -1349,6 +1355,7 @@ bool FlashNextGpu::Reset(std::string* error) {
   }
   ngram_history_.Reset();
   position_ = 0;
+  if (bound_ == mtp_owner_) mtp_pos_ = 0;
   return dev_.Fill(ple_history_, 0, error) && dev_.Synchronize(error);
 }
 

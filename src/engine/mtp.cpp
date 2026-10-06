@@ -79,6 +79,7 @@ bool FlashNextGpu::SetDraftVocab(std::span<const std::int32_t> ids, std::string*
   owned_.push_back(draft_qs_);
   owned_.push_back(draft_d_);
   draft_rows_ = static_cast<std::uint32_t>(ids.size());
+  draft_ids_.assign(ids.begin(), ids.end());
   return true;
 }
 
@@ -88,6 +89,10 @@ bool FlashNextGpu::TrunkHidden(std::vector<float>* out, std::string* error) {
 }
 
 bool FlashNextGpu::MtpStep(std::int32_t token, bool from_trunk, std::span<float> logits, std::string* error) {
+  return MtpRun(token, from_trunk ? &res_ : nullptr, logits, error);
+}
+
+bool FlashNextGpu::MtpRun(std::int32_t token, const rt::Buffer* hidden, std::span<float> logits, std::string* error) {
   const auto& c = w_.config;
   if (!mtp_) {
     if (error) *error = "MTP block not loaded";
@@ -109,7 +114,7 @@ bool FlashNextGpu::MtpStep(std::int32_t token, bool from_trunk, std::span<float>
   params[kHaloNVisible] = complete <= budget ? n_kv : budget * ratio + (n_kv - complete * ratio);
   if (!dev_.Upload(ple_emb_, params_offset_, params, sizeof(params), error)) return false;
   // Hidden input: the trunk residual (res_) or the block's previous output.
-  if (!CopyFloats(mtp_in_, from_trunk ? res_ : mtp_res_, D, error)) return false;
+  if (!CopyFloats(mtp_in_, hidden ? *hidden : mtp_res_, D, error)) return false;
   std::swap(res_, mtp_res_);  // the helpers below work on res_
   struct Back {
     rt::Buffer& a;

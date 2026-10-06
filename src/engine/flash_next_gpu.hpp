@@ -329,6 +329,29 @@ class FlashNextGpu {
   /// Advances MtpPosition(); MtpRewind(p) moves it back (later steps overwrite the cache rows).
   [[nodiscard]] bool MtpStep(std::int32_t token, bool from_trunk, std::span<float> logits, std::string* error);
   void MtpRewind(std::uint32_t position) noexcept { mtp_pos_ = position; }
+
+  // ---- P5 speculative decoding (spec_decode.cpp; docs/MTP.md) ----
+  /// Keeps the draft block's history in step with the bound session from now on: every Step / StepSample /
+  /// Prefill also feeds the draft block (its attention cache trails the trunk by one position: the last trunk
+  /// position's hidden waits for the next token). Turn on right after Reset (history starts at position 0).
+  /// The trunk's results do not change.
+  [[nodiscard]] bool MtpTrack(bool on, std::string* error);
+  [[nodiscard]] bool MtpTracking() const noexcept { return mtp_track_; }
+  struct SpecResult {
+    std::vector<std::int32_t> tokens;  ///< emitted after `token`, in order; the last one is not yet run
+    std::uint32_t drafted = 0, accepted = 0;
+    std::uint64_t rng = 0;  ///< greedy: the request's RNG passed through
+  };
+  /// One speculative cycle. Like StepSample(token): runs `token` and returns what follows it, here 1 + accepted
+  /// tokens. `drafts` tokens are drafted with the MTP block (trimmed head when SetDraftVocab was called) and
+  /// verified in one batched pass whose columns are byte-identical to single steps; rejected rows' recurrent
+  /// state is rolled back from per-row snapshots (no replay).
+  /// Greedy (`sampler` null): device greedy sampling per verified row: the emitted tokens are exactly
+  /// StepSample's. Sampled (`sampler` set, no penalties): host p / q acceptance with residual correction.
+  /// drafts == 0, or no draft history yet: an ordinary step (the draft block still catches up).
+  [[nodiscard]] bool SpecStep(std::int32_t token, std::uint32_t drafts, sampling::SamplerState* sampler,
+                              SpecResult* result, std::string* error);
+  static constexpr std::uint32_t kMaxDrafts = 7;
   /// Draft head restricted to `ids` (FR-Spec style, draft logits only): MtpStep then fills logits.size() ==
   /// ids.size() entries, entry i the logit of token ids[i] (the same rows of the LM head, same GEMV). Empty: full.
   [[nodiscard]] bool SetDraftVocab(std::span<const std::int32_t> ids, std::string* error);
@@ -594,6 +617,7 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   struct BatchGraph {
     std::vector<SessionId> sessions;
     int head = 0;
+    bool verify = false;
     rt::Graph graph;
     std::uint64_t used = 0;
   };
@@ -610,8 +634,21 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   AttnState mtp_attn_;
   rt::Buffer mtp_res_, mtp_in_, mtp_hn_, mtp_cat_;
   std::uint32_t mtp_pos_ = 0;
+  bool MtpRun(std::int32_t token, const rt::Buffer* hidden, std::span<float> logits, std::string* error);
+  // Speculative state: tracking flag, the session it tracks, the last trunk position's hidden (pending), and the
+  // per-row recurrent snapshots of a verify pass (verify_snap_[row]: one buffer per DeltaNet layer's state and
+  // conv, then the PLE history).
+  bool mtp_track_ = false;
+  SessionId mtp_owner_ = 0;
+  rt::Buffer mtp_hpend_;
+  std::vector<std::vector<rt::Buffer>> verify_snap_;
+  bool verify_ = false;  // RecordBatch: the entries are consecutive rows of one session; snapshot after each
+  bool MtpPending() const noexcept { return mtp_track_ && bound_ == mtp_owner_ && position_ > 0 && mtp_pos_ + 1 == position_; }
+  bool MtpAfterPrefillRows(std::span<const std::int32_t> tokens, std::string* error);
+  bool AllocVerifySnaps(std::uint32_t rows, std::string* error);
   rt::Buffer draft_qs_, draft_d_;
   std::uint32_t draft_rows_ = 0;
+  std::vector<std::int32_t> draft_ids_;
   std::vector<LinearState> linear_;
   std::vector<AttnState> attn_;
   std::vector<rt::Buffer> owned_;

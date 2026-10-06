@@ -1395,6 +1395,7 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
                  T, ms(t_start, t_prep), ms(t_start, t_hash), ms(t_hash, t_read), deferred_read_ms,
                  ms(t_prep, t_upload), ms(t_upload, std::chrono::steady_clock::now()));
   }
+  if (mtp_track_ && bound_ == mtp_owner_ && !MtpAfterPrefillRows(tokens, error)) return false;
   ngram_history_ = history;
   const std::uint32_t complete = (position_ + T) / ratio;
   for (auto& s : attn_) s.blocks = complete;
@@ -1402,4 +1403,25 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
   return true;
 }
 
+}  // namespace halo::engine
+
+namespace halo::engine {
+// The draft block over a prefilled chunk: base steps for its positions from the chunk's final residual rows
+// (prefill arithmetic; the draft history only steers drafts, never outputs). The last row stays pending.
+bool FlashNextGpu::MtpAfterPrefillRows(std::span<const std::int32_t> tokens, std::string* error) {
+  const auto& c = w_.config;
+  const std::uint32_t D = c.HcDim(), T = static_cast<std::uint32_t>(tokens.size());
+  if (position_ > 0 && mtp_pos_ + 1 != position_) return true;  // history already broken: no drafting
+  if (position_ > 0 && !MtpRun(tokens[0], &mtp_hpend_, {}, error)) return false;
+  for (std::uint32_t t = 0; t < T; ++t) {
+    const bool ok = Res16() ? Launch(Rk("halo_res_to_f32", Res16()).c_str(), {Blocks(D)}, {kBlock},
+                                     {rt::Arg::Buf(mtp_hpend_), rt::Arg::Buf(ck_.res, std::size_t{t} * D * 2), rt::Arg::Val(D)},
+                                     error)
+                            : Launch("halo_copy", {Blocks(D)}, {kBlock},
+                                     {rt::Arg::Buf(mtp_hpend_), rt::Arg::Buf(ck_.res, std::size_t{t} * D * 4), rt::Arg::Val(D)},
+                                     error);
+    if (!ok || (t + 1 < T && !MtpRun(tokens[t + 1], &mtp_hpend_, {}, error))) return false;
+  }
+  return true;
+}
 }  // namespace halo::engine
