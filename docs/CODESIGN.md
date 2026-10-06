@@ -5,7 +5,7 @@ The questions:
 2. How far is Qwen3.8-Flash-Next from it, and where does that cost time?
 3. Which adaptation paths get an existing model closer without pretraining, and at what cost?
 
-Research and arithmetic only: nothing in this document was run on the GPU.
+Research and arithmetic only, except the section "First experiment: results", which was measured on this machine.
 
 **Labels.**
 - **[M]** measured on this machine. The source is the halo-flash doc or file named.
@@ -952,7 +952,7 @@ mean ± SE, cases up/down, is in parentheses.
   +0.010).
   - It is ready to ship as an option for the speed (−6% prefill, −3.7% decode).
   - The rule paired it with A, which failed, so whether k = 8 becomes a default is a separate
-    call. It uses 55% of the short-set NLL margin and 63% of the agreement margin, which then
+    call. It uses 56% of the short-set NLL margin and 63% of the agreement margin, which then
     leaves little room for any other lossy change (A, D, rank 4).
 - **B, k = 6: fails, and r = 5.4 ≥ 3 is the cliff case: don't fund k = 6 KD.**
   - Rank 4b's KD budget, if spent at all, targets k = 8: to recover its +0.010, or to make room
