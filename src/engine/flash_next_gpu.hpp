@@ -157,6 +157,10 @@ class FlashNextGpu {
   /// Precision option (stream P): DeltaNet qkv and z GEMM outputs in fp16,
   /// read as fp16 by the conv, the conv state advance and the gated norm.
   static inline bool prefill_gdn_io16_ = false;
+  /// Precision option (stream P): the chunk's hyper-connection residual
+  /// streams stored in 16 bits (1: fp16, 2: bf16) instead of fp32; every
+  /// residual reader and writer of the prefill takes the matching variant.
+  static inline int prefill_res16_ = 0;
   /// Attention of a chunk's tokens in batched launches (same arithmetic as
   /// stepping) instead of token by token.
   static inline bool prefill_batched_attention_ = true;

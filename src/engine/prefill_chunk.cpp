@@ -37,6 +37,13 @@ bool FlashNextGpu::ChunkSupported() const {
   return true;
 }
 
+namespace {
+// Kernel name for the residual's element type (precision option prefill_res16_: 1 fp16, 2 bf16).
+std::string Rk(const char* base, int res16) {
+  return std::string(base) + (res16 == 1 ? "_r16" : res16 == 2 ? "_rb" : "");
+}
+}  // namespace
+
 bool FlashNextGpu::AllocChunk(std::string* error) {
   if (ck_ready_) return true;
   const auto& c = w_.config;
@@ -262,14 +269,14 @@ bool FlashNextGpu::HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_
   const auto irows = static_cast<std::uint32_t>(m.inject.rows);
   const bool norm_ok =
       normed ||
-      (h16 ? Launch("halo_rmsnorm_rows_h", {T * c.hc_count}, {kBlock},
+      (h16 ? Launch(Rk("halo_rmsnorm_rows_h", prefill_res16_).c_str(), {T * c.hc_count}, {kBlock},
                    {rt::Arg::Buf(ck_.res), rt::Arg::Buf(tensors_.at(m.norm.data).buf), rt::Arg::Buf(ck_.xn),
                     rt::Arg::Buf(ck_.xh), rt::Arg::Val(H), rt::Arg::Val(c.rms_eps), rt::Arg::Val(H),
                     rt::Arg::Val(c.hc_count),
                     fused_inject ? rt::Arg::Buf(tensors_.at(m.inject.data).buf) : rt::Arg::Val<std::uint64_t>(0),
                     rt::Arg::Buf(ck_.ipart), rt::Arg::Val(irows), rt::Arg::Val(BlockedXh(m) ? T : 0u)},
                    error)
-          : Launch("halo_rmsnorm_rows", {T * c.hc_count}, {kBlock},
+          : Launch(Rk("halo_rmsnorm_rows", prefill_res16_).c_str(), {T * c.hc_count}, {kBlock},
                    {rt::Arg::Buf(ck_.res), rt::Arg::Buf(tensors_.at(m.norm.data).buf), rt::Arg::Buf(ck_.xn),
                     rt::Arg::Val(H), rt::Arg::Val(c.rms_eps), rt::Arg::Val(H), rt::Arg::Val(c.hc_count)},
                    error));
@@ -311,6 +318,11 @@ bool FlashNextGpu::MixUp(const model::HcMixer& m, std::uint32_t T, std::string* 
     const auto rows = static_cast<std::uint32_t>(m.up.rows);
     const bool rebuild = xn_skipped_;  // xn was not written: rebuild it from res
     xn_skipped_ = false;
+    const bool mix_h = prefill_mix_h16_ && F16Route(m.down) && BlockedXh(m) && c.hc_count == 4 && rows % 256 == 0;
+    if (prefill_res16_ && rebuild && !mix_h) {
+      if (error) *error = "internal: the 16-bit residual needs the fp16 mix (--mix-h16)";
+      return false;
+    }
     // Precision option: the epilogue reads the norm's fp16 K-blocked copy of xn (still in xh).
     if (prefill_mix_h16_ && F16Route(m.down) && BlockedXh(m) && c.hc_count == 4 && rows % 256 == 0)
       return Half(ck_.lo, ck_.lh, T * low, error) &&
@@ -348,7 +360,7 @@ bool FlashNextGpu::PleChunk(const model::LayerWeights& l, std::uint32_t T, std::
   // Rows: key pa, value mixed, query xn, gated gate, normalized pb (the
   // mixer buffers are free until this layer's mixer runs).
   const auto norm = [&](const rt::Buffer& x, const model::TensorRef& w, const rt::Buffer& y) {
-    return Launch("halo_rmsnorm_rows", {T * hc}, {kBlock},
+    return Launch(Rk("halo_rmsnorm_rows", &x == &ck_.res ? prefill_res16_ : 0).c_str(), {T * hc}, {kBlock},
                   {rt::Arg::Buf(x), rt::Arg::Buf(tensors_.at(w.data).buf), rt::Arg::Buf(y), rt::Arg::Val(H),
                    rt::Arg::Val(c.rms_eps), rt::Arg::Val(H), rt::Arg::Val(hc)},
                   error);
@@ -361,7 +373,7 @@ bool FlashNextGpu::PleChunk(const model::LayerWeights& l, std::uint32_t T, std::
                  rt::Arg::Val(H), rt::Arg::Val(hc)},
                 error) &&
          norm(ck_.gate, l.ple_norm_conv, ck_.pb) &&
-         Launch("halo_ple_conv_prefill", {Blocks(D), T}, {kBlock},
+         Launch(Rk("halo_ple_conv_prefill", prefill_res16_).c_str(), {Blocks(D), T}, {kBlock},
                 {rt::Arg::Buf(ck_.pb), rt::Arg::Buf(ck_.gate), rt::Arg::Buf(ple_history_),
                  rt::Arg::Buf(tensors_.at(l.ple_conv1d.data).buf), rt::Arg::Buf(ck_.res), rt::Arg::Val(D),
                  rt::Arg::Val(c.ple_conv_kernel), rt::Arg::Val(c.ple_ngram_size)},
@@ -1035,13 +1047,13 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
     if (!dev_.Launch(emb.embed_rows, {Blocks(H), T}, {kBlock}, eargs, error)) return false;
   }
   if (timing_) Stamp("token embedding (per token)");
-  if (!Launch("halo_broadcast_rows", {Blocks(std::size_t{T} * D)}, {kBlock},
+  if (!Launch(Rk("halo_broadcast_rows", prefill_res16_).c_str(), {Blocks(std::size_t{T} * D)}, {kBlock},
               {rt::Arg::Buf(ck_.res), rt::Arg::Buf(ck_.embd), rt::Arg::Val(c.hc_count), rt::Arg::Val(H),
                rt::Arg::Val(T)},
               error))
     return false;
   const auto combine = [&] {
-    return Launch("halo_hc_combine_rows", {Blocks(std::size_t{T} * D)}, {kBlock},
+    return Launch(Rk("halo_hc_combine_rows", prefill_res16_).c_str(), {Blocks(std::size_t{T} * D)}, {kBlock},
                   {rt::Arg::Buf(ck_.res), rt::Arg::Buf(ck_.block_out), rt::Arg::Buf(ck_.inject),
                    rt::Arg::Val(c.hc_count), rt::Arg::Val(H), rt::Arg::Val(T)},
                   error);
@@ -1056,7 +1068,7 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
     xn_skipped_ = prefill_mix_rebuild_ && h16 && FuseInject(next) && MixFused(next) && c.hc_count == 4;
     // Precision option: the down projection as W8A8 reads an int8 copy of xn written here.
     const auto& dd = tensors_.at(next.down.data);
-    xq_valid_ = prefill_down_w8a8_ && h16 && BlockedXh(next) && H % 32 == 0 && dd.qs &&
+    xq_valid_ = prefill_down_w8a8_ && prefill_res16_ == 0 && h16 && BlockedXh(next) && H % 32 == 0 && dd.qs &&
                 !lora_.contains(next.down.data);
     const bool want16 = h16 && (!xq_valid_ || prefill_mix_h16_);  // xh's readers: the fp16 down GEMM, the h16 mix
     const rt::Arg a0 = rt::Arg::Buf(ck_.res), a1 = rt::Arg::Buf(ck_.block_out), a2 = rt::Arg::Buf(ck_.inject),
@@ -1073,7 +1085,7 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
                               {a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, rt::Arg::Buf(ck_.xq),
                                rt::Arg::Buf(ck_.xd)},
                               error)
-                     : Launch("halo_hc_combine_norm_rows", {T * c.hc_count}, {kBlock},
+                     : Launch(Rk("halo_hc_combine_norm_rows", prefill_res16_).c_str(), {T * c.hc_count}, {kBlock},
                               {a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13}, error);
   };
   const bool fuse = prefill_fused_combine_ && H <= 16 * kBlock;
@@ -1091,8 +1103,12 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
   }
   // The last token's logits through the decode head.
   if (!logits.empty()) {
-    if (!Launch("halo_copy", {Blocks(D)}, {kBlock},
-                {rt::Arg::Buf(res_), rt::Arg::Buf(ck_.res, std::size_t{T - 1} * D * 4), rt::Arg::Val(D)}, error) ||
+    if (!(prefill_res16_ ? Launch(Rk("halo_res_to_f32", prefill_res16_).c_str(), {Blocks(D)}, {kBlock},
+                                  {rt::Arg::Buf(res_), rt::Arg::Buf(ck_.res, std::size_t{T - 1} * D * 2), rt::Arg::Val(D)},
+                                  error)
+                         : Launch("halo_copy", {Blocks(D)}, {kBlock},
+                                  {rt::Arg::Buf(res_), rt::Arg::Buf(ck_.res, std::size_t{T - 1} * D * 4), rt::Arg::Val(D)},
+                                  error)) ||
         !HcMix(w_.hc_head, false, error) || !MatVec(w_.output, 0, mixed_, logits_, error) ||
         !dev_.Download(logits_, 0, logits.data(), c.vocab_size * 4, error))
       return false;

@@ -56,6 +56,19 @@ __device__ inline float BlockMax(float v, float* scratch) {
 __device__ inline float Bf16(std::uint16_t h) { return __uint_as_float(static_cast<std::uint32_t>(h) << 16); }
 __device__ inline float F16(std::uint16_t h) { return static_cast<float>(*reinterpret_cast<const _Float16*>(&h)); }
 __device__ inline float Sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+// Residual element types (precision option, stream P): fp32, fp16, or bf16 bits (round to nearest even).
+struct HaloBf16 {
+  std::uint16_t bits;
+};
+__device__ inline float RLd(const float* p) { return *p; }
+__device__ inline float RLd(const _Float16* p) { return static_cast<float>(*p); }
+__device__ inline float RLd(const HaloBf16* p) { return __uint_as_float(static_cast<std::uint32_t>(p->bits) << 16); }
+__device__ inline void RSt(float* p, float v) { *p = v; }
+__device__ inline void RSt(_Float16* p, float v) { *p = static_cast<_Float16>(v); }
+__device__ inline void RSt(HaloBf16* p, float v) {
+  const std::uint32_t u = __float_as_uint(v);
+  p->bits = static_cast<std::uint16_t>((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+}
 __device__ inline float Silu(float x) { return x * Sigmoid(x); }
 __device__ inline float Softplus(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
 
@@ -556,8 +569,9 @@ extern "C" __global__ void halo_ple_gate_rows(const float* key, const float* que
 // tap `back` tokens back reads the chunk or, before it, the history; the
 // history is not touched (halo_ple_history_advance moves it afterwards).
 //   rows [T][dim]; grid (ceil(dim / 256), T)
-extern "C" __global__ void halo_ple_conv_prefill(const float* normalized, const float* gated, const float* history,
-                                                 const float* w, float* res, std::uint32_t dim, std::uint32_t kern,
+template <typename RT>
+__device__ __attribute__((always_inline)) inline void PleConvPrefill(const float* normalized, const float* gated, const float* history,
+                                                 const float* w, RT* res, std::uint32_t dim, std::uint32_t kern,
                                                  std::uint32_t dil) {
   const std::uint32_t hist = (kern - 1) * dil, t = blockIdx.y;
   const std::uint32_t ch = blockIdx.x * blockDim.x + threadIdx.x;
@@ -571,7 +585,22 @@ extern "C" __global__ void halo_ple_conv_prefill(const float* normalized, const 
                                   : history[static_cast<std::size_t>(hist + t - back) * dim + ch];
     acc += w[ch * kern + k] * src;
   }
-  res[row + ch] += gated[row + ch] + Silu(acc);
+  RSt(res + row + ch, RLd(res + row + ch) + (gated[row + ch] + Silu(acc)));
+}
+extern "C" __global__ void halo_ple_conv_prefill(const float* normalized, const float* gated, const float* history,
+                                                 const float* w, float* res, std::uint32_t dim, std::uint32_t kern,
+                                                 std::uint32_t dil) {
+  PleConvPrefill(normalized, gated, history, w, res, dim, kern, dil);
+}
+extern "C" __global__ void halo_ple_conv_prefill_r16(const float* normalized, const float* gated, const float* history,
+                                                 const float* w, _Float16* res, std::uint32_t dim, std::uint32_t kern,
+                                                 std::uint32_t dil) {
+  PleConvPrefill(normalized, gated, history, w, res, dim, kern, dil);
+}
+extern "C" __global__ void halo_ple_conv_prefill_rb(const float* normalized, const float* gated, const float* history,
+                                                 const float* w, HaloBf16* res, std::uint32_t dim, std::uint32_t kern,
+                                                 std::uint32_t dil) {
+  PleConvPrefill(normalized, gated, history, w, res, dim, kern, dil);
 }
 
 // The PLE conv history after T tokens: the last `hist` of (history, rows).
@@ -3566,6 +3595,27 @@ extern "C" __global__ void halo_rmsnorm_rows(const float* x, const float* w_all,
   const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
   for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) yv[i] = xv[i] * scale * w[i];
 }
+template <typename RT>
+__device__ __attribute__((always_inline)) inline void RmsnormRows(const RT* x, const float* w_all, float* y, std::uint32_t d, float eps,
+                                             std::uint32_t w_stride, std::uint32_t w_period) {
+  __shared__ float scratch[32];
+  const RT* xv = x + static_cast<std::size_t>(blockIdx.x) * d;
+  const float* w = w_all + (blockIdx.x % w_period) * w_stride;
+  float* yv = y + static_cast<std::size_t>(blockIdx.x) * d;
+  float ss = 0.0f;
+  for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) ss += RLd(xv + i) * RLd(xv + i);
+  ss = BlockSum(ss, scratch);
+  const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
+  for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) yv[i] = RLd(xv + i) * scale * w[i];
+}
+extern "C" __global__ void halo_rmsnorm_rows_r16(const _Float16* x, const float* w_all, float* y, std::uint32_t d,
+                                                 float eps, std::uint32_t w_stride, std::uint32_t w_period) {
+  RmsnormRows(x, w_all, y, d, eps, w_stride, w_period);
+}
+extern "C" __global__ void halo_rmsnorm_rows_rb(const HaloBf16* x, const float* w_all, float* y, std::uint32_t d,
+                                                float eps, std::uint32_t w_stride, std::uint32_t w_period) {
+  RmsnormRows(x, w_all, y, d, eps, w_stride, w_period);
+}
 
 // The mixer's fp16 streams in K-blocked layout [cols / 64][T][64]: the down
 // projection (halo_gemm_q8r_f16_mb) then reads each 64-value K stage of its
@@ -3593,8 +3643,8 @@ __device__ inline std::size_t XhBlocked(std::uint32_t t, std::uint32_t c, std::u
 // GemmQ8A8 (yq [4 h / 64][T][64], yd [4 h / 32][T], T = y16_tokens), for the
 // mixer's W8A8 down projection; requires h % 32 == 0 (a warp's 32 values of
 // one k are one block).
-template <bool kQ8>
-__device__ __attribute__((always_inline)) inline void HcCombineNormRows(float* res, const float* out, const float* inject, const float* w_all,
+template <bool kQ8, typename RT = float>
+__device__ __attribute__((always_inline)) inline void HcCombineNormRows(RT* res, const float* out, const float* inject, const float* w_all,
                                          float* y, _Float16* y16, std::uint32_t hc, std::uint32_t h, float eps,
                                          const float* iw, float* ipart, std::uint32_t irows, float* rscale,
                                          std::uint32_t y16_tokens, std::int8_t* yq, float* yd) {
@@ -3611,7 +3661,7 @@ __device__ __attribute__((always_inline)) inline void HcCombineNormRows(float* r
 #pragma unroll
   for (std::uint32_t k = 0; k < 16; ++k) {
     const std::uint32_t i = threadIdx.x + k * blockDim.x;
-    vals[k] = i < h ? res[row + i] : 0.0f;
+    vals[k] = i < h ? RLd(res + row + i) : 0.0f;
     outs[k] = i < h ? out[t * h + i] : 0.0f;
   }
   HALO_SPAN(1);  // residual and block_out loads issued
@@ -3620,8 +3670,9 @@ __device__ __attribute__((always_inline)) inline void HcCombineNormRows(float* r
   for (std::uint32_t k = 0; k < 16; ++k) {
     const std::uint32_t i = threadIdx.x + k * blockDim.x;
     if (i < h) {
-      const float x = vals[k] + outs[k] * a;
-      res[row + i] = x;
+      float x = vals[k] + outs[k] * a;
+      RSt(res + row + i, x);
+      if constexpr (!__is_same(RT, float)) x = RLd(res + row + i);  // the norm sees the stored residual
       vals[k] = x;
       ss += x * x;
     }
@@ -3706,6 +3757,20 @@ extern "C" __global__ void __launch_bounds__(256)
                            nullptr);
 }
 extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_combine_norm_rows_r16(_Float16* res, const float* out, const float* inject, const float* w_all, float* y,
+                                  _Float16* y16, std::uint32_t hc, std::uint32_t h, float eps, const float* iw,
+                                  float* ipart, std::uint32_t irows, float* rscale, std::uint32_t y16_tokens) {
+  HcCombineNormRows<false>(res, out, inject, w_all, y, y16, hc, h, eps, iw, ipart, irows, rscale, y16_tokens, nullptr,
+                           nullptr);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_combine_norm_rows_rb(HaloBf16* res, const float* out, const float* inject, const float* w_all, float* y,
+                                 _Float16* y16, std::uint32_t hc, std::uint32_t h, float eps, const float* iw,
+                                 float* ipart, std::uint32_t irows, float* rscale, std::uint32_t y16_tokens) {
+  HcCombineNormRows<false>(res, out, inject, w_all, y, y16, hc, h, eps, iw, ipart, irows, rscale, y16_tokens, nullptr,
+                           nullptr);
+}
+extern "C" __global__ void __launch_bounds__(256)
     halo_hc_combine_norm_rows_q8(float* res, const float* out, const float* inject, const float* w_all, float* y,
                                  _Float16* y16, std::uint32_t hc, std::uint32_t h, float eps, const float* iw,
                                  float* ipart, std::uint32_t irows, float* rscale, std::uint32_t y16_tokens,
@@ -3729,7 +3794,8 @@ extern "C" __global__ void halo_inject_reduce(const float* ipart, float* inject,
 // the FP16 route), sparing a conversion pass.
 // iw / ipart / irows: the next projection's partial products, as in
 // halo_hc_combine_norm_rows (w_period = hc streams; iw null to skip).
-extern "C" __global__ void halo_rmsnorm_rows_h(const float* x, const float* w_all, float* y, _Float16* y16,
+template <typename RT>
+__device__ __attribute__((always_inline)) inline void RmsnormRowsH(const RT* x, const float* w_all, float* y, _Float16* y16,
                                                std::uint32_t d, float eps, std::uint32_t w_stride,
                                                std::uint32_t w_period, const float* iw, float* ipart,
                                                std::uint32_t irows, std::uint32_t y16_tokens) {
@@ -3738,12 +3804,12 @@ extern "C" __global__ void halo_rmsnorm_rows_h(const float* x, const float* w_al
   const std::uint32_t st = blockIdx.x % w_period;
   const float* w = w_all + st * w_stride;
   float ss = 0.0f;
-  for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) ss += x[row + i] * x[row + i];
+  for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) ss += RLd(x + row + i) * RLd(x + row + i);
   ss = BlockSum(ss, scratch);
   const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
   float ip[8] = {};
   for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) {
-    const float v = x[row + i] * scale * w[i];
+    const float v = RLd(x + row + i) * scale * w[i];
     y[row + i] = v;
     y16[y16_tokens ? XhBlocked(blockIdx.x / w_period, st * d + i, y16_tokens) : row + i] = static_cast<_Float16>(v);
     if (iw) {
@@ -3760,6 +3826,24 @@ extern "C" __global__ void halo_rmsnorm_rows_h(const float* x, const float* w_al
       if (threadIdx.x == 0) ipart[static_cast<std::size_t>(blockIdx.x) * irows + r] = sum;
     }
   }
+}
+extern "C" __global__ void halo_rmsnorm_rows_h(const float* x, const float* w_all, float* y, _Float16* y16,
+                                               std::uint32_t d, float eps, std::uint32_t w_stride,
+                                               std::uint32_t w_period, const float* iw, float* ipart,
+                                               std::uint32_t irows, std::uint32_t y16_tokens) {
+  RmsnormRowsH(x, w_all, y, y16, d, eps, w_stride, w_period, iw, ipart, irows, y16_tokens);
+}
+extern "C" __global__ void halo_rmsnorm_rows_h_r16(const _Float16* x, const float* w_all, float* y, _Float16* y16,
+                                               std::uint32_t d, float eps, std::uint32_t w_stride,
+                                               std::uint32_t w_period, const float* iw, float* ipart,
+                                               std::uint32_t irows, std::uint32_t y16_tokens) {
+  RmsnormRowsH(x, w_all, y, y16, d, eps, w_stride, w_period, iw, ipart, irows, y16_tokens);
+}
+extern "C" __global__ void halo_rmsnorm_rows_h_rb(const HaloBf16* x, const float* w_all, float* y, _Float16* y16,
+                                               std::uint32_t d, float eps, std::uint32_t w_stride,
+                                               std::uint32_t w_period, const float* iw, float* ipart,
+                                               std::uint32_t irows, std::uint32_t y16_tokens) {
+  RmsnormRowsH(x, w_all, y, y16, d, eps, w_stride, w_period, iw, ipart, irows, y16_tokens);
 }
 
 // halo_gated_norm writing its result in fp16 only (the out projection's
@@ -3811,27 +3895,62 @@ extern "C" __global__ void halo_hc_mix_rows(const float* xn, const float* gate, 
 }
 
 // halo_hc_combine for T rows: res [T][hc][h] += out [T][h] * 2 sigmoid(inject [T][hc] / hc).
-extern "C" __global__ void halo_hc_combine_rows(float* res, const float* out, const float* inject, std::uint32_t hc,
-                                                std::uint32_t h, std::uint32_t tokens) {
+template <typename RT>
+__device__ __attribute__((always_inline)) inline void HcCombineRows(RT* res, const float* out, const float* inject,
+                                                                    std::uint32_t hc, std::uint32_t h,
+                                                                    std::uint32_t tokens) {
   const std::size_t n = static_cast<std::size_t>(tokens) * hc * h;
   for (std::size_t idx = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; idx < n;
        idx += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
     const std::size_t t = idx / (static_cast<std::size_t>(hc) * h), r = idx % (static_cast<std::size_t>(hc) * h);
     const std::uint32_t s = static_cast<std::uint32_t>(r / h);
-    res[idx] += out[t * h + r % h] * 2.0f * Sigmoid(inject[t * hc + s] / static_cast<float>(hc));
+    RSt(res + idx, RLd(res + idx) + out[t * h + r % h] * 2.0f * Sigmoid(inject[t * hc + s] / static_cast<float>(hc)));
   }
+}
+extern "C" __global__ void halo_hc_combine_rows(float* res, const float* out, const float* inject, std::uint32_t hc,
+                                                std::uint32_t h, std::uint32_t tokens) {
+  HcCombineRows(res, out, inject, hc, h, tokens);
+}
+extern "C" __global__ void halo_hc_combine_rows_r16(_Float16* res, const float* out, const float* inject,
+                                                    std::uint32_t hc, std::uint32_t h, std::uint32_t tokens) {
+  HcCombineRows(res, out, inject, hc, h, tokens);
+}
+extern "C" __global__ void halo_hc_combine_rows_rb(HaloBf16* res, const float* out, const float* inject,
+                                                   std::uint32_t hc, std::uint32_t h, std::uint32_t tokens) {
+  HcCombineRows(res, out, inject, hc, h, tokens);
 }
 
 // halo_broadcast for T rows: res [T][hc][h] = x [T][h].
-extern "C" __global__ void halo_broadcast_rows(float* res, const float* x, std::uint32_t hc, std::uint32_t h,
-                                               std::uint32_t tokens) {
+template <typename RT>
+__device__ __attribute__((always_inline)) inline void BroadcastRows(RT* res, const float* x, std::uint32_t hc,
+                                                                    std::uint32_t h, std::uint32_t tokens) {
   const std::size_t n = static_cast<std::size_t>(tokens) * hc * h;
   for (std::size_t idx = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; idx < n;
        idx += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
     const std::size_t t = idx / (static_cast<std::size_t>(hc) * h);
-    res[idx] = x[t * h + idx % h];
+    RSt(res + idx, x[t * h + idx % h]);
   }
 }
+extern "C" __global__ void halo_broadcast_rows(float* res, const float* x, std::uint32_t hc, std::uint32_t h,
+                                               std::uint32_t tokens) {
+  BroadcastRows(res, x, hc, h, tokens);
+}
+extern "C" __global__ void halo_broadcast_rows_r16(_Float16* res, const float* x, std::uint32_t hc, std::uint32_t h,
+                                                   std::uint32_t tokens) {
+  BroadcastRows(res, x, hc, h, tokens);
+}
+extern "C" __global__ void halo_broadcast_rows_rb(HaloBf16* res, const float* x, std::uint32_t hc, std::uint32_t h,
+                                                  std::uint32_t tokens) {
+  BroadcastRows(res, x, hc, h, tokens);
+}
+// The last token's residual (16-bit) widened into the decode state.
+template <typename RT>
+__device__ __attribute__((always_inline)) inline void ResToF32(float* y, const RT* x, std::uint32_t n) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = RLd(x + i);
+}
+extern "C" __global__ void halo_res_to_f32_r16(float* y, const _Float16* x, std::uint32_t n) { ResToF32(y, x, n); }
+extern "C" __global__ void halo_res_to_f32_rb(float* y, const HaloBf16* x, std::uint32_t n) { ResToF32(y, x, n); }
 
 // halo_axpy_sigmoid for T rows: y [T][n] += x [T][n] * sigmoid(g [T]).
 extern "C" __global__ void halo_axpy_sigmoid_rows(float* y, const float* x, const float* g, std::uint32_t n,

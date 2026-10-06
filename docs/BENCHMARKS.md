@@ -83,6 +83,7 @@ mean over cases of the per-case NLL difference ± its standard error.
 | Router, fp16 weights, fp32 activations split hi/lo (`--router-f16 3`) | 0.286079 / 92.55% | −0.00026 ± 0.00040 (48/50) | 0.121366 / 97.26% | +0.00009 ± 0.00057 (8/4), +0.0027 | **passes** (default) |
 | DeltaNet alpha/beta + shared-expert gate on fp16 WMMA (`--small-f16 1`) | 0.285613 / 92.60% | −0.00038 ± 0.00041 (44/54) | 0.122459 / 96.87% | +0.00118 ± 0.00105 (6/6), +0.0089 | **passes** (default on) |
 | Mix epilogue reads the norm's fp16 K-blocked xn (`--mix-h16 1`) | 0.285795 / 92.58% | −0.00024 ± 0.00041 (46/52) | 0.122384 / 97.52% | +0.00111 ± 0.00076 (7/5), +0.0046 | **passes** (default on) |
+| Mixer down as W8A8 (`--down-w8a8 1`) | 0.285805 / 92.62% | −0.00029 ± 0.00048 (49/49) | 0.122210 / 97.65% | +0.00095 ± 0.00109 (7/5), +0.0120 | passes (not kept: no speed gain) |
 | Shared-expert gate/up as W8A8 (`--shexp-w8a8 1`) | 0.285309 / 92.60% | −0.00081 ± 0.00093 (56/42) | 0.121921 / 97.26% | +0.00064 ± 0.00095 (7/5), +0.0058 | **passes** (default on) |
 
 The F32 router, DeltaNet alpha/beta and shared-expert gate weights hold exact bf16 values (all of them),
