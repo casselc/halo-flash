@@ -85,6 +85,10 @@ class EvalService {
   void Wait(const std::string& run_id);
   bool Cancel(const std::string& run_id);
   bool Active(const std::string& run_id);
+  /// Cancels every executor and waits for them (each finishes its current
+  /// item); the routes stay usable. Call before stopping the server that a
+  /// run's target lives on.
+  void Shutdown();
 
  private:
   struct Exec {

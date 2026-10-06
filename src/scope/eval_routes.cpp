@@ -124,7 +124,9 @@ EvalService::EvalService(EvalStore& store, EvalRoutesOptions options) : store_(s
   }
 }
 
-EvalService::~EvalService() {
+EvalService::~EvalService() { Shutdown(); }
+
+void EvalService::Shutdown() {
   std::map<std::string, std::unique_ptr<Exec>> all;
   {
     std::lock_guard<std::mutex> lk(mu_);
