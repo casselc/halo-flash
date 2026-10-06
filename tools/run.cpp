@@ -197,6 +197,7 @@ int main(int argc, char** argv) {
     else if (a == "--prefill-prompt") prefill_prompt = std::string(argv[i + 1]) == "1";
     else if (a == "--decode-logits-out") decode_logits_out = argv[i + 1];
     else if (a == "--decode-attn-b") engine::FlashNextGpu::decode_attn_batched_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--decode-opt") engine::FlashNextGpu::decode_opt_ = static_cast<unsigned>(std::strtoul(argv[i + 1], nullptr, 0));
     else if (a == "--decode-timing") decode_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--kernel-timing") kernel_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";

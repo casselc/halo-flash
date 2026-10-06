@@ -8587,3 +8587,1138 @@ extern "C" __global__ void halo_bench_chase(const std::uint32_t* next, std::uint
   for (std::uint32_t s = 0; s < steps; ++s) i = next[i];
   out[0] = i;
 }
+
+// ---- D2: decode fusions (bit-identical to the launches they replace) ---------
+
+// The routed experts of a layer whose gate/up are Q5_K (one layer of this model), all slots in one launch:
+// h[slot][r] = silu(<gate_r, x>) * <up_r, x>, each dot product in halo_matvec_q5_k's order (lane l takes
+// columns l, l + 32, ...; the wave sums them), each value as LoadQ5_K::At computes it. A lane's pieces of a
+// 256-column super-block (16-byte header, its qh byte and its four qs bytes) are loaded before any is used.
+// grid (ceil(rows / 8), slots), block 256: one wave per row.
+namespace {
+__device__ inline float Q5KRowDot(const std::uint8_t* row, const float* x, std::uint32_t cols, std::uint32_t lane) {
+  float acc = 0.0f;
+  const std::uint32_t nsb = cols / 256;
+  constexpr std::uint32_t kBatch = 5;  // super-blocks loaded together
+  for (std::uint32_t s0 = 0; s0 < nsb; s0 += kBatch) {
+    int4 hdr[kBatch];
+    std::uint32_t qh[kBatch], qs[kBatch][4];
+#pragma unroll
+    for (std::uint32_t k = 0; k < kBatch; ++k) {
+      const std::uint8_t* b = row + static_cast<std::size_t>(min(s0 + k, nsb - 1)) * 176;
+      hdr[k] = *reinterpret_cast<const int4*>(b);
+      qh[k] = b[16 + lane];
+#pragma unroll
+      for (std::uint32_t ch = 0; ch < 4; ++ch) qs[k][ch] = b[48 + ch * 32 + lane];
+    }
+#pragma unroll
+    for (std::uint32_t k = 0; k < kBatch; ++k) {
+      if (s0 + k >= nsb) break;
+      const std::uint32_t w0 = static_cast<std::uint32_t>(hdr[k].x), w1 = static_cast<std::uint32_t>(hdr[k].y),
+                          w2 = static_cast<std::uint32_t>(hdr[k].z), w3 = static_cast<std::uint32_t>(hdr[k].w);
+      const float d = F16(static_cast<std::uint16_t>(w0 & 0xFFFF)), dmin = F16(static_cast<std::uint16_t>(w0 >> 16));
+#pragma unroll
+      for (std::uint32_t e8 = 0; e8 < 8; ++e8) {  // column (s0 + k) * 256 + e8 * 32 + lane
+        const std::uint32_t chunk = e8 / 2, hi = e8 % 2;
+        std::uint32_t sc, m;
+        ScaleMinK4Words(2 * chunk + hi, w1, w2, w3, sc, m);
+        std::uint32_t q = hi ? (qs[k][chunk] >> 4) : (qs[k][chunk] & 0xF);
+        if (qh[k] & (1u << (2 * chunk + hi))) q += 16;
+        const float v = d * static_cast<float>(sc) * static_cast<float>(q) - dmin * static_cast<float>(m);
+        acc += v * x[(s0 + k) * 256 + e8 * 32 + lane];
+      }
+    }
+  }
+  return WarpSum(acc);
+}
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_gate_up_q5_k_rows(const std::uint8_t* gate, const std::uint8_t* up, const std::uint32_t* ids,
+                               const float* x, float* h, std::uint64_t expert_bytes, std::uint32_t rows,
+                               std::uint32_t cols, std::uint64_t row_bytes) {
+  const std::uint32_t slot = blockIdx.y, r = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp;
+  if (r >= rows) return;
+  const std::uint32_t lane = threadIdx.x % kWarp;
+  const std::size_t off = ids[slot] * expert_bytes + static_cast<std::size_t>(r) * row_bytes;
+  const float g = Q5KRowDot(gate + off, x, cols, lane);
+  const float u = Q5KRowDot(up + off, x, cols, lane);
+  if (lane == 0) h[static_cast<std::size_t>(slot) * rows + r] = Silu(g) * u;
+}
+
+// halo_matvec_bf16 for two matrices with the same input in one launch (the QSA indexer's q and k projections):
+// blocks [0, blocks1) take matrix 1. Each row in halo_matvec_bf16's order (lane l: columns l, l + 32, ...),
+// with a lane's 2-byte loads issued kBatch at a time. cols % 32 == 0. grid (blocks1 + ceil(rows2 / 8)), block 256.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_matvec_bf16_dual(const std::uint16_t* w1, float* y1, std::uint32_t rows1, const std::uint16_t* w2, float* y2,
+                          std::uint32_t rows2, const float* x, std::uint32_t cols, std::uint32_t blocks1) {
+  const bool first = blockIdx.x < blocks1;
+  const std::uint32_t b = first ? blockIdx.x : blockIdx.x - blocks1;
+  const std::uint32_t r = b * (blockDim.x / kWarp) + threadIdx.x / kWarp, rows = first ? rows1 : rows2;
+  if (r >= rows) return;
+  const std::uint16_t* row = (first ? w1 : w2) + static_cast<std::size_t>(r) * cols;
+  float* y = first ? y1 : y2;
+  const std::uint32_t lane = threadIdx.x % kWarp, n = cols / kWarp;
+  constexpr std::uint32_t kBatch = 16;
+  float acc = 0.0f;
+  for (std::uint32_t j0 = 0; j0 < n; j0 += kBatch) {
+    std::uint16_t wv[kBatch];
+    float xv[kBatch];
+#pragma unroll
+    for (std::uint32_t k = 0; k < kBatch; ++k) {
+      const std::uint32_t c = min(j0 + k, n - 1) * kWarp + lane;
+      wv[k] = row[c];
+      xv[k] = x[c];
+    }
+#pragma unroll
+    for (std::uint32_t k = 0; k < kBatch; ++k)
+      if (j0 + k < n) acc += Bf16(wv[k]) * xv[k];
+  }
+  acc = WarpSum(acc);
+  if (lane == 0) y[r] = acc;
+}
+
+// GemvQ8rMulti with x in a 6144-float LDS array (24 KB instead of 48): the 80-block 2560 x 6144 projections fit
+// all their blocks on the GPU at once (48 KB allows two blocks per WGP, 40 of 80). Same sums as r2 / r4.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_r2n(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y, std::uint32_t rows,
+                      std::uint32_t cols, std::uint32_t qstride) {
+  GemvQ8rMulti<2, 6144>(qs, d, x, y, rows, cols, qstride);
+}
+
+// halo_gemv_q8r_dual with x in a 4096-float LDS array (cols <= 4096).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_dual_n(const std::int8_t* q1, const std::uint16_t* d1, float* y1, std::uint32_t rows1,
+                         std::uint32_t qstride1, const std::int8_t* q2, const std::uint16_t* d2, float* y2,
+                         std::uint32_t rows2, std::uint32_t qstride2, const float* x, std::uint32_t cols,
+                         std::uint32_t blocks1) {
+  __shared__ float xs[4096];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  const bool first = blockIdx.x < blocks1;
+  const std::uint32_t b = first ? blockIdx.x : blockIdx.x - blocks1;
+  const std::int8_t* qs = first ? q1 : q2;
+  const std::uint16_t* d = first ? d1 : d2;
+  float* y = first ? y1 : y2;
+  const std::uint32_t rows = first ? rows1 : rows2, qstride = first ? qstride1 : qstride2;
+  constexpr int kRows = 4;
+  const std::uint32_t r0 = (b * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  float acc[kRows];
+  Q8RowsDot<kRows>(qs, d, xs, r0, rows, cols, qstride, acc);
+  if (threadIdx.x % kWarp == 0)
+#pragma unroll
+    for (int k = 0; k < kRows; ++k)
+      if (r0 + k < rows) y[r0 + k] = acc[k];
+}
+
+// halo_hc_mix_a with only the block's column chunk in LDS (chunk <= 2048; 8 KB instead of 48 KB, so all of its
+// 168 blocks are resident at once instead of 40 at a time). Same values, same sums.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_mix_a_c(const float* res, const float* norm_w, const float* scale, const std::int8_t* dqs,
+                    const std::uint16_t* dd, const float* inject_w, float* xn, float* lo_part, float* inject_part,
+                    std::uint32_t hc, std::uint32_t h, std::uint32_t low_rank, std::uint32_t down_blocks,
+                    std::uint32_t qstride, std::uint32_t chunk) {
+  __shared__ float xsc[2048];
+  __shared__ float scratch[32];
+  const std::uint32_t D = hc * h, ky = blockIdx.y, c0 = ky * chunk, c1 = min(D, c0 + chunk);
+  for (std::uint32_t i = c0 + threadIdx.x; i < c1; i += blockDim.x) xsc[i - c0] = res[i] * scale[i / h] * norm_w[i];
+  __syncthreads();
+  if (blockIdx.x == 0)
+    for (std::uint32_t i = c0 + threadIdx.x; i < c1; i += blockDim.x) xn[i] = xsc[i - c0];
+  const std::uint32_t lane = threadIdx.x % kWarp;
+  if (blockIdx.x >= down_blocks) {
+    const std::uint32_t r = blockIdx.x - down_blocks;
+    const float* w = inject_w + static_cast<std::size_t>(r) * D;
+    float acc = 0.0f;
+    for (std::uint32_t c = c0 + threadIdx.x; c < c1; c += blockDim.x) acc += w[c] * xsc[c - c0];
+    acc = BlockSum(acc, scratch);
+    if (threadIdx.x == 0) inject_part[ky * hc + r] = acc;
+    return;
+  }
+  constexpr int kRows = 2;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= low_rank) return;
+  const std::uint32_t nblk = D / 32;
+  float acc[kRows] = {};
+  for (std::uint32_t c = c0 + lane * 16; c < c1; c += kWarp * 16) {
+    float xr[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) xr[i] = xsc[c - c0 + i];
+#pragma unroll
+    for (int k = 0; k < kRows; ++k) {
+      const std::uint32_t r = min(r0 + k, low_rank - 1);
+      const int4 q = *reinterpret_cast<const int4*>(dqs + static_cast<std::size_t>(r) * qstride + c);
+      const float sc = F16(dd[static_cast<std::size_t>(r) * nblk + c / 32]);
+      const std::int8_t* v = reinterpret_cast<const std::int8_t*>(&q);
+      float part = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) part += static_cast<float>(v[i]) * xr[i];
+      acc[k] += sc * part;
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < kRows; ++k) {
+    const float a = WarpSum(acc[k]);
+    if (lane == 0 && r0 + k < low_rank) lo_part[ky * low_rank + r0 + k] = a;
+  }
+}
+
+// halo_moe_gate_up_q4_k_dot with its weight loads issued before the activations are quantized (and the
+// quantizer's x loads issued together): the same items per lane in the same order, the same int8 activations
+// and the same arithmetic as Q4KItemDot, so h is bit-identical. kItems = items per lane (2 x 2 rows x cols / 64
+// / 32); cols <= 4096, cols % 256 == 0. grid (ceil(rows / 16), slots), block 256.
+namespace {
+
+__device__ inline void QuantizeActivationsBatched(const float* x, std::uint32_t cols, Q8Act& a) {
+  const std::uint32_t lane = threadIdx.x % kWarp, warp = threadIdx.x / kWarp, warps = blockDim.x / kWarp;
+  constexpr std::uint32_t kMax = 16;  // 4096 / 32 / 8 warps
+  float xv[kMax];
+#pragma unroll
+  for (std::uint32_t j = 0; j < kMax; ++j) {
+    const std::uint32_t blk = warp + j * warps;
+    xv[j] = blk < cols / 32 ? x[blk * 32 + lane] : 0.0f;
+  }
+#pragma unroll
+  for (std::uint32_t j = 0; j < kMax; ++j) {
+    const std::uint32_t blk = warp + j * warps;
+    if (blk >= cols / 32) break;
+    const float v = xv[j];
+    float amax = fabsf(v), sum = v;
+    for (int o = kWarp / 2; o > 0; o >>= 1) {
+      amax = fmaxf(amax, __shfl_xor(amax, o, kWarp));
+      sum += __shfl_xor(sum, o, kWarp);
+    }
+    const float scale = amax / 127.0f;
+    const int qv = scale > 0.0f ? static_cast<int>(rintf(v / scale)) : 0;
+    const std::uint32_t byte = static_cast<std::uint32_t>(qv & 0xFF) << (8 * (lane & 3));
+    std::uint32_t word = byte;
+    word |= __shfl_xor(word, 1, kWarp);
+    word |= __shfl_xor(word, 2, kWarp);
+    if ((lane & 3) == 0) a.q[blk * 8 + lane / 4] = word;
+    if (lane == 0) {
+      a.scale[blk] = scale;
+      a.sum[blk] = sum;
+    }
+  }
+}
+
+__device__ inline float Q4KItemDotRegs(const int4 hdr, const int4 qa, const int4 qb, const Q8Act& a,
+                                       std::uint32_t item) {
+  const std::uint32_t sb = item / 4, c = item % 4;
+  const auto w0 = static_cast<std::uint32_t>(hdr.y), w1 = static_cast<std::uint32_t>(hdr.z),
+             w2 = static_cast<std::uint32_t>(hdr.w);
+  std::uint32_t sc0, m0, sc1, m1;
+  ScaleMinK4Words(2 * c, w0, w1, w2, sc0, m0);
+  ScaleMinK4Words(2 * c + 1, w0, w1, w2, sc1, m1);
+  const std::uint32_t s0 = sb * 8 + 2 * c, s1 = s0 + 1;
+  const std::uint32_t* x0 = a.q + s0 * 8;
+  const std::uint32_t* x1 = a.q + s1 * 8;
+  const std::uint32_t qw[8] = {static_cast<std::uint32_t>(qa.x), static_cast<std::uint32_t>(qa.y),
+                               static_cast<std::uint32_t>(qa.z), static_cast<std::uint32_t>(qa.w),
+                               static_cast<std::uint32_t>(qb.x), static_cast<std::uint32_t>(qb.y),
+                               static_cast<std::uint32_t>(qb.z), static_cast<std::uint32_t>(qb.w)};
+  int lo = 0, hi = 0;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    lo = __builtin_amdgcn_sudot4(false, static_cast<int>(qw[k] & 0x0F0F0F0Fu), true, static_cast<int>(x0[k]), lo, false);
+    hi = __builtin_amdgcn_sudot4(false, static_cast<int>((qw[k] >> 4) & 0x0F0F0F0Fu), true, static_cast<int>(x1[k]), hi,
+                                 false);
+  }
+  const float d = F16(static_cast<std::uint16_t>(hdr.x & 0xFFFF));
+  const float dmin = F16(static_cast<std::uint16_t>(static_cast<std::uint32_t>(hdr.x) >> 16));
+  return d * (static_cast<float>(sc0) * a.scale[s0] * static_cast<float>(lo) +
+              static_cast<float>(sc1) * a.scale[s1] * static_cast<float>(hi)) -
+         dmin * (static_cast<float>(m0) * a.sum[s0] + static_cast<float>(m1) * a.sum[s1]);
+}
+
+template <std::uint32_t kItems>
+__device__ void GateUpQ4kDotPrefetch(const std::uint8_t* gate, const std::uint8_t* up, const std::uint32_t* ids,
+                                     const float* x, float* h, std::uint64_t expert_bytes, std::uint32_t rows,
+                                     std::uint32_t cols, std::uint64_t row_bytes) {
+  constexpr int kRows = 2;
+  __shared__ Q8Act act;
+  const std::uint32_t slot = blockIdx.y;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  const std::uint32_t lane = threadIdx.x % kWarp, per_row = cols / 64, n = 2 * kRows * per_row;
+  const std::size_t e = ids[slot];
+  int4 hdr[kItems], qa[kItems], qb[kItems];
+#pragma unroll
+  for (std::uint32_t j = 0; j < kItems; ++j) {
+    const std::uint32_t t = min(lane + j * kWarp, n - 1);
+    const std::uint32_t m = t / (kRows * per_row), rem = t % (kRows * per_row), k = rem / per_row, i = rem % per_row;
+    const std::uint32_t r = min(min(r0, rows - 1) + k, rows - 1);
+    const std::uint8_t* b = (m == 0 ? gate : up) + e * expert_bytes + r * row_bytes + (i / 4) * 144;
+    hdr[j] = *reinterpret_cast<const int4*>(b);
+    qa[j] = *reinterpret_cast<const int4*>(b + 16 + (i % 4) * 32);
+    qb[j] = *reinterpret_cast<const int4*>(b + 16 + (i % 4) * 32 + 16);
+  }
+  QuantizeActivationsBatched(x, cols, act);
+  __syncthreads();
+  if (r0 >= rows) return;
+  float g[kRows] = {}, u[kRows] = {};
+#pragma unroll
+  for (std::uint32_t j = 0; j < kItems; ++j) {
+    const std::uint32_t t = lane + j * kWarp;
+    if (t >= n) break;
+    const std::uint32_t m = t / (kRows * per_row), rem = t % (kRows * per_row), k = rem / per_row, i = rem % per_row;
+    const float v = Q4KItemDotRegs(hdr[j], qa[j], qb[j], act, i);
+#pragma unroll
+    for (int kk = 0; kk < kRows; ++kk) {
+      if (kk == static_cast<int>(k) && m == 0) g[kk] += v;
+      if (kk == static_cast<int>(k) && m == 1) u[kk] += v;
+    }
+  }
+#pragma unroll
+  for (int kk = 0; kk < kRows; ++kk) {
+    const float gs = WarpSum(g[kk]), us = WarpSum(u[kk]);
+    if (lane == 0 && r0 + kk < rows) h[static_cast<std::size_t>(slot) * rows + r0 + kk] = Silu(gs) * us;
+  }
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_gate_up_q4_k_dot_p5(const std::uint8_t* gate, const std::uint8_t* up, const std::uint32_t* ids,
+                                 const float* x, float* h, std::uint64_t expert_bytes, std::uint32_t rows,
+                                 std::uint32_t cols, std::uint64_t row_bytes) {
+  GateUpQ4kDotPrefetch<5>(gate, up, ids, x, h, expert_bytes, rows, cols, row_bytes);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_gate_up_q4_k_dot_p8(const std::uint8_t* gate, const std::uint8_t* up, const std::uint32_t* ids,
+                                 const float* x, float* h, std::uint64_t expert_bytes, std::uint32_t rows,
+                                 std::uint32_t cols, std::uint64_t row_bytes) {
+  GateUpQ4kDotPrefetch<8>(gate, up, ids, x, h, expert_bytes, rows, cols, row_bytes);
+}
+
+// halo_qsa_scores with q in LDS, the block's key row read 8 floats at a time, and the heads' dot products run
+// as independent chains side by side (each still summed over i in order; acc adds the heads in order), so the
+// scores are bit-identical. heads <= 8, heads * dim <= 2048, dim % 8 == 0. grid / block as halo_qsa_scores.
+extern "C" __global__ void halo_qsa_scores_b(const float* q, const float* blocks, float* score,
+                                             const std::uint32_t* params, std::uint32_t heads, std::uint32_t dim) {
+  __shared__ float qs[2048];
+  for (std::uint32_t i = threadIdx.x; i < heads * dim; i += blockDim.x) qs[i] = q[i];
+  __syncthreads();
+  const std::uint32_t n_blocks = params[kHaloComplete];
+  for (std::uint32_t b = blockIdx.x * blockDim.x + threadIdx.x; b < n_blocks; b += gridDim.x * blockDim.x) {
+    const float4* row = reinterpret_cast<const float4*>(blocks + static_cast<std::size_t>(b) * dim);
+    float dot[8] = {};
+    for (std::uint32_t i0 = 0; i0 < dim; i0 += 8) {
+      const float4 a = row[i0 / 4], c = row[i0 / 4 + 1];
+      const float kv[8] = {a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w};
+#pragma unroll
+      for (std::uint32_t h = 0; h < 8; ++h) {
+        if (h >= heads) break;
+#pragma unroll
+        for (std::uint32_t j = 0; j < 8; ++j) dot[h] += qs[h * dim + i0 + j] * kv[j];
+      }
+    }
+    float acc = 0.0f;
+#pragma unroll
+    for (std::uint32_t h = 0; h < 8; ++h)
+      if (h < heads) acc += fmaxf(0.0f, dot[h]);
+    score[b] = acc;
+  }
+}
+
+// halo_hc_combine then halo_hc_norm_scales in one launch: one 256-thread block per stream updates its residual
+// (the combine's expression) and sums the squares of the new values in halo_hc_norm_scales's order.
+// grid (hc), block 256.
+extern "C" __global__ void halo_hc_combine_scales(float* res, const float* out, const float* inject, float* scale,
+                                                  std::uint32_t hc, std::uint32_t h, float eps) {
+  __shared__ float scratch[32];
+  const std::uint32_t s = blockIdx.x;
+  float* x = res + static_cast<std::size_t>(s) * h;
+  float ss = 0.0f;
+  for (std::uint32_t i = threadIdx.x; i < h; i += blockDim.x) {
+    const float v = x[i] + out[i] * 2.0f * Sigmoid(inject[s] / static_cast<float>(hc));
+    x[i] = v;
+    ss += v * v;
+  }
+  ss = BlockSum(ss, scratch);
+  if (threadIdx.x == 0) scale[s] = 1.0f / sqrtf(ss / static_cast<float>(h) + eps);
+}
+
+// halo_moe_combine then halo_shexp_down_add in one launch: out[r] = sum_s w[s] part[s][r] (the combine's order)
+// + sigmoid(sgate) * <down_r, h>. grid (ceil(rows / 32)), block 256.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_shexp_down_combine(const std::int8_t* dq, const std::uint16_t* dd, const float* hin, const float* sgate,
+                            const float* part, const float* weights, std::uint32_t slots, float* out,
+                            std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride) {
+  __shared__ float hs[kGemvMaxCols];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) hs[i] = hin[i];
+  __syncthreads();
+  constexpr int kRows = 4;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  float y[kRows];
+  Q8RowsDot<kRows>(dq, dd, hs, r0, rows, cols, qstride, y);
+  const float s = Sigmoid(sgate[0]);
+  if (threadIdx.x % kWarp == 0)
+#pragma unroll
+    for (int k = 0; k < kRows; ++k)
+      if (r0 + k < rows) {
+        float acc = 0.0f;
+        for (std::uint32_t sl = 0; sl < slots; ++sl) acc += weights[sl] * part[static_cast<std::size_t>(sl) * rows + r0 + k];
+        out[r0 + k] = acc + s * y[k];
+      }
+}
+
+// halo_gemv_q8r_dual and halo_matvec_f32_rowblock2 (DeltaNet alpha / beta, same input) in one launch: blocks
+// [0, blocks12) are the dual's, the next 2 * ab_rows blocks rowblock2's. grid (blocks12 + 2 ab_rows), block 256.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_dual_ab(const std::int8_t* q1, const std::uint16_t* d1, float* y1, std::uint32_t rows1,
+                          std::uint32_t qstride1, const std::int8_t* q2, const std::uint16_t* d2, float* y2,
+                          std::uint32_t rows2, std::uint32_t qstride2, const float* x, std::uint32_t cols,
+                          std::uint32_t blocks1, std::uint32_t blocks12, const float* wa, const float* wb, float* ya,
+                          float* yb, std::uint32_t ab_rows) {
+  __shared__ float xs[12288];
+  __shared__ float scratch[32];
+  if (blockIdx.x >= blocks12) {
+    const std::uint32_t bb = blockIdx.x - blocks12;
+    const bool a = bb < ab_rows;
+    const std::uint32_t r = a ? bb : bb - ab_rows;
+    const float* row = (a ? wa : wb) + static_cast<std::size_t>(r) * cols;
+    float acc = 0.0f;
+    for (std::uint32_t c = threadIdx.x; c < cols; c += blockDim.x) acc += row[c] * x[c];
+    acc = BlockSum(acc, scratch);
+    if (threadIdx.x == 0) (a ? ya : yb)[r] = acc;
+    return;
+  }
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  const bool first = blockIdx.x < blocks1;
+  const std::uint32_t b = first ? blockIdx.x : blockIdx.x - blocks1;
+  const std::int8_t* qs = first ? q1 : q2;
+  const std::uint16_t* d = first ? d1 : d2;
+  float* y = first ? y1 : y2;
+  const std::uint32_t rows = first ? rows1 : rows2, qstride = first ? qstride1 : qstride2;
+  constexpr int kRows = 4;
+  const std::uint32_t r0 = (b * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  float acc[kRows];
+  Q8RowsDot<kRows>(qs, d, xs, r0, rows, cols, qstride, acc);
+  if (threadIdx.x % kWarp == 0)
+#pragma unroll
+    for (int k = 0; k < kRows; ++k)
+      if (r0 + k < rows) y[r0 + k] = acc[k];
+}
+
+// ---- D2: Q8 GEMVs with the next column chunk's loads in flight ------------------
+// GemvQ8rMulti / Q8RowsDot with a one-chunk register prefetch: chunk c + 512's int4 and scale loads are issued
+// before chunk c is consumed. The same values are summed in the same order (bit-identical); only the loads move.
+namespace {
+
+template <int kWaveRows, std::uint32_t kMaxCols>
+__device__ void GemvQ8rMultiPf(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y,
+                               std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride) {
+  __shared__ float xs[kMaxCols];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kWaveRows;
+  if (r0 >= rows) return;
+  const std::uint32_t lane = threadIdx.x % kWarp, nblk = cols / 32;
+  float acc[kWaveRows] = {};
+  int4 qn[kWaveRows];
+  float sn[kWaveRows];
+  const auto load = [&](std::uint32_t c) {
+#pragma unroll
+    for (int k = 0; k < kWaveRows; ++k) {
+      const std::uint32_t r = min(r0 + k, rows - 1);
+      qn[k] = *reinterpret_cast<const int4*>(qs + static_cast<std::size_t>(r) * qstride + c);
+      sn[k] = F16(d[static_cast<std::size_t>(r) * nblk + c / 32]);
+    }
+  };
+  if (lane * 16 < cols) load(lane * 16);
+  for (std::uint32_t c = lane * 16; c < cols; c += kWarp * 16) {
+    int4 q[kWaveRows];
+    float s[kWaveRows];
+#pragma unroll
+    for (int k = 0; k < kWaveRows; ++k) {
+      q[k] = qn[k];
+      s[k] = sn[k];
+    }
+    if (c + kWarp * 16 < cols) load(c + kWarp * 16);
+    const float* xv = xs + c;
+    float xr[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) xr[i] = xv[i];
+#pragma unroll
+    for (int k = 0; k < kWaveRows; ++k) {
+      const std::int8_t* v = reinterpret_cast<const std::int8_t*>(&q[k]);
+      float part = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) part += static_cast<float>(v[i]) * xr[i];
+      acc[k] += s[k] * part;
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < kWaveRows; ++k) {
+    const float a = WarpSum(acc[k]);
+    if (lane == 0 && r0 + k < rows) y[r0 + k] = a;
+  }
+}
+
+// Q8RowsDot with the same one-chunk prefetch.
+template <int kRows>
+__device__ inline void Q8RowsDotPf(const std::int8_t* qs, const std::uint16_t* d, const float* xs, std::uint32_t r0,
+                                   std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, float (&out)[kRows]) {
+  const std::uint32_t lane = threadIdx.x % kWarp, nblk = cols / 32;
+  float acc[kRows] = {};
+  int4 qn[kRows];
+  float sn[kRows];
+  const auto load = [&](std::uint32_t c) {
+#pragma unroll
+    for (int k = 0; k < kRows; ++k) {
+      const std::uint32_t r = min(r0 + k, rows - 1);
+      qn[k] = *reinterpret_cast<const int4*>(qs + static_cast<std::size_t>(r) * qstride + c);
+      sn[k] = F16(d[static_cast<std::size_t>(r) * nblk + c / 32]);
+    }
+  };
+  if (lane * 16 < cols) load(lane * 16);
+  for (std::uint32_t c = lane * 16; c < cols; c += kWarp * 16) {
+    float xr[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) xr[i] = xs[c + i];
+    int4 q[kRows];
+    float sc[kRows];
+#pragma unroll
+    for (int k = 0; k < kRows; ++k) {
+      q[k] = qn[k];
+      sc[k] = sn[k];
+    }
+    if (c + kWarp * 16 < cols) load(c + kWarp * 16);
+#pragma unroll
+    for (int k = 0; k < kRows; ++k) {
+      const std::int8_t* v = reinterpret_cast<const std::int8_t*>(&q[k]);
+      float part = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) part += static_cast<float>(v[i]) * xr[i];
+      acc[k] += sc[k] * part;
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < kRows; ++k) out[k] = WarpSum(acc[k]);
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_r2p(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y, std::uint32_t rows,
+                      std::uint32_t cols, std::uint32_t qstride) {
+  GemvQ8rMultiPf<2, 12288>(qs, d, x, y, rows, cols, qstride);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_r4p(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y, std::uint32_t rows,
+                      std::uint32_t cols, std::uint32_t qstride) {
+  GemvQ8rMultiPf<4, 12288>(qs, d, x, y, rows, cols, qstride);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_dual_abp(const std::int8_t* q1, const std::uint16_t* d1, float* y1, std::uint32_t rows1,
+                           std::uint32_t qstride1, const std::int8_t* q2, const std::uint16_t* d2, float* y2,
+                           std::uint32_t rows2, std::uint32_t qstride2, const float* x, std::uint32_t cols,
+                           std::uint32_t blocks1, std::uint32_t blocks12, const float* wa, const float* wb, float* ya,
+                           float* yb, std::uint32_t ab_rows) {
+  __shared__ float xs[12288];
+  __shared__ float scratch[32];
+  if (blockIdx.x >= blocks12) {
+    const std::uint32_t bb = blockIdx.x - blocks12;
+    const bool a = bb < ab_rows;
+    const std::uint32_t r = a ? bb : bb - ab_rows;
+    const float* row = (a ? wa : wb) + static_cast<std::size_t>(r) * cols;
+    float acc = 0.0f;
+    for (std::uint32_t c = threadIdx.x; c < cols; c += blockDim.x) acc += row[c] * x[c];
+    acc = BlockSum(acc, scratch);
+    if (threadIdx.x == 0) (a ? ya : yb)[r] = acc;
+    return;
+  }
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  const bool first = blockIdx.x < blocks1;
+  const std::uint32_t b = first ? blockIdx.x : blockIdx.x - blocks1;
+  const std::int8_t* qs = first ? q1 : q2;
+  const std::uint16_t* d = first ? d1 : d2;
+  float* y = first ? y1 : y2;
+  const std::uint32_t rows = first ? rows1 : rows2, qstride = first ? qstride1 : qstride2;
+  constexpr int kRows = 4;
+  const std::uint32_t r0 = (b * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  float acc[kRows];
+  Q8RowsDotPf<kRows>(qs, d, xs, r0, rows, cols, qstride, acc);
+  if (threadIdx.x % kWarp == 0)
+#pragma unroll
+    for (int k = 0; k < kRows; ++k)
+      if (r0 + k < rows) y[r0 + k] = acc[k];
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_shexp_gate_up_p(const std::int8_t* gq, const std::uint16_t* gd, const std::int8_t* uq, const std::uint16_t* ud,
+                         const float* gate_inp, const float* x, float* h, float* sgate, std::uint32_t rows,
+                         std::uint32_t cols, std::uint32_t qstride) {
+  __shared__ float xs[kGemvMaxCols];
+  __shared__ float scratch[32];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  if (blockIdx.x == 0) {
+    float a = 0.0f;
+    for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) a += gate_inp[i] * xs[i];
+    a = BlockSum(a, scratch);
+    if (threadIdx.x == 0) sgate[0] = a;
+  }
+  constexpr int kRows = 2;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  float g[kRows], u[kRows];
+  Q8RowsDotPf<kRows>(gq, gd, xs, r0, rows, cols, qstride, g);
+  Q8RowsDotPf<kRows>(uq, ud, xs, r0, rows, cols, qstride, u);
+  if (threadIdx.x % kWarp == 0)
+#pragma unroll
+    for (int k = 0; k < kRows; ++k)
+      if (r0 + k < rows) h[r0 + k] = Silu(g[k]) * u[k];
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_shexp_down_combine_p(const std::int8_t* dq, const std::uint16_t* dd, const float* hin, const float* sgate,
+                              const float* part, const float* weights, std::uint32_t slots, float* out,
+                              std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride) {
+  __shared__ float hs[kGemvMaxCols];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) hs[i] = hin[i];
+  __syncthreads();
+  constexpr int kRows = 4;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  float y[kRows];
+  Q8RowsDotPf<kRows>(dq, dd, hs, r0, rows, cols, qstride, y);
+  const float s = Sigmoid(sgate[0]);
+  if (threadIdx.x % kWarp == 0)
+#pragma unroll
+    for (int k = 0; k < kRows; ++k)
+      if (r0 + k < rows) {
+        float acc = 0.0f;
+        for (std::uint32_t sl = 0; sl < slots; ++sl) acc += weights[sl] * part[static_cast<std::size_t>(sl) * rows + r0 + k];
+        out[r0 + k] = acc + s * y[k];
+      }
+}
+
+// ---- D2: weight loads issued before the activation prologue ---------------------
+// The weights do not depend on the staged activations, so each lane's weight loads go out first and the
+// staging (and its barrier) runs under them. Same items, same order, same arithmetic: bit-identical.
+namespace {
+
+__device__ inline float Q5_1ItemRegs(const uint2 hd, const uint2 qa, const uint2 qb, const float* x) {
+  const std::uint32_t qh = hd.y;
+  std::uint8_t q[16];
+  *reinterpret_cast<uint2*>(q) = qa;
+  *reinterpret_cast<uint2*>(q + 8) = qb;
+  float s = 0, sx = 0;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    const float lo = static_cast<float>((q[j] & 0xF) | (((qh >> j) & 1) << 4));
+    const float hi = static_cast<float>((q[j] >> 4) | (((qh >> (j + 16)) & 1) << 4));
+    s += lo * x[j] + hi * x[16 + j];
+    sx += x[j] + x[16 + j];
+  }
+  return F16(static_cast<std::uint16_t>(hd.x & 0xFFFF)) * s + F16(static_cast<std::uint16_t>(hd.x >> 16)) * sx;
+}
+
+}  // namespace
+
+// halo_moe_down_q5_1_r4 with each lane's (at most kItems = 3) Q5_1 blocks loaded before h is staged.
+// Requires 4 * cols / 32 <= 3 * 32 (cols <= 768). grid (ceil(rows / 32), slots), block 256.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_down_q5_1_r4p(const std::uint8_t* down, const std::uint32_t* ids, const float* h, float* part,
+                           std::uint64_t expert_bytes, std::uint32_t rows, std::uint32_t cols, std::uint64_t row_bytes) {
+  constexpr int kRows = 4;
+  constexpr std::uint32_t kItems = 3;
+  __shared__ float xs[2048];
+  const std::uint32_t slot = blockIdx.y;
+  const std::uint8_t* w = down + ids[slot] * expert_bytes;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  const std::uint32_t lane = threadIdx.x % kWarp, per_row = cols / 32, n = kRows * per_row;
+  uint2 hd[kItems], qa[kItems], qb[kItems];
+#pragma unroll
+  for (std::uint32_t j = 0; j < kItems; ++j) {
+    const std::uint32_t t = min(lane + j * kWarp, n - 1), k = t / per_row, i = t % per_row;
+    const std::uint32_t r = min(min(r0, rows - 1) + k, rows - 1);
+    const std::uint8_t* b = w + r * row_bytes + i * 24;
+    hd[j] = *reinterpret_cast<const uint2*>(b);
+    qa[j] = *reinterpret_cast<const uint2*>(b + 8);
+    qb[j] = *reinterpret_cast<const uint2*>(b + 16);
+  }
+  const float* x = h + static_cast<std::size_t>(slot) * cols;
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  if (r0 >= rows) return;
+  float acc[kRows] = {};
+#pragma unroll
+  for (std::uint32_t j = 0; j < kItems; ++j) {
+    const std::uint32_t t = lane + j * kWarp;
+    if (t >= n) break;
+    const std::uint32_t k = t / per_row, i = t % per_row;
+    const float v = Q5_1ItemRegs(hd[j], qa[j], qb[j], xs + i * 32);
+#pragma unroll
+    for (int kk = 0; kk < kRows; ++kk)
+      if (kk == static_cast<int>(k)) acc[kk] += v;
+  }
+  float* y = part + static_cast<std::size_t>(slot) * rows;
+#pragma unroll
+  for (int kk = 0; kk < kRows; ++kk) {
+    const float a = WarpSum(acc[kk]);
+    if (lane == 0 && r0 + kk < rows) y[r0 + kk] = a;
+  }
+}
+
+// halo_hc_mix_b with the up projection's loads (low_rank <= 512: one 16-column chunk a lane) issued before the
+// low-rank partials are summed. grid (ceil(h / 8)), block 256.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_mix_b_p(const float* lo_part, std::uint32_t parts, const float* inject_part, float* inject,
+                    std::uint32_t inject_rows, const std::int8_t* uqs, const std::uint16_t* ud, const float* xn,
+                    float* mixed, std::uint32_t hc, std::uint32_t h, std::uint32_t low_rank, std::uint32_t qstride) {
+  __shared__ float ls[kHcMaxLow];
+  const std::uint32_t i = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp;
+  const std::uint32_t lane = threadIdx.x % kWarp, nblk = low_rank / 32, c = lane * 16;
+  const bool live = i < h && c < low_rank;
+  int4 q[4];
+  float sc[4];
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    const std::size_t r = static_cast<std::size_t>(min(static_cast<std::uint32_t>(s), hc - 1)) * h + min(i, h - 1);
+    const std::uint32_t cc = live ? c : 0;
+    q[s] = *reinterpret_cast<const int4*>(uqs + r * qstride + cc);
+    sc[s] = F16(ud[r * nblk + cc / 32]);
+  }
+  for (std::uint32_t j = threadIdx.x; j < low_rank; j += blockDim.x) {
+    float a = 0.0f;
+    for (std::uint32_t p = 0; p < parts; ++p) a += lo_part[p * low_rank + j];
+    ls[j] = Silu(a / static_cast<float>(hc));
+  }
+  if (blockIdx.x == 0 && threadIdx.x < inject_rows) {
+    float a = 0.0f;
+    for (std::uint32_t p = 0; p < parts; ++p) a += inject_part[p * hc + threadIdx.x];
+    inject[threadIdx.x] = a;
+  }
+  __syncthreads();
+  if (i >= h) return;
+  float acc[4] = {};
+  if (c < low_rank) {
+    float xr[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) xr[j] = ls[c + j];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      if (static_cast<std::uint32_t>(s) >= hc) break;
+      const std::int8_t* v = reinterpret_cast<const std::int8_t*>(&q[s]);
+      float part = 0.0f;
+#pragma unroll
+      for (int j = 0; j < 16; ++j) part += static_cast<float>(v[j]) * xr[j];
+      acc[s] += sc[s] * part;
+    }
+  }
+  float m = 0.0f;
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    const float g = WarpSum(acc[s]);
+    if (static_cast<std::uint32_t>(s) < hc) m += xn[s * h + i] * Sigmoid(g);
+  }
+  if (lane == 0) mixed[i] = m / static_cast<float>(hc);
+}
+
+// One row per wave (8 rows a block): the same per-row sums as r2 / r4.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemv_q8r_r1(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* y, std::uint32_t rows,
+                     std::uint32_t cols, std::uint32_t qstride) {
+  GemvQ8rMulti<1, 12288>(qs, d, x, y, rows, cols, qstride);
+}
+
+// ---- D2: block-per-row F32 dot products with every load issued first ------------
+// `for (c = tid; c < cols; c += blockDim) acc += row[c] * x[c]` compiles to one load pair, a wait and an FMA per
+// iteration: ~10 dependent DRAM round trips a thread for 2560 columns. Here a thread's loads (cols <= 16 x
+// blockDim) are issued together, then the same FMAs run in the same order: bit-identical.
+namespace {
+__device__ inline float RowDotHoisted(const float* row, const float* x, std::uint32_t cols) {
+  constexpr std::uint32_t kMax = 16;
+  float wv[kMax], xv[kMax];
+#pragma unroll
+  for (std::uint32_t j = 0; j < kMax; ++j) {
+    const std::uint32_t c = threadIdx.x + j * blockDim.x;
+    wv[j] = c < cols ? row[c] : 0.0f;
+    xv[j] = c < cols ? x[c] : 0.0f;
+  }
+  float acc = 0.0f;
+#pragma unroll
+  for (std::uint32_t j = 0; j < kMax; ++j)
+    if (threadIdx.x + j * blockDim.x < cols) acc += wv[j] * xv[j];
+  return acc;
+}
+}  // namespace
+
+// halo_matvec_f32_rowblock with hoisted loads (cols <= 16 * 256).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_matvec_f32_rowblock_u(const float* w, const float* x, float* y, std::uint32_t rows, std::uint32_t cols) {
+  __shared__ float scratch[32];
+  const std::uint32_t r = blockIdx.x;
+  if (r >= rows) return;
+  const float acc = BlockSum(RowDotHoisted(w + static_cast<std::size_t>(r) * cols, x, cols), scratch);
+  if (threadIdx.x == 0) y[r] = acc;
+}
+
+// halo_gemv_q8r_dual_ab with the alpha/beta rows' loads hoisted (cols <= 4096).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_matvec_f32_rowblock2_u(const float* wa, const float* wb, const float* x, float* ya, float* yb,
+                                std::uint32_t rows, std::uint32_t cols) {
+  __shared__ float scratch[32];
+  const bool a = blockIdx.x < rows;
+  const std::uint32_t r = a ? blockIdx.x : blockIdx.x - rows;
+  const float acc = BlockSum(RowDotHoisted((a ? wa : wb) + static_cast<std::size_t>(r) * cols, x, cols), scratch);
+  if (threadIdx.x == 0) (a ? ya : yb)[r] = acc;
+}
+
+// halo_shexp_gate_up with block 0's gate logit (sgate) loads hoisted (cols <= 4096).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_shexp_gate_up_u(const std::int8_t* gq, const std::uint16_t* gd, const std::int8_t* uq, const std::uint16_t* ud,
+                         const float* gate_inp, const float* x, float* h, float* sgate, std::uint32_t rows,
+                         std::uint32_t cols, std::uint32_t qstride) {
+  __shared__ float xs[kGemvMaxCols];
+  __shared__ float scratch[32];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = x[i];
+  __syncthreads();
+  if (blockIdx.x == 0) {
+    const float a = BlockSum(RowDotHoisted(gate_inp, xs, cols), scratch);
+    if (threadIdx.x == 0) sgate[0] = a;
+  }
+  constexpr int kRows = 2;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  float g[kRows], u[kRows];
+  Q8RowsDot<kRows>(gq, gd, xs, r0, rows, cols, qstride, g);
+  Q8RowsDot<kRows>(uq, ud, xs, r0, rows, cols, qstride, u);
+  if (threadIdx.x % kWarp == 0)
+#pragma unroll
+    for (int k = 0; k < kRows; ++k)
+      if (r0 + k < rows) h[r0 + k] = Silu(g[k]) * u[k];
+}
+
+// ---- D2: the routed experts' int8 activations quantized once per layer ----------
+// halo_moe_gate_up_q4_k_dot quantizes x in every one of its 400 blocks before any weight load (8 warps x 10
+// serial rounds of an L2 load and ~20 dependent lane shuffles). Here the router launch (which reads the same x)
+// quantizes it once: block b < cols / 32 has its first warp quantize 32-value block b exactly as
+// QuantizeActivations does (the per-block values do not depend on which warp computes them), into a global
+// Q8Act; the gate/up kernel then copies the 5 KB into LDS with 16-byte loads. Bit-identical.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_router_rowblock_q8act(const float* w, const float* x, float* y, std::uint32_t rows, std::uint32_t cols,
+                               Q8Act* act) {
+  __shared__ float scratch[32];
+  if (blockIdx.x < cols / 32 && threadIdx.x < kWarp) {
+    const std::uint32_t lane = threadIdx.x, blk = blockIdx.x;
+    const float v = x[blk * 32 + lane];
+    float amax = fabsf(v), sum = v;
+    for (int o = kWarp / 2; o > 0; o >>= 1) {
+      amax = fmaxf(amax, __shfl_xor(amax, o, kWarp));
+      sum += __shfl_xor(sum, o, kWarp);
+    }
+    const float scale = amax / 127.0f;
+    const int qv = scale > 0.0f ? static_cast<int>(rintf(v / scale)) : 0;
+    const std::uint32_t byte = static_cast<std::uint32_t>(qv & 0xFF) << (8 * (lane & 3));
+    std::uint32_t word = byte;
+    word |= __shfl_xor(word, 1, kWarp);
+    word |= __shfl_xor(word, 2, kWarp);
+    if ((lane & 3) == 0) act->q[blk * 8 + lane / 4] = word;
+    if (lane == 0) {
+      act->scale[blk] = scale;
+      act->sum[blk] = sum;
+    }
+  }
+  const std::uint32_t r = blockIdx.x;
+  if (r >= rows) return;
+  const float acc = BlockSum(RowDotHoisted(w + static_cast<std::size_t>(r) * cols, x, cols), scratch);
+  if (threadIdx.x == 0) y[r] = acc;
+}
+
+// halo_moe_gate_up_q4_k_dot reading the activations quantized by halo_router_rowblock_q8act.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_moe_gate_up_q4_k_dot_g(const std::uint8_t* gate, const std::uint8_t* up, const std::uint32_t* ids,
+                                const Q8Act* gact, float* h, std::uint64_t expert_bytes, std::uint32_t rows,
+                                std::uint32_t cols, std::uint64_t row_bytes) {
+  constexpr int kRows = 2;
+  __shared__ Q8Act act;
+  {
+    const uint4* src = reinterpret_cast<const uint4*>(gact);
+    uint4* dst = reinterpret_cast<uint4*>(&act);
+    constexpr std::uint32_t n16 = sizeof(Q8Act) / 16;
+    for (std::uint32_t i = threadIdx.x; i < n16; i += blockDim.x) dst[i] = src[i];
+  }
+  __syncthreads();
+  const std::uint32_t slot = blockIdx.y;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  const std::uint32_t lane = threadIdx.x % kWarp, per_row = cols / 64;
+  const std::size_t e = ids[slot];
+  float g[kRows] = {}, u[kRows] = {};
+  for (std::uint32_t t = lane; t < 2 * kRows * per_row; t += kWarp) {
+    const std::uint32_t m = t / (kRows * per_row), rem = t % (kRows * per_row), k = rem / per_row, i = rem % per_row;
+    const std::uint32_t r = min(r0 + k, rows - 1);
+    const float v = Q4KItemDot((m == 0 ? gate : up) + e * expert_bytes + r * row_bytes, act, i);
+#pragma unroll
+    for (int kk = 0; kk < kRows; ++kk) {
+      if (kk == static_cast<int>(k) && m == 0) g[kk] += v;
+      if (kk == static_cast<int>(k) && m == 1) u[kk] += v;
+    }
+  }
+#pragma unroll
+  for (int kk = 0; kk < kRows; ++kk) {
+    const float gs = WarpSum(g[kk]), us = WarpSum(u[kk]);
+    if (lane == 0 && r0 + kk < rows) h[static_cast<std::size_t>(slot) * rows + r0 + kk] = Silu(gs) * us;
+  }
+}
+
+// ---- D2: small kernels with their loop loads hoisted (same order of every sum) ---
+extern "C" __global__ void halo_hc_norm_scales_u(const float* res, float* scale, std::uint32_t h, float eps) {
+  __shared__ float scratch[32];
+  const float* x = res + blockIdx.x * h;
+  constexpr std::uint32_t kMax = 16;  // h <= 16 * blockDim
+  float v[kMax];
+#pragma unroll
+  for (std::uint32_t j = 0; j < kMax; ++j) {
+    const std::uint32_t i = threadIdx.x + j * blockDim.x;
+    v[j] = i < h ? x[i] : 0.0f;
+  }
+  float ss = 0.0f;
+#pragma unroll
+  for (std::uint32_t j = 0; j < kMax; ++j)
+    if (threadIdx.x + j * blockDim.x < h) ss += v[j] * v[j];
+  ss = BlockSum(ss, scratch);
+  if (threadIdx.x == 0) scale[blockIdx.x] = 1.0f / sqrtf(ss / static_cast<float>(h) + eps);
+}
+
+extern "C" __global__ void halo_moe_combine_u(const float* part, const float* weights, float* out, std::uint32_t slots,
+                                              std::uint32_t n) {
+  constexpr std::uint32_t kMax = 16;  // slots <= 16
+  for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+    float pv[kMax], wv[kMax];
+#pragma unroll
+    for (std::uint32_t s = 0; s < kMax; ++s) {
+      pv[s] = s < slots ? part[static_cast<std::size_t>(s) * n + i] : 0.0f;
+      wv[s] = s < slots ? weights[s] : 0.0f;
+    }
+    float acc = 0.0f;
+#pragma unroll
+    for (std::uint32_t s = 0; s < kMax; ++s)
+      if (s < slots) acc += wv[s] * pv[s];
+    out[i] = acc;
+  }
+}
+
+// halo_shexp_down_combine with the routed partials loaded by the row's 32 lanes... in order: lane s < slots loads
+// part[s][r] and weights[s]; lane 0 then sums them in slot order (same sums). slots <= 32.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_shexp_down_combine_u(const std::int8_t* dq, const std::uint16_t* dd, const float* hin, const float* sgate,
+                              const float* part, const float* weights, std::uint32_t slots, float* out,
+                              std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride) {
+  __shared__ float hs[kGemvMaxCols];
+  for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) hs[i] = hin[i];
+  __syncthreads();
+  constexpr int kRows = 4;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= rows) return;
+  const std::uint32_t lane = threadIdx.x % kWarp;
+  float pv[kRows];
+  const float wl = lane < slots ? weights[lane] : 0.0f;
+#pragma unroll
+  for (int k = 0; k < kRows; ++k)
+    pv[k] = lane < slots && r0 + k < rows ? part[static_cast<std::size_t>(lane) * rows + r0 + k] : 0.0f;
+  float y[kRows];
+  Q8RowsDot<kRows>(dq, dd, hs, r0, rows, cols, qstride, y);
+  const float s = Sigmoid(sgate[0]);
+#pragma unroll
+  for (int k = 0; k < kRows; ++k) {
+    float acc = 0.0f;
+    for (std::uint32_t sl = 0; sl < slots; ++sl) acc += __shfl(wl, sl, kWarp) * __shfl(pv[k], sl, kWarp);
+    if (lane == 0 && r0 + k < rows) out[r0 + k] = acc + s * y[k];
+  }
+}
+
+// halo_hc_mix_b with the low-rank partial sums' loads hoisted (parts <= 16, low_rank <= 512); the up projection's
+// loads stay after the barrier (issuing them first made halo_hc_mix_b_p slower).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_mix_b_u(const float* lo_part, std::uint32_t parts, const float* inject_part, float* inject,
+                     std::uint32_t inject_rows, const std::int8_t* uqs, const std::uint16_t* ud, const float* xn,
+                     float* mixed, std::uint32_t hc, std::uint32_t h, std::uint32_t low_rank, std::uint32_t qstride) {
+  __shared__ float ls[kHcMaxLow];
+  const std::uint32_t i = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp;
+  const std::uint32_t lane = threadIdx.x % kWarp, nblk = low_rank / 32, c = lane * 16;
+  const bool live = i < h && c < low_rank;
+  constexpr std::uint32_t kMaxParts = 16;
+#pragma unroll
+  for (std::uint32_t jj = 0; jj < 2; ++jj) {  // low_rank <= 512 = 2 x 256
+    const std::uint32_t j = threadIdx.x + jj * blockDim.x;
+    float pv[kMaxParts];
+#pragma unroll
+    for (std::uint32_t p = 0; p < kMaxParts; ++p) pv[p] = j < low_rank && p < parts ? lo_part[p * low_rank + j] : 0.0f;
+    if (j < low_rank) {
+      float a = 0.0f;
+#pragma unroll
+      for (std::uint32_t p = 0; p < kMaxParts; ++p)
+        if (p < parts) a += pv[p];
+      ls[j] = Silu(a / static_cast<float>(hc));
+    }
+  }
+  if (blockIdx.x == 0 && threadIdx.x < inject_rows) {
+    float a = 0.0f;
+    for (std::uint32_t p = 0; p < parts; ++p) a += inject_part[p * hc + threadIdx.x];
+    inject[threadIdx.x] = a;
+  }
+  __syncthreads();
+  if (i >= h) return;
+  int4 q[4];
+  float sc[4];
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    const std::size_t r = static_cast<std::size_t>(min(static_cast<std::uint32_t>(s), hc - 1)) * h + min(i, h - 1);
+    const std::uint32_t cc = live ? c : 0;
+    q[s] = *reinterpret_cast<const int4*>(uqs + r * qstride + cc);
+    sc[s] = F16(ud[r * nblk + cc / 32]);
+  }
+  float acc[4] = {};
+  if (c < low_rank) {
+    float xr[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) xr[j] = ls[c + j];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      if (static_cast<std::uint32_t>(s) >= hc) break;
+      const std::int8_t* v = reinterpret_cast<const std::int8_t*>(&q[s]);
+      float part = 0.0f;
+#pragma unroll
+      for (int j = 0; j < 16; ++j) part += static_cast<float>(v[j]) * xr[j];
+      acc[s] += sc[s] * part;
+    }
+  }
+  float m = 0.0f;
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    const float g = WarpSum(acc[s]);
+    if (static_cast<std::uint32_t>(s) < hc) m += xn[s * h + i] * Sigmoid(g);
+  }
+  if (lane == 0) mixed[i] = m / static_cast<float>(hc);
+}
+
+// halo_hc_mix_a_c with the staging loads hoisted (chunk <= 2048 = 8 x 256) and the inject rows' loads hoisted.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_mix_a_cu(const float* res, const float* norm_w, const float* scale, const std::int8_t* dqs,
+                     const std::uint16_t* dd, const float* inject_w, float* xn, float* lo_part, float* inject_part,
+                     std::uint32_t hc, std::uint32_t h, std::uint32_t low_rank, std::uint32_t down_blocks,
+                     std::uint32_t qstride, std::uint32_t chunk) {
+  __shared__ float xsc[2048];
+  __shared__ float scratch[32];
+  const std::uint32_t D = hc * h, ky = blockIdx.y, c0 = ky * chunk, c1 = min(D, c0 + chunk);
+  constexpr std::uint32_t kMax = 8;
+  {
+    float rv[kMax], sv[kMax], nv[kMax];
+#pragma unroll
+    for (std::uint32_t j = 0; j < kMax; ++j) {
+      const std::uint32_t i = c0 + threadIdx.x + j * blockDim.x;
+      const bool in = i < c1;
+      rv[j] = in ? res[i] : 0.0f;
+      sv[j] = in ? scale[i / h] : 0.0f;
+      nv[j] = in ? norm_w[i] : 0.0f;
+    }
+#pragma unroll
+    for (std::uint32_t j = 0; j < kMax; ++j) {
+      const std::uint32_t i = c0 + threadIdx.x + j * blockDim.x;
+      if (i < c1) xsc[i - c0] = rv[j] * sv[j] * nv[j];
+    }
+  }
+  __syncthreads();
+  if (blockIdx.x == 0)
+    for (std::uint32_t i = c0 + threadIdx.x; i < c1; i += blockDim.x) xn[i] = xsc[i - c0];
+  const std::uint32_t lane = threadIdx.x % kWarp;
+  if (blockIdx.x >= down_blocks) {
+    const std::uint32_t r = blockIdx.x - down_blocks;
+    const float* w = inject_w + static_cast<std::size_t>(r) * D;
+    float wv[kMax];
+#pragma unroll
+    for (std::uint32_t j = 0; j < kMax; ++j) {
+      const std::uint32_t cc = c0 + threadIdx.x + j * blockDim.x;
+      wv[j] = cc < c1 ? w[cc] : 0.0f;
+    }
+    float acc = 0.0f;
+#pragma unroll
+    for (std::uint32_t j = 0; j < kMax; ++j) {
+      const std::uint32_t cc = c0 + threadIdx.x + j * blockDim.x;
+      if (cc < c1) acc += wv[j] * xsc[cc - c0];
+    }
+    acc = BlockSum(acc, scratch);
+    if (threadIdx.x == 0) inject_part[ky * hc + r] = acc;
+    return;
+  }
+  constexpr int kRows = 2;
+  const std::uint32_t r0 = (blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  if (r0 >= low_rank) return;
+  const std::uint32_t nblk = D / 32;
+  float acc[kRows] = {};
+  for (std::uint32_t c = c0 + lane * 16; c < c1; c += kWarp * 16) {
+    float xr[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) xr[i] = xsc[c - c0 + i];
+#pragma unroll
+    for (int k = 0; k < kRows; ++k) {
+      const std::uint32_t r = min(r0 + k, low_rank - 1);
+      const int4 q = *reinterpret_cast<const int4*>(dqs + static_cast<std::size_t>(r) * qstride + c);
+      const float sc = F16(dd[static_cast<std::size_t>(r) * nblk + c / 32]);
+      const std::int8_t* v = reinterpret_cast<const std::int8_t*>(&q);
+      float part = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) part += static_cast<float>(v[i]) * xr[i];
+      acc[k] += sc * part;
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < kRows; ++k) {
+    const float a = WarpSum(acc[k]);
+    if (lane == 0 && r0 + k < low_rank) lo_part[ky * low_rank + r0 + k] = a;
+  }
+}
+
+// halo_gdn_step_d128_norm without holding the 128-entry state column in registers (256 VGPRs, 152 spilled):
+// pass 1 reads it in chunks of 32 for A and B, pass 2 reads it again (L2) for the update. The same values, the
+// same sums in the same order: bit-identical.
+extern "C" __global__ void __launch_bounds__(128)
+    halo_gdn_step_d128_norm_r(const float* q, const float* k, const float* v, const float* alpha, const float* beta,
+                              const float* a, const float* dt, float* state, const float* norm_w, const float* z,
+                              float* out, std::uint32_t num_k_heads, float eps, std::uint32_t mode) {
+  constexpr std::uint32_t d = 128, kChunk = 32;
+  __shared__ float ks[d], qs[d], red[32];
+  const std::uint32_t h = blockIdx.x, j = threadIdx.x;
+  const float* qh = q + (h % num_k_heads) * d;
+  const float* kh = k + (h % num_k_heads) * d;
+  ks[j] = kh[j];
+  qs[j] = qh[j];
+  const float kq = BlockSum(kh[j] * qh[j], red);
+  const float decay = expf(a[h] * Softplus(alpha[h] + dt[h]));
+  const float b = Sigmoid(beta[h]);
+  float* S = state + static_cast<std::size_t>(h) * d * d + j;
+  float A = 0.0f, B = 0.0f;
+#pragma unroll 1
+  for (std::uint32_t i0 = 0; i0 < d; i0 += kChunk) {
+    float s[kChunk];
+#pragma unroll
+    for (std::uint32_t i = 0; i < kChunk; ++i) s[i] = S[(i0 + i) * d];
+#pragma unroll
+    for (std::uint32_t i = 0; i < kChunk; ++i) {
+      A += s[i] * ks[i0 + i];
+      B += s[i] * qs[i0 + i];
+    }
+  }
+  const float delta = (v[h * d + j] - decay * A) * b;
+#pragma unroll 1
+  for (std::uint32_t i0 = 0; i0 < d; i0 += kChunk) {
+    float s[kChunk];
+#pragma unroll
+    for (std::uint32_t i = 0; i < kChunk; ++i) s[i] = S[(i0 + i) * d];
+#pragma unroll
+    for (std::uint32_t i = 0; i < kChunk; ++i) S[(i0 + i) * d] = decay * s[i] + delta * ks[i0 + i];
+  }
+  const float o = (decay * B + delta * kq) / sqrtf(static_cast<float>(d));
+  const float ss = BlockSum(o * o, red);
+  const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
+  const float zv = z[h * d + j];
+  out[h * d + j] = o * scale * norm_w[j] * (mode == 0 ? Silu(zv) : Sigmoid(zv));
+}

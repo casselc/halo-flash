@@ -47,6 +47,9 @@ std::unique_ptr<FlashNextGpu> FlashNextGpu::Create(rt::Device& device, const mod
 
 FlashNextGpu::~FlashNextGpu() {
   for (auto& g : graphs_) dev_.FreeGraph(g);
+  for (auto& g : post_graphs_) dev_.FreeGraph(g);
+  dev_.FreeGraph(pre_graph_);
+  dev_.FreeHost(ple_rows_host_);
   for (auto& [_, t] : tensors_) {
     dev_.Free(t.buf);
     dev_.Free(t.qs);
@@ -184,15 +187,25 @@ bool FlashNextGpu::MatVec(const model::TensorRef& t, std::uint64_t expert, const
     // where 32-row blocks would leave the GPU idle); see halo_gemv_bench.
     // From halo_gemv_bench at DRAM working sets: 4 rows per wave is best
     // (LM head 242 GB/s); 2 for few rows (hc down, 320 rows).
-    const char* k = rows < 2048 ? "halo_gemv_q8r_r2" : "halo_gemv_q8r_r4";
-    const std::uint32_t per_block = rows < 2048 ? 16 : 32;
+    const bool n = (decode_opt_ & kDecodeGemvLds) && cols <= 6144;
+    const bool pf = !n && (decode_opt_ & kDecodeGemvPrefetch);
+    const char* k = rows < 2048 ? (n ? "halo_gemv_q8r_r2n" : pf ? "halo_gemv_q8r_r2p" : "halo_gemv_q8r_r2")
+                                : (n ? "halo_gemv_q8r_r4n" : pf ? "halo_gemv_q8r_r4p" : "halo_gemv_q8r_r4");
+    std::uint32_t per_block = rows < 2048 ? 16 : 32;
+    if (!n && !pf && rows >= 2048 && rows <= 4096 && cols > 4096 && (decode_opt_ & (kDecodeWideR2 | kDecodeWideR1))) {
+      const bool one = decode_opt_ & kDecodeWideR1;
+      k = one ? "halo_gemv_q8r_r1" : "halo_gemv_q8r_r2";
+      per_block = one ? 8 : 16;
+    }
     if (!Launch(k, {Blocks(rows, per_block)}, {256},
                 {rt::Arg::Buf(d.qs, e * rows * d.qstride), rt::Arg::Buf(d.d, e * rows * (cols / 32) * 2),
                  rt::Arg::Buf(x, x_off), rt::Arg::Buf(y, y_off), rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride)},
                 error))
       return false;
   } else if (t.type == core::GgmlType::kF32 && rows <= 1024 && expert == 0 && small_row_kernels_) {
-    if (!Launch("halo_matvec_f32_rowblock", {rows}, {256},
+    if (!Launch((decode_opt_ & kDecodeHoistRowLoads) && cols <= 4096 ? "halo_matvec_f32_rowblock_u"
+                                                                     : "halo_matvec_f32_rowblock",
+                {rows}, {256},
                 {rt::Arg::Buf(d.buf), rt::Arg::Buf(x, x_off), rt::Arg::Buf(y, y_off), rt::Arg::Val(rows), rt::Arg::Val(cols)}, error))
       return false;
   } else {
@@ -298,6 +311,10 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   step_host_.assign(penalty_offset_ + std::size_t{HALO_SAMPLE_MAX_PENALTIES} * sizeof(HaloPenalty), 0);
   ple_emb_ = dev_.Alloc(step_host_.size(), error);
   if (!ple_emb_) return false;
+  if (c.ple_layer > 0) {
+    ple_rows_host_ = static_cast<float*>(dev_.AllocHost(std::size_t{c.PleEmbeddingDim()} * 4, error));
+    if (!ple_rows_host_) return false;
+  }
   owned_.push_back(ple_emb_);
   ple_key_ = Scratch(D, error);
   ple_value_ = Scratch(H, error);
@@ -325,6 +342,7 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   block_scores_ = Scratch(max_context / c.compress_ratio + 1, error);
   visible_ = Scratch(max_context, error);
   router_ = Scratch(c.num_experts, error);
+  q8act_ = Scratch(1280, error);  // struct Q8Act in core.hip: 1024 words + 128 + 128 floats
   expert_ids_ = Scratch(c.num_experts_used, error);
   expert_weights_ = Scratch(c.num_experts_used, error);
   moe_h_ = Scratch(std::size_t{c.num_experts_used} * c.expert_ff, error);
@@ -406,7 +424,7 @@ bool FlashNextGpu::GroupedNorm(const rt::Buffer& x, const model::TensorRef& w, c
                 error);
 }
 
-bool FlashNextGpu::HcMix(const model::HcMixer& m, bool inject, std::string* error) {
+bool FlashNextGpu::HcMix(const model::HcMixer& m, bool inject, std::string* error, bool scales_ready) {
   const auto& c = w_.config;
   // P3 fused path: two launches when both projections are repacked Q8_0.
   const auto& dn = tensors_.at(m.down.data);
@@ -419,17 +437,26 @@ bool FlashNextGpu::HcMix(const model::HcMixer& m, bool inject, std::string* erro
     // down projection fills the GPU.
     const std::uint32_t chunk = (c.HcDim() / kHcParts + 511) / 512 * 512;
     const std::uint32_t parts = (c.HcDim() + chunk - 1) / chunk;
-    return Launch("halo_hc_norm_scales", {c.hc_count}, {256},
-                  {rt::Arg::Buf(res_), rt::Arg::Buf(hc_scale_), rt::Arg::Val(c.hidden_size), rt::Arg::Val(c.rms_eps)},
-                  error) &&
-           Launch("halo_hc_mix_a", {down_blocks + inject_rows, parts}, {256},
+    return (scales_ready ||
+            Launch((decode_opt_ & kDecodeHoistSmall) && c.hidden_size <= 4096 ? "halo_hc_norm_scales_u"
+                                                                               : "halo_hc_norm_scales",
+                   {c.hc_count}, {256},
+                   {rt::Arg::Buf(res_), rt::Arg::Buf(hc_scale_), rt::Arg::Val(c.hidden_size), rt::Arg::Val(c.rms_eps)},
+                   error)) &&
+           Launch((decode_opt_ & kDecodeHcMixLds) && chunk <= 2048
+                      ? ((decode_opt_ & kDecodeHoistSmall) ? "halo_hc_mix_a_cu" : "halo_hc_mix_a_c")
+                      : "halo_hc_mix_a",
+                  {down_blocks + inject_rows, parts}, {256},
                   {rt::Arg::Buf(res_), rt::Arg::Buf(tensors_.at(m.norm.data).buf), rt::Arg::Buf(hc_scale_),
                    rt::Arg::Buf(dn.qs), rt::Arg::Buf(dn.d), rt::Arg::Buf(inject ? tensors_.at(m.inject.data).buf : res_),
                    rt::Arg::Buf(xn_), rt::Arg::Buf(hc_lo_part_), rt::Arg::Buf(hc_inject_part_), rt::Arg::Val(c.hc_count),
                    rt::Arg::Val(c.hidden_size), rt::Arg::Val(c.hc_low_rank), rt::Arg::Val(down_blocks),
                    rt::Arg::Val(dn.qstride), rt::Arg::Val(chunk)},
                   error) &&
-           Launch("halo_hc_mix_b", {Blocks(c.hidden_size, 8)}, {256},
+           Launch((decode_opt_ & kDecodeHoistSmall) && c.hc_low_rank <= 512 && parts <= 16 ? "halo_hc_mix_b_u"
+                  : (decode_opt_ & kDecodeWeightsFirst) && c.hc_low_rank <= 512                ? "halo_hc_mix_b_p"
+                                                                                               : "halo_hc_mix_b",
+                  {Blocks(c.hidden_size, 8)}, {256},
                   {rt::Arg::Buf(hc_lo_part_), rt::Arg::Val(parts), rt::Arg::Buf(hc_inject_part_), rt::Arg::Buf(inject_),
                    rt::Arg::Val(inject_rows), rt::Arg::Buf(upt.qs), rt::Arg::Buf(upt.d), rt::Arg::Buf(xn_),
                    rt::Arg::Buf(mixed_), rt::Arg::Val(c.hc_count), rt::Arg::Val(c.hidden_size),
@@ -478,22 +505,14 @@ bool FlashNextGpu::Linear(const model::LayerWeights& l, LinearState& s, std::str
       l.ssm_beta.type == core::GgmlType::kF32 && ch % 128 == 0 && (2 * kd) % 128 == 0) {
     const auto rq = static_cast<std::uint32_t>(l.ssm_qkv.rows), rz = static_cast<std::uint32_t>(l.ssm_gate.rows);
     const std::uint32_t b1 = Blocks(rq, 32);
-    return Launch("halo_gemv_q8r_dual", {b1 + Blocks(rz, 32)}, {256},
-                  {rt::Arg::Buf(tq.qs), rt::Arg::Buf(tq.d), rt::Arg::Buf(qkv_), rt::Arg::Val(rq), rt::Arg::Val(tq.qstride),
-                   rt::Arg::Buf(tz.qs), rt::Arg::Buf(tz.d), rt::Arg::Buf(z_), rt::Arg::Val(rz), rt::Arg::Val(tz.qstride),
-                   rt::Arg::Buf(mixed_), rt::Arg::Val(H), rt::Arg::Val(b1)},
-                  error) &&
-           Launch("halo_matvec_f32_rowblock2", {2 * c.ssm_num_v_heads}, {256},
-                  {rt::Arg::Buf(tensors_.at(l.ssm_alpha.data).buf), rt::Arg::Buf(tensors_.at(l.ssm_beta.data).buf),
-                   rt::Arg::Buf(mixed_), rt::Arg::Buf(alpha_), rt::Arg::Buf(beta_), rt::Arg::Val(c.ssm_num_v_heads),
-                   rt::Arg::Val(H)},
-                  error) &&
-           Launch("halo_conv_l2norm", {ch / 128}, {128},
+    const auto tail = [&]() {  // conv + L2, DeltaNet + gated norm, out
+      return Launch("halo_conv_l2norm", {ch / 128}, {128},
                   {rt::Arg::Buf(qkv_), rt::Arg::Buf(s.conv), rt::Arg::Buf(tensors_.at(l.ssm_conv1d.data).buf),
                    rt::Arg::Buf(conv_out_), rt::Arg::Val(ch), rt::Arg::Val(c.ssm_conv_kernel), rt::Arg::Val(2 * kd),
                    rt::Arg::Val(c.rms_eps)},
                   error) &&
-           Launch("halo_gdn_step_d128_norm", {c.ssm_num_v_heads}, {128},
+           Launch(decode_opt_ & kDecodeGdnNoSpill ? "halo_gdn_step_d128_norm_r" : "halo_gdn_step_d128_norm",
+                  {c.ssm_num_v_heads}, {128},
                   {rt::Arg::Buf(conv_out_), rt::Arg::Buf(conv_out_, kd * 4ull), rt::Arg::Buf(conv_out_, 2ull * kd * 4),
                    rt::Arg::Buf(alpha_), rt::Arg::Buf(beta_), rt::Arg::Buf(tensors_.at(l.ssm_a.data).buf),
                    rt::Arg::Buf(tensors_.at(l.ssm_dt.data).buf), rt::Arg::Buf(s.state),
@@ -501,6 +520,34 @@ bool FlashNextGpu::Linear(const model::LayerWeights& l, LinearState& s, std::str
                    rt::Arg::Val(c.ssm_num_k_heads), rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(1)},
                   error) &&
            MatVec(l.ssm_out, 0, gdn_out_, block_out_, error);
+    };
+    if (decode_opt_ & kDecodeDualAb) {
+      const std::uint32_t b12 = b1 + Blocks(rz, 32);
+      return Launch(decode_opt_ & kDecodeGemvPrefetch ? "halo_gemv_q8r_dual_abp" : "halo_gemv_q8r_dual_ab",
+                    {b12 + 2 * c.ssm_num_v_heads}, {256},
+                    {rt::Arg::Buf(tq.qs), rt::Arg::Buf(tq.d), rt::Arg::Buf(qkv_), rt::Arg::Val(rq),
+                     rt::Arg::Val(tq.qstride), rt::Arg::Buf(tz.qs), rt::Arg::Buf(tz.d), rt::Arg::Buf(z_),
+                     rt::Arg::Val(rz), rt::Arg::Val(tz.qstride), rt::Arg::Buf(mixed_), rt::Arg::Val(H), rt::Arg::Val(b1),
+                     rt::Arg::Val(b12), rt::Arg::Buf(tensors_.at(l.ssm_alpha.data).buf),
+                     rt::Arg::Buf(tensors_.at(l.ssm_beta.data).buf), rt::Arg::Buf(alpha_), rt::Arg::Buf(beta_),
+                     rt::Arg::Val(c.ssm_num_v_heads)},
+                    error) &&
+             tail();
+    }
+    return Launch((decode_opt_ & kDecodeDualLds) && H <= 4096 ? "halo_gemv_q8r_dual_n" : "halo_gemv_q8r_dual",
+                  {b1 + Blocks(rz, 32)}, {256},
+                  {rt::Arg::Buf(tq.qs), rt::Arg::Buf(tq.d), rt::Arg::Buf(qkv_), rt::Arg::Val(rq), rt::Arg::Val(tq.qstride),
+                   rt::Arg::Buf(tz.qs), rt::Arg::Buf(tz.d), rt::Arg::Buf(z_), rt::Arg::Val(rz), rt::Arg::Val(tz.qstride),
+                   rt::Arg::Buf(mixed_), rt::Arg::Val(H), rt::Arg::Val(b1)},
+                  error) &&
+           Launch((decode_opt_ & kDecodeHoistRowLoads) && H <= 4096 ? "halo_matvec_f32_rowblock2_u"
+                                                                    : "halo_matvec_f32_rowblock2",
+                  {2 * c.ssm_num_v_heads}, {256},
+                  {rt::Arg::Buf(tensors_.at(l.ssm_alpha.data).buf), rt::Arg::Buf(tensors_.at(l.ssm_beta.data).buf),
+                   rt::Arg::Buf(mixed_), rt::Arg::Buf(alpha_), rt::Arg::Buf(beta_), rt::Arg::Val(c.ssm_num_v_heads),
+                   rt::Arg::Val(H)},
+                  error) &&
+           tail();
   }
   return MatVec(l.ssm_qkv, 0, mixed_, qkv_, error) && MatVec(l.ssm_gate, 0, mixed_, z_, error) &&
          MatVec(l.ssm_alpha, 0, mixed_, alpha_, error) && MatVec(l.ssm_beta, 0, mixed_, beta_, error) &&
@@ -554,6 +601,22 @@ bool FlashNextGpu::Attention(const model::LayerWeights& l, AttnState& s, std::st
                   {rt::Arg::Buf(cache), rt::Arg::Buf(row), params, rt::Arg::Val(slot), rt::Arg::Val(n), rt::Arg::Val(n)},
                   error);
   };
+  // D2: the indexer's two BF16 projections in one launch (halo_matvec_bf16's sums, batched loads).
+  const auto indexer_qk = [&]() {
+    const auto& iq = l.indexer_q;
+    const auto& ik = l.indexer_k;
+    if ((decode_opt_ & kDecodeIndexerDual) && iq.type == core::GgmlType::kBF16 && ik.type == iq.type &&
+        iq.cols == ik.cols && iq.cols % 32 == 0 && !lora_.contains(iq.data) && !lora_.contains(ik.data)) {
+      const auto rq = static_cast<std::uint32_t>(iq.rows), rk = static_cast<std::uint32_t>(ik.rows);
+      const std::uint32_t b1 = Blocks(rq, 8);
+      return Launch("halo_matvec_bf16_dual", {b1 + Blocks(rk, 8)}, {256},
+                    {rt::Arg::Buf(tensors_.at(iq.data).buf), rt::Arg::Buf(iq_), rt::Arg::Val(rq),
+                     rt::Arg::Buf(tensors_.at(ik.data).buf), rt::Arg::Buf(ik_), rt::Arg::Val(rk), rt::Arg::Buf(mixed_),
+                     rt::Arg::Val(static_cast<std::uint32_t>(iq.cols)), rt::Arg::Val(b1)},
+                    error);
+    }
+    return MatVec(iq, 0, mixed_, iq_, error) && MatVec(ik, 0, mixed_, ik_, error);
+  };
   const std::uint32_t ratio = c.compress_ratio, budget = c.indexer_top_k / ratio;
   const std::uint32_t max_blocks = max_context_ / ratio + 1;
   return MatVec(l.attn_q, 0, mixed_, qg_, error) && MatVec(l.attn_k, 0, mixed_, k_, error) &&
@@ -566,7 +629,7 @@ bool FlashNextGpu::Attention(const model::LayerWeights& l, AttnState& s, std::st
          // QSA indexer: raw keys cached; the block holding this token is
          // pooled, normalized and rotated at its start every step, final
          // once complete (incomplete slots are never scored).
-         MatVec(l.indexer_q, 0, mixed_, iq_, error) && MatVec(l.indexer_k, 0, mixed_, ik_, error) &&
+         indexer_qk() &&
          append(s.index_k, ik_, kHaloPosition, idim) && norm(iq_, l.indexer_q_norm, c.indexer_heads, idim) &&
          rope(iq_, c.indexer_heads, idim, kHaloPosition, 1) &&
          Launch("halo_pool_block", {1}, {128},
@@ -575,7 +638,11 @@ bool FlashNextGpu::Attention(const model::LayerWeights& l, AttnState& s, std::st
          norm(pooled_, l.indexer_k_norm, 1, idim) && rope(pooled_, 1, idim, kHaloBlock, ratio) &&
          append(s.block_k, pooled_, kHaloBlock, idim) &&
          // Selection on device with the reference's rule.
-         Launch("halo_qsa_scores", {std::min(Blocks(max_blocks), 64u)}, {kBlock},
+         Launch((decode_opt_ & kDecodeQsaScores) && c.indexer_heads <= 8 && c.indexer_heads * idim <= 2048 &&
+                        idim % 8 == 0
+                    ? "halo_qsa_scores_b"
+                    : "halo_qsa_scores",
+                {std::min(Blocks(max_blocks), 64u)}, {kBlock},
                 {rt::Arg::Buf(iq_), rt::Arg::Buf(s.block_k), rt::Arg::Buf(block_scores_), params,
                  rt::Arg::Val(c.indexer_heads), rt::Arg::Val(idim)},
                 error) &&
@@ -610,8 +677,21 @@ bool FlashNextGpu::ExpertMatVec(const model::TensorRef& t, std::uint32_t slot, c
 bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
   const auto& c = w_.config;
   const std::uint32_t H = c.hidden_size;
+  // D2: the router launch also quantizes x for the routed gate/up (kDecodeQ8ActOnce).
+  const bool act_once = (decode_opt_ & kDecodeQ8ActOnce) && fused_moe_ && int8_act_moe_ && H <= 4096 && H % 32 == 0 &&
+                        l.router.type == core::GgmlType::kF32 && l.router.rows <= 1024 && small_row_kernels_ &&
+                        !lora_.contains(l.router.data) && l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
+                        l.ffn_up_exps.type == core::GgmlType::kQ4_K && l.ffn_gate_exps.cols % 256 == 0;
+  const auto router = [&]() {
+    if (!act_once) return MatVec(l.router, 0, mixed_, router_, error);
+    const auto rows = static_cast<std::uint32_t>(l.router.rows);
+    return Launch("halo_router_rowblock_q8act", {std::max(rows, H / 32)}, {256},
+                  {rt::Arg::Buf(tensors_.at(l.router.data).buf), rt::Arg::Buf(mixed_), rt::Arg::Buf(router_),
+                   rt::Arg::Val(rows), rt::Arg::Val(H), rt::Arg::Buf(q8act_)},
+                  error);
+  };
   // Routing on device: softmax, top-k (ties keep the lower expert), renormalize.
-  if (!MatVec(l.router, 0, mixed_, router_, error) ||
+  if (!router() ||
       !Launch("halo_router_topk", {1}, {kBlock},
               {rt::Arg::Buf(router_), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(expert_weights_),
                rt::Arg::Val(c.num_experts), rt::Arg::Val(c.num_experts_used)},
@@ -626,6 +706,18 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
                             up.rows == gate.rows && up.cols == gate.cols && gate.cols % 256 == 0 && gate.cols <= 8192;
   const bool down_q5_1 = down.type == core::GgmlType::kQ5_1 && down.cols % 32 == 0 && down.cols <= 8192;
   const bool down_q8r = static_cast<bool>(dd.qs);
+  const bool q5k_fast = (decode_opt_ & kDecodeQ5kExperts) && gate.type == core::GgmlType::kQ5_K &&
+                        up.type == gate.type && up.rows == gate.rows && up.cols == gate.cols && gate.cols % 256 == 0 &&
+                        down_q8r && down.cols == gate.rows && down.cols <= 6144 &&
+                        !(gate_up_fast && (down_q5_1 || down_q8r));
+  const auto& sg = tensors_.at(l.shexp_gate.data);
+  const auto& su = tensors_.at(l.shexp_up.data);
+  const auto& sd = tensors_.at(l.shexp_down.data);
+  const bool shexp_fast = fused_shexp_ && sg.qs && su.qs && sd.qs && l.shexp_gate_inp.type == core::GgmlType::kF32 &&
+                          H <= 8192 && c.shared_expert_ff <= 8192 && l.shexp_gate.cols == H;
+  // D2: the routed combine folded into the shared expert's down launch.
+  const bool defer_combine =
+      (decode_opt_ & kDecodeShexpCombine) && shexp_fast && ((gate_up_fast && (down_q5_1 || down_q8r)) || q5k_fast);
   if (gate_up_fast && (down_q5_1 || down_q8r)) {
     const auto ff = static_cast<std::uint32_t>(gate.rows), used = c.num_experts_used;
     // 4 rows per wave with precomputed x sub-block sums (inputs <= 4096).
@@ -633,15 +725,20 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
     // float s2 with precomputed x sums; both for inputs <= 4096.
     const bool s2 = H <= 4096;
     const char* gu = !s2 ? "halo_moe_gate_up_q4_k" : int8_act_moe_ ? "halo_moe_gate_up_q4_k_dot" : "halo_moe_gate_up_q4_k_s2";
+    if (s2 && int8_act_moe_ && (decode_opt_ & kDecodeGateUpPrefetch))
+      gu = 4 * (H / 64) <= 5 * 32 ? "halo_moe_gate_up_q4_k_dot_p5" : "halo_moe_gate_up_q4_k_dot_p8";
+    if (act_once) gu = "halo_moe_gate_up_q4_k_dot_g";
     if (!Launch(gu, {Blocks(ff, s2 ? 16 : 8), used}, {256},
                 {rt::Arg::Buf(tensors_.at(gate.data).buf), rt::Arg::Buf(tensors_.at(up.data).buf),
-                 rt::Arg::Buf(expert_ids_), rt::Arg::Buf(mixed_), rt::Arg::Buf(moe_h_),
+                 rt::Arg::Buf(expert_ids_), rt::Arg::Buf(act_once ? q8act_ : mixed_), rt::Arg::Buf(moe_h_),
                  rt::Arg::Val<std::uint64_t>(gate.RowBytes() * gate.rows), rt::Arg::Val(ff), rt::Arg::Val(H),
                  rt::Arg::Val<std::uint64_t>(gate.RowBytes())},
                 error))
       return false;
     const bool down_ok =
-        down_q5_1 ? Launch(ff <= 2048 ? "halo_moe_down_q5_1_r4" : "halo_moe_down_q5_1",
+        down_q5_1 ? Launch(ff <= 2048 ? ((decode_opt_ & kDecodeWeightsFirst) && ff <= 768 ? "halo_moe_down_q5_1_r4p"
+                                                                                          : "halo_moe_down_q5_1_r4")
+                                      : "halo_moe_down_q5_1",
                            {Blocks(H, ff <= 2048 ? 32 : 8), used}, {256},
                            {rt::Arg::Buf(dd.buf), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(moe_h_), rt::Arg::Buf(moe_part_),
                             rt::Arg::Val<std::uint64_t>(down.RowBytes() * down.rows), rt::Arg::Val(H), rt::Arg::Val(ff),
@@ -651,15 +748,33 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
                            {rt::Arg::Buf(dd.qs), rt::Arg::Buf(dd.d), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(moe_h_),
                             rt::Arg::Buf(moe_part_), rt::Arg::Val(H), rt::Arg::Val(ff), rt::Arg::Val(dd.qstride)},
                            error);
-    if (!down_ok || !Launch("halo_moe_combine", {Blocks(H)}, {kBlock},
+    if (!down_ok || (!defer_combine && !Launch((decode_opt_ & kDecodeHoistSmall) && c.num_experts_used <= 16 ? "halo_moe_combine_u" : "halo_moe_combine", {Blocks(H)}, {kBlock},
                             {rt::Arg::Buf(moe_part_), rt::Arg::Buf(expert_weights_), rt::Arg::Buf(block_out_),
                              rt::Arg::Val(used), rt::Arg::Val(H)},
-                            error))
+                            error)))
+      return false;
+  } else if (q5k_fast) {
+    // D2: the Q5_K layer's experts in three launches instead of five per expert (same sums, same order).
+    const auto ff = static_cast<std::uint32_t>(gate.rows), used = c.num_experts_used;
+    if (!Launch("halo_moe_gate_up_q5_k_rows", {Blocks(ff, 8), used}, {256},
+                {rt::Arg::Buf(tensors_.at(gate.data).buf), rt::Arg::Buf(tensors_.at(up.data).buf),
+                 rt::Arg::Buf(expert_ids_), rt::Arg::Buf(mixed_), rt::Arg::Buf(moe_h_),
+                 rt::Arg::Val<std::uint64_t>(gate.RowBytes() * gate.rows), rt::Arg::Val(ff), rt::Arg::Val(H),
+                 rt::Arg::Val<std::uint64_t>(gate.RowBytes())},
+                error) ||
+        !Launch("halo_moe_down_q8r_r4", {Blocks(H, 32), used}, {256},
+                {rt::Arg::Buf(dd.qs), rt::Arg::Buf(dd.d), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(moe_h_),
+                 rt::Arg::Buf(moe_part_), rt::Arg::Val(H), rt::Arg::Val(ff), rt::Arg::Val(dd.qstride)},
+                error) ||
+        (!defer_combine && !Launch((decode_opt_ & kDecodeHoistSmall) && c.num_experts_used <= 16 ? "halo_moe_combine_u" : "halo_moe_combine", {Blocks(H)}, {kBlock},
+                                   {rt::Arg::Buf(moe_part_), rt::Arg::Buf(expert_weights_), rt::Arg::Buf(block_out_),
+                                    rt::Arg::Val(used), rt::Arg::Val(H)},
+                                   error)))
       return false;
   } else if (!dev_.Fill(block_out_, 0, error)) {
     return false;
   }
-  for (std::uint32_t i = 0; !(gate_up_fast && (down_q5_1 || down_q8r)) && i < c.num_experts_used; ++i) {
+  for (std::uint32_t i = 0; !(gate_up_fast && (down_q5_1 || down_q8r)) && !q5k_fast && i < c.num_experts_used; ++i) {
     if (!ExpertMatVec(l.ffn_gate_exps, i, mixed_, eg_, error) || !ExpertMatVec(l.ffn_up_exps, i, mixed_, eu_, error) ||
         !Launch("halo_silu_mul", {Blocks(c.expert_ff)}, {kBlock},
                 {rt::Arg::Buf(eg_), rt::Arg::Buf(eu_), rt::Arg::Val(c.expert_ff)}, error) ||
@@ -671,13 +786,27 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
       return false;
   }
   // P3 fused shared expert: two launches when its projections are repacked Q8.
-  const auto& sg = tensors_.at(l.shexp_gate.data);
-  const auto& su = tensors_.at(l.shexp_up.data);
-  const auto& sd = tensors_.at(l.shexp_down.data);
-  if (fused_shexp_ && sg.qs && su.qs && sd.qs && l.shexp_gate_inp.type == core::GgmlType::kF32 && H <= 8192 &&
-      c.shared_expert_ff <= 8192 && l.shexp_gate.cols == H) {
+  if (shexp_fast) {
     const auto sff = c.shared_expert_ff;
-    return Launch("halo_shexp_gate_up", {Blocks(sff, 16)}, {256},
+    const bool pf = decode_opt_ & kDecodeGemvPrefetch;
+    const char* sgu = pf                                                     ? "halo_shexp_gate_up_p"
+                      : (decode_opt_ & kDecodeHoistRowLoads) && H <= 4096 ? "halo_shexp_gate_up_u"
+                                                                           : "halo_shexp_gate_up";
+    if (defer_combine)
+      return Launch(sgu, {Blocks(sff, 16)}, {256},
+                    {rt::Arg::Buf(sg.qs), rt::Arg::Buf(sg.d), rt::Arg::Buf(su.qs), rt::Arg::Buf(su.d),
+                     rt::Arg::Buf(tensors_.at(l.shexp_gate_inp.data).buf), rt::Arg::Buf(mixed_), rt::Arg::Buf(eg_),
+                     rt::Arg::Buf(sgate_), rt::Arg::Val(sff), rt::Arg::Val(H), rt::Arg::Val(sg.qstride)},
+                    error) &&
+             Launch(pf                                                                      ? "halo_shexp_down_combine_p"
+                    : (decode_opt_ & kDecodeHoistSmall) && c.num_experts_used <= 32 ? "halo_shexp_down_combine_u"
+                                                                                    : "halo_shexp_down_combine",
+                    {Blocks(H, 32)}, {256},
+                    {rt::Arg::Buf(sd.qs), rt::Arg::Buf(sd.d), rt::Arg::Buf(eg_), rt::Arg::Buf(sgate_),
+                     rt::Arg::Buf(moe_part_), rt::Arg::Buf(expert_weights_), rt::Arg::Val(c.num_experts_used),
+                     rt::Arg::Buf(block_out_), rt::Arg::Val(H), rt::Arg::Val(sff), rt::Arg::Val(sd.qstride)},
+                    error);
+    return Launch(sgu, {Blocks(sff, 16)}, {256},
                   {rt::Arg::Buf(sg.qs), rt::Arg::Buf(sg.d), rt::Arg::Buf(su.qs), rt::Arg::Buf(su.d),
                    rt::Arg::Buf(tensors_.at(l.shexp_gate_inp.data).buf), rt::Arg::Buf(mixed_), rt::Arg::Buf(eg_),
                    rt::Arg::Buf(sgate_), rt::Arg::Val(sff), rt::Arg::Val(H), rt::Arg::Val(sg.qstride)},
@@ -695,30 +824,51 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
                 {rt::Arg::Buf(block_out_), rt::Arg::Buf(ed_), rt::Arg::Buf(sgate_), rt::Arg::Val(H)}, error);
 }
 
-bool FlashNextGpu::Record(Head head, std::string* error) {
+bool FlashNextGpu::Record(Head head, std::string* error, int part) {
   const auto& c = w_.config;
   const auto& emb = tensors_.at(w_.token_embd.data);
   const rt::Arg eargs[] = {rt::Arg::Buf(emb.buf), rt::Arg::Buf(embd_), rt::Arg::Buf(ple_emb_, params_offset_),
                            rt::Arg::Val(c.hidden_size), rt::Arg::Val<std::uint64_t>(w_.token_embd.RowBytes())};
-  if (!dev_.Launch(emb.embed, {Blocks(c.hidden_size)}, {kBlock}, eargs, error) ||
-      !Launch("halo_broadcast", {Blocks(c.HcDim())}, {kBlock},
-              {rt::Arg::Buf(res_), rt::Arg::Buf(embd_), rt::Arg::Val(c.hc_count), rt::Arg::Val(c.hidden_size)}, error))
+  if (part != 2 && (!dev_.Launch(emb.embed, {Blocks(c.hidden_size)}, {kBlock}, eargs, error) ||
+                    !Launch("halo_broadcast", {Blocks(c.HcDim())}, {kBlock},
+                            {rt::Arg::Buf(res_), rt::Arg::Buf(embd_), rt::Arg::Val(c.hc_count),
+                             rt::Arg::Val(c.hidden_size)},
+                            error)))
     return false;
-  const auto combine = [&]() {
+  const std::uint32_t split = c.ple_layer > 0 ? static_cast<std::uint32_t>(c.ple_layer) : 0;
+  const std::uint32_t l_begin = part == 2 ? split : 0, l_end = part == 1 ? split : c.num_layers;
+  // D2: when a mixer follows the combine directly, the combine also writes the mixer's stream scales.
+  bool ready = false;
+  const auto combine = [&](bool mixer_next) {
+    ready = mixer_next && (decode_opt_ & kDecodeCombineScales) && fused_hc_;
+    if (ready)
+      return Launch("halo_hc_combine_scales", {c.hc_count}, {256},
+                    {rt::Arg::Buf(res_), rt::Arg::Buf(block_out_), rt::Arg::Buf(inject_), rt::Arg::Buf(hc_scale_),
+                     rt::Arg::Val(c.hc_count), rt::Arg::Val(c.hidden_size), rt::Arg::Val(c.rms_eps)},
+                    error);
     return Launch("halo_hc_combine", {Blocks(c.HcDim())}, {kBlock},
                   {rt::Arg::Buf(res_), rt::Arg::Buf(block_out_), rt::Arg::Buf(inject_), rt::Arg::Val(c.hc_count),
                    rt::Arg::Val(c.hidden_size)},
                   error);
   };
-  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+  const auto mix = [&](const model::HcMixer& m, bool inject) {
+    const bool r = ready;
+    ready = false;
+    return HcMix(m, inject, error, r);
+  };
+  for (std::uint32_t il = l_begin; il < l_end; ++il) {
     const auto& l = w_.layers[il];
-    if (c.IsPleLayer(il) && !Ple(l, error)) return false;
-    if (!HcMix(l.hc_attn, true, error)) return false;
+    if (c.IsPleLayer(il)) {
+      ready = false;  // the PLE block rewrites the residual
+      if (!Ple(l, error)) return false;
+    }
+    if (!mix(l.hc_attn, true)) return false;
     if (l.linear ? !Linear(l, linear_[il], error) : !Attention(l, attn_[il], error)) return false;
-    if (!combine() || !HcMix(l.hc_ffn, true, error) || !Moe(l, error) || !combine()) return false;
+    const bool next_mixer = il + 1 < c.num_layers ? !c.IsPleLayer(il + 1) : head != Head::kNone;
+    if (!combine(true) || !mix(l.hc_ffn, true) || !Moe(l, error) || !combine(next_mixer)) return false;
   }
-  if (head == Head::kNone) return true;
-  if (!HcMix(w_.hc_head, false, error) || !MatVec(w_.output, 0, mixed_, logits_, error)) return false;
+  if (head == Head::kNone || part == 1) return true;
+  if (!mix(w_.hc_head, false) || !MatVec(w_.output, 0, mixed_, logits_, error)) return false;
   if (head == Head::kLogits) return true;
   // Sampling: fast blocks + final, then the exact kernel, which runs only
   // when the final kernel asked for it (or always, in exact mode).
@@ -769,11 +919,14 @@ bool FlashNextGpu::Run(std::int32_t token, Head head, const SampleRequest* reque
   // Host side of the step: n-gram rows and the step parameters, uploaded
   // together; everything else is device work (captured once, replayed).
   model::NgramHistory history = ngram_history_;
+  // D2: with the split graph, the rows are read while the layers before the PLE layer run.
+  const bool split = (decode_opt_ & kDecodeSplitGraph) && use_graphs_ && !timing_ && c.ple_layer > 0 &&
+                     ple_rows_host_ != nullptr;
+  std::vector<std::uint32_t> rows(c.ple_layer >= 0 ? c.ple_heads : 0);
   if (c.ple_layer >= 0) {
-    std::vector<std::uint32_t> rows(c.ple_heads);
     model::HashNgramRows(c, history, std::span<const std::int32_t>(&token, 1), rows);
     const std::span<float> emb(reinterpret_cast<float*>(step_host_.data()), c.PleEmbeddingDim());
-    if (!ngram_ || !ngram_->Read(rows, emb)) {
+    if (!split && (!ngram_ || !ngram_->Read(rows, emb))) {
       if (error) *error = "n-gram table read failed";
       return false;
     }
@@ -812,9 +965,38 @@ bool FlashNextGpu::Run(std::int32_t token, Head head, const SampleRequest* reque
     }
     upload = penalty_offset_ + request->penalties.size() * sizeof(HaloPenalty);
   }
-  if (!dev_.Upload(ple_emb_, 0, step_host_.data(), upload, error)) return false;
+  const auto capture = [&](rt::Graph& g, int part) {
+    if (g) return true;
+    if (!dev_.BeginCapture(error)) return false;
+    const bool recorded = Record(head, error, part);
+    std::string end_error;
+    const bool ended = dev_.EndCapture(&g, &end_error);
+    if (!recorded || !ended) {
+      if (recorded && error) *error = end_error;
+      return false;
+    }
+    return true;
+  };
+  if (split) {
+    if (!dev_.Upload(ple_emb_, params_offset_, step_host_.data() + params_offset_, upload - params_offset_, error) ||
+        !capture(pre_graph_, 1) || !capture(post_graphs_[static_cast<int>(head)], 2) ||
+        !dev_.LaunchGraph(pre_graph_, error))
+      return false;
+    const std::span<float> emb(ple_rows_host_, c.PleEmbeddingDim());
+    if (!ngram_ || !ngram_->Read(rows, emb)) {
+      if (error) *error = "n-gram table read failed";
+      return false;
+    }
+    if (!dev_.UploadAsync(ple_emb_, 0, ple_rows_host_, emb.size_bytes(), error) ||
+        !dev_.LaunchGraph(post_graphs_[static_cast<int>(head)], error))
+      return false;
+  } else if (!dev_.Upload(ple_emb_, 0, step_host_.data(), upload, error)) {
+    return false;
+  }
 
-  if (use_graphs_ && !timing_) {  // kernel timing stamps eager launches only
+  if (split) {
+    // launched above
+  } else if (use_graphs_ && !timing_) {  // kernel timing stamps eager launches only
     rt::Graph& g = graphs_[static_cast<int>(head)];
     if (!g) {
       if (!dev_.BeginCapture(error)) return false;
