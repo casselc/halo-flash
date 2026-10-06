@@ -150,7 +150,7 @@ class FlashNextGpu {
   static inline bool prefill_mix_h16_ = true;
   /// Precision option (stream P): the shared expert's gate and up as W8A8
   /// (halo_gemm_q8a8_128x128, activations quantized per token and 32 values).
-  static inline bool prefill_shexp_w8a8_ = false;
+  static inline bool prefill_shexp_w8a8_ = true;
   /// Precision option (stream P): the mixers' down projection as W8A8
   /// (halo_gemm_q8a8_160x64 over an int8 copy of xn written by combine_norm).
   static inline bool prefill_down_w8a8_ = false;
