@@ -592,7 +592,10 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
       const bool same = Argmax(a.data(), V) == Argmax(b.data(), V);
       agreed[mode] += same;
       const auto at = [&] { return std::string(what) + " at position " + std::to_string(chunked->Position()) + ", " + names[mode]; };
-      ASSERT_LT(rel_split, 1e-4) << "split " << at();
+      // A split changes the chunk sizes, and the fp16 / int8 modes pick kernels and roundings by chunk size. Worst
+      // split vs stepping over 30 cases (2026-10-06): before the precision defaults fp16 2.6e-4 / 4.2e-3, int8
+      // 2.0e-3 / 3.0e-2; with them fp16 1.8e-3 / 3.3e-3, int8 1.3e-2 / 1.4e-2. Exact mode splits bit-identically.
+      ASSERT_LT(rel_split, mode == kExact ? 1e-4 : 0.05) << "split " << at();
       ASSERT_EQ(Argmax(a.data(), V), Argmax(s.data(), V)) << "split " << at();
       ASSERT_LT(rel, mode == kExact ? 1e-4 : 0.5) << at();
       if (mode == kExact) ASSERT_TRUE(same) << at();
@@ -633,8 +636,12 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
       EXPECT_EQ(chunked->LaunchedKernel("halo_gemm_bf16_f16_k128"), mode != kExact);
       EXPECT_EQ(chunked->LaunchedKernel(E::prefill_parallel_bucket_ ? "halo_moe_bucket_count" : "halo_moe_bucket"),
                 mode != kExact);
-      EXPECT_TRUE(chunked->LaunchedKernel("halo_attention_wmma_rows") ||
-                  chunked->LaunchedKernel("halo_attention_wmma_mq") || mode == kExact);
+      // Any of the WMMA attention paths (flash, multi-query, QSA-selected, per-row); the check predated the flash kernels.
+      bool wmma_attention = false;
+      for (const char* k : {"halo_attention_fa", "halo_attention_fa_h", "halo_attention_fa_hg", "halo_attention_wmma_mq",
+                            "halo_attention_wmma_qsel", "halo_attention_wmma_qsel_h", "halo_attention_wmma_rows"})
+        wmma_attention = wmma_attention || chunked->LaunchedKernel(k);
+      EXPECT_TRUE(wmma_attention || mode == kExact);
     }
   }, {.test_cases = 30});
   E::prefill_exact_projections_ = saved_exact;
