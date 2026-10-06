@@ -1028,6 +1028,9 @@ compared with `cmp` against the unmodified build; gpu_tests property tests bitwi
 | tok_moe inject phase ablated (irows 0; timing only) | — | 87.4 -> 82.4 ms: the inject partials are ~5 ms of it | n/a |
 | Deferred n-gram read vs layer 0 (`HALO_PREFILL_TIMING`) | — | read 67-73 ms warm (155 cold) while layer 0 takes ~30: ~35 ms of GPU idle per 2048-token prefill, charged to the PLE `halo_f16_rows`. `halo_disk_bench`: 4K random reads saturate at ~217K IOPS from QD 16 (PCIe Gen3 x4): IOPS-bound, so the levers are a larger row cache or a Gen4 link, not kernels | open (policy) |
 
+| MoE down in 256-row blocks: two row tiles a wave, the activation stage and its barriers serve twice the rows (`MoeDown<RT>`; halogen's down runs 256 rows a workgroup and spends 10% at barriers vs our 29-34%) | -15..-23 | 133.2 -> 131.0 ms (-2.2; end to end within noise); bit-identical. ATT: barrier 23 -> 17%, but VGPRs 158 -> 240 (9 -> 6 waves) and VALU (dequant) 33 -> 38% with 30% VALU-stalled: the kernel is issue-bound on Q5_1 dequant once barriers shrink. The templated RT = 1 copy also lost 3 ms (166 VGPRs) | no (reverted) |
+| Gate/up compiled for 7 waves (`amdgpu_waves_per_eu(7)`, the same source) | -15..-25 (halogen at 210 VGPRs) | compiler reaches 216 VGPRs only with 167 spills: not run. Note: a second caller of `MoeGateUp` stops it being inlined (420 B scratch), and forcing inline gives 256 VGPRs instead of 241: register count here depends on inlining order | no |
+
 Exactness trap found on the way: with one element per thread, the backend fused the norm's `x * x` into
 WarpSum's first butterfly add (`v_fmac` across the `ds_bpermute`), a different rounding from `halo_rmsnorm`
 (whose loop keeps the product rounded). An empty `asm volatile("" : "+v"(ss))` keeps the rounding. A per-element
