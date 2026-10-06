@@ -329,9 +329,21 @@ class FlashNextGpu {
   /// Advances MtpPosition(); MtpRewind(p) moves it back (later steps overwrite the cache rows).
   [[nodiscard]] bool MtpStep(std::int32_t token, bool from_trunk, std::span<float> logits, std::string* error);
   void MtpRewind(std::uint32_t position) noexcept { mtp_pos_ = position; }
+  /// Draft head restricted to `ids` (FR-Spec style, draft logits only): MtpStep then fills logits.size() ==
+  /// ids.size() entries, entry i the logit of token ids[i] (the same rows of the LM head, same GEMV). Empty: full.
+  [[nodiscard]] bool SetDraftVocab(std::span<const std::int32_t> ids, std::string* error);
   [[nodiscard]] std::uint32_t MtpPosition() const noexcept { return mtp_pos_; }
   /// The bound session's trunk residual (hc_dim floats) after its last Step.
   [[nodiscard]] bool TrunkHidden(std::vector<float>* out, std::string* error);
+
+  // ---- PROBE ONLY (probe.cpp): batch-shaped WMMA kernels timed in the engine; never part of a decode ----
+  /// Routed expert ids for the probe's B columns: ids[layer][b * k + slot].
+  [[nodiscard]] bool ProbeSetRouting(std::uint32_t B, const std::vector<std::vector<std::uint32_t>>& ids,
+                                     std::string* error);
+  /// Launches every layer's batch-shaped dense GEMVs (+ split-K reduces), routed experts (grouped, routing from
+  /// ProbeSetRouting), shared expert, mixers' projections and the LM head for B columns. Results are discarded.
+  /// `check`: also compares the first qkv projection's column 0 with the decode GEMV (relative L2 printed).
+  [[nodiscard]] bool ProbeRun(std::uint32_t B, bool check, std::string* error);
 
   /// One decode step for several sessions at once (P6 batched decode): every weight is read once for the
   /// batch, routed experts grouped across sessions. Each entry's logits / sampled token / state are byte-identical
@@ -591,10 +603,15 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   /// Points the per-token scratch members at entry b's slices of bb_ and binds its session (recording only).
   void BatchEntryScope(std::uint32_t b, std::span<const SessionId> sessions, bool enter);
   bool skip_attn_proj_ = false;  // Attention(): projections done by the batched caller
+  rt::Buffer probe_x_, probe_part_, probe_y_, probe_h_, probe_ep_, probe_tab_;
+  std::uint32_t probe_B_ = 0;
+  std::size_t probe_tab_stride_ = 0;
   const model::MtpWeights* mtp_ = nullptr;
   AttnState mtp_attn_;
   rt::Buffer mtp_res_, mtp_in_, mtp_hn_, mtp_cat_;
   std::uint32_t mtp_pos_ = 0;
+  rt::Buffer draft_qs_, draft_d_;
+  std::uint32_t draft_rows_ = 0;
   std::vector<LinearState> linear_;
   std::vector<AttnState> attn_;
   std::vector<rt::Buffer> owned_;

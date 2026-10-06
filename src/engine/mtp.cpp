@@ -1,6 +1,7 @@
 // P5 measurement stage: the MTP draft block on the GPU (ReferenceModel::MtpStep's graph), eager launches, the
 // trunk's helpers (HcMix, Attention, Moe) on the draft block's weights. No verify path: the trunk is unchanged.
 
+#include <cstdlib>
 #include <cstring>
 
 #include "engine/flash_next_gpu.hpp"
@@ -49,6 +50,36 @@ bool FlashNextGpu::LoadMtp(const model::MtpWeights& m, std::string* error) {
   mtp_ = &m;
   mtp_pos_ = 0;
   return dev_.Synchronize(error);
+}
+
+bool FlashNextGpu::SetDraftVocab(std::span<const std::int32_t> ids, std::string* error) {
+  const auto& out = w_.output;
+  const auto& d = tensors_.at(out.data);
+  if (draft_qs_) dev_.Free(draft_qs_);
+  if (draft_d_) dev_.Free(draft_d_);
+  draft_rows_ = 0;
+  if (ids.empty()) return true;
+  if (!d.qs) {
+    if (error) *error = "trimmed draft head needs the repacked Q8 LM head";
+    return false;
+  }
+  const std::size_t cols = out.cols, rowq = d.qstride, rowd = cols / 32 * 2, V = out.rows;
+  std::vector<std::uint8_t> qs(V * rowq), dd(V * rowd), tq(ids.size() * rowq), td(ids.size() * rowd);
+  if (!dev_.Download(d.qs, 0, qs.data(), qs.size(), error) || !dev_.Download(d.d, 0, dd.data(), dd.size(), error))
+    return false;
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    std::memcpy(tq.data() + i * rowq, qs.data() + static_cast<std::size_t>(ids[i]) * rowq, rowq);
+    std::memcpy(td.data() + i * rowd, dd.data() + static_cast<std::size_t>(ids[i]) * rowd, rowd);
+  }
+  draft_qs_ = dev_.Alloc(tq.size(), error);
+  draft_d_ = dev_.Alloc(td.size(), error);
+  if (!draft_qs_ || !draft_d_ || !dev_.Upload(draft_qs_, 0, tq.data(), tq.size(), error) ||
+      !dev_.Upload(draft_d_, 0, td.data(), td.size(), error))
+    return false;
+  owned_.push_back(draft_qs_);
+  owned_.push_back(draft_d_);
+  draft_rows_ = static_cast<std::uint32_t>(ids.size());
+  return true;
 }
 
 bool FlashNextGpu::TrunkHidden(std::vector<float>* out, std::string* error) {
@@ -101,7 +132,12 @@ bool FlashNextGpu::MtpStep(std::int32_t token, bool from_trunk, std::span<float>
                   error);
   };
   if (!dev_.Launch(emb.embed, {Blocks(H)}, {kBlock}, eargs, error) || !norm(embd_, l.nextn_enorm, mtp_cat_, H) ||
-      !norm(mtp_in_, l.nextn_hnorm, mtp_hn_, D))
+      !(std::getenv("HALO_MTP_HNORM_GROUPED")  // wiring ablation: one RMS per stream instead of one over all
+            ? Launch("halo_rmsnorm", {c.hc_count}, {kBlock},
+                     {rt::Arg::Buf(mtp_in_), rt::Arg::Buf(tensors_.at(l.nextn_hnorm.data).buf), rt::Arg::Buf(mtp_hn_),
+                      rt::Arg::Val(H), rt::Arg::Val(c.rms_eps), rt::Arg::Val(H)},
+                     error)
+            : norm(mtp_in_, l.nextn_hnorm, mtp_hn_, D)))
     return false;
   // fused stream s = eh_proj [fc_embedding | fc_hidden] . [enorm(e) ; hnorm(h)_s] (one dot over 2H; the reference
   // sums the two halves separately in double, so draft logits differ from it at float rounding).
@@ -113,9 +149,20 @@ bool FlashNextGpu::MtpStep(std::int32_t token, bool from_trunk, std::span<float>
   if (!HcMix(l.hc_attn, true, error) || !Attention(l, mtp_attn_, error) || !combine() ||
       !HcMix(l.hc_ffn, true, error) || !Moe(l, error) || !combine())
     return false;
+  const bool trimmed = draft_rows_ > 0 && logits.size() == draft_rows_;
+  const auto head = [&]() {
+    if (!trimmed) return MatVec(w_.output, 0, mixed_, logits_, error);
+    const auto& d = tensors_.at(w_.output.data);
+    const auto cols = static_cast<std::uint32_t>(w_.output.cols);
+    return Launch(draft_rows_ < 2048 ? "halo_gemv_q8r_r2" : "halo_gemv_q8r_r4", {Blocks(draft_rows_, draft_rows_ < 2048 ? 16 : 32)},
+                  {256},
+                  {rt::Arg::Buf(draft_qs_), rt::Arg::Buf(draft_d_), rt::Arg::Buf(mixed_), rt::Arg::Buf(logits_),
+                   rt::Arg::Val(draft_rows_), rt::Arg::Val(cols), rt::Arg::Val(d.qstride)},
+                  error);
+  };
   if (!logits.empty() &&
-      (!HcMix(l.nextn_head, false, error) || !MatVec(w_.output, 0, mixed_, logits_, error) ||
-       !dev_.Download(logits_, 0, logits.data(), c.vocab_size * 4, error)))
+      (!HcMix(l.nextn_head, false, error) || !head() ||
+       !dev_.Download(logits_, 0, logits.data(), (trimmed ? draft_rows_ : c.vocab_size) * 4ull, error)))
     return false;
   if (logits.empty() && !dev_.Synchronize(error)) return false;
   mtp_attn_.blocks = complete;

@@ -152,6 +152,7 @@ if(HALO_GPU)
     src/engine/prefill_chunk.cpp
     src/engine/batch_decode.cpp
     src/engine/mtp.cpp
+    src/engine/probe.cpp
     ${HALO_GEN}/kernels/core_hsaco.cpp)
   target_include_directories(halo_gpu PUBLIC ${HALO_GEN})
   target_compile_definitions(halo_gpu PUBLIC __HIP_PLATFORM_AMD__ HALO_WITH_HIP=1)
