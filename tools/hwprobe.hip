@@ -8,7 +8,7 @@
 //   halo_hwprobe stream          the hyper-connection residual's DRAM traffic patterns
 //   halo_hwprobe clock           shader clock (in-kernel counters) vs load
 //   halo_hwprobe dram [MB]       bandwidth vs segment size, dispatch order, read/write
-//   halo_hwprobe wmma            f16 / bf16 / iu8 WMMA rate, chain latency, VALU overlap
+//   halo_hwprobe wmma            f16 / bf16 / iu8 / iu4 WMMA rate, chain latency, VALU overlap
 //
 // Clock truth comes from inside kernels: SHADER_CYCLES (20 bits, wraps every
 // ~0.35 ms at 2.9 GHz) against the 100 MHz realtime counter. sysfs reports the
@@ -515,8 +515,9 @@ typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f __attribute__((ext_vector_type(8)));
 typedef int v8i __attribute__((ext_vector_type(8)));
 typedef int v4i __attribute__((ext_vector_type(4)));
+typedef int v2i __attribute__((ext_vector_type(2)));
 
-// T: 0 f16, 1 bf16, 2 iu8. ACC independent accumulators per wave; VALU
+// T: 0 f16, 1 bf16, 2 iu8, 3 iu4 (16x16x16, both operands 4-bit: 8 bytes per lane). ACC independent accumulators per wave; VALU
 // independent FMAs per WMMA interleaved (0 = none). Each wave runs `iters`
 // rounds of ACC WMMAs.
 template <int T, int ACC, int VALU>
@@ -525,6 +526,7 @@ __global__ void WmmaKernel(int iters, float* out) {
   v16h ah, bh;
   v16s as, bs;
   v4i ai = {lane, 3, 5, 7}, bi = {1, lane, 2, 9};
+  v2i a4 = {lane, 0x1234567}, b4 = {0x7654321, lane};
   for (int i = 0; i < 16; ++i) {
     ah[i] = static_cast<_Float16>((lane + i) % 7 * 0.01f);
     bh[i] = static_cast<_Float16>((lane * 3 + i) % 5 * 0.01f);
@@ -540,7 +542,8 @@ __global__ void WmmaKernel(int iters, float* out) {
     for (int a = 0; a < ACC; ++a) {
       if constexpr (T == 0) cf[a] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ah, bh, cf[a]);
       else if constexpr (T == 1) cf[a] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(as, bs, cf[a]);
-      else ci[a] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, ai, true, bi, ci[a], false);
+      else if constexpr (T == 2) ci[a] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, ai, true, bi, ci[a], false);
+      else ci[a] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a4, true, b4, ci[a], false);
 #pragma unroll
       for (int v = 0; v < VALU; ++v) f[v] = __builtin_fmaf(f[v], 1.0001f, 0.5f);
     }
@@ -571,13 +574,13 @@ void Wmma() {
   constexpr double kClockGHz = 2.88, kSimds = 80;  // 20 WGPs x 4 SIMD32 (clock: halo_hwprobe clock)
   float* out;
   CHECK(hipMalloc(&out, 64));
-  const char* names[3] = {"f16", "bf16", "iu8"};
+  const char* names[4] = {"f16", "bf16", "iu8", "iu4"};
   std::printf("WMMA 16x16x16 (one wave-instruction = 8192 FLOP/OP); cycles per WMMA per SIMD at %.2f GHz\n", kClockGHz);
   const auto row = [&](const char* label, int t, int waves_per_simd, int acc, double ms, int iters) {
     const double wmmas = kSimds * waves_per_simd * double(iters) * acc;
     const double cyc = ms * 1e-3 * kClockGHz * 1e9 / (wmmas / kSimds);
     std::printf("  %-4s %-28s %6.2f cycles/WMMA/SIMD  %6.1f T%s/s\n", names[t], label, cyc,
-                wmmas * 8192 / (ms * 1e-3) / 1e12, t == 2 ? "OP" : "FLOP");
+                wmmas * 8192 / (ms * 1e-3) / 1e12, t >= 2 ? "OP" : "FLOP");
   };
   const int iters = 20000;
   (void)WmmaTime<0, 4, 0>(80, 128, iters, out);  // a full-length throwaway first: the clock ramps from idle
@@ -593,6 +596,7 @@ void Wmma() {
   WMMA_ROWS(0)
   WMMA_ROWS(1)
   WMMA_ROWS(2)
+  WMMA_ROWS(3)
   row("1 wave/SIMD, 1 chain, again", 0, 1, 1, WmmaTime<0, 1, 0>(80, 32, iters, out), iters);
 #undef WMMA_ROWS
   CHECK(hipFree(out));

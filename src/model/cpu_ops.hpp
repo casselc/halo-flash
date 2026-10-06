@@ -39,6 +39,15 @@ void L2Norm(std::span<float> x, float eps);
 void Rope(float* x, std::uint32_t heads, std::uint32_t head_dim,
           std::uint32_t rotary_dim, std::uint32_t pos, float theta);
 
+/// MoE routing as the GPU's halo_router_topk computes it: softmax over every
+/// expert's logit, the k largest probabilities (ties to the lower index) in
+/// descending order, renormalized to sum to 1 (sum floored at 2^-14). The
+/// trained count k comes from the file; a smaller k (ModelWeights::
+/// SetExpertsUsed) is the untrained renormalized top-k of CODESIGN arm B.
+/// `ids` and `weights` hold k entries, 1 <= k <= logits.size().
+void RouteTopK(std::span<const float> logits, std::span<std::uint32_t> ids,
+               std::span<float> weights);
+
 }  // namespace halo::model::cpu
 
 #endif  // HALO_MODEL_CPU_OPS_HPP_

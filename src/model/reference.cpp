@@ -532,33 +532,17 @@ void ReferenceModel::Moe(const LayerWeights& l, std::span<const float> x,
   std::vector<float> logits(c_.num_experts);
   MatVec(l.router, 0, x, logits, true);
   // Softmax over every expert, top-k of the probabilities, renormalized.
-  const float max_logit = *std::max_element(logits.begin(), logits.end());
-  double denom = 0.0;
-  for (float& v : logits) {
-    v = std::exp(v - max_logit);
-    denom += v;
-  }
-  for (float& v : logits) {
-    v = static_cast<float>(v / denom);
-  }
-  std::vector<std::uint32_t> order(c_.num_experts);
-  std::iota(order.begin(), order.end(), 0U);
-  std::partial_sort(
-      order.begin(), order.begin() + c_.num_experts_used, order.end(),
-      [&](std::uint32_t a, std::uint32_t b) { return logits[a] > logits[b]; });
-  float sum = 0.0F;
-  for (std::uint32_t i = 0; i < c_.num_experts_used; ++i) {
-    sum += logits[order[i]];
-  }
-  sum = std::max(sum, 6.103515625e-5F);
+  std::vector<std::uint32_t> ids(c_.num_experts_used);
+  std::vector<float> weights(c_.num_experts_used);
+  cpu::RouteTopK(logits, ids, weights);
 
   std::fill(out.begin(), out.end(), 0.0F);
   std::vector<float> gate(c_.expert_ff);
   std::vector<float> up(c_.expert_ff);
   std::vector<float> down(c_.hidden_size);
   for (std::uint32_t i = 0; i < c_.num_experts_used; ++i) {
-    const std::uint32_t e = order[i];
-    const float weight = logits[e] / sum;
+    const std::uint32_t e = ids[i];
+    const float weight = weights[i];
     if (int8_expert_activations_ && l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
         l.ffn_up_exps.type == core::GgmlType::kQ4_K && x.size() % 256 == 0) {
       Q4kInt8MatVec(l.ffn_gate_exps, e, x, gate);

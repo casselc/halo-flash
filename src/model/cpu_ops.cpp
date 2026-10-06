@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <string>
 #include <algorithm>
 #include <thread>
@@ -180,6 +181,28 @@ void Rope(float* x, std::uint32_t heads, std::uint32_t head_dim,
       v[i] = a * c - b * s;
       v[i + half] = a * s + b * c;
     }
+  }
+}
+
+void RouteTopK(std::span<const float> logits, std::span<std::uint32_t> ids,
+               std::span<float> weights) {
+  const std::size_t n = logits.size(), k = ids.size();
+  if (k == 0 || k > n || weights.size() != k) std::abort();
+  const float max_logit = *std::max_element(logits.begin(), logits.end());
+  std::vector<float> prob(n);
+  double denom = 0.0;
+  for (std::size_t i = 0; i < n; ++i) denom += prob[i] = std::exp(logits[i] - max_logit);
+  for (float& v : prob) v = static_cast<float>(v / denom);
+  std::vector<std::uint32_t> order(n);
+  std::iota(order.begin(), order.end(), 0U);
+  std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(k), order.end(),
+                    [&](std::uint32_t a, std::uint32_t b) { return prob[a] > prob[b] || (prob[a] == prob[b] && a < b); });
+  float sum = 0.0F;
+  for (std::size_t i = 0; i < k; ++i) sum += prob[order[i]];
+  sum = std::max(sum, 6.103515625e-5F);
+  for (std::size_t i = 0; i < k; ++i) {
+    ids[i] = order[i];
+    weights[i] = prob[order[i]] / sum;
   }
 }
 

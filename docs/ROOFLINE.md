@@ -1187,3 +1187,11 @@ stream P (`ab_bench.py`, 4 rounds x 3 reps, pinned, prose_1 at 2048 tokens; qual
 Stream R total (stream/precision2 with main a9e0af3 merged, against main 56693d8's binary, same A/B): main 1280.7, R with
 `--gdn-f16 0` 1278.2 (within noise; logits byte-identical to main's defaults), R defaults **1246.0 ms, -34.7 ms
 significant** (1599 -> 1644 tok/s). Cumulative quality = the `--gdn-f16` row (the only kept change).
+**Experts per token as an option (`--moe-topk N`, stream Q, CODESIGN first experiment arm B; not a default).**
+- ab_bench, 4 rounds x 3 reps, pinned, prose_1 at 2048 tokens, main defaults: 1281.0 ms at k = 10, k = 8
+  **-78.8 ms**, k = 6 **-154.1 ms**, both significant.
+- Predicted -15 / -35 from "experts stream every weight once whatever k is". Wrong: the grouped gate/up
+  (251 -> 208 -> 162 ms) and down (133 -> 111 -> 86 ms) scale with pairs. At prefill they are bound by per-pair work,
+  not by the expert byte stream, so time per pair is the lever in those kernels.
+- Decode -1.58 / -3.45 ms per token.
+- Quality: k = 8 passes the gate (short +0.0105), k = 6 fails (+0.0565). Default stays 10.

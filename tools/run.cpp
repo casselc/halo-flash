@@ -138,6 +138,7 @@ int main(int argc, char** argv) {
   std::uint32_t span_sample = 1;
   bool eager = false, profile = false, device_sample = false;
   bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
+  std::uint32_t moe_topk = 0;  // --moe-topk N: experts per token (0: the file's count; CODESIGN arm B)
   double ngram_cache_gb = 4.0;  // --ngram-cache-gb N: cache of n-gram rows read from disk (0: off)
   setvbuf(stdout, nullptr, _IOLBF, 0);
   std::uint32_t max_context = 512;
@@ -200,6 +201,7 @@ int main(int argc, char** argv) {
     else if (a == "--kernel-timing") kernel_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";
     else if (a == "--ngram-cache-gb") ngram_cache_gb = std::atof(argv[i + 1]);
+    else if (a == "--moe-topk") moe_topk = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--prefill-warm") prefill_warm = argv[i + 1];
     else if (a == "--reps") reps = std::max(1, std::atoi(argv[i + 1]));
     else if (a == "--batched-prefill") engine::FlashNextGpu::batched_prefill_ = std::string(argv[i + 1]) == "1";
@@ -230,6 +232,7 @@ int main(int argc, char** argv) {
   if (!reader) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
   auto weights = model::ModelWeights::Bind(*reader, &error);
   if (!weights) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+  if (moe_topk && !weights->SetExpertsUsed(moe_topk, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 2;
   auto tok = text::Tokenizer::FromGguf(*reader, &error);
   if (!tok) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
   const auto& c = weights->config;
