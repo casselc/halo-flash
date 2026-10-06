@@ -658,6 +658,197 @@ points on Llama-3-8B) makes it a long shot.
 
 ---
 
+## First experiment: results
+
+Arms A, B and D and the iu4 probe of section 5 (stream Q). Arm C belongs to stream P and is
+not covered here. **Status:** phase 1 done: the flag, the variant GGUFs, the probe, and the
+rules and predictions below, fixed before any GPU run. The GPU phase (scoring, timing, the
+probe) waits for stream P to finish.
+
+### What was built (phase 1, CPU and disk only)
+
+**Arm B: experts per token as a runtime parameter.**
+- **Flag:** `--moe-topk N` in `halo_score`, `halo_run` and `halo_serve`, through
+  `ModelWeights::SetExpertsUsed`. The router keeps its softmax over all 512 experts and
+  renormalizes the N largest to sum to 1.
+- **Nothing in the kernels assumes k = 10.** Every place takes k from
+  `config.num_experts_used`:
+  - router top-k, single row and row-wise;
+  - bucketing, one-block and three-pass;
+  - grouped gate/up and down tiles (the token of a pair is `pair / k`);
+  - `combine_grouped`, `combine_shared`, and the `combine_norm_tok_moe` epilogue;
+  - the decode fused and unfused expert loops;
+  - every buffer size.
+
+  The GPU kernel tests already draw k in 1..10 (`GroupedExpertsMatchCpuReference`,
+  `FusedMoeMatchesCpuComposition`, `CombineNormTokEqualsRows`, `RouterTopkMatchesReferenceRule`).
+  The only check of 10 is `Config::IsFlashNextGeometry`, which `halo_run` prints and nothing
+  gates on.
+- **Tests:**
+  - CPU, Hegel: the reference's routing (`cpu::RouteTopK`) equals a stable-sort oracle; a
+    smaller k is a renormalized prefix of a larger one; `SetExpertsUsed` validates its range.
+  - GPU, gated on `HALO_TINY_HF_DIR`: the engine at every k below the trained count against the
+    reference.
+  - Real model (phase 2): `--moe-topk 10` must give logits bit-identical to no flag.
+
+**Arm A: `halo_requant A`, rotated 4-bit dense trunk and LM head.**
+- **Tensors:** 497. Every 2-D Q8_0 tensor except `token_embd` and the five Q8_0 routed-expert
+  `ffn_down_exps`:
+  - DeltaNet `attn_qkv`, `attn_gate`, `ssm_out`;
+  - attention `attn_q/k/v/output`;
+  - the shared expert;
+  - the hyper-connection mixers, including the output mixer;
+  - the PLE projections;
+  - the LM head.
+
+  The BF16 indexer, the F32 router and the injects are unchanged.
+- **Code, 4.125 bpw** (halogen's trunk format, HALOGEN-NOTES):
+  - a randomized block Hadamard R = diag(±1) H₁₂₈/√128 on the input dimension (64 for the
+    mixer `up` rows of 320); signs seeded by the tensor name;
+  - the 16-entry IQ4_NL codebook times one fp16 scale per 128 rotated values (per 64 for those
+    rows).
+- **Rounding: RTN with rotation, not GPTQ.** Each group's scale minimizes its squared error:
+  a grid over clipping, each point refit by least squares.
+  - GPTQ needs each layer's input Hessian from real activations. That means a GPU pass over
+    calibration text, which phase 1 does not have.
+  - So arm A measures the pessimistic end of rank 1. Calibrated rounding can only improve on it.
+- **Simulation:** each row is stored as dequant(Q(W·R))·Rᵀ, quantized in the rotated basis.
+  Rotating W and back without quantizing in between would return W.
+- **Container: Q8_0, not BF16.** The loader accepts BF16 for these tensors, but the engine's
+  fast paths need Q8_0: the FP16-WMMA prefill route (`F16Route` needs the repacked int8 copy),
+  the fused mixer, DeltaNet and shared-expert decode kernels. BF16 would change which kernels
+  run, not only the weights, and would add ~9 GB. Q8_0 keeps every kernel of the baseline.
+- **Error the container adds** (measured by the tool per tensor, relative Frobenius error
+  against today's Q8_0 weights, over all 497 tensors):
+  - the 4-bit code: 0.0863 (0.082-0.090 per tensor class);
+  - Q8_0 re-rounding: +0.0064;
+  - total: 0.0866.
+
+  So the container adds 0.56% of the code's error energy: Q8_0 simulates the 4-bit code
+  faithfully.
+- **Time and memory:** 4.5 min on 12 threads, 166 MB resident.
+
+**Arm D: `halo_requant D`, 2-bit routed experts in layers 12-23, stored exactly.**
+- **Tensors:** 36. In this band gate/up are Q4_K and down is Q5_1 in every layer.
+- **Code, 2.5 bpw** (2.425 for the down rows of 640):
+  - every 32 values hold the four levels a + s·l (l = 0..3, a ≤ 0), fit by least squares
+    (llama.cpp make_qkx2-style);
+  - s and −a quantized to 6 bits against the maximum of the super-block, as Q4_K quantizes
+    its scales;
+  - no rotation, no calibration (RTN).
+- **Exact in the tensors' own containers:**
+  - Q4_K with q = 5l: d·sc·q − dmin·m holds exactly these levels.
+  - Q5_1 with q = 10l: d = s/10 and m = a in fp16; the fp16 rounding is ≤ 2⁻¹¹ of the step,
+    and the stored tensor is still exactly a 4-level uniform code.
+
+  Sizes and the fast kernels (`gate_up_q4_k`, `down_q5_1`, grouped) are unchanged.
+- **Test:** a Hegel property decodes each container with the engine's own dequantizers and
+  checks at most 4 levels on one uniform grid per 32 values. It covers Q4_K, Q5_K, Q5_1 and
+  Q8_0 (Q8_0 for the five Q8_0 down layers outside this band).
+- **Error:** 0.3076 relative to today's 4-5-bit experts (gate 0.307, up 0.307, down 0.309).
+  The container adds nothing.
+- **Checked on the written file:** a pure-Python decode of 40 random rows from each of three
+  tensors found only q ∈ {0, 5, 10, 15} (Q4_K) or {0, 10, 20, 30} (Q5_1), 7,200 groups in all.
+- **Time and memory:** 5.3 min, 165 MB resident.
+
+**iu4 probe.** `halo_hwprobe wmma` now has an iu4 row set: `v_wmma_i32_16x16x16_iu4`, both
+operands 4-bit, confirmed in the device assembly.
+
+**Variant files** (in `/data/halo-work/codesign/`):
+- The tensor types and sizes are unchanged, so each variant is a reflink copy of the four
+  original shards with the chosen tensors rewritten in place. Only rewritten extents use disk.
+- `manifest.tsv` gives each tensor's error terms and an FNV-64 of its bytes.
+- `halo_requant` streams 64 MB row chunks, ~170 MB resident. It resumes from `progress.tsv`
+  under a header bound to the arm and the source shards' sizes and mtimes.
+- Crash test: one band killed mid-tensor and resumed gave shards byte-identical to an
+  uninterrupted run. A progress file with a different header is refused.
+- Variants on disk: `A-rot4/` and `D-exp2/` (+5 GB and +18 GB of unshared extents).
+- GPU-phase scripts: `tools/codesign/` (`q_sweep.sh` scores, `q_speed.sh` for
+  timing/sanity/iu4). Each chunk takes `flock /data/halo-work/gpu.lock` on its own, pins and
+  unpins inside, stays under 14 min, and refuses to start below 85 GiB available.
+
+### Rules and predictions, fixed before measuring
+
+**Protocol.**
+- **One binary for every arm:** this branch merged with main at the time of the GPU phase.
+  - Without flags its GPU paths are main's: the branch changes only the CPU reference's
+    routing and adds flags.
+  - The baseline is the original UD-Q4_K_XL on that binary.
+- **Scoring:** `halo_score --prefill 1`, default n-gram cache, in chunks (`--start/--limit`)
+  under the GPU lock.
+  - Short set: 98 cases.
+  - Long set: 12 cases, 2K-24K-token prompts.
+- **Paired comparison:** `tools/paired_nll.py`, per case against the baseline.
+  - The shift is the token-weighted NLL difference.
+  - Also reported: the per-case mean ± SE, cases up/down, and the largest |d|.
+- **Gate (BENCHMARKS):** short-set NLL ≤ 0.305 and API top-token agreement ≥ 91%.
+- **Expected baseline:** NLL 0.2859-0.2864, agreement 92.5-92.7%.
+- **Sanity checks before any arm counts:**
+  - `--moe-topk 10` logits bit-identical to no flag (`halo_run --logits-out`);
+  - the baseline on the gate within its expected range.
+
+**Arm A (rank 1: ship or not).**
+- **Prediction:**
+  - short-set shift +0.004..+0.012 (central +0.007);
+  - agreement −0.2..−0.8 points;
+  - long-set shift +0.002..+0.010;
+  - the gate passes.
+- **Decision:**
+  - **Go:** the gate passes and the long-set shift is ≤ +0.010. Build the 4-bit dense GEMV
+    (rank 1).
+  - **Inconclusive:** the gate passes but the long-set shift is > +0.010. Re-run A with
+    calibrated (GPTQ-style) rounding before any kernel work.
+  - **No-go for RTN:** the gate fails. Rank 1 needs calibrated rounding; re-run A with it.
+
+**Arm B (rank 4b: is KD needed, and its budget).**
+- **Prediction:**
+  - short-set shift: k = 8 +0.003..+0.020 (central +0.008); k = 6 +0.012..+0.060 (central
+    +0.030);
+  - so k = 8 passes the gate and k = 6 is marginal to failing.
+  - Ratio r = shift(6) / shift(8) ≈ 3-4.
+  - Prefill, 2048 tokens, pinned: k = 8 −5..−25 ms, k = 6 −10..−50 ms. The MoE stays co-bound
+    by the 68 GB expert stream; the compute share falls 20% / 40%.
+  - Decode: −1.4 ms (k = 8) and −2.8 ms (k = 6) per token. Expert bytes fall 0.29 / 0.59 GB at
+    today's ~210 GB/s effective.
+- **Decision:**
+  - **k = 8:**
+    - Passes untrained: the gate passes and the long-set shift is ≤ +0.010. Ship it with A
+      (the default stays 10 until then).
+    - Fails: KD is needed for k = 8 too.
+  - **k = 6:**
+    - Passes untrained: ship k = 6, no KD.
+    - Fails, with r < 3: buy the KD (rank 4b, ~$0.3-1.5k), bundled with rank 4's run.
+    - Fails, with r ≥ 3: a cliff. Don't fund k = 6 KD; at most k = 8.
+  - **Inconclusive** when shift(8) < 0.002: r is then a ratio of noise. Decide k = 6 on its
+    own shift against the gate.
+
+**Arm D (the slope of rank 4).**
+- **Prediction:**
+  - short-set shift +0.006..+0.040 (central +0.015), so likely inconclusive;
+  - long-set shift similar.
+  - The code's relative error is ~3.5x that of Q4_K. One quarter of the layers' experts
+    carries it.
+- **Decision:**
+  - **Fund rank 4 (~$0.3-3k):** shift < 0.010 on the short set, and also on the long set.
+  - **Inconclusive:** 0.010-0.030. Before the full spend, run a one-band QAT pilot: layers
+    12-23, Block-AP only, a few H100-hours.
+  - **Don't fund rank 4 as costed:** > 0.030. 2-bit is too far from PTQ here; consider 3-bit
+    experts instead.
+
+**iu4 probe.**
+- **Prediction:** 40% that iu4 runs at 2x iu8 (~17 cycles per WMMA per SIMD, as RDNA3's
+  1024 vs 512 ops/clk/CU sheet says); otherwise the same rate as iu8 (~34 cycles).
+- **Decision:**
+  - **≥ 1.8x iu8:** W4A4 for the dense trunk goes on the list for a QuaRot/SpinQuant study.
+    Still a long shot: 4 points on Llama-3-8B.
+  - **≤ 1.2x:** close the item.
+
+### Results
+
+Pending the GPU phase.
+
+---
+
 ## 6. Hybrid GPU + CPU + NPU over unified memory
 
 The three engines share one 128 GB LPDDR5X pool with no copies. They also share **one 240 GB/s
