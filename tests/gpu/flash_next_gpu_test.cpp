@@ -8,6 +8,8 @@
 #include <hegel/gtest.h>
 
 #include <algorithm>
+#include <bit>
+#include <numeric>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -564,6 +566,75 @@ TEST(FlashNextGpu, SmallQuantizedModelRunsFastPathsAndMatchesReference) {
 //     large as a one-row error (0.07-0.11 for one changed token at a chunk
 //     boundary), so the split bound below cannot tell the two apart there.
 //   HALO_SMALL_QUANT_DIR  holds small-q.gguf
+// Chunks longer than the dense range (stream L): a chunk crossing the end of the dense positions runs its
+// prefix on the flash kernel and the rest on the QSA path from the same position, and the GEMMs whose
+// activations outgrow the MALL run on token slices, so long chunks give byte-identical logits to chunks of
+// the dense range's length (the engine's 2048-token default), with slicing on or off.
+TEST(FlashNextGpu, LongChunksMatchDenseRangeChunks) {
+  const char* dir = std::getenv("HALO_SMALL_QUANT_DIR");
+  if (!dir) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  std::string error;
+  auto reader = core::GgufReader::OpenFile(std::string(dir) + "/small-q.gguf", &error);
+  ASSERT_TRUE(reader) << error;
+  auto weights = model::ModelWeights::Bind(*reader, &error);
+  ASSERT_TRUE(weights) << error;
+  const auto& p = weights->ple_table;
+  auto ngram = model::NgramTable::Open(reader->GetMappedRegions()[p.shard].file_descriptor, p.file_offset, p.rows,
+                                       weights->config.ple_head_dim, p.type, &error);
+  ASSERT_TRUE(ngram) << error;
+  auto devices = Devices();
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  const auto& c = weights->config;
+  const std::size_t V = c.vocab_size;
+  const std::uint32_t dense_end = c.indexer_top_k / c.compress_ratio * c.compress_ratio;
+  ASSERT_GT(dense_end, 0u);
+  // The reference chunk: the dense range's length rounded up to a multiple of 128 positions (2048 for the
+  // production model; the small model's dense range is 8 positions, and chunks that short also change the
+  // DeltaNet scan's 16 / 64-token pieces and the GEMM tiles, which is not what this test is about).
+  const std::uint32_t R = std::lcm(dense_end, 128u);
+  const std::uint32_t max_context = 3 * R + 256;
+  using E = engine::FlashNextGpu;
+  struct Restore {
+    std::uint32_t chunk = E::prefill_chunk_, slice = E::prefill_gemm_slice_;
+    bool prefix = E::prefill_dense_prefix_;
+    ~Restore() {
+      E::prefill_chunk_ = chunk;
+      E::prefill_gemm_slice_ = slice;
+      E::prefill_dense_prefix_ = prefix;
+    }
+  } restore;  // also when a case fails and throws
+  hegel::test([&](hegel::TestCase& tc) {
+    auto& dev = *devices[tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = devices.size() - 1}))];
+    const auto n = tc.draw(gs::integers<std::uint32_t>({.min_value = R + 1, .max_value = max_context - 1}));
+    std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+    std::vector<std::int32_t> tokens(n);
+    for (auto& t : tokens) {
+      seed = seed * 1664525u + 1013904223u;
+      t = static_cast<std::int32_t>((seed >> 8) % V);
+    }
+    const auto run = [&](std::uint32_t chunk, std::uint32_t slice, std::vector<float>& logits, std::vector<float>& next) {
+      E::prefill_chunk_ = chunk;
+      E::prefill_gemm_slice_ = slice;
+      E::prefill_dense_prefix_ = true;
+      auto e = E::Create(dev, *weights, ngram.get(), nullptr, max_context, &error);
+      ASSERT_TRUE(e) << error;
+      ASSERT_TRUE(e->Prefill(tokens, logits, &error)) << error;
+      ASSERT_TRUE(e->Step(tokens[0], next, &error)) << error;
+    };
+    std::vector<float> want(V), want_next(V), got(V), got_next(V);
+    run(R, 0, want, want_next);
+    const auto chunk = tc.draw(gs::sampled_from(std::vector<std::uint32_t>{2 * R, 3 * R, n}));
+    const auto slice = tc.draw(gs::sampled_from(std::vector<std::uint32_t>{0, 128, 256, R}));
+    run(chunk, slice, got, got_next);
+    for (std::size_t i = 0; i < V; ++i) {
+      ASSERT_EQ(std::bit_cast<std::uint32_t>(got[i]), std::bit_cast<std::uint32_t>(want[i]))
+          << "prefill logit " << i << ", " << n << " tokens, chunk " << chunk << ", slice " << slice;
+      ASSERT_EQ(std::bit_cast<std::uint32_t>(got_next[i]), std::bit_cast<std::uint32_t>(want_next[i]))
+          << "next-step logit " << i << ", " << n << " tokens, chunk " << chunk << ", slice " << slice;
+    }
+  }, {.test_cases = 6});
+}
+
 TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
   const char* dir = std::getenv("HALO_SMALL_QUANT_DIR");
   if (!dir) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
@@ -667,7 +738,8 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
       // Any of the WMMA attention paths (flash, multi-query, QSA-selected, per-row); the check predated the flash kernels.
       bool wmma_attention = false;
       for (const char* k : {"halo_attention_fa", "halo_attention_fa_h", "halo_attention_fa_hg", "halo_attention_wmma_mq",
-                            "halo_attention_wmma_qsel", "halo_attention_wmma_qsel_h", "halo_attention_wmma_rows"})
+                            "halo_attention_wmma_qsel", "halo_attention_wmma_qsel_h", "halo_attention_wmma_qsel_h2",
+                            "halo_attention_wmma_rows"})
         wmma_attention = wmma_attention || chunked->LaunchedKernel(k);
       EXPECT_TRUE(wmma_attention || mode == kExact);
     }

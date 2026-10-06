@@ -94,6 +94,13 @@ class FlashNextGpu {
   /// this and the context when first needed). Large chunks let each routed
   /// expert see enough tokens to reuse its weights.
   static inline std::uint32_t prefill_chunk_ = 2048;
+  /// GEMMs whose per-token cost rises with the token count (their activations stop fitting the MALL past
+  /// ~2048 tokens: `_l`, `_s`, the router and the small fp32 projections) run on slices of this many tokens
+  /// when a chunk is longer (0: never). Per-token results do not depend on the slicing.
+  static inline std::uint32_t prefill_gemm_slice_ = 2048;
+  /// A chunk crossing the end of the dense range runs its dense prefix on the flash kernel (as 2048-token
+  /// chunks do) instead of all of it on the QSA path.
+  static inline bool prefill_dense_prefix_ = true;
   static inline bool batched_prefill_ = true;
   /// Debug: chunk projections through the decode GEMVs (token by token)
   /// instead of the int8 GEMMs, so a chunk equals stepping up to float order.
@@ -169,6 +176,10 @@ class FlashNextGpu {
   /// Past the QSA budget, attention for 4 tokens at a time over the union of
   /// their selections (shared K/V reads) instead of token by token.
   static inline bool prefill_qsel_attention_ = true;
+  // QSA top-k selection on 256-thread blocks (halo_qsa_select_rows256; same lists as the 1024-thread kernel).
+  static inline bool prefill_select256_ = true;
+  // QSA attention with V packed in registers and 16-byte softmax LDS accesses (halo_attention_wmma_qsel_h2; bit-identical).
+  static inline bool prefill_qsel_h2_ = true;
   /// The router GEMM on bf16 WMMA with hi/lo-split operands (~2^-15 per
   /// product) instead of fp32 VALU.
   static inline bool prefill_router_bf16x3_ = true;
@@ -378,6 +389,15 @@ class FlashNextGpu {
   bool MixFused(const model::HcMixer& m) const;
   bool MixUp(const model::HcMixer& m, std::uint32_t T, std::string* error);
   bool Half(const rt::Buffer& x, const rt::Buffer& out, std::uint32_t n, std::string* error);
+  /// f(t0, n) over the token slices of a chunk (prefill_gemm_slice_); one call for short chunks.
+  template <class F>
+  bool ForGemmSlices(std::uint32_t T, F&& f) {
+    const std::uint32_t S = prefill_gemm_slice_;
+    if (S == 0 || T <= S) return f(0u, T);
+    for (std::uint32_t t0 = 0; t0 < T; t0 += S)
+      if (!f(t0, T - t0 < S ? T - t0 : S)) return false;
+    return true;
+  }
   bool MixedHalf(std::uint32_t T, std::string* error);
   bool RouterHL(const model::LayerWeights& l);
   const rt::Buffer* MixedH() const;

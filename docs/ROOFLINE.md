@@ -1313,3 +1313,63 @@ mixers 2.3 (lock-stepped one-to-three rounds of ~1.4 MB); shared expert 0.8; sma
 (attention prep chain of ~15 launches a layer, top-k softmax 12.8 us x 48); 7K attention 1.8 (floor ~0.5). A
 page-locality / translation probe (same bytes in flight over 4 KB vs 64 KB vs 2 MB spans, at 40 / 100 / 160
 resident blocks) should come before any of these.
+## 11. 2026-10-06 (stream L, branch `stream/longctx`): long-prompt prefill (8K)
+
+8K = the first 8192 tokens of `streams/S/prose_10k.txt`, pinned unless noted. End-to-end metric: `ab_bench.py
+--chunks 0` sums every chunk's device time of a rep (whole prefill; the old metric kept only the last chunk).
+
+**Profile of main 19d80bb.** Device per 2048-token chunk 1243 / 1319 / 1348 / 1425 ms (5335 total; the 2048 prompt
+alone 1243); wall 5.38 s pinned (1522 tok/s), 5.37 s default clock (1527 tok/s). The QSA path (positions >= 2048)
+costs `qsel_h` 386.6, `qsa_select_rows` 52.3, `qsa_scores_wmma` ~21, `union4` 3.4 = 463 ms, in place of what dense
+`fa_hg` would cost at 2048 (3 x 39.8): ~+345 ms long-context-specific; everything else is the per-chunk cost a
+2048 prompt also pays. Halogen claims 1584 tok/s at 8K (one 32K chunk); no gufo 8K number in the docs.
+
+**Selection statistics** (debug dump of every token's selection, 12 layers x 6144 tokens): the union of 4 tokens
+is 3042 keys (1.49 x 2048) at block granularity; a tile mask with 16-key tiles already covers 0.89 of the causal
+context, 32 tokens x 64-key tiles 1.00. Halogen's sparse path (`k_sel_tilemask` + `k_attn_fa2`) is therefore dense
+attention at 8K: at our dense efficiency ~594 ms for chunks 2-4 (halogen's 1.19x per-key edge: ~500) vs the QSA
+path's 463. Not a lever for this model at 8K; the FaSel layout was not needed to decide it.
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| `halo_qsa_select_rows256`: 256-thread blocks; each radix pass's threshold digit found by one wave (8 digits a lane, shuffle prefix sum, ballot) instead of thread 0 walking up to 256 bins one dependent LDS read at a time; compaction by wave ballots + 8 per-wave totals (2 barriers an iteration) instead of Hillis-Steele scans (20 barriers each at 1024 threads). Same lists (ties, order); property test vs the reference rule (heavy ties, up to 70K blocks) | 52.3 -> 4-7 ms | 52.3 -> 10.3-10.9 ms (71 us a call); end to end inside noise (-24.7, spreads 90 / 127) | yes |
+| `halo_attention_wmma_qsel_h2`: V loaded 4 bytes (2 dims) of one key a lane and instruction, 8 keys a task, packed by v_perm into the transposed tile (2 x 16-byte stores instead of 32 two-byte stores a thread); softmax reads its 8 scores as 2 x 16 bytes and stores its 8 p as one 16-byte store. Hypothesis: qsel_h LDS-throughput bound (~80% by HARDWARE.md rates) | -60..-105 (fallback -10..-25) | 386.5 -> 372.0 ms (-14.5); span: softmax 0.99 -> 0.60 us, staging 0.51 -> 0.63, others unchanged; ATT barrier 61 -> 64% | yes (small) |
+| qsel_h3: h2 with 3 scoring waves (row tile x both key tiles, each Q fragment read once for 2 WMMAs) | -17..-27 | 387.2 ms (+15 vs h2) | no (removed) |
+| Long chunks, exact: `--prefill-chunk 8192` with the `_l` / `_s` / router / k128 GEMMs on 2048-token slices (`--gemm-slice`, default 2048) and a chunk crossing position 2048 running its prefix on `fa_h` and the QSA loop from position 2048 (`--dense-prefix`, default on) | -300..-400 kernel at 8K | **-371.9 ms end to end, significant** (5329 -> 4957, 1537 -> 1653 tok/s); logits byte-identical to 2048-token chunks | flags kept; default chunk unchanged (+4.3 GB, below) |
+
+*Why qsel_h2 missed:* the hypothesis that the kernel is LDS-throughput bound overall is refuted. Each phase is bound
+by its own fragment stream and latency and the phases do not overlap within a block (barrier 64%); removing the
+16-bit V stores did not shorten the staging (the 16 four-byte V loads with uniform per-key addresses replaced 4
+16-byte ones). The remaining design that differs from qsel_w (wave-owned rows) and from these: warp specialization
+across chunks (scorers holding Q in registers, P.V waves separate, scores(c+1) overlapping P.V(c), 2 barriers a
+chunk, no Q tile in LDS: ~42.6 KB, 3 blocks a WGP). Not built: no skeleton probe yet, and the floor-style estimate
+(~2x) is the kind that failed for qsel_w.
+
+*Long chunks.* Unmodified, chunk 4096 / 8192 gave 5.39 / 5.34 s (no gain) and different logits: the MoE kernels
+amortize per-pair work (gate/up -162, down -105, the q8r / q5_k variants -54 ms at 8192) and lr8 -52, but `_l`
++208, `_s` +120, router +80, k128 +36: their T x cols fp16 activations stop fitting the 32 MB MALL past 2048
+tokens and are re-read per row tile from DRAM; and the first 2048 positions went through the QSA path. Slicing those
+GEMMs keeps their per-token cost (per-token results do not depend on the slice) and the dense prefix keeps the flash
+kernel for positions < 2048, so chunk 4096 and 8192 give logits byte-identical to main's 2048-token chunks (8K and a
+3485-token prompt checked; new engine test `LongChunksMatchDenseRangeChunks`, negative control: with the prefix off
+it fails). Kernel-timed rep at 8192: 5286 -> 4958 ms; residual losses `_l` +30, k128 +17, `_s` +14 after slicing.
+Memory: chunk scratch ~0.7 MB a token: MemAvailable minimum during an 8K prefill 29.3 GB at chunk 2048, 25.0 GB at
+8192 (+4.3 GB). Chunk 4096 (one run): 5.10 s.
+
+Stream L total, against main 19d80bb (ab_bench, 4 rounds x 3 reps, pinned, whole-prefill device sum, 8192 tokens):
+main 5329.2 ms (1537 tok/s); L defaults 5285.9 (-43.3, within noise; qsel_h2 + select256 -57 kernel); L with
+`--prefill-chunk 8192` **4957.3 ms, -371.9, significant (1653 tok/s)**.
+2048 tokens (same A/B): main 1249.6, L 1242.2 (-7.4), L with `--prefill-chunk 8192` 1243.2 (-6.4), both within noise;
+logits byte-identical to `logits_main_5e5466e.bin`; gpu_tests 49 passed with the small-model fixtures.
+Default clock, wall, 8K (6 reps over two processes each, after a warm prefill; other streams idle but the host
+was not quiet): main median 5.39 s (min 5.34, 1534 tok/s), L chunk 8192 median 5.07 s (min 5.02, **1631 tok/s**),
+above halogen's claimed 1584.
+
+Remaining long-prompt levers, by size: (1) chunk 8192 as the default for long prompts (-372 ms at 8K, +4.3 GB; the
+scratch is sized min(chunk, max context), so a 262K server pays it once); (2) qsel at 372 ms against a ~0.74 ms a
+call WMMA floor (2.58 ms measured): warp specialization across chunks (above), prove with a skeleton first;
+(3) `_l` / `_s` / k128 still +60 ms at chunk 8192 after slicing (a MALL-aware tile order for T > 2048 instead of
+slices); (4) select256 at 71 us a call writes 4 MB of visible lists that only `union4` reads: fusing selection
+into the union (bitmaps straight from the radix threshold) ~-8 ms; (5) decode: `halo_qsa_select` (1024 threads,
+serial digit walk) runs 12 times a decode step, ~28 us each at 7K: the 256-thread kernel would save ~0.25 ms a
+token (stream D2's area, not changed here).
