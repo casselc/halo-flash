@@ -68,7 +68,7 @@ void FlashNextGpu::FreeChunk() {
                                    &k.eu, &k.ed, &k.sgate, &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp,
                                    &k.x16, &k.bcounts, &k.bbase, &k.pa, &k.pb, &k.ipart, &k.rscale, &k.xh, &k.mh,
                                    &k.lh, &k.ml, &k.bscores, &k.vis, &k.ascores, &k.ublk, &k.umask, &k.ucount,
-                                   &k.gdnprep};
+                                   &k.gdnprep, &k.qsh, &k.qsl};
   for (rt::Buffer* b : bufs) {
     if (!*b) continue;
     std::erase_if(owned_, [&](const rt::Buffer& o) { return o.device == b->device; });
@@ -92,7 +92,11 @@ bool FlashNextGpu::AllocChunk(std::uint32_t tokens, std::string* error) {
   const std::size_t qdim = c.AttentionQDim(), kvdim = c.AttentionKvDim(), vd = c.SsmValueDim();
   const std::size_t max_cols = std::max({D, H, qdim, vd, std::size_t{c.shared_expert_ff}, std::size_t{c.hc_low_rank}});
   auto& k = ck_;
-  const auto f = [&](std::size_t n) { return Scratch(n, error); };
+  k.bytes = 0;
+  const auto f = [&](std::size_t n) {
+    k.bytes += std::max<std::size_t>(n, 1) * 4;
+    return Scratch(n, error);
+  };
   k.res = f(T * D);
   k.xn = f(T * D);
   k.lo = f(T * c.hc_low_rank);
@@ -156,6 +160,8 @@ bool FlashNextGpu::AllocChunk(std::uint32_t tokens, std::string* error) {
     k.umask = f((groups * max_u + 3) / 4);  // bytes
     k.ucount = f(groups);
   }
+  k.qsh = f(sub * c.indexer_heads * c.indexer_head_dim / 2 + 1);
+  k.qsl = f(sub * c.indexer_heads * c.indexer_head_dim / 2 + 1);
   k.params_offset = (T * c.PleEmbeddingDim() * 4 + 63) / 64 * 64;
   ck_host_.assign(k.params_offset + T * 64, 0);
   k.host = dev_.Alloc(ck_host_.size(), error);
@@ -164,7 +170,7 @@ bool FlashNextGpu::AllocChunk(std::uint32_t tokens, std::string* error) {
                         &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg, &k.q, &k.gate_a, &k.k, &k.v, &k.ctx,
                         &k.iq, &k.ik, &k.router, &k.ids, &k.wts, &k.eg, &k.eu, &k.ed, &k.sgate, &k.host,
                         &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp, &k.x16, &k.bcounts, &k.bbase, &k.pa, &k.pb, &k.ipart, &k.rscale, &k.gdnprep, &k.xh, &k.mh, &k.lh, &k.ml,
-                        &k.bscores, &k.vis, &k.ascores, &k.ublk, &k.umask, &k.ucount})
+                        &k.bscores, &k.vis, &k.ascores, &k.ublk, &k.umask, &k.ucount, &k.qsh, &k.qsl})
     if (!*b) return false;
   // Index-major copies of the mixers' up projections (fused GEMM + mix).
   if (c.hc_count == 4)
@@ -886,7 +892,17 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
     // Block scores as one bf16x3 WMMA GEMM per sub-chunk (rows: token x head,
     // columns: the complete blocks of the sub-chunk's last token).
     const std::uint32_t cols = (pos0 + t0 + n) / ratio;
-    if (!(scores_wmma && cols > 0
+    const std::uint32_t nq = n * ih * idim;
+    if (!(scores_wmma && cols > 0 && prefill_scores_b_ && idim == 128
+              ? Launch("halo_split_bf16_rows", {Blocks(nq)}, {kBlock},
+                       {rt::Arg::Buf(ck_.iq, std::size_t{t0} * ih * idim * 4), rt::Arg::Buf(ck_.qsh),
+                        rt::Arg::Buf(ck_.qsl), rt::Arg::Val(nq)},
+                       error) &&
+                    Launch("halo_qsa_scores_wmma_b", {(cols + 63) / 64, (n * ih + 511) / 512}, {256},
+                           {rt::Arg::Buf(ck_.qsh), rt::Arg::Buf(ck_.qsl), rt::Arg::Buf(s.block_k),
+                            rt::Arg::Buf(ck_.bscores), rt::Arg::Val(n), rt::Arg::Val(cols), rt::Arg::Val(bstride)},
+                           error)
+          : scores_wmma && cols > 0
               ? Launch("halo_qsa_scores_wmma", {(cols + 63) / 64, (n + 15) / 16}, {128},
                        {rt::Arg::Buf(ck_.iq, std::size_t{t0} * ih * idim * 4), rt::Arg::Buf(s.block_k),
                         rt::Arg::Buf(ck_.bscores), rt::Arg::Val(n), rt::Arg::Val(cols), rt::Arg::Val(idim),

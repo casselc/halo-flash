@@ -194,6 +194,9 @@ class FlashNextGpu {
   static inline bool kv_index_window_ = true;
   /// QSA block scores of a chunk as one bf16x3 WMMA GEMM (near-fp32).
   static inline bool prefill_scores_wmma_ = true;
+  /// Stream C (exact): the block scores with each block-key tile split once per block in LDS and q split once
+  /// (halo_qsa_scores_wmma_b; same WMMAs per score in the same order).
+  static inline bool prefill_scores_b_ = true;
   /// Past the QSA budget, attention for 4 tokens at a time over the union of
   /// their selections (shared K/V reads) instead of token by token.
   static inline bool prefill_qsel_attention_ = true;
@@ -335,6 +338,12 @@ class FlashNextGpu {
     std::size_t recurrent = 0, kv_mapped = 0, kv_exclusive = 0;
   };
   [[nodiscard]] SessionBytes SessionMemory(SessionId id) const;
+  /// Stream C: whether the bound session can grow to `positions` (prompt and generation) in the memory the device
+  /// reports left (rt::Device::AvailableBytes), counting its KV kinds' bytes per token beyond the pages it already
+  /// maps and the long-prompt chunk buffers a prefill of `prefill_tokens` would add; `why` says what is short.
+  [[nodiscard]] bool KvRoomFor(std::uint32_t positions, std::uint32_t prefill_tokens, std::string* why) const;
+  /// Device bytes one more position costs the bound session (its KV kind table; indexer keys windowed).
+  [[nodiscard]] double KvBytesPerToken() const;
 
   /// One decode step for several sessions at once (P6 batched decode): every weight is read once for the
   /// batch, routed experts grouped across sessions. Each entry's logits / sampled token / state are byte-identical
@@ -440,10 +449,12 @@ class FlashNextGpu {
     rt::Buffer xh, mh, lh, ml;  // ml: fp16 lo of `mixed` (router mode 4); fp16 activations: per GEMM, the shared `mixed`, the mixer lo (mix_h16)  // grouped experts (hp, x16 fp16)
     rt::Buffer bscores, vis, ascores;                // batched attention, kAttnSub tokens at a time
     rt::Buffer ublk, umask, ucount;                  // QSA unions of 4 tokens (halo_qsa_union4)
+    rt::Buffer qsh, qsl;                             // a sub-chunk's indexer q split to bf16 hi / lo (scores_b)
     rt::Buffer gdnprep;                              // chunked DeltaNet: per (head, 16-token chunk) halo_gdn_c16_prep
     std::size_t params_offset = 0;  // in `host`: per-token step params after the n-gram rows
     std::uint32_t cap = 0;  // tokens the buffers hold
     std::uint32_t bstride = 0;  // bscores row stride (QSA blocks): grown with the position, not max_context
+    std::size_t bytes = 0;      // device bytes of the chunk buffers (for KvRoomFor)
   };
   static constexpr std::uint32_t kAttnSub = 512;
   std::uint32_t AttnVisibleStride() const;
@@ -582,6 +593,8 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   /// Maps KV pages so the bound session can hold `tokens` positions, read from `live` on (indexer-key pages wholly
   /// below IndexLiveRow(live) are released, those at or above it mapped).
   bool EnsureKv(std::uint32_t tokens, std::uint32_t live, std::string* error);
+  /// Unmaps every KV page of the bound session (Reset, Restore): pages shared with forks stay with them.
+  bool ReleaseKvPages(std::string* error);
   // ---- P6 batched decode (batch_decode.cpp) ----
   struct BatchBuffers {
     rt::Buffer res, xn, mixed, block_out, embd, inject, scale, lo_part, inject_part;

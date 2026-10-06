@@ -701,3 +701,58 @@ TEST(GpuSelect, Fp16KvAttentionMatchesFp32OnRoundedCache) {
     }, {.test_cases = 60});
   }
 }
+
+// Stream C: halo_qsa_scores_wmma_b (block-key tile split once per block in LDS, q pre-split by
+// halo_split_bf16_rows) against halo_qsa_scores_wmma, bit for bit: the same WMMAs per score in the same order.
+// Up to 512 tokens (a sub-chunk) and 5000 blocks, ragged both ways, rows past the 512-row block boundary,
+// unused stride columns untouched.
+TEST(GpuSelect, WmmaBlockScoresBIsBitIdentical) {
+  std::string error;
+  for (auto backend : {rt::Backend::kHip, rt::Backend::kHrx}) {
+    auto dev = rt::Device::Create(backend, &error);
+    if (!dev) continue;
+    ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+    hegel::test([&](hegel::TestCase& tc) {
+      constexpr std::uint32_t heads = 4, dim = 128;
+      const std::uint32_t T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 512}));
+      const std::uint32_t cols = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 5000}));
+      const std::uint32_t stride = cols + tc.draw(gs::integers<std::uint32_t>({.min_value = 0, .max_value = 9}));
+      std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+      const auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return static_cast<float>(seed >> 8) / 16777216.0f - 0.5f; };
+      const float amp = tc.draw(gs::sampled_from(std::vector<float>{0.25f, 2.0f, 16.0f, 3e4f}));
+      std::vector<float> q(std::size_t{T} * heads * dim), kb(std::size_t{cols} * dim);
+      for (auto& x : q) x = amp * rnd();
+      for (auto& x : kb) x = rnd();
+      const std::size_t nq = q.size();
+      auto qb = dev->Alloc(nq * 4, &error), bb = dev->Alloc(kb.size() * 4, &error), qh = dev->Alloc(nq * 2, &error),
+           ql = dev->Alloc(nq * 2, &error), s1 = dev->Alloc(std::size_t{T} * stride * 4, &error),
+           s2 = dev->Alloc(std::size_t{T} * stride * 4, &error);
+      ASSERT_TRUE(qb && bb && qh && ql && s1 && s2) << error;
+      ASSERT_TRUE(dev->Upload(qb, 0, q.data(), nq * 4, &error) && dev->Upload(bb, 0, kb.data(), kb.size() * 4, &error) &&
+                  dev->Fill(s1, 0x7F, &error) && dev->Fill(s2, 0x7F, &error))
+          << error;
+      const rt::Arg wa[] = {rt::Arg::Buf(qb), rt::Arg::Buf(bb), rt::Arg::Buf(s1), rt::Arg::Val(T), rt::Arg::Val(cols),
+                            rt::Arg::Val(dim), rt::Arg::Val(stride)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_qsa_scores_wmma", &error), {(cols + 63) / 64, (T + 15) / 16}, {128}, wa,
+                              &error))
+          << error;
+      const rt::Arg sa[] = {rt::Arg::Buf(qb), rt::Arg::Buf(qh), rt::Arg::Buf(ql), rt::Arg::Val(static_cast<std::uint32_t>(nq))};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_split_bf16_rows", &error), {static_cast<std::uint32_t>((nq + 255) / 256)},
+                              {256}, sa, &error))
+          << error;
+      const rt::Arg ba[] = {rt::Arg::Buf(qh), rt::Arg::Buf(ql), rt::Arg::Buf(bb), rt::Arg::Buf(s2), rt::Arg::Val(T),
+                            rt::Arg::Val(cols), rt::Arg::Val(stride)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_qsa_scores_wmma_b", &error), {(cols + 63) / 64, (T * heads + 511) / 512},
+                              {256}, ba, &error))
+          << error;
+      std::vector<std::uint32_t> want(std::size_t{T} * stride), got(want.size());
+      ASSERT_TRUE(dev->Download(s1, 0, want.data(), want.size() * 4, &error) &&
+                  dev->Download(s2, 0, got.data(), got.size() * 4, &error))
+          << error;
+      for (auto* b : {&qb, &bb, &qh, &ql, &s1, &s2}) dev->Free(*b);
+      for (std::size_t i = 0; i < want.size(); ++i)
+        ASSERT_EQ(got[i], want[i]) << rt::BackendName(backend) << " t " << i / stride << " b " << i % stride << " T " << T
+                                   << " cols " << cols;
+    }, {.test_cases = 40});
+  }
+}

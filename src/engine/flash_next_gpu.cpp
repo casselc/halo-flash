@@ -2,6 +2,7 @@
 #include "engine/flash_next_gpu.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
@@ -1306,6 +1307,47 @@ FlashNextGpu::SessionBytes FlashNextGpu::SessionMemory(SessionId id) const {
   return b;
 }
 
+double FlashNextGpu::KvBytesPerToken() const {
+  double b = 0;
+  for (const auto& r : kv_)
+    if (!(index_window_ && r.kind == KvKind::kIndexK)) b += double(r.row_bytes) / r.row_tokens;
+  return b;
+}
+
+bool FlashNextGpu::KvRoomFor(std::uint32_t positions, std::uint32_t prefill_tokens, std::string* why) const {
+  const std::size_t avail = dev_.AvailableBytes();
+  if (avail == SIZE_MAX) return true;  // the backend cannot tell
+  // Positions the bound session's pages already hold (its K or fp16 K region: one row a position).
+  std::uint64_t held = 0;
+  for (const auto& r : kv_)
+    if (r.kind == (kv16_only_ ? KvKind::kK16 : KvKind::kK)) {
+      std::size_t mapped = 0;
+      for (const auto& p : r.pages) mapped += p ? 1 : 0;
+      held = r.paged ? mapped * dev_.PageBytes() / r.row_bytes : max_context_;
+      break;
+    }
+  const std::uint64_t want = std::min<std::uint64_t>(std::uint64_t{positions} + kKvSlackTokens, max_context_);
+  double need = want > held ? (want - held) * KvBytesPerToken() : 0.0;
+  // The long-prompt chunk buffers, allocated on the first prompt longer than prefill_chunk_ (~0.7 MB a token).
+  const std::uint32_t chunk = prefill_long_chunk_ > prefill_chunk_ && prefill_tokens > prefill_chunk_
+                                  ? std::min(prefill_long_chunk_, max_context_)
+                                  : std::min(prefill_chunk_, max_context_);
+  if (prefill_tokens > 0 && ck_.cap < chunk) {
+    const double per = ck_.cap ? double(ck_.bytes) / ck_.cap : 0.72e6;
+    need += (chunk - ck_.cap) * per;
+  }
+  constexpr double kReserve = 2e9;  // driver, host buffers, the n-gram cache's growth
+  if (need + kReserve <= double(avail)) return true;
+  if (why) {
+    char b[256];
+    std::snprintf(b, sizeof(b),
+                  "not enough memory for %u positions: needs %.1f GB more (KV %.1f KB a token), %.1f GB available",
+                  positions, need / 1e9, KvBytesPerToken() / 1e3, avail / 1e9);
+    *why = b;
+  }
+  return false;
+}
+
 bool FlashNextGpu::RouteTrace(std::vector<std::uint32_t>* ids, std::string* error) {
   const auto& c = w_.config;
   if (!route_trace_buf_) {
@@ -1377,7 +1419,8 @@ bool FlashNextGpu::Restore(const Snapshot& snap, std::string* error) {
     if (error) *error = "snapshot is empty or from another device";
     return false;
   }
-  if (!EnsureKv(snap.position_, snap.position_, error)) return false;
+  // Fresh pages for the copy: the bound session's own may be shared with a fork (see Reset).
+  if (!ReleaseKvPages(error) || !EnsureKv(snap.position_, snap.position_, error)) return false;
   // Counts first: ForEachState sizes the KV copies from the restored position.
   position_ = snap.position_;
   for (std::size_t l = 0; l < attn_.size(); ++l) {
@@ -1393,8 +1436,23 @@ bool FlashNextGpu::Restore(const Snapshot& snap, std::string* error) {
          dev_.Synchronize(error);
 }
 
+bool FlashNextGpu::ReleaseKvPages(std::string* error) {
+  if (!dev_.Synchronize(error)) return false;  // queued work may still read them
+  const std::size_t pb = dev_.PageBytes();
+  for (auto& r : kv_) {
+    if (!r.paged) continue;
+    for (std::size_t j = 0; j < r.pages.size(); ++j)
+      if (r.pages[j] && !dev_.UnmapPage(r.va, j * pb, error)) return false;
+    r.pages.clear();  // the last holder of each (forks share pages) releases it
+  }
+  return true;
+}
+
 bool FlashNextGpu::Reset(std::string* error) {
   const auto& c = w_.config;
+  // The bound session's KV pages go: a fork may share them, and the rewritten positions must not reach it
+  // (sessions only append, so shared pages are otherwise never written). EnsureKv maps fresh ones as needed.
+  if (!ReleaseKvPages(error)) return false;
   for (std::uint32_t l = 0; l < c.num_layers; ++l)
     if (c.IsLinearLayer(l) && (!dev_.Fill(linear_[l].conv, 0, error) || !dev_.Fill(linear_[l].state, 0, error)))
       return false;

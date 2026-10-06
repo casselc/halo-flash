@@ -59,6 +59,13 @@ TextGenerator::Result FlashNextGenerator::Generate(const Params& params,
     if (!engine_.Reset(&error)) return r.error = error, r;
   }
   r.cached_tokens = reuse;
+  // A prompt the memory left cannot hold is refused before its prefill (minutes at long context), not midway.
+  if (std::string why; !engine_.KvRoomFor(static_cast<std::uint32_t>(ids.size()) + budget,
+                                          static_cast<std::uint32_t>(ids.size() - 1 - reuse), &why)) {
+    history_.clear();
+    (void)engine_.Reset(&error);
+    return r.error = why, r;
+  }
   const std::span<const std::int32_t> prompt(ids.data(), ids.size());
   if (ids.size() - 1 > reuse) {
     if (!engine_.Prefill(prompt.subspan(reuse, ids.size() - 1 - reuse), {}, &error)) {

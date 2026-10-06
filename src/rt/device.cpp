@@ -68,4 +68,6 @@ std::unique_ptr<Device> Device::Create(Backend backend, std::string* error) {
   return nullptr;
 }
 
+std::size_t Device::AvailableBytes() const { return SIZE_MAX; }
+
 }  // namespace halo::rt

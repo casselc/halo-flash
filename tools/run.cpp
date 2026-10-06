@@ -258,6 +258,7 @@ int main(int argc, char** argv) {
     else if (a == "--router-f16") engine::FlashNextGpu::prefill_router_f16_ = std::atoi(argv[i + 1]);
     else if (a == "--prefill-int8") engine::FlashNextGpu::prefill_int8_gemm_ = std::string(argv[i + 1]) == "1";
     else if (a == "--kv-f16") engine::FlashNextGpu::kv_f16_only_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--scores-b") engine::FlashNextGpu::prefill_scores_b_ = std::string(argv[i + 1]) == "1";
     else if (a == "--decode-ab") decode_ab = argv[i + 1];
     else if (a == "--decode-ab-rounds") decode_ab_rounds = std::max(1, std::atoi(argv[i + 1]));
     else if (a == "--sb-snapshot") sb_snapshot = std::string(argv[i + 1]) == "1";

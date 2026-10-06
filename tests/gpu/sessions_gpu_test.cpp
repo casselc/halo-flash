@@ -490,3 +490,61 @@ TEST(Sessions, SnapshotRestoresIntoAnotherSessionMidBlock) {
     }
   }, {.test_cases = 40});
 }
+
+// Stream C regression: a session that a fork shares pages with is reset (or restored) and rewritten from position
+// 0; the fork must not see the rewrite. Main's Reset kept the pages and wrote into them (found by the swarm at 4 KB
+// pages, where a fork at position 2 already shares a page). 4 KB pages, so short prefixes share several pages.
+TEST(Sessions, ForkSurvivesParentResetAndRestore) {
+  Small* s = LoadSmall();
+  if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  const char* saved_pb = std::getenv("HALO_PAGE_BYTES");
+  const std::string saved = saved_pb ? saved_pb : "";
+  setenv("HALO_PAGE_BYTES", "4096", 1);
+  auto devices = Devices();
+  if (saved_pb) setenv("HALO_PAGE_BYTES", saved.c_str(), 1);
+  else unsetenv("HALO_PAGE_BYTES");
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  if (devices[0]->PageBytes() == 0) GTEST_SKIP() << "no page mapping";
+  const auto& c = s->weights->config;
+  const std::size_t V = c.vocab_size;
+  constexpr std::uint32_t kMaxContext = 256;
+  struct Kv16 {
+    bool saved = engine::FlashNextGpu::kv_f16_only_;
+    ~Kv16() { engine::FlashNextGpu::kv_f16_only_ = saved; }
+  } kv16_guard;
+  hegel::test([&](hegel::TestCase& tc) {
+    auto& dev = *devices[0];
+    std::string error;
+    engine::FlashNextGpu::kv_f16_only_ = tc.draw(gs::booleans());
+    auto gpu = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+    ASSERT_TRUE(gpu) << error;
+    auto oracle = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+    ASSERT_TRUE(oracle) << error;
+    gpu->SetUseGraphs(tc.draw(gs::booleans()));
+    const auto token = [&] {
+      return tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = static_cast<std::int32_t>(V - 1)}));
+    };
+    std::vector<std::int32_t> a(tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 120}))),
+        b(tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 120}))), tail(4);
+    for (auto& t : a) t = token();
+    for (auto& t : b) t = token();
+    for (auto& t : tail) t = token();
+    const bool restore = tc.draw(gs::booleans());
+    ASSERT_TRUE(gpu->Prefill(a, {}, &error)) << error;
+    auto snap = gpu->NewSnapshot(&error);
+    if (restore) ASSERT_TRUE(snap && gpu->Save(*snap, &error)) << error;
+    engine::FlashNextGpu::SessionId f;
+    ASSERT_TRUE(gpu->ForkSession(0, &f, &error)) << error;
+    // The parent rewrites its positions from 0 (reset, or a restore after moving on), with other tokens.
+    ASSERT_TRUE(gpu->Reset(&error) && gpu->Prefill(b, {}, &error)) << error;
+    if (restore) ASSERT_TRUE(gpu->Restore(*snap, &error) && gpu->Step(b[0], {}, &error)) << error;
+    ASSERT_TRUE(gpu->BindSession(f, &error)) << error;
+    ASSERT_TRUE(oracle->Prefill(a, {}, &error)) << error;
+    std::vector<float> got(V), want(V);
+    for (std::size_t j = 0; j < tail.size(); ++j) {
+      ASSERT_TRUE(gpu->Step(tail[j], got, &error) && oracle->Step(tail[j], want, &error)) << error;
+      ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0)
+          << "fork step " << j << " after its parent (" << a.size() << " tokens) " << (restore ? "restored" : "reset");
+    }
+  }, {.test_cases = 30});
+}

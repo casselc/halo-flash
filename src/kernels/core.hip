@@ -5817,6 +5817,65 @@ extern "C" __global__ void __launch_bounds__(128)
   }
 }
 
+// Stream C: fp32 rows split once into bf16 hi / lo (SplitBf16), for halo_qsa_scores_wmma_b's q operand.
+//   grid (ceil(n / 256))
+extern "C" __global__ void halo_split_bf16_rows(const float* x, short* hi, short* lo, std::uint32_t n) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) SplitBf16(x[i], hi[i], lo[i]);
+}
+
+// halo_qsa_scores_wmma with the same WMMAs per output in the same order (bit-identical), restructured for long
+// contexts: the 64-column tile of pooled block keys is split into bf16 hi / lo once per block, in LDS, and every
+// wave loops over RT row tiles against it; q comes pre-split (halo_split_bf16_rows). The original re-reads and
+// re-splits each block-key tile in every wave of every 16-token row block (32 row blocks a 512-token sub-chunk;
+// block_k is 33.5 MB a layer at 262K positions, past the MALL), 15 TFLOPS at 256K.
+//   grid (ceil(cols / 64), ceil(tokens * 4 / 512)), block 256; heads == 4, dim == 128.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_qsa_scores_wmma_b(const short* qh, const short* ql, const float* blocks, float* score, std::uint32_t tokens,
+                           std::uint32_t cols, std::uint32_t score_stride) {
+  constexpr std::uint32_t HEADS = 4, TN = 4, D = 128, RS = D + 8, RT = 4, NW = 8;
+  __shared__ __attribute__((aligned(16))) short Bh[64 * RS], Bl[64 * RS];
+  const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const std::uint32_t c0 = blockIdx.x * 64, rows = tokens * HEADS;
+  for (std::uint32_t i = tid; i < 64 * (D / 4); i += 256) {
+    const std::uint32_t col = i / (D / 4), k = (i % (D / 4)) * 4;
+    const float4 v = *reinterpret_cast<const float4*>(blocks + static_cast<std::size_t>(min(c0 + col, cols - 1)) * D + k);
+    const float f[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int e = 0; e < 4; ++e) SplitBf16(f[e], Bh[col * RS + k + e], Bl[col * RS + k + e]);
+  }
+  __syncthreads();
+  for (std::uint32_t rt = 0; rt < RT; ++rt) {
+    const std::uint32_t r0 = ((blockIdx.y * RT + rt) * NW + wave) * 16;
+    if (r0 >= rows) break;
+    const std::size_t arow = static_cast<std::size_t>(min(r0 + lane % 16, rows - 1)) * D;
+    halo_v8f acc[TN] = {};
+#pragma unroll 2
+    for (std::uint32_t k0 = 0; k0 < D; k0 += 16) {
+      const halo_v16s ah = LdsFragS(qh + arow + k0), al = LdsFragS(ql + arow + k0);
+#pragma unroll
+      for (std::uint32_t n = 0; n < TN; ++n) {
+        const std::uint32_t br = (n * 16 + lane % 16) * RS + k0;
+        const halo_v16s bh = LdsFragS(Bh + br), bl = LdsFragS(Bl + br);
+        acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al, bh, acc[n]);
+        acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ah, bl, acc[n]);
+        acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ah, bh, acc[n]);
+      }
+    }
+#pragma unroll
+    for (std::uint32_t n = 0; n < TN; ++n) {
+      const std::uint32_t b = c0 + n * 16 + lane % 16;
+#pragma unroll
+      for (std::uint32_t tq = 0; tq < 4; ++tq) {
+        float part = fmaxf(0.0f, acc[n][2 * tq]) + fmaxf(0.0f, acc[n][2 * tq + 1]);
+        part += __shfl_xor(part, 16, 32);
+        const std::uint32_t t = r0 / HEADS + tq;
+        if (lane < 16 && b < cols && t < tokens) score[static_cast<std::size_t>(t) * score_stride + b] = part;
+      }
+    }
+  }
+}
+
 // Lane exchange within aligned groups of 4 lanes by DPP quad permutes:
 // QuadXor1 reads lane ^ 1, QuadXor2 lane ^ 2 (quad_perm [1,0,3,2], [2,3,0,1]).
 __device__ inline float QuadXor1(float v) {
