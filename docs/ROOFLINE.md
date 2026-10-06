@@ -1075,3 +1075,13 @@ chunk), which is a precision change (stream P).
 Multi-chunk check for this set (control flow per chunk): all new flags on vs off give identical logits for 2048 tokens in
 512- and 768-token chunks, and for a 3485-token prompt in 2048-token chunks (second chunk on the QSA path, gate_a written).
 
+**Candidate A (halogen-style dense attention: one workgroup per KV head x 32 tokens over all 12 q heads), stopped at the
+gate (2026-10-05 night, stream E).** The case for it was halogen's dense kernel at T = 8192 (36.3 vs our 43.1 ms a
+call). In our engine the dense flash kernel only ever runs while the context is within the indexer budget
+(top-k 2048 tokens / ratio 4 = 512 blocks), i.e. for the first 2048 positions of a prompt; beyond that the model's
+QSA selection applies and attention is `halo_attention_wmma_qsel_h`, which already covers all 12 heads of a KV head
+per block (48 rows). Kernel timing of a 6940-token prefill (pinned): `fa_hg` 12 calls, 39.4 ms (first chunk only);
+`qsel_h` 120 calls, 357 ms; `qsa_select_rows` 41.5 ms. So the 8K saving (-70..-90 ms) does not exist for this model, and
+at 2048 tokens the ceiling is 12 x (3.28 - ~2.9) = ~-4.5 ms (0.3% of the prefill, below the A/B noise of 10-20 ms).
+Not built. The long-prompt attention lead is `qsel_h` (3.08 ms a 512-token call, ~6% of an 8K prefill).
+
