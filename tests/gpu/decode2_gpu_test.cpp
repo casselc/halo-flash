@@ -199,51 +199,6 @@ TEST(GpuDecode2, Bf16DualMatchesMatvec) {
   });
 }
 
-// The smaller-LDS Q8 GEMVs (r2n, r4n, dual_n) == r2, r4, dual for cols within their LDS.
-TEST(GpuDecode2, SmallLdsGemvsMatch) {
-  ForEachDevice([](rt::Device& dev, rt::Backend backend) {
-    hegel::test([&](hegel::TestCase& tc) {
-      const std::uint32_t rows = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 3000}));
-      const std::uint32_t rows2 = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 1000}));
-      const std::uint32_t cols = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 192}));
-      Rng r{tc.draw(gs::integers<std::uint32_t>())};
-      const std::uint32_t qstride = (cols + 15) / 16 * 16 + 16 * (r.U() % 2);
-      std::vector<std::int8_t> q1, q2;
-      std::vector<std::uint16_t> d1, d2;
-      RandomQ8r(r, rows, cols, qstride, q1, d1);
-      RandomQ8r(r, rows2, cols, qstride, q2, d2);
-      std::vector<float> x(cols);
-      for (auto& v : x) v = r.F(16.0f);
-      Bufs b{dev, {}};
-      auto q1b = b.Up(q1), d1b = b.Up(d1), q2b = b.Up(q2), d2b = b.Up(d2), xb = b.Up(x);
-      const std::string be = rt::BackendName(backend);
-      for (auto [a, n, pa, pn] : {std::tuple{"halo_gemv_q8r_r2", "halo_gemv_q8r_r2n", 16u, 16u},
-                                   std::tuple{"halo_gemv_q8r_r4", "halo_gemv_q8r_r4n", 32u, 32u},
-                                   std::tuple{"halo_gemv_q8r_r2", "halo_gemv_q8r_r2p", 16u, 16u},
-                                   std::tuple{"halo_gemv_q8r_r4", "halo_gemv_q8r_r4p", 32u, 32u},
-                                   std::tuple{"halo_gemv_q8r_r4", "halo_gemv_q8r_r1", 32u, 8u},
-                                   std::tuple{"halo_gemv_q8r_r4", "halo_gemv_q8r_r2", 32u, 16u}}) {
-        auto ya = b.Zero(rows), yn = b.Zero(rows);
-        for (auto [k, y, per] : {std::tuple{a, ya, pa}, std::tuple{n, yn, pn}})
-          b.Run(k, {Blocks(rows, per)},
-                {rt::Arg::Buf(q1b), rt::Arg::Buf(d1b), rt::Arg::Buf(xb), rt::Arg::Buf(y), rt::Arg::Val(rows),
-                 rt::Arg::Val(cols), rt::Arg::Val(qstride)});
-        ExpectBitEqual(b.Down(ya, rows), b.Down(yn, rows), be + " " + n);
-      }
-      if (cols <= 4096) {
-        auto a1 = b.Zero(rows), a2 = b.Zero(rows2), n1 = b.Zero(rows), n2 = b.Zero(rows2);
-        const std::uint32_t b1 = Blocks(rows, 32);
-        for (auto [k, y1, y2] : {std::tuple{"halo_gemv_q8r_dual", a1, a2}, std::tuple{"halo_gemv_q8r_dual_n", n1, n2}})
-          b.Run(k, {b1 + Blocks(rows2, 32)},
-                {rt::Arg::Buf(q1b), rt::Arg::Buf(d1b), rt::Arg::Buf(y1), rt::Arg::Val(rows), rt::Arg::Val(qstride),
-                 rt::Arg::Buf(q2b), rt::Arg::Buf(d2b), rt::Arg::Buf(y2), rt::Arg::Val(rows2), rt::Arg::Val(qstride),
-                 rt::Arg::Buf(xb), rt::Arg::Val(cols), rt::Arg::Val(b1)});
-        ExpectBitEqual(b.Down(a1, rows), b.Down(n1, rows), be + " dual_n 1");
-        ExpectBitEqual(b.Down(a2, rows2), b.Down(n2, rows2), be + " dual_n 2");
-      }
-    }, {.test_cases = 40});
-  });
-}
 
 // halo_hc_mix_a_c == halo_hc_mix_a (xn, lo partials, inject partials) for hc 1..4 streams, chunks <= 2048.
 TEST(GpuDecode2, HcMixAChunkLdsMatches) {
@@ -289,48 +244,6 @@ TEST(GpuDecode2, HcMixAChunkLdsMatches) {
   });
 }
 
-// halo_moe_gate_up_q4_k_dot_p5 / _p8 (weights loaded before the activations are quantized) == _dot.
-TEST(GpuDecode2, GateUpPrefetchMatchesDot) {
-  ForEachDevice([](rt::Device& dev, rt::Backend backend) {
-    hegel::test([&](hegel::TestCase& tc) {
-      const std::uint32_t experts = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 12}));
-      const std::uint32_t slots = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 10}));
-      const std::uint32_t ff = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 700}));
-      const std::uint32_t H = 256 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 16}));
-      const float amp = tc.draw(gs::sampled_from(std::vector<float>{0.0f, 0.01f, 1.0f, 40.0f}));
-      Rng r{tc.draw(gs::integers<std::uint32_t>())};
-      const std::uint64_t row_bytes = H / 256 * 144, expert_bytes = row_bytes * ff;
-      std::vector<std::uint8_t> gate(expert_bytes * experts), up(gate.size());
-      for (auto* w : {&gate, &up}) {
-        for (auto& b : *w) b = static_cast<std::uint8_t>(r.U() >> 24);
-        for (std::size_t sb = 0; sb < w->size(); sb += 144) {
-          const std::uint16_t d = Half(r), m = Half(r);
-          std::memcpy(w->data() + sb, &d, 2);
-          std::memcpy(w->data() + sb + 2, &m, 2);
-        }
-      }
-      std::vector<float> x(H);
-      for (auto& v : x) v = r.F(amp);
-      std::vector<std::uint32_t> ids(slots);
-      for (auto& e : ids) e = r.U() % experts;
-      Bufs b{dev, {}};
-      auto gb = b.Up(gate), ub = b.Up(up), xb = b.Up(x), ib = b.Up(ids);
-      std::vector<const char*> ks{"halo_moe_gate_up_q4_k_dot", "halo_moe_gate_up_q4_k_dot_p8"};
-      if (4 * (H / 64) <= 160) ks.push_back("halo_moe_gate_up_q4_k_dot_p5");
-      std::vector<std::vector<float>> outs;
-      for (const char* k : ks) {
-        auto hb = b.Zero(std::size_t{slots} * ff);
-        b.Run(k, {Blocks(ff, 16), slots},
-              {rt::Arg::Buf(gb), rt::Arg::Buf(ub), rt::Arg::Buf(ib), rt::Arg::Buf(xb), rt::Arg::Buf(hb),
-               rt::Arg::Val<std::uint64_t>(expert_bytes), rt::Arg::Val(ff), rt::Arg::Val(H),
-               rt::Arg::Val<std::uint64_t>(row_bytes)});
-        outs.push_back(b.Down(hb, std::size_t{slots} * ff));
-      }
-      for (std::size_t i = 1; i < outs.size(); ++i)
-        ExpectBitEqual(outs[0], outs[i], std::string(rt::BackendName(backend)) + " " + ks[i]);
-    }, {.test_cases = 40});
-  });
-}
 
 // halo_qsa_scores_b == halo_qsa_scores (1 .. 8 heads, dims 8 .. 256, up to 3000 complete blocks).
 TEST(GpuDecode2, QsaScoresBatchedMatch) {
@@ -361,33 +274,6 @@ TEST(GpuDecode2, QsaScoresBatchedMatch) {
   });
 }
 
-// halo_hc_combine_scales == halo_hc_combine then halo_hc_norm_scales (residual and scales).
-TEST(GpuDecode2, CombineScalesMatch) {
-  ForEachDevice([](rt::Device& dev, rt::Backend backend) {
-    hegel::test([&](hegel::TestCase& tc) {
-      const std::uint32_t hc = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 4}));
-      const std::uint32_t h = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 4096}));
-      const float amp = tc.draw(gs::sampled_from(std::vector<float>{0.001f, 1.0f, 300.0f}));
-      Rng r{tc.draw(gs::integers<std::uint32_t>())};
-      std::vector<float> res(std::size_t{hc} * h), out(h), inj(hc);
-      for (auto& v : res) v = r.F(amp);
-      for (auto& v : out) v = r.F(amp);
-      for (auto& v : inj) v = r.F(8.0f);
-      const float eps = 1e-6f;
-      Bufs b{dev, {}};
-      auto r1 = b.Up(res), r2 = b.Up(res), ob = b.Up(out), ib = b.Up(inj), s1 = b.Zero(hc), s2 = b.Zero(hc);
-      b.Run("halo_hc_combine", {Blocks(std::size_t{hc} * h, 256)},
-            {rt::Arg::Buf(r1), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Val(hc), rt::Arg::Val(h)});
-      b.Run("halo_hc_norm_scales", {hc}, {rt::Arg::Buf(r1), rt::Arg::Buf(s1), rt::Arg::Val(h), rt::Arg::Val(eps)});
-      b.Run("halo_hc_combine_scales", {hc},
-            {rt::Arg::Buf(r2), rt::Arg::Buf(ob), rt::Arg::Buf(ib), rt::Arg::Buf(s2), rt::Arg::Val(hc), rt::Arg::Val(h),
-             rt::Arg::Val(eps)});
-      const std::string be = rt::BackendName(backend);
-      ExpectBitEqual(b.Down(r1, res.size()), b.Down(r2, res.size()), be + " combine res");
-      ExpectBitEqual(b.Down(s1, hc), b.Down(s2, hc), be + " combine scales");
-    }, {.test_cases = 40});
-  });
-}
 
 // halo_shexp_down_combine == halo_moe_combine then halo_shexp_down_add.
 TEST(GpuDecode2, ShexpDownCombineMatches) {
@@ -413,145 +299,15 @@ TEST(GpuDecode2, ShexpDownCombineMatches) {
       b.Run("halo_shexp_down_add", {Blocks(rows, 32)},
             {rt::Arg::Buf(qb), rt::Arg::Buf(db), rt::Arg::Buf(hb), rt::Arg::Buf(sgb), rt::Arg::Buf(o1), rt::Arg::Val(rows),
              rt::Arg::Val(cols), rt::Arg::Val(qstride)});
-      auto o3 = b.Zero(rows);
-      for (auto [k, o] : {std::pair{"halo_shexp_down_combine", o2}, std::pair{"halo_shexp_down_combine_p", o3}})
-        b.Run(k, {Blocks(rows, 32)},
-              {rt::Arg::Buf(qb), rt::Arg::Buf(db), rt::Arg::Buf(hb), rt::Arg::Buf(sgb), rt::Arg::Buf(pb),
-               rt::Arg::Buf(wb), rt::Arg::Val(slots), rt::Arg::Buf(o), rt::Arg::Val(rows), rt::Arg::Val(cols),
-               rt::Arg::Val(qstride)});
+      b.Run("halo_shexp_down_combine", {Blocks(rows, 32)},
+            {rt::Arg::Buf(qb), rt::Arg::Buf(db), rt::Arg::Buf(hb), rt::Arg::Buf(sgb), rt::Arg::Buf(pb), rt::Arg::Buf(wb),
+             rt::Arg::Val(slots), rt::Arg::Buf(o2), rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(qstride)});
       ExpectBitEqual(b.Down(o1, rows), b.Down(o2, rows), std::string(rt::BackendName(backend)) + " shexp down combine");
-      ExpectBitEqual(b.Down(o1, rows), b.Down(o3, rows), std::string(rt::BackendName(backend)) + " shexp down combine p");
-      // halo_shexp_gate_up_p == halo_shexp_gate_up (rows x cols gate and up, the same q8 data for both).
-      std::vector<float> gin(cols);
-      for (auto& v : gin) v = r.F(1.0f);
-      auto gib = b.Up(gin), h1 = b.Zero(rows), h2 = b.Zero(rows), g1 = b.Zero(1), g2 = b.Zero(1);
-      if (cols <= 8192)
-        for (auto [k, hh, gg] : {std::tuple{"halo_shexp_gate_up", h1, g1}, std::tuple{"halo_shexp_gate_up_p", h2, g2}})
-          b.Run(k, {Blocks(rows, 16)},
-                {rt::Arg::Buf(qb), rt::Arg::Buf(db), rt::Arg::Buf(qb), rt::Arg::Buf(db), rt::Arg::Buf(gib),
-                 rt::Arg::Buf(hb), rt::Arg::Buf(hh), rt::Arg::Buf(gg), rt::Arg::Val(rows), rt::Arg::Val(cols),
-                 rt::Arg::Val(qstride)});
-      ExpectBitEqual(b.Down(h1, rows), b.Down(h2, rows), std::string(rt::BackendName(backend)) + " shexp gate_up p");
-      ExpectBitEqual(b.Down(g1, 1), b.Down(g2, 1), std::string(rt::BackendName(backend)) + " shexp sgate p");
     }, {.test_cases = 40});
   });
 }
 
-// halo_gemv_q8r_dual_ab == halo_gemv_q8r_dual + halo_matvec_f32_rowblock2.
-TEST(GpuDecode2, DualAbMatches) {
-  ForEachDevice([](rt::Device& dev, rt::Backend backend) {
-    hegel::test([&](hegel::TestCase& tc) {
-      const std::uint32_t r1 = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 2000}));
-      const std::uint32_t r2 = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 1000}));
-      const std::uint32_t ab = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 64}));
-      const std::uint32_t cols = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 128}));
-      Rng r{tc.draw(gs::integers<std::uint32_t>())};
-      const std::uint32_t qstride = (cols + 15) / 16 * 16;
-      std::vector<std::int8_t> q1, q2;
-      std::vector<std::uint16_t> d1, d2;
-      RandomQ8r(r, r1, cols, qstride, q1, d1);
-      RandomQ8r(r, r2, cols, qstride, q2, d2);
-      std::vector<float> x(cols), wa(std::size_t{ab} * cols), wbv(wa.size());
-      for (auto& v : x) v = r.F(8.0f);
-      for (auto& v : wa) v = r.F(1.0f);
-      for (auto& v : wbv) v = r.F(1.0f);
-      Bufs b{dev, {}};
-      auto q1b = b.Up(q1), d1b = b.Up(d1), q2b = b.Up(q2), d2b = b.Up(d2), xb = b.Up(x), wab = b.Up(wa), wbb = b.Up(wbv);
-      auto y1 = b.Zero(r1), y2 = b.Zero(r2), ya = b.Zero(ab), yb = b.Zero(ab);
-      auto z1 = b.Zero(r1), z2 = b.Zero(r2), za = b.Zero(ab), zb = b.Zero(ab);
-      const std::uint32_t b1 = Blocks(r1, 32), b12 = b1 + Blocks(r2, 32);
-      b.Run("halo_gemv_q8r_dual", {b12},
-            {rt::Arg::Buf(q1b), rt::Arg::Buf(d1b), rt::Arg::Buf(y1), rt::Arg::Val(r1), rt::Arg::Val(qstride),
-             rt::Arg::Buf(q2b), rt::Arg::Buf(d2b), rt::Arg::Buf(y2), rt::Arg::Val(r2), rt::Arg::Val(qstride),
-             rt::Arg::Buf(xb), rt::Arg::Val(cols), rt::Arg::Val(b1)});
-      b.Run("halo_matvec_f32_rowblock2", {2 * ab},
-            {rt::Arg::Buf(wab), rt::Arg::Buf(wbb), rt::Arg::Buf(xb), rt::Arg::Buf(ya), rt::Arg::Buf(yb), rt::Arg::Val(ab),
-             rt::Arg::Val(cols)});
-      const std::string be = rt::BackendName(backend);
-      for (const char* k : {"halo_gemv_q8r_dual_ab", "halo_gemv_q8r_dual_abp"}) {
-      b.Run(k, {b12 + 2 * ab},
-            {rt::Arg::Buf(q1b), rt::Arg::Buf(d1b), rt::Arg::Buf(z1), rt::Arg::Val(r1), rt::Arg::Val(qstride),
-             rt::Arg::Buf(q2b), rt::Arg::Buf(d2b), rt::Arg::Buf(z2), rt::Arg::Val(r2), rt::Arg::Val(qstride),
-             rt::Arg::Buf(xb), rt::Arg::Val(cols), rt::Arg::Val(b1), rt::Arg::Val(b12), rt::Arg::Buf(wab),
-             rt::Arg::Buf(wbb), rt::Arg::Buf(za), rt::Arg::Buf(zb), rt::Arg::Val(ab)});
-      ExpectBitEqual(b.Down(y1, r1), b.Down(z1, r1), be + " dual_ab 1");
-      ExpectBitEqual(b.Down(y2, r2), b.Down(z2, r2), be + " dual_ab 2");
-      ExpectBitEqual(b.Down(ya, ab), b.Down(za, ab), be + " dual_ab alpha");
-      ExpectBitEqual(b.Down(yb, ab), b.Down(zb, ab), be + " dual_ab beta");
-      }
-    }, {.test_cases = 40});
-  });
-}
 
-// halo_moe_down_q5_1_r4p == halo_moe_down_q5_1_r4 (cols <= 768); halo_hc_mix_b_p == halo_hc_mix_b (low rank <= 512).
-TEST(GpuDecode2, WeightsFirstKernelsMatch) {
-  ForEachDevice([](rt::Device& dev, rt::Backend backend) {
-    hegel::test([&](hegel::TestCase& tc) {
-      const std::string be = rt::BackendName(backend);
-      Rng r{tc.draw(gs::integers<std::uint32_t>())};
-      {
-        const std::uint32_t experts = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 8}));
-        const std::uint32_t slots = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 10}));
-        const std::uint32_t rows = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 3000}));
-        const std::uint32_t cols = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 24}));
-        const std::uint64_t row_bytes = cols / 32 * 24, expert_bytes = row_bytes * rows;
-        std::vector<std::uint8_t> w(expert_bytes * experts);
-        for (auto& b : w) b = static_cast<std::uint8_t>(r.U() >> 24);
-        for (std::size_t o = 0; o < w.size(); o += 24) {
-          const std::uint16_t d = Half(r), m = Half(r);
-          std::memcpy(w.data() + o, &d, 2);
-          std::memcpy(w.data() + o + 2, &m, 2);
-        }
-        std::vector<float> hv(std::size_t{slots} * cols);
-        for (auto& v : hv) v = r.F(4.0f);
-        std::vector<std::uint32_t> ids(slots);
-        for (auto& e : ids) e = r.U() % experts;
-        Bufs b{dev, {}};
-        auto wb = b.Up(w), hb = b.Up(hv), ib = b.Up(ids);
-        std::vector<std::vector<float>> outs;
-        for (const char* k : {"halo_moe_down_q5_1_r4", "halo_moe_down_q5_1_r4p"}) {
-          auto pb = b.Zero(std::size_t{slots} * rows);
-          b.Run(k, {Blocks(rows, 32), slots},
-                {rt::Arg::Buf(wb), rt::Arg::Buf(ib), rt::Arg::Buf(hb), rt::Arg::Buf(pb),
-                 rt::Arg::Val<std::uint64_t>(expert_bytes), rt::Arg::Val(rows), rt::Arg::Val(cols),
-                 rt::Arg::Val<std::uint64_t>(row_bytes)});
-          outs.push_back(b.Down(pb, std::size_t{slots} * rows));
-        }
-        ExpectBitEqual(outs[0], outs[1], be + " q5_1 down r4p");
-      }
-      {
-        const std::uint32_t hc = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 4}));
-        const std::uint32_t h = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 3000}));
-        const std::uint32_t low = 32 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 16}));
-        const std::uint32_t parts = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 8}));
-        const std::uint32_t inject_rows = tc.draw(gs::booleans()) ? hc : 0;
-        const std::uint32_t qstride = low;
-        std::vector<std::int8_t> q;
-        std::vector<std::uint16_t> d;
-        RandomQ8r(r, hc * h, low, qstride, q, d);
-        std::vector<float> lo(std::size_t{parts} * low), ip(std::size_t{parts} * hc), xn(std::size_t{hc} * h);
-        for (auto& v : lo) v = r.F(8.0f);
-        for (auto& v : ip) v = r.F(8.0f);
-        for (auto& v : xn) v = r.F(4.0f);
-        Bufs b{dev, {}};
-        auto lb = b.Up(lo), ipb = b.Up(ip), qb = b.Up(q), db = b.Up(d), xb = b.Up(xn);
-        std::vector<std::vector<float>> outs;
-        for (const char* k : {"halo_hc_mix_b", "halo_hc_mix_b_p"}) {
-          auto inj = b.Zero(hc), mixed = b.Zero(h);
-          b.Run(k, {Blocks(h, 8)},
-                {rt::Arg::Buf(lb), rt::Arg::Val(parts), rt::Arg::Buf(ipb), rt::Arg::Buf(inj), rt::Arg::Val(inject_rows),
-                 rt::Arg::Buf(qb), rt::Arg::Buf(db), rt::Arg::Buf(xb), rt::Arg::Buf(mixed), rt::Arg::Val(hc),
-                 rt::Arg::Val(h), rt::Arg::Val(low), rt::Arg::Val(qstride)});
-          auto v = b.Down(mixed, h);
-          const auto iv = b.Down(inj, hc);
-          v.insert(v.end(), iv.begin(), iv.end());
-          outs.push_back(v);
-        }
-        ExpectBitEqual(outs[0], outs[1], be + " hc_mix_b_p");
-      }
-    }, {.test_cases = 40});
-  });
-}
 
 // halo_router_rowblock_q8act + halo_moe_gate_up_q4_k_dot_g == halo_matvec_f32_rowblock + halo_moe_gate_up_q4_k_dot.
 TEST(GpuDecode2, Q8ActOnceMatches) {
@@ -771,5 +527,31 @@ TEST(GpuDecode2, GdnStepNoSpillMatches) {
       }
       ExpectBitEqual(outs[0], outs[1], std::string(rt::BackendName(backend)) + " gdn step no-spill");
     }, {.test_cases = 30});
+  });
+}
+
+// halo_router_topk_w == halo_router_topk (ids and weights), logits on coarse grids so ties are common.
+TEST(GpuDecode2, TopkWarpMatches) {
+  ForEachDevice([](rt::Device& dev, rt::Backend backend) {
+    hegel::test([&](hegel::TestCase& tc) {
+      const std::uint32_t n = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 1024}));
+      const std::uint32_t k = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = std::min(16u, n)}));
+      const std::uint32_t levels = tc.draw(gs::sampled_from(std::vector<std::uint32_t>{1, 2, 7, 1000, 1u << 20}));
+      Rng r{tc.draw(gs::integers<std::uint32_t>())};
+      std::vector<float> lg(n);
+      for (auto& v : lg) v = 0.01f * static_cast<float>(r.U() % levels) - 3.0f;
+      Bufs b{dev, {}};
+      auto lb = b.Up(lg);
+      std::vector<std::vector<float>> outs;
+      for (const char* name : {"halo_router_topk", "halo_router_topk_w"}) {
+        auto ib = b.Zero(k), wb = b.Zero(k);
+        b.Run(name, {1}, {rt::Arg::Buf(lb), rt::Arg::Buf(ib), rt::Arg::Buf(wb), rt::Arg::Val(n), rt::Arg::Val(k)});
+        auto v = b.Down(ib, k);
+        const auto w = b.Down(wb, k);
+        v.insert(v.end(), w.begin(), w.end());
+        outs.push_back(v);
+      }
+      ExpectBitEqual(outs[0], outs[1], std::string(rt::BackendName(backend)) + " topk_w n " + std::to_string(n));
+    }, {.test_cases = 60});
   });
 }

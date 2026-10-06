@@ -187,16 +187,8 @@ bool FlashNextGpu::MatVec(const model::TensorRef& t, std::uint64_t expert, const
     // where 32-row blocks would leave the GPU idle); see halo_gemv_bench.
     // From halo_gemv_bench at DRAM working sets: 4 rows per wave is best
     // (LM head 242 GB/s); 2 for few rows (hc down, 320 rows).
-    const bool n = (decode_opt_ & kDecodeGemvLds) && cols <= 6144;
-    const bool pf = !n && (decode_opt_ & kDecodeGemvPrefetch);
-    const char* k = rows < 2048 ? (n ? "halo_gemv_q8r_r2n" : pf ? "halo_gemv_q8r_r2p" : "halo_gemv_q8r_r2")
-                                : (n ? "halo_gemv_q8r_r4n" : pf ? "halo_gemv_q8r_r4p" : "halo_gemv_q8r_r4");
-    std::uint32_t per_block = rows < 2048 ? 16 : 32;
-    if (!n && !pf && rows >= 2048 && rows <= 4096 && cols > 4096 && (decode_opt_ & (kDecodeWideR2 | kDecodeWideR1))) {
-      const bool one = decode_opt_ & kDecodeWideR1;
-      k = one ? "halo_gemv_q8r_r1" : "halo_gemv_q8r_r2";
-      per_block = one ? 8 : 16;
-    }
+    const char* k = rows < 2048 ? "halo_gemv_q8r_r2" : "halo_gemv_q8r_r4";
+    const std::uint32_t per_block = rows < 2048 ? 16 : 32;
     if (!Launch(k, {Blocks(rows, per_block)}, {256},
                 {rt::Arg::Buf(d.qs, e * rows * d.qstride), rt::Arg::Buf(d.d, e * rows * (cols / 32) * 2),
                  rt::Arg::Buf(x, x_off), rt::Arg::Buf(y, y_off), rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride)},
@@ -424,7 +416,7 @@ bool FlashNextGpu::GroupedNorm(const rt::Buffer& x, const model::TensorRef& w, c
                 error);
 }
 
-bool FlashNextGpu::HcMix(const model::HcMixer& m, bool inject, std::string* error, bool scales_ready) {
+bool FlashNextGpu::HcMix(const model::HcMixer& m, bool inject, std::string* error) {
   const auto& c = w_.config;
   // P3 fused path: two launches when both projections are repacked Q8_0.
   const auto& dn = tensors_.at(m.down.data);
@@ -437,8 +429,7 @@ bool FlashNextGpu::HcMix(const model::HcMixer& m, bool inject, std::string* erro
     // down projection fills the GPU.
     const std::uint32_t chunk = (c.HcDim() / kHcParts + 511) / 512 * 512;
     const std::uint32_t parts = (c.HcDim() + chunk - 1) / chunk;
-    return (scales_ready ||
-            Launch((decode_opt_ & kDecodeHoistSmall) && c.hidden_size <= 4096 ? "halo_hc_norm_scales_u"
+    return (Launch((decode_opt_ & kDecodeHoistSmall) && c.hidden_size <= 4096 ? "halo_hc_norm_scales_u"
                                                                                : "halo_hc_norm_scales",
                    {c.hc_count}, {256},
                    {rt::Arg::Buf(res_), rt::Arg::Buf(hc_scale_), rt::Arg::Val(c.hidden_size), rt::Arg::Val(c.rms_eps)},
@@ -454,7 +445,6 @@ bool FlashNextGpu::HcMix(const model::HcMixer& m, bool inject, std::string* erro
                    rt::Arg::Val(dn.qstride), rt::Arg::Val(chunk)},
                   error) &&
            Launch((decode_opt_ & kDecodeHoistSmall) && c.hc_low_rank <= 512 && parts <= 16 ? "halo_hc_mix_b_u"
-                  : (decode_opt_ & kDecodeWeightsFirst) && c.hc_low_rank <= 512                ? "halo_hc_mix_b_p"
                                                                                                : "halo_hc_mix_b",
                   {Blocks(c.hidden_size, 8)}, {256},
                   {rt::Arg::Buf(hc_lo_part_), rt::Arg::Val(parts), rt::Arg::Buf(hc_inject_part_), rt::Arg::Buf(inject_),
@@ -521,20 +511,7 @@ bool FlashNextGpu::Linear(const model::LayerWeights& l, LinearState& s, std::str
                   error) &&
            MatVec(l.ssm_out, 0, gdn_out_, block_out_, error);
     };
-    if (decode_opt_ & kDecodeDualAb) {
-      const std::uint32_t b12 = b1 + Blocks(rz, 32);
-      return Launch(decode_opt_ & kDecodeGemvPrefetch ? "halo_gemv_q8r_dual_abp" : "halo_gemv_q8r_dual_ab",
-                    {b12 + 2 * c.ssm_num_v_heads}, {256},
-                    {rt::Arg::Buf(tq.qs), rt::Arg::Buf(tq.d), rt::Arg::Buf(qkv_), rt::Arg::Val(rq),
-                     rt::Arg::Val(tq.qstride), rt::Arg::Buf(tz.qs), rt::Arg::Buf(tz.d), rt::Arg::Buf(z_),
-                     rt::Arg::Val(rz), rt::Arg::Val(tz.qstride), rt::Arg::Buf(mixed_), rt::Arg::Val(H), rt::Arg::Val(b1),
-                     rt::Arg::Val(b12), rt::Arg::Buf(tensors_.at(l.ssm_alpha.data).buf),
-                     rt::Arg::Buf(tensors_.at(l.ssm_beta.data).buf), rt::Arg::Buf(alpha_), rt::Arg::Buf(beta_),
-                     rt::Arg::Val(c.ssm_num_v_heads)},
-                    error) &&
-             tail();
-    }
-    return Launch((decode_opt_ & kDecodeDualLds) && H <= 4096 ? "halo_gemv_q8r_dual_n" : "halo_gemv_q8r_dual",
+    return Launch("halo_gemv_q8r_dual",
                   {b1 + Blocks(rz, 32)}, {256},
                   {rt::Arg::Buf(tq.qs), rt::Arg::Buf(tq.d), rt::Arg::Buf(qkv_), rt::Arg::Val(rq), rt::Arg::Val(tq.qstride),
                    rt::Arg::Buf(tz.qs), rt::Arg::Buf(tz.d), rt::Arg::Buf(z_), rt::Arg::Val(rz), rt::Arg::Val(tz.qstride),
@@ -692,7 +669,9 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
   };
   // Routing on device: softmax, top-k (ties keep the lower expert), renormalize.
   if (!router() ||
-      !Launch("halo_router_topk", {1}, {kBlock},
+      !Launch((decode_opt_ & kDecodeTopkWarp) && c.num_experts <= 1024 && c.num_experts_used <= 16 ? "halo_router_topk_w"
+                                                                                                 : "halo_router_topk",
+              {1}, {kBlock},
               {rt::Arg::Buf(router_), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(expert_weights_),
                rt::Arg::Val(c.num_experts), rt::Arg::Val(c.num_experts_used)},
               error))
@@ -725,8 +704,6 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
     // float s2 with precomputed x sums; both for inputs <= 4096.
     const bool s2 = H <= 4096;
     const char* gu = !s2 ? "halo_moe_gate_up_q4_k" : int8_act_moe_ ? "halo_moe_gate_up_q4_k_dot" : "halo_moe_gate_up_q4_k_s2";
-    if (s2 && int8_act_moe_ && (decode_opt_ & kDecodeGateUpPrefetch))
-      gu = 4 * (H / 64) <= 5 * 32 ? "halo_moe_gate_up_q4_k_dot_p5" : "halo_moe_gate_up_q4_k_dot_p8";
     if (act_once) gu = "halo_moe_gate_up_q4_k_dot_g";
     if (!Launch(gu, {Blocks(ff, s2 ? 16 : 8), used}, {256},
                 {rt::Arg::Buf(tensors_.at(gate.data).buf), rt::Arg::Buf(tensors_.at(up.data).buf),
@@ -736,9 +713,7 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
                 error))
       return false;
     const bool down_ok =
-        down_q5_1 ? Launch(ff <= 2048 ? ((decode_opt_ & kDecodeWeightsFirst) && ff <= 768 ? "halo_moe_down_q5_1_r4p"
-                                                                                          : "halo_moe_down_q5_1_r4")
-                                      : "halo_moe_down_q5_1",
+        down_q5_1 ? Launch(ff <= 2048 ? "halo_moe_down_q5_1_r4" : "halo_moe_down_q5_1",
                            {Blocks(H, ff <= 2048 ? 32 : 8), used}, {256},
                            {rt::Arg::Buf(dd.buf), rt::Arg::Buf(expert_ids_), rt::Arg::Buf(moe_h_), rt::Arg::Buf(moe_part_),
                             rt::Arg::Val<std::uint64_t>(down.RowBytes() * down.rows), rt::Arg::Val(H), rt::Arg::Val(ff),
@@ -788,9 +763,7 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
   // P3 fused shared expert: two launches when its projections are repacked Q8.
   if (shexp_fast) {
     const auto sff = c.shared_expert_ff;
-    const bool pf = decode_opt_ & kDecodeGemvPrefetch;
-    const char* sgu = pf                                                     ? "halo_shexp_gate_up_p"
-                      : (decode_opt_ & kDecodeHoistRowLoads) && H <= 4096 ? "halo_shexp_gate_up_u"
+    const char* sgu = (decode_opt_ & kDecodeHoistRowLoads) && H <= 4096 ? "halo_shexp_gate_up_u"
                                                                            : "halo_shexp_gate_up";
     if (defer_combine)
       return Launch(sgu, {Blocks(sff, 16)}, {256},
@@ -798,8 +771,7 @@ bool FlashNextGpu::Moe(const model::LayerWeights& l, std::string* error) {
                      rt::Arg::Buf(tensors_.at(l.shexp_gate_inp.data).buf), rt::Arg::Buf(mixed_), rt::Arg::Buf(eg_),
                      rt::Arg::Buf(sgate_), rt::Arg::Val(sff), rt::Arg::Val(H), rt::Arg::Val(sg.qstride)},
                     error) &&
-             Launch(pf                                                                      ? "halo_shexp_down_combine_p"
-                    : (decode_opt_ & kDecodeHoistSmall) && c.num_experts_used <= 32 ? "halo_shexp_down_combine_u"
+             Launch((decode_opt_ & kDecodeHoistSmall) && c.num_experts_used <= 32 ? "halo_shexp_down_combine_u"
                                                                                     : "halo_shexp_down_combine",
                     {Blocks(H, 32)}, {256},
                     {rt::Arg::Buf(sd.qs), rt::Arg::Buf(sd.d), rt::Arg::Buf(eg_), rt::Arg::Buf(sgate_),
@@ -837,35 +809,19 @@ bool FlashNextGpu::Record(Head head, std::string* error, int part) {
     return false;
   const std::uint32_t split = c.ple_layer > 0 ? static_cast<std::uint32_t>(c.ple_layer) : 0;
   const std::uint32_t l_begin = part == 2 ? split : 0, l_end = part == 1 ? split : c.num_layers;
-  // D2: when a mixer follows the combine directly, the combine also writes the mixer's stream scales.
-  bool ready = false;
-  const auto combine = [&](bool mixer_next) {
-    ready = mixer_next && (decode_opt_ & kDecodeCombineScales) && fused_hc_;
-    if (ready)
-      return Launch("halo_hc_combine_scales", {c.hc_count}, {256},
-                    {rt::Arg::Buf(res_), rt::Arg::Buf(block_out_), rt::Arg::Buf(inject_), rt::Arg::Buf(hc_scale_),
-                     rt::Arg::Val(c.hc_count), rt::Arg::Val(c.hidden_size), rt::Arg::Val(c.rms_eps)},
-                    error);
+  const auto combine = [&]() {
     return Launch("halo_hc_combine", {Blocks(c.HcDim())}, {kBlock},
                   {rt::Arg::Buf(res_), rt::Arg::Buf(block_out_), rt::Arg::Buf(inject_), rt::Arg::Val(c.hc_count),
                    rt::Arg::Val(c.hidden_size)},
                   error);
   };
-  const auto mix = [&](const model::HcMixer& m, bool inject) {
-    const bool r = ready;
-    ready = false;
-    return HcMix(m, inject, error, r);
-  };
+  const auto mix = [&](const model::HcMixer& m, bool inject) { return HcMix(m, inject, error); };
   for (std::uint32_t il = l_begin; il < l_end; ++il) {
     const auto& l = w_.layers[il];
-    if (c.IsPleLayer(il)) {
-      ready = false;  // the PLE block rewrites the residual
-      if (!Ple(l, error)) return false;
-    }
+    if (c.IsPleLayer(il) && !Ple(l, error)) return false;
     if (!mix(l.hc_attn, true)) return false;
     if (l.linear ? !Linear(l, linear_[il], error) : !Attention(l, attn_[il], error)) return false;
-    const bool next_mixer = il + 1 < c.num_layers ? !c.IsPleLayer(il + 1) : head != Head::kNone;
-    if (!combine(true) || !mix(l.hc_ffn, true) || !Moe(l, error) || !combine(next_mixer)) return false;
+    if (!combine() || !mix(l.hc_ffn, true) || !Moe(l, error) || !combine()) return false;
   }
   if (head == Head::kNone || part == 1) return true;
   if (!mix(w_.hc_head, false) || !MatVec(w_.output, 0, mixed_, logits_, error)) return false;

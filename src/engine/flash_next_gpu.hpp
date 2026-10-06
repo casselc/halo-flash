@@ -64,31 +64,24 @@ class FlashNextGpu {
   static inline bool fused_moe_ = true;   ///< P3 routed experts in three launches
   /// Decode attention with batched loads (halo_attention_select_b; bit-identical to halo_attention_select).
   static inline bool decode_attn_batched_ = true;
-  /// Stream D2 decode fusions, one bit each (all bit-identical to the launches they replace; 0 is main's decode):
-  /// kDecodeQ5kExperts, kDecodeIndexerDual, ... (see DecodeOpt).
+  /// Stream D2 decode options, one bit each, every one bit-identical to the launches it replaces (0 is main's
+  /// decode; docs/ROOFLINE.md section 10 has the measured bits that were not kept and their numbers).
   enum DecodeOpt : unsigned {
-    kDecodeQ5kExperts = 1u,   ///< the Q5_K layer's experts in 3 launches (halo_moe_gate_up_q5_k_rows)
-    kDecodeIndexerDual = 2u,  ///< QSA indexer q + k projections in one launch (halo_matvec_bf16_dual)
-    kDecodeGemvLds = 4u,      ///< Q8 GEMVs with cols <= 6144 stage x in 24 KB of LDS (r2n / r4n)
-    kDecodeHcMixLds = 8u,     ///< hc_mix_a stages only its column chunk (halo_hc_mix_a_c)
-    kDecodeDualLds = 16u,     ///< DeltaNet qkv + z GEMV stages x in 16 KB (halo_gemv_q8r_dual_n)
-    kDecodeGateUpPrefetch = 32u,  ///< routed gate/up loads weights before quantizing x (halo_moe_gate_up_q4_k_dot_p*)
+    kDecodeQ5kExperts = 1u,       ///< the Q5_K layer's experts in 3 launches (halo_moe_gate_up_q5_k_rows)
+    kDecodeIndexerDual = 2u,      ///< QSA indexer q + k projections in one launch (halo_matvec_bf16_dual)
+    kDecodeHcMixLds = 8u,         ///< hc_mix_a stages only its column chunk (halo_hc_mix_a_c)
     kDecodeQsaScores = 64u,       ///< QSA block scores with q in LDS and the heads' chains side by side
-    kDecodeCombineScales = 128u,  ///< residual combine + the next mixer's stream scales in one launch
     kDecodeShexpCombine = 256u,   ///< routed combine folded into the shared expert's down launch
-    kDecodeDualAb = 512u,         ///< DeltaNet alpha/beta rows in the qkv + z GEMV launch
-    kDecodeGemvPrefetch = 1024u,  ///< Q8 GEMVs keep the next column chunk's loads in flight
     kDecodeSplitGraph = 2048u,    ///< graph split before the PLE layer: the n-gram read overlaps the layers before it
-    kDecodeWeightsFirst = 4096u,  ///< hc_mix_b and the Q5_1 expert down issue weight loads before their prologue
-    kDecodeWideR2 = 8192u,        ///< Q8 GEMVs with cols > 4096 and rows <= 4096: 2 rows a wave (r2)
-    kDecodeWideR1 = 16384u,       ///< ... 1 row a wave (r1)
     kDecodeQ8ActOnce = 32768u,    ///< routed gate/up activations quantized once, in the router launch
     kDecodeHoistRowLoads = 65536u,  ///< block-per-row F32 dots (router, alpha/beta, shexp gate) issue all loads first
     kDecodeHoistSmall = 131072u,    ///< norm scales, combines, the mixers' prologues: loop loads issued first
     kDecodeGdnNoSpill = 262144u,    ///< DeltaNet step reads its state column twice instead of spilling it
+    kDecodeTopkWarp = 524288u,      ///< router top-k by warp shuffles (halo_router_topk_w)
   };
-  // Bits 4, 16, 32 and 1024 measured slower, 128 and 512 no gain (not kept).
-  static inline unsigned decode_opt_ = 1u | 2u | 8u | 64u | 256u | 2048u;  // bits 4 and 16 measured slower (not kept)
+  static inline unsigned decode_opt_ = kDecodeQ5kExperts | kDecodeIndexerDual | kDecodeHcMixLds | kDecodeQsaScores |
+                                       kDecodeShexpCombine | kDecodeSplitGraph | kDecodeQ8ActOnce | kDecodeHoistRowLoads |
+                                       kDecodeHoistSmall | kDecodeGdnNoSpill | kDecodeTopkWarp;
   static inline bool small_row_kernels_ = true;  ///< P3 block-per-row F32 matvec for few rows
   /// P3 expert gate+up with int8 activations (llama.cpp-style Q8_1); false
   /// keeps the float kernel. A quality-gated choice (docs/BENCHMARKS.md).
@@ -314,7 +307,7 @@ class FlashNextGpu {
   bool MatVec(const model::TensorRef& t, std::uint64_t expert, const rt::Buffer& x, const rt::Buffer& y,
               std::string* error, std::size_t x_off = 0, std::size_t y_off = 0);
   bool GroupedNorm(const rt::Buffer& x, const model::TensorRef& w, const rt::Buffer& y, std::string* error);
-  bool HcMix(const model::HcMixer& m, bool inject, std::string* error, bool scales_ready = false);
+  bool HcMix(const model::HcMixer& m, bool inject, std::string* error);
   bool Ple(const model::LayerWeights& l, std::string* error);
   /// Emits one whole step (everything after the host upload) as device
   /// work; run eagerly or captured into a graph.
