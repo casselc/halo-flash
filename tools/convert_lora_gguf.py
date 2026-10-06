@@ -47,8 +47,13 @@ def main():
         raise SystemExit("rsLoRA/DoRA adapters are not supported")
     rank, alpha = int(cfg["r"]), float(cfg["lora_alpha"])
 
-    arch = json.load(open(base_dir / "config.json"))["architectures"][0]
+    hf_config = json.load(open(base_dir / "config.json"))
+    arch = hf_config["architectures"][0]
     cls, gguf_arch = CLASSES[arch]
+    # A base without MTP layers (e.g. the tiny test models) converts like
+    # convert_hf_to_gguf.py --no-mtp; adapters never touch MTP tensors.
+    if not hf_config.get("text_config", hf_config).get("mtp_num_hidden_layers") and getattr(cls, "supports_mtp_export", False):
+        cls.no_mtp = True
     model = cls(base_dir, gguf.LlamaFileType.ALL_F32, out, eager=True, dry_run=True)
     types = model.hparams.get("layer_types") or []
     model.hparams["layer_types"] = ["full_attention" if t == "indexed_attention" else t for t in types]

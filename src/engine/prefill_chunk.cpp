@@ -13,7 +13,9 @@
 //   expert routing and (for now) the routed experts.
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,10 +48,34 @@ std::string Rk(const char* base, int res16) {
 int Res16() { return FlashNextGpu::prefill_exact_projections_ ? 0 : FlashNextGpu::prefill_res16_; }
 }  // namespace
 
-bool FlashNextGpu::AllocChunk(std::string* error) {
-  if (ck_ready_) return true;
+void FlashNextGpu::FreeChunk() {
+  auto& k = ck_;
+  std::vector<rt::Buffer*> bufs = {&k.res, &k.xn, &k.lo, &k.gate, &k.mixed, &k.inject, &k.block_out, &k.embd, &k.xq,
+                                   &k.xd, &k.host, &k.qkv, &k.conv, &k.z, &k.alpha, &k.beta, &k.gdn, &k.qg, &k.q,
+                                   &k.gate_a, &k.k, &k.v, &k.ctx, &k.iq, &k.ik, &k.router, &k.ids, &k.wts, &k.eg,
+                                   &k.eu, &k.ed, &k.sgate, &k.sorted, &k.pos, &k.tiles, &k.ntiles, &k.hp, &k.yp,
+                                   &k.x16, &k.bcounts, &k.bbase, &k.pa, &k.pb, &k.ipart, &k.rscale, &k.xh, &k.mh,
+                                   &k.lh, &k.ml, &k.bscores, &k.vis, &k.ascores, &k.ublk, &k.umask, &k.ucount,
+                                   &k.gdnprep};
+  for (rt::Buffer* b : bufs) {
+    if (!*b) continue;
+    std::erase_if(owned_, [&](const rt::Buffer& o) { return o.device == b->device; });
+    dev_.Free(*b);
+  }
+  ck_ = ChunkBuffers{};
+  ck_ready_ = false;
+}
+
+bool FlashNextGpu::AllocChunk(std::uint32_t tokens, std::string* error) {
+  const std::uint32_t want = std::max<std::uint32_t>(1, std::min(tokens, max_context_));
+  if (ck_ready_ && ck_.cap >= want) return true;
+  if (ck_ready_) {
+    // Growing (a long prompt after short ones): the buffers hold no state between Prefill calls.
+    if (!dev_.Synchronize(error)) return false;
+    FreeChunk();
+  }
   const auto& c = w_.config;
-  const std::size_t T = std::max<std::uint32_t>(1, std::min(prefill_chunk_, max_context_)), H = c.hidden_size,
+  const std::size_t T = want, H = c.hidden_size,
                     D = c.HcDim();
   const std::size_t qdim = c.AttentionQDim(), kvdim = c.AttentionKvDim(), vd = c.SsmValueDim();
   const std::size_t max_cols = std::max({D, H, qdim, vd, std::size_t{c.shared_expert_ff}, std::size_t{c.hc_low_rank}});
@@ -1178,7 +1204,7 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
       if (error) *error = "token out of range";
       return false;
     }
-  if (!AllocChunk(error) || !EnsureKv(position_ + T, error)) return false;
+  if (!AllocChunk(prefill_chunk_, error) || !EnsureKv(position_ + T, error)) return false;
   // HALO_PREFILL_TIMING: host preparation, upload and device time per chunk.
   static const bool timing = std::getenv("HALO_PREFILL_TIMING") != nullptr;
   const auto t_start = std::chrono::steady_clock::now();
@@ -1222,6 +1248,8 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
     const std::uint32_t pos = position_ + t, n_kv = pos + 1, complete = n_kv / ratio;
     std::uint32_t params[kHaloStepParamCount] = {};
     params[kHaloToken] = static_cast<std::uint32_t>(tokens[t]);
+    if (prefill_test_perturb_ == 1 && t + 1 == T && logits.empty())  // a chunk boundary inside the prompt
+      params[kHaloToken] = (params[kHaloToken] + 1) % c.vocab_size;
     params[kHaloPosition] = pos;
     params[kHaloNkv] = n_kv;
     params[kHaloComplete] = complete;
@@ -1246,6 +1274,19 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
                              rt::Arg::Buf(ck_.host, ck_.params_offset), rt::Arg::Val(H),
                              rt::Arg::Val<std::uint64_t>(w_.token_embd.RowBytes())};
     if (!dev_.Launch(emb.embed_rows, {Blocks(H), T}, {kBlock}, eargs, error)) return false;
+  }
+  if (prefill_test_perturb_ == 2) {  // test only: every row's embedding moved by a few ulps (host round trip)
+    std::vector<float> e(std::size_t{T} * H);
+    if (!dev_.Synchronize(error) || !dev_.Download(ck_.embd, 0, e.data(), e.size() * sizeof(float), error)) return false;
+    // Up or down by element (a hashed sign), so the change is not a uniform scale that the first norm removes.
+    for (std::size_t i = 0; i < e.size(); ++i) {
+      if (e[i] == 0 || !std::isfinite(e[i])) continue;
+      const bool away = ((i % H) * 2654435761u >> 13) & 1;  // away from zero, or toward it (not past it)
+      const auto bits = std::bit_cast<std::uint32_t>(e[i]);
+      const std::uint32_t k = std::min<std::uint32_t>(prefill_test_ulps_, bits & 0x7fffffffu);
+      e[i] = std::bit_cast<float>(away ? bits + k : bits - k);
+    }
+    if (!dev_.Upload(ck_.embd, 0, e.data(), e.size() * sizeof(float), error)) return false;
   }
   if (timing_) Stamp("token embedding (per token)");
   if (!Launch(Rk("halo_broadcast_rows", Res16()).c_str(), {Blocks(std::size_t{T} * D)}, {kBlock},

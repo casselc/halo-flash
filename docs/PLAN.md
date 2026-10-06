@@ -519,6 +519,18 @@ Engine requirements:
 - **Small-model path.** The same trainer works on Qwen3.5 (dense, so cheaper);
   it is the recommended first target for narrow tasks.
 
+**P10/P11 stage 1 status (2026-10-06).** docs/TRAINING.md. Variant
+manifests (base hash, part hashes, provenance, eval summary) with load-time
+refusal, a registry and C ABI (`include/halo_variant.h`), several LoRA
+variants resident on the Qwen3.5 GPU engine and selected per request
+(`variant` / `base:variant` on the OpenAI routes and `/v1/systemone`),
+merged = unmerged tested. `halo_train` trains last-k LoRA and classifier
+heads on Qwen3.5 with the frozen trunk on the GPU and the tail on the CPU
+(gradient-checked against PyTorch, 4.0e-5 worst), resumable bit for bit
+after kills; on Qwen3.5-2B a 2-layer LoRA took a held-out letter-coded
+sentiment task from chance (0.507) to 1.000. Flash-Next variants and
+full-depth backward are stage 2.
+
 **P12: embedded LLM observability and evaluation ("halo-scope"; user, 2026-10-03).**
 
 Goal: the engine records its own LLM telemetry directly into embedded

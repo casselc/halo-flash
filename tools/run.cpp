@@ -206,6 +206,7 @@ int main(int argc, char** argv) {
     else if (a == "--gemm-slice") engine::FlashNextGpu::prefill_gemm_slice_ = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--dense-prefix") engine::FlashNextGpu::prefill_dense_prefix_ = std::string(argv[i + 1]) != "0";
     else if (a == "--prefill-chunk") engine::FlashNextGpu::prefill_chunk_ = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--prefill-long-chunk") engine::FlashNextGpu::prefill_long_chunk_ = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--router-bf16x3") engine::FlashNextGpu::prefill_router_bf16x3_ = std::string(argv[i + 1]) == "1";
     else if (a == "--prompt-file") prompt_file = argv[i + 1];
     else if (a == "--prefill-prompt") prefill_prompt = std::string(argv[i + 1]) == "1";

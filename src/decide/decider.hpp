@@ -6,6 +6,7 @@
 // systemone.hpp. This is the CPU reference path (correctness first); the GPU
 // path will reuse the same request/answer plumbing.
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -15,6 +16,7 @@
 #include "decide/systemone.hpp"
 #include "model/lora.hpp"
 #include "model/qwen35.hpp"
+#include "model/variant.hpp"
 #include "text/tokenizer.hpp"
 #if HALO_WITH_HIP
 #include "engine/qwen35_gpu.hpp"
@@ -40,9 +42,29 @@ struct PointerHead {
                                           const std::vector<std::vector<float>>& options) const;
 };
 
+/// A pointer head and its inference settings, as a head GGUF carries them
+/// (tools/convert_decider_head.py).
+struct Readout {
+  PointerHead head;
+  float temperature = 1.0F;
+  std::vector<std::pair<Kind, float>> temperature_by_kind;
+  double ordinal_smoothing = 0.0;
+  [[nodiscard]] float Temperature(Kind kind) const;
+  [[nodiscard]] static std::optional<Readout> FromGguf(const core::GgufReader& head, std::uint32_t hidden,
+                                                       std::string* error);
+};
+
 class StrandsDecider {
  public:
   [[nodiscard]] static std::unique_ptr<StrandsDecider> Open(const DeciderFiles& files, std::string* error);
+
+  /// P10: adds a variant of the torso's base model, selected per request by
+  /// Request::variant. Its LoRA part (if any) replaces the decider's own
+  /// LoRA; its pointer_head part (required) replaces the readout. Fails for
+  /// a variant without a pointer head or a name already added.
+  [[nodiscard]] bool AddVariant(std::shared_ptr<const model::LoadedVariant> variant, std::string* error);
+  [[nodiscard]] std::vector<std::string> Variants() const;
+  [[nodiscard]] const core::GgufReader& torso_file() const { return *torso_file_; }
 
   /// Answers a /v1/systemone request. Returns the response body, or nullopt
   /// with `error` set (e.g. images on this text-only engine, or an option list
@@ -53,17 +75,17 @@ class StrandsDecider {
 
  private:
   StrandsDecider() = default;
-  [[nodiscard]] float Temperature(Kind kind) const;
-
   std::unique_ptr<core::GgufReader> torso_file_, lora_file_, head_file_, tok_file_;
   std::optional<model::Qwen35Weights> torso_;
   std::optional<model::LoraAdapter> lora_;
   std::unique_ptr<text::Tokenizer> tokenizer_;
-  PointerHead head_;
-  float temperature_ = 1.0F;
-  std::vector<std::pair<Kind, float>> temperature_by_kind_;
-  double ordinal_smoothing_ = 0.0;
+  Readout readout_;
   FitOptions fit_;
+  struct Variant {
+    std::shared_ptr<const model::LoadedVariant> v;
+    Readout readout;
+  };
+  std::map<std::string, Variant, std::less<>> variants_;
 #if HALO_WITH_HIP
   std::unique_ptr<rt::Device> dev_;
   std::unique_ptr<engine::Qwen35Gpu> gpu_;

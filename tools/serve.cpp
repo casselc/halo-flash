@@ -17,6 +17,13 @@
 // files, as the decider tests expect).
 // Endpoints: GET /health, /metrics (Prometheus, vLLM names), /v1/models, /v1/responses/{id};
 //            POST /v1/completions, /v1/chat/completions, /v1/responses.
+// P10 variants: --qwen35-model GGUF --qwen35-tokenizer GGUF serves the OpenAI
+// routes from a Qwen3.5 dense model instead of Flash-Next (no --model);
+// --variant MANIFEST (repeatable) loads a variant of the Qwen3.5 base (the
+// --qwen35-model, else the decider torso): its LoRA becomes selectable on
+// the OpenAI routes ("variant" or model "<id>:<name>") and, with a
+// pointer_head part, on /v1/systemone. A variant built for another base is
+// refused at startup.
 
 #include <csignal>
 #include <filesystem>
@@ -28,6 +35,9 @@
 
 #include "core/gguf.hpp"
 #include "decide/decider.hpp"
+#include "engine/qwen35_gpu.hpp"
+#include "model/qwen35.hpp"
+#include "model/variant.hpp"
 #include "engine/flash_next_gpu.hpp"
 #include "model/ngram.hpp"
 #include "model/weights.hpp"
@@ -36,6 +46,7 @@
 #include "server/http.hpp"
 #include "server/metrics.hpp"
 #include "server/openai_service.hpp"
+#include "server/qwen35_generator.hpp"
 #include "server/systemone_service.hpp"
 #include "text/tokenizer.hpp"
 #if HALO_WITH_SCOPE
@@ -64,6 +75,7 @@ class StrandsEngine : public server::DecisionEngine {
   std::optional<json::Value> Evaluate(const decide::Request& r, std::string* error) override {
     return d_->Evaluate(r, error);
   }
+  decide::StrandsDecider& decider() { return *d_; }
 
  private:
   std::unique_ptr<decide::StrandsDecider> d_;
@@ -73,7 +85,8 @@ class StrandsEngine : public server::DecisionEngine {
 int main(int argc, char** argv) {
   std::string model, device = "hip", host = "127.0.0.1", api_key, model_id = "qwen3.8-flash-next", decider_dir,
                     decider_device = "hip", scope_dir, scope_project = "halo-flash", scope_capture = "digest",
-                    scope_wal, scope_eval_endpoint;
+                    scope_wal, scope_eval_endpoint, qwen35_model, qwen35_tokenizer;
+  std::vector<std::string> variant_paths;
   int port = 8080;
   std::uint32_t moe_topk = 0;  // --moe-topk N: experts per token (0: the file's count; CODESIGN arm B)
   double ngram_cache_gb = 4.0;  // cache of n-gram rows read from disk, GiB (0: off)
@@ -96,30 +109,62 @@ int main(int argc, char** argv) {
     else if (a == "--scope-capture") scope_capture = v;
     else if (a == "--scope-wal") scope_wal = v;
     else if (a == "--scope-eval-endpoint") scope_eval_endpoint = v;
+    else if (a == "--variant") variant_paths.push_back(v);
+    else if (a == "--qwen35-model") qwen35_model = v;
+    else if (a == "--qwen35-tokenizer") qwen35_tokenizer = v;
     else return std::fprintf(stderr, "unknown option %s\n", a.c_str()), 2;
   }
-  if (model.empty()) return std::fprintf(stderr, "usage: halo_serve --model <gguf> [options]\n"), 2;
+  if (model.empty() == qwen35_model.empty())
+    return std::fprintf(stderr, "usage: halo_serve --model <gguf> | --qwen35-model <gguf> --qwen35-tokenizer <gguf> [options]\n"), 2;
   std::string error;
-  auto reader = core::GgufReader::OpenFile(model, &error);
-  if (!reader) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
-  auto weights = model::ModelWeights::Bind(*reader, &error);
-  auto tok = text::Tokenizer::FromGguf(*reader, &error);
-  if (!weights || !tok) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
-  if (moe_topk && !weights->SetExpertsUsed(moe_topk, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 2;
-  const auto& t = weights->ple_table;
-  auto ngram = model::NgramTable::Open(reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset, t.rows,
-                                       weights->config.ple_head_dim, t.type, &error,
-                                       static_cast<std::size_t>(ngram_cache_gb * (1ull << 30)));
-  if (!ngram) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
-  auto dev = rt::Device::Create(device == "hrx" ? rt::Backend::kHrx : rt::Backend::kHip, &error);
-  if (!dev) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
-  std::vector<rt::FileSource> sources;
-  for (const auto& r : reader->GetMappedRegions()) sources.push_back({r.data, r.size, r.file_descriptor});
-  std::fprintf(stderr, "loading weights...\n");
-  auto engine = engine::FlashNextGpu::Create(*dev, *weights, ngram.get(), nullptr, max_context, &error, sources);
-  if (!engine) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+  std::unique_ptr<server::TextGenerator> generator;
+  // Flash-Next (--model) or a Qwen3.5 dense model with variants (--qwen35-model).
+  std::unique_ptr<core::GgufReader> reader, q35_reader, q35_tok_reader;
+  std::optional<model::ModelWeights> weights;
+  std::optional<model::Qwen35Weights> q35_weights;
+  std::unique_ptr<text::Tokenizer> tok;
+  std::unique_ptr<model::NgramTable> ngram;
+  std::unique_ptr<rt::Device> dev;
+  std::unique_ptr<engine::FlashNextGpu> engine;
+  std::unique_ptr<engine::Qwen35Gpu> q35_engine;
+  server::Qwen35Generator* q35_generator = nullptr;
+  if (!model.empty()) {
+    reader = core::GgufReader::OpenFile(model, &error);
+    if (!reader) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    weights = model::ModelWeights::Bind(*reader, &error);
+    tok = text::Tokenizer::FromGguf(*reader, &error);
+    if (!weights || !tok) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    if (moe_topk && !weights->SetExpertsUsed(moe_topk, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 2;
+    const auto& t = weights->ple_table;
+    ngram = model::NgramTable::Open(reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset, t.rows,
+                                    weights->config.ple_head_dim, t.type, &error,
+                                    static_cast<std::size_t>(ngram_cache_gb * (1ull << 30)));
+    if (!ngram) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    dev = rt::Device::Create(device == "hrx" ? rt::Backend::kHrx : rt::Backend::kHip, &error);
+    if (!dev) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    std::vector<rt::FileSource> sources;
+    for (const auto& r : reader->GetMappedRegions()) sources.push_back({r.data, r.size, r.file_descriptor});
+    std::fprintf(stderr, "loading weights...\n");
+    engine = engine::FlashNextGpu::Create(*dev, *weights, ngram.get(), nullptr, max_context, &error, sources);
+    if (!engine) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    generator = std::make_unique<server::FlashNextGenerator>(*engine, *tok, max_context);
+  } else {
+    q35_reader = core::GgufReader::OpenFile(qwen35_model, &error);
+    if (!q35_reader) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    q35_weights = model::Qwen35Weights::Bind(*q35_reader, &error);
+    q35_tok_reader = core::GgufReader::OpenFile(qwen35_tokenizer.empty() ? qwen35_model : qwen35_tokenizer, &error);
+    if (!q35_weights || !q35_tok_reader) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    tok = text::Tokenizer::FromGguf(*q35_tok_reader, &error);
+    if (!tok) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    dev = rt::Device::Create(device == "hrx" ? rt::Backend::kHrx : rt::Backend::kHip, &error);
+    if (!dev) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    q35_engine = engine::Qwen35Gpu::Create(*dev, *q35_weights, nullptr, max_context, &error);
+    if (!q35_engine) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    auto g = std::make_unique<server::Qwen35Generator>(*q35_engine, *tok, max_context);
+    q35_generator = g.get();
+    generator = std::move(g);
+  }
 
-  server::FlashNextGenerator generator(*engine, *tok, max_context);
   server::ServiceOptions so;
   so.model_id = model_id;
   server::Metrics metrics(model_id);
@@ -166,7 +211,25 @@ int main(int argc, char** argv) {
 #else
   if (!scope_dir.empty()) return std::fprintf(stderr, "--scope-dir needs a build with HALO_SCOPE=ON\n"), 2;
 #endif
-  server::OpenAiService service(generator, so);
+  if (!qwen35_model.empty()) so.template_kind = text::ChatTemplateKind::kQwen35;
+  // Variants of the Qwen3.5 text model, loaded before the routes go live.
+  std::unique_ptr<model::VariantRegistry> q35_variants;
+  if (q35_generator && !variant_paths.empty()) {
+    const std::vector<std::string> files = {qwen35_model};
+    const auto hash = model::BaseContentHashCached(files, &error);
+    if (!hash) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    q35_variants = std::make_unique<model::VariantRegistry>(*q35_reader, *hash);
+    for (const auto& path : variant_paths) {
+      const auto v = q35_variants->Load(path, &error);
+      if (!v) return std::fprintf(stderr, "variant %s: %s\n", path.c_str(), error.c_str()), 1;
+      if (v->lora && !q35_generator->AddVariant(*v, &error))
+        return std::fprintf(stderr, "variant %s: %s\n", path.c_str(), error.c_str()), 1;
+      std::fprintf(stderr, "variant %s v%lld loaded\n", v->manifest.name.c_str(),
+                   static_cast<long long>(v->manifest.version));
+    }
+  }
+  if (q35_generator) so.variants = [q35_generator] { return q35_generator->Variants(); };
+  server::OpenAiService service(*generator, so);
   server::HttpServer http({.host = host, .port = port, .api_key = api_key});
   service.Register(http);
   metrics.Register(http);
@@ -186,6 +249,22 @@ int main(int argc, char** argv) {
                                             decider_device},
                                            &error);
     if (!sd) return std::fprintf(stderr, "decider: %s\n", error.c_str()), 1;
+    // Decider variants (a pointer_head part) of the torso's base model.
+    std::unique_ptr<model::VariantRegistry> reg;
+    for (const auto& path : variant_paths) {
+      if (!reg) {
+        const std::vector<std::string> files = {d + "/Qwen3.5-2B-Base-BF16.gguf"};
+        const auto hash = model::BaseContentHashCached(files, &error);
+        if (!hash) return std::fprintf(stderr, "decider: %s\n", error.c_str()), 1;
+        reg = std::make_unique<model::VariantRegistry>(sd->torso_file(), *hash);
+      }
+      const auto v = reg->Load(path, &error);
+      if (!v) return std::fprintf(stderr, "decider variant %s: %s\n", path.c_str(), error.c_str()), 1;
+      if (!v->manifest.Find(model::VariantPartKind::kPointerHead)) continue;  // a text-model variant
+      if (!sd->AddVariant(v, &error))
+        return std::fprintf(stderr, "decider variant %s: %s\n", path.c_str(), error.c_str()), 1;
+      std::fprintf(stderr, "decider variant %s loaded\n", v->manifest.name.c_str());
+    }
     decider = std::make_unique<StrandsEngine>(std::move(sd));
     server::RegisterSystemOne(http, *decider);
   }

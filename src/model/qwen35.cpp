@@ -286,6 +286,20 @@ void Qwen35Reference::Attention(const Qwen35Layer& l, std::size_t index, std::sp
 }
 
 bool Qwen35Reference::Step(std::int32_t token, std::span<float> hidden, std::span<float> logits, std::string* error) {
+  return Run(token, w_->config.num_layers, {}, hidden, logits, error);
+}
+
+bool Qwen35Reference::StepToLayer(std::int32_t token, std::uint32_t layer, std::span<float> residual,
+                                  std::string* error) {
+  if (layer > w_->config.num_layers || residual.size() != w_->config.hidden_size) {
+    if (error) *error = "StepToLayer: bad layer or residual size";
+    return false;
+  }
+  return Run(token, layer, residual, {}, {}, error);
+}
+
+bool Qwen35Reference::Run(std::int32_t token, std::uint32_t stop_layer, std::span<float> residual,
+                          std::span<float> hidden, std::span<float> logits, std::string* error) {
   const auto& c = w_->config;
   if (position_ >= max_context_ || token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size) {
     if (error) *error = position_ >= max_context_ ? "context is full" : "token out of range";
@@ -295,6 +309,11 @@ bool Qwen35Reference::Step(std::int32_t token, std::span<float> hidden, std::spa
   std::vector<float> res(H), xn(H), out(H), g(c.ffn), up(c.ffn);
   cpu::DequantizeRow(w_->token_embd, 0, static_cast<std::uint64_t>(token), res.data());
   for (std::uint32_t l = 0; l < c.num_layers; ++l) {
+    if (l == stop_layer) {
+      std::copy(res.begin(), res.end(), residual.begin());
+      ++position_;
+      return true;
+    }
     const auto& L = w_->layers[l];
     xn = res;
     RmsNormOnePlus(xn, L.attn_norm, c.rms_eps);
@@ -309,6 +328,7 @@ bool Qwen35Reference::Step(std::int32_t token, std::span<float> hidden, std::spa
     MatVec(L.ffn_down, g, out);
     for (std::uint32_t i = 0; i < H; ++i) res[i] += out[i];
   }
+  if (stop_layer == c.num_layers && !residual.empty()) std::copy(res.begin(), res.end(), residual.begin());
   RmsNormOnePlus(res, w_->output_norm, c.rms_eps);
   if (!hidden.empty()) std::copy(res.begin(), res.end(), hidden.begin());
   if (!logits.empty()) MatVec(w_->output, res, logits);

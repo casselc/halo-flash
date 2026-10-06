@@ -93,9 +93,13 @@ def run_once(cmd, args, env):
     device = [float(m.group(1)) for m in re.finditer(r"device ([0-9.]+) ms", out)]
     n = args.reps + (1 if kernels else 0)
     chunks = args.chunks
-    if chunks == 0:  # auto: the arm's --prefill-chunk (default 2048)
-        m = re.search(r"--prefill-chunk\s+(\d+)", cmd)
-        chunks = -(-args.tokens // int(m.group(1) if m else 2048))
+    if chunks == 0:  # auto: the arm's --prefill-chunk (default 2048), or --prefill-long-chunk (default 8192)
+        m = re.search(r"--prefill-chunk\s+(\d+)", cmd)  # for a prompt longer than the chunk (0: off)
+        ml = re.search(r"--prefill-long-chunk\s+(\d+)", cmd)
+        chunk, long_chunk = int(m.group(1) if m else 2048), int(ml.group(1) if ml else 8192)
+        if long_chunk > chunk and args.tokens > chunk:
+            chunk = long_chunk
+        chunks = -(-args.tokens // chunk)
     if chunks > 1:
         # Whole prefill: each rep prints one device line per chunk; sum them per rep.
         tail = device[-n * chunks:] if len(device) >= n * chunks else []

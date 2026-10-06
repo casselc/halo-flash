@@ -1358,8 +1358,10 @@ bool FlashNextGpu::Prefill(std::span<const std::int32_t> tokens, std::span<float
       if (!Step(tokens[i], i + 1 == tokens.size() ? logits : std::span<float>{}, error)) return false;
     return true;
   }
-  if (!AllocChunk(error)) return false;
-  const std::size_t chunk = std::max<std::uint32_t>(1, std::min(prefill_chunk_, ck_.cap));
+  const std::uint32_t want =
+      prefill_long_chunk_ > prefill_chunk_ && tokens.size() > prefill_chunk_ ? prefill_long_chunk_ : prefill_chunk_;
+  if (!AllocChunk(want, error)) return false;
+  const std::size_t chunk = std::max<std::uint32_t>(1, std::min(want, ck_.cap));
   // The next chunk's n-gram rows are read on a host thread while this chunk
   // runs on the device. One read is in flight at a time: the prefetch starts
   // after this chunk's own read, and the next chunk then skips its read.
