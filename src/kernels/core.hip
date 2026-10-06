@@ -3233,9 +3233,9 @@ extern "C" __global__ void halo_conv_l2norm_prefill(const float* in, const float
 // form ran 163,840 blocks of 4 loads each per 2048 tokens: 1.28 ms against
 // ~0.7 ms of traffic.
 //   grid (ceil(channels / 128), ceil(T / 8)), block 128; kern == 4
-template <typename IT>
+template <typename IT, typename OT = float>
 __device__ __attribute__((always_inline)) inline void ConvL2normPrefill8(const IT* in, const float* state,
-                                                                        const float* w, float* out,
+                                                                        const float* w, OT* out,
                                                                         std::uint32_t channels, std::uint32_t tokens,
                                                                         std::uint32_t l2_channels, float eps) {
   constexpr std::uint32_t TT = 8, kern = 4;
@@ -3279,7 +3279,7 @@ __device__ __attribute__((always_inline)) inline void ConvL2normPrefill8(const I
   if (!live) return;
 #pragma unroll
   for (std::uint32_t t = 0; t < TT; ++t)
-    if (t0 + t < tokens) out[static_cast<std::size_t>(t0 + t) * channels + ch] = v[t];
+    if (t0 + t < tokens) out[static_cast<std::size_t>(t0 + t) * channels + ch] = static_cast<OT>(v[t]);
 }
 extern "C" __global__ void __launch_bounds__(128)
     halo_conv_l2norm_prefill8(const float* in, const float* state, const float* w, float* out,
@@ -3290,6 +3290,12 @@ extern "C" __global__ void __launch_bounds__(128)
 extern "C" __global__ void __launch_bounds__(128)
     halo_conv_l2norm_prefill8_h(const _Float16* in, const float* state, const float* w, float* out,
                                 std::uint32_t channels, std::uint32_t tokens, std::uint32_t l2_channels, float eps) {
+  ConvL2normPrefill8(in, state, w, out, channels, tokens, l2_channels, eps);
+}
+// Precision option (stream R, --gdn-f16): fp16 in and fp16 out (each output the fp32 value rounded once).
+extern "C" __global__ void __launch_bounds__(128)
+    halo_conv_l2norm_prefill8_hh(const _Float16* in, const float* state, const float* w, _Float16* out,
+                                 std::uint32_t channels, std::uint32_t tokens, std::uint32_t l2_channels, float eps) {
   ConvL2normPrefill8(in, state, w, out, channels, tokens, l2_channels, eps);
 }
 
@@ -4300,19 +4306,20 @@ extern "C" __global__ void halo_gated_norm_hz(const float* o, const float* w, co
 // L + 32 w; the sum of squares reproduces the 128-thread kernel's: each w's WarpSum is that warp's, and
 // BlockSum's second stage over 4 partials (and zeros) is (p0 + p2) + (p1 + p3).
 //   grid (ceil(rows / 8)), block 256
-extern "C" __global__ void __launch_bounds__(256)
-    halo_gated_norm_h128w(const float* o, const float* w, const float* z, _Float16* y16, std::uint32_t rows, float eps,
-                          std::uint32_t mode) {
+template <typename OT, typename ZT>
+__device__ __attribute__((always_inline)) inline void GatedNormH128W(const OT* o, const float* w, const ZT* z,
+                                                                    _Float16* y16, std::uint32_t rows, float eps,
+                                                                    std::uint32_t mode) {
   constexpr std::uint32_t d = 128;
   const std::uint32_t lane = threadIdx.x % kWarp, r = blockIdx.x * 8 + threadIdx.x / kWarp;
   if (r >= rows) return;
-  const float* ov = o + static_cast<std::size_t>(r) * d;
-  const float* zv = z + static_cast<std::size_t>(r) * d;
+  const OT* ov = o + static_cast<std::size_t>(r) * d;
+  const ZT* zv = z + static_cast<std::size_t>(r) * d;
   float x[4], zz[4], p[4];
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
-    x[q] = ov[lane + 32 * q];
-    zz[q] = zv[lane + 32 * q];
+    x[q] = static_cast<float>(ov[lane + 32 * q]);
+    zz[q] = static_cast<float>(zv[lane + 32 * q]);
   }
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
@@ -4329,6 +4336,17 @@ extern "C" __global__ void __launch_bounds__(256)
     const float g = mode == 0 ? Silu(zz[q]) : Sigmoid(zz[q]);
     y16[static_cast<std::size_t>(r) * d + i] = static_cast<_Float16>(x[q] * scale * w[i] * g);
   }
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gated_norm_h128w(const float* o, const float* w, const float* z, _Float16* y16, std::uint32_t rows, float eps,
+                          std::uint32_t mode) {
+  GatedNormH128W(o, w, z, y16, rows, eps, mode);
+}
+// Precision option (stream R, --gdn-f16): the same over fp16 o (the scan's output) and fp16 z.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gated_norm_h128w_hh(const _Float16* o, const float* w, const _Float16* z, _Float16* y16, std::uint32_t rows,
+                             float eps, std::uint32_t mode) {
+  GatedNormH128W(o, w, z, y16, rows, eps, mode);
 }
 
 // halo_hc_mix for T rows: xn, gate [T][hc][h] -> mixed [T][h].
@@ -5142,6 +5160,11 @@ extern "C" __global__ void __launch_bounds__(256)
 extern "C" __global__ void halo_f16_perm_rows(const float* x, _Float16* y, std::uint32_t n) {
   const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) y[MoePerm(i)] = static_cast<_Float16>(x[i]);
+}
+// Stream R: the same permutation from the fp16 copy mh (mh = fp16(mixed): the same bits as above).
+extern "C" __global__ void halo_f16_perm_rows_h(const _Float16* x, _Float16* y, std::uint32_t n) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[MoePerm(i)] = x[i];
 }
 
 // out[t][i] = sum_s w[t][s] * yp[pos[t * k + s]][i], slots in order.
@@ -6318,10 +6341,21 @@ extern "C" __global__ void __launch_bounds__(256)
 // K, Q and gates prefetched into registers behind LDS-only barriers (a trace
 // of the one-chunk version: 55% of cycles at barriers, 22% waiting on loads).
 //   grid (ceil(ceil(T / 16) / cpb), num_k_heads), block 256
-extern "C" __global__ void __launch_bounds__(256)
-    halo_gdn_c16_prep2(const float* q, const float* k, const float* alpha, const float* beta, const float* a,
-                       const float* dt, float* prep, std::uint32_t heads, std::uint32_t tokens, std::uint32_t qk_stride,
-                       std::uint32_t cpb) {
+// Four consecutive elements as a float4 (fp32: one 16-byte load; fp16: one 8-byte load, widened exactly).
+__device__ __attribute__((always_inline)) inline float4 Load4F(const float* p) {
+  return *reinterpret_cast<const float4*>(p);
+}
+__device__ __attribute__((always_inline)) inline float4 Load4F(const _Float16* p) {
+  typedef _Float16 v4h __attribute__((ext_vector_type(4)));
+  const v4h x = *reinterpret_cast<const v4h*>(p);
+  return make_float4(static_cast<float>(x[0]), static_cast<float>(x[1]), static_cast<float>(x[2]),
+                     static_cast<float>(x[3]));
+}
+template <typename IT>
+__device__ __attribute__((always_inline)) inline void GdnC16Prep2(const IT* q, const IT* k, const float* alpha,
+                                                                 const float* beta, const float* a, const float* dt,
+                                                                 float* prep, std::uint32_t heads, std::uint32_t tokens,
+                                                                 std::uint32_t qk_stride, std::uint32_t cpb) {
   constexpr std::uint32_t d = 128, C = 16, RM = 8, NT = 256;
   __shared__ __attribute__((aligned(16))) float ks[C][d + 4], qs[C][d + 4];
   __shared__ float KK[C][C + 1], QK[C][C + 1], G[RM][C], bs[RM][C], Am[RM][C][C + 1];
@@ -6345,8 +6379,8 @@ extern "C" __global__ void __launch_bounds__(256)
     for (std::uint32_t p = 0; p < 2; ++p) {
       const std::uint32_t x = tid + p * NT, tt = x / (d / 4), i = (x % (d / 4)) * 4;
       const std::uint32_t row = (t0 + min(tt, n - 1)) * qk_stride + kh * d + i;
-      rk[p] = *reinterpret_cast<const float4*>(k + row);
-      rq[p] = *reinterpret_cast<const float4*>(q + row);
+      rk[p] = Load4F(k + row);
+      rq[p] = Load4F(q + row);
     }
     const std::uint32_t t = t0 + min(lane, n - 1);
     ral = alpha[t * heads + h_mine];
@@ -6426,6 +6460,19 @@ extern "C" __global__ void __launch_bounds__(256)
     }
     barrier();  // LDS reads done before the next chunk is staged
   }
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gdn_c16_prep2(const float* q, const float* k, const float* alpha, const float* beta, const float* a,
+                       const float* dt, float* prep, std::uint32_t heads, std::uint32_t tokens, std::uint32_t qk_stride,
+                       std::uint32_t cpb) {
+  GdnC16Prep2(q, k, alpha, beta, a, dt, prep, heads, tokens, qk_stride, cpb);
+}
+// Precision option (stream R, --gdn-f16): q and k read from the conv's fp16 output.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gdn_c16_prep2_h(const _Float16* q, const _Float16* k, const float* alpha, const float* beta, const float* a,
+                         const float* dt, float* prep, std::uint32_t heads, std::uint32_t tokens,
+                         std::uint32_t qk_stride, std::uint32_t cpb) {
+  GdnC16Prep2(q, k, alpha, beta, a, dt, prep, heads, tokens, qk_stride, cpb);
 }
 
 // KS3: K S0 with the three-way split (6 WMMAs a tile).
@@ -6880,6 +6927,162 @@ extern "C" __global__ void __launch_bounds__(128)
   GdnC16ScanH(q, k, v, prep, state, out, num_k_heads, tokens, qk_stride, v_stride, o_stride);
 }
 #undef HALO_GDN_C16_SCAN3
+// Precision option (stream R, --gdn-f16): the scan over the conv's fp16 output. K and Q are exact in fp16, so
+// K S0, Q S0 and the update need no lo halves: 2 WMMAs each (against the state's fp16 hi / lo) instead of
+// scanh's 3; V is read in fp16 and O written in fp16. Delta and O keep scanh's bf16 hi / lo products.
+// KT: the update's A operand (K^T) from a transposed copy staged once a chunk (128-bit fragment loads)
+// instead of 16 16-bit gathers per key tile.
+template <bool KT>
+__device__ void GdnC16ScanF(const _Float16* q, const _Float16* k, const _Float16* v, const float* prep, float* state,
+                            _Float16* out, std::uint32_t num_k_heads, std::uint32_t tokens, std::uint32_t qk_stride,
+                            std::uint32_t v_stride, std::uint32_t o_stride) {
+  constexpr std::uint32_t d = 128, C = 16, KR = d + 8, NT = 128, KP = C * d / 4 / NT, PP = kGdnP16 / 4, TR = C + 8;
+  __shared__ __attribute__((aligned(16))) short kh[C][KR], qh[C][KR];
+  __shared__ __attribute__((aligned(16))) short kt_[KT ? d : 1][TR];
+  __shared__ __attribute__((aligned(16))) float P[kGdnP16];
+  const std::uint32_t h = blockIdx.y, tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  const std::uint32_t kh_ = h % num_k_heads, col = blockIdx.x * 64 + wave * 16 + lane % 16, hi = lane / 16;
+  const std::uint32_t nchunks = (tokens + C - 1) / C;
+  float* S = state + static_cast<std::size_t>(h) * d * d;
+  std::uint32_t so = hi * d + col;
+  halo_v8f acc[8];
+#pragma unroll
+  for (int kt = 0; kt < 8; ++kt)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[kt][j] = (S + (kt * 16 + 2 * j) * d)[so];
+  const auto barrier = [] {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+  };
+  static_assert(KP == 4, "rk/rq hold 4 x 4 halves");
+  uint2 rk[KP], rq[KP];
+  halo_v8f rp, rv;
+  const auto load_v = [&](std::uint32_t ch) {
+    const std::uint32_t t0 = ch * C, n = min(C, tokens - t0);
+#pragma unroll
+    for (std::uint32_t j = 0; j < 8; ++j)
+      rv[j] = static_cast<float>(v[(t0 + min(2 * j + hi, n - 1)) * v_stride + h * d + col]);
+  };
+  const auto load = [&](std::uint32_t ch) {
+    const std::uint32_t t0 = ch * C, n = min(C, tokens - t0);
+#pragma unroll
+    for (std::uint32_t p = 0; p < KP; ++p) {
+      const std::uint32_t x = tid + p * NT, tt = x / (d / 4), i = (x % (d / 4)) * 4;
+      const std::uint32_t row = (t0 + min(tt, n - 1)) * qk_stride + kh_ * d + i;
+      rk[p] = *reinterpret_cast<const uint2*>(k + row);
+      rq[p] = *reinterpret_cast<const uint2*>(q + row);
+    }
+    const float4* pp = reinterpret_cast<const float4*>(prep);
+#pragma unroll
+    for (std::uint32_t p = 0; p < 2; ++p) {
+      const float4 x = pp[(h * nchunks + ch) * PP + min(tid + p * NT, PP - 1)];
+      rp[4 * p] = x.x, rp[4 * p + 1] = x.y, rp[4 * p + 2] = x.z, rp[4 * p + 3] = x.w;
+    }
+  };
+  const auto H = [](const halo_v16s& x) { return __builtin_bit_cast(halo_v16h, x); };
+  load(0);
+  load_v(0);
+  for (std::uint32_t ch = 0; ch < nchunks; ++ch) {
+    const std::uint32_t t0 = ch * C, n = min(C, tokens - t0);
+#pragma unroll
+    for (std::uint32_t p = 0; p < KP; ++p) {
+      const std::uint32_t x = tid + p * NT, tt = x / (d / 4), i = (x % (d / 4)) * 4;
+      *reinterpret_cast<uint2*>(&kh[tt][i]) = rk[p];
+      *reinterpret_cast<uint2*>(&qh[tt][i]) = rq[p];
+      if constexpr (KT) {
+        kt_[i][tt] = static_cast<short>(rk[p].x & 0xFFFFu);
+        kt_[i + 1][tt] = static_cast<short>(rk[p].x >> 16);
+        kt_[i + 2][tt] = static_cast<short>(rk[p].y & 0xFFFFu);
+        kt_[i + 3][tt] = static_cast<short>(rk[p].y >> 16);
+      }
+    }
+#pragma unroll
+    for (std::uint32_t p = 0; p < 2; ++p)
+      if (tid + p * NT < PP)
+        reinterpret_cast<float4*>(P)[tid + p * NT] = make_float4(rp[4 * p], rp[4 * p + 1], rp[4 * p + 2], rp[4 * p + 3]);
+    const std::uint32_t nx = min(ch + 1, nchunks - 1);
+    load(nx);
+    barrier();
+    // K S0 and Q S0: exact fp16 K / Q against the state's fp16 hi / lo (lo term first, as Wmma3H).
+    halo_v8f pk = {}, pq = {};
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+      halo_v16s bh, bl;
+      AccToBSplitPH(acc[kt], bh, bl);
+      const halo_v16s ak = LdsFragS(&kh[lane % 16][kt * 16]), aq = LdsFragS(&qh[lane % 16][kt * 16]);
+      pk = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(H(ak), H(bl), pk);
+      pk = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(H(ak), H(bh), pk);
+      pq = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(H(aq), H(bl), pq);
+      pq = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(H(aq), H(bh), pq);
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    // Delta = T' (V - e^G (K S0)); accumulator rows are tokens 2 j + hi.
+    halo_v8f r;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) r[j] = rv[j] - P[2 * C * C + C + 2 * j + hi] * pk[j];
+    load_v(nx);
+    halo_v16s rh, rl, th, tl;
+    AccToBSplitP(r, rh, rl);
+    RowSplitP(&P[(lane % 16) * C], th, tl);
+    halo_v8f dl = {};
+    dl = Wmma3(th, tl, rh, rl, dl);
+    halo_v16s dh, dlo;
+    AccToBSplitP(dl, dh, dlo);
+    // O = e^G / sqrt d (Q S0) + P' Delta.
+    RowSplitP(&P[C * C + (lane % 16) * C], th, tl);
+    halo_v8f o = {};
+    o = Wmma3(th, tl, dh, dlo, o);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const std::uint32_t t = 2 * j + hi;
+      if (t < n) {
+        float ov = P[2 * C * C + t] * pq[j] + o[j];
+        asm volatile("" : "+v"(ov));  // rounded to fp32 first, as scanh's store (no fma_mix into fp16)
+        out[static_cast<std::size_t>(t0 + t) * o_stride + h * d + col] = static_cast<_Float16>(ov);
+      }
+    }
+    // S = e^G_n S0 + K^T (w Delta): B operand w Delta (fp16 hi / lo), A operand K^T (exact fp16).
+#pragma unroll
+    for (int j = 0; j < 8; ++j) dl[j] *= P[2 * C * C + 2 * C + 2 * j + hi];
+    AccToBSplitPH(dl, dh, dlo);
+    const float en = P[2 * C * C + 3 * C];
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[kt][j] *= en;
+      halo_v16s ah;  // key kt * 16 + lane % 16 over the chunk's tokens
+      if constexpr (KT) {
+        ah = LdsFragS(&kt_[kt * 16 + lane % 16][0]);
+      } else {
+#pragma unroll
+        for (int e = 0; e < 16; ++e) ah[e] = kh[e][kt * 16 + lane % 16];
+      }
+      acc[kt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(H(ah), H(dlo), acc[kt]);
+      acc[kt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(H(ah), H(dh), acc[kt]);
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    barrier();
+  }
+  asm volatile("" : "+v"(so));
+#pragma unroll
+  for (int kt = 0; kt < 8; ++kt)
+#pragma unroll
+    for (int j = 0; j < 8; ++j) (S + (kt * 16 + 2 * j) * d)[so] = acc[kt][j];
+}
+//   grid (2, heads), block 128; q, k, v and out in fp16
+extern "C" __global__ void __launch_bounds__(128)
+    halo_gdn_c16_scanf(const _Float16* q, const _Float16* k, const _Float16* v, const float* prep, float* state,
+                       _Float16* out, std::uint32_t num_k_heads, std::uint32_t tokens, std::uint32_t qk_stride,
+                       std::uint32_t v_stride, std::uint32_t o_stride) {
+  GdnC16ScanF<false>(q, k, v, prep, state, out, num_k_heads, tokens, qk_stride, v_stride, o_stride);
+}
+extern "C" __global__ void __launch_bounds__(128)
+    halo_gdn_c16_scanft(const _Float16* q, const _Float16* k, const _Float16* v, const float* prep, float* state,
+                        _Float16* out, std::uint32_t num_k_heads, std::uint32_t tokens, std::uint32_t qk_stride,
+                        std::uint32_t v_stride, std::uint32_t o_stride) {
+  GdnC16ScanF<true>(q, k, v, prep, state, out, num_k_heads, tokens, qk_stride, v_stride, o_stride);
+}
 
 // ---- Study: structural floor of a chunked DeltaNet scan ---------------------
 // The loads, LDS staging, barriers and state traffic of a chunked scan with
@@ -7001,11 +7204,11 @@ HALO_GDN_SKEL(halo_gdnskel_c64_n32_pf_seq, 64, 32, 256, 4, true, true)
 // With rs and nw, xn is the residual and xn[t][s h + i] is rebuilt as
 // (res * rs[t * 4 + s]) * nw[s h + i] (combine_norm's arithmetic).
 template <std::uint32_t BM, std::uint32_t BN, std::uint32_t WM, std::uint32_t WN, std::uint32_t KS, bool kMix = false,
-          bool kRowsFast = false, std::uint32_t RG = 1, bool kBlockedX = false, bool kMixH = false>
+          bool kRowsFast = false, std::uint32_t RG = 1, bool kBlockedX = false, bool kMixH = false, bool kMixLo = false>
 __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
                            std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens,
                            const float* xn = nullptr, _Float16* y16 = nullptr, const float* rs = nullptr,
-                           const float* nw = nullptr, const _Float16* xh = nullptr) {
+                           const float* nw = nullptr, const _Float16* xh = nullptr, _Float16* ylo = nullptr) {
   constexpr std::uint32_t RS = KS + 8, NT = 256;
   constexpr std::uint32_t TM = BM / WM / 16, TN = BN / WN / 16;
   constexpr std::uint32_t APR = KS / 16, BPR = KS / 8;  // 16-byte pieces per row: int8 weights, fp16 tokens
@@ -7163,11 +7366,19 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
           }
           m[q] = acc / 4.0f;
         }
-        *reinterpret_cast<float4*>(y + static_cast<std::size_t>(t) * h + i) = make_float4(m[0], m[1], m[2], m[3]);
+        if (!kMixLo || y) *reinterpret_cast<float4*>(y + static_cast<std::size_t>(t) * h + i) = make_float4(m[0], m[1], m[2], m[3]);
         const halo_h2 lo = {static_cast<_Float16>(m[0]), static_cast<_Float16>(m[1])};
         const halo_h2 hi = {static_cast<_Float16>(m[2]), static_cast<_Float16>(m[3])};
         *reinterpret_cast<halo_h2*>(y16 + static_cast<std::size_t>(t) * h + i) = lo;
         *reinterpret_cast<halo_h2*>(y16 + static_cast<std::size_t>(t) * h + i + 2) = hi;
+        if constexpr (kMixLo) {  // stream R: the fp16 lo halves, m - hi rounded (the router's split)
+          const halo_h2 l0 = {static_cast<_Float16>(m[0] - static_cast<float>(lo.x)),
+                              static_cast<_Float16>(m[1] - static_cast<float>(lo.y))};
+          const halo_h2 l1 = {static_cast<_Float16>(m[2] - static_cast<float>(hi.x)),
+                              static_cast<_Float16>(m[3] - static_cast<float>(hi.y))};
+          *reinterpret_cast<halo_h2*>(ylo + static_cast<std::size_t>(t) * h + i) = l0;
+          *reinterpret_cast<halo_h2*>(ylo + static_cast<std::size_t>(t) * h + i + 2) = l1;
+        }
       }
     } else if constexpr (kMix) {
       const std::uint32_t h = rows / 4;
@@ -7392,6 +7603,125 @@ extern "C" __global__ void __launch_bounds__(256)
                             const _Float16* xh, _Float16* y16) {
   GemmQ8rF16<256, 128, 8, 1, 32, true, true, 1, false, true>(qs, d, x, y, rows, cols, qstride, tokens, nullptr, y16,
                                                              nullptr, nullptr, xh);
+}
+
+// Stream R (router mode 4): halo_gemm_q8r_f16_mixth also writing the fp16 lo half of each mixed value
+// (ylo = rne(m - rne(m))), so the router reads fp16 hi / lo instead of splitting fp32 `mixed` itself.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_q8r_f16_mixthl(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
+                             std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens,
+                             const _Float16* xh, _Float16* y16, _Float16* ylo) {
+  GemmQ8rF16<256, 128, 8, 1, 32, true, true, 1, false, true, true>(qs, d, x, y, rows, cols, qstride, tokens, nullptr,
+                                                                   y16, nullptr, nullptr, xh, ylo);
+}
+
+// Stream R (router mode 4): y [T][rows] = W x over fp16 W and x given as fp16 hi / lo halves; per 16-K step
+// and tile the lo product first, then the hi (halo_gemm_f32_f16_x2's order: the same bits as router mode 3).
+// Block BR rows x BT tokens, NWR x NWT waves of (BR / NWR) x (BT / NWT); K stage BK.
+//   grid (ceil(T / BT), ceil(rows / BR)); rows % BR == 0, cols % BK == 0
+template <std::uint32_t BR, std::uint32_t BT, std::uint32_t BK, std::uint32_t NWR, std::uint32_t NWT>
+__device__ void GemmHHL(const _Float16* w, const _Float16* xh, const _Float16* xl, float* y, std::uint32_t rows,
+                        std::uint32_t cols, std::uint32_t tokens) {
+  constexpr std::uint32_t NT = 32 * NWR * NWT, RS = BK + 8, MI = BR / NWR / 16, NK = BT / NWT / 16;
+  constexpr std::uint32_t PR = BK / 8;                   // 16-byte pieces per staged row
+  constexpr std::uint32_t CA = BR * PR / NT, CB = BT * PR / NT;
+  static_assert(BR * PR % NT == 0 && BT * PR % NT == 0 && CA >= 1 && CB >= 1, "stage splits evenly");
+  __shared__ __attribute__((aligned(16))) _Float16 As[BR * RS], Bh[BT * RS], Bl[BT * RS];
+  typedef _Float16 v8h __attribute__((ext_vector_type(8)));
+  const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32, wr = wave % NWR, wt = wave / NWR;
+  const std::uint32_t r0 = blockIdx.y * BR, t0 = blockIdx.x * BT;
+  halo_v4i ra[CA], rh[CB], rl[CB];
+  const auto load = [&](std::uint32_t k0) {
+#pragma unroll
+    for (std::uint32_t c = 0; c < CA; ++c) {
+      const std::uint32_t x = tid + c * NT, row = x / PR, part = (x % PR) * 8;
+      ra[c] = *reinterpret_cast<const halo_v4i*>(w + static_cast<std::size_t>(r0 + row) * cols + k0 + part);
+    }
+#pragma unroll
+    for (std::uint32_t c = 0; c < CB; ++c) {
+      const std::uint32_t x = tid + c * NT, tk = x / PR, part = (x % PR) * 8;
+      const std::size_t o = static_cast<std::size_t>(min(t0 + tk, tokens - 1)) * cols + k0 + part;
+      rh[c] = *reinterpret_cast<const halo_v4i*>(xh + o);
+      rl[c] = *reinterpret_cast<const halo_v4i*>(xl + o);
+    }
+  };
+  const auto store = [&]() {
+#pragma unroll
+    for (std::uint32_t c = 0; c < CA; ++c) {
+      const std::uint32_t x = tid + c * NT, row = x / PR, part = (x % PR) * 8;
+      *reinterpret_cast<halo_v4i*>(&As[row * RS + part]) = ra[c];
+    }
+#pragma unroll
+    for (std::uint32_t c = 0; c < CB; ++c) {
+      const std::uint32_t x = tid + c * NT, tk = x / PR, part = (x % PR) * 8;
+      *reinterpret_cast<halo_v4i*>(&Bh[tk * RS + part]) = rh[c];
+      *reinterpret_cast<halo_v4i*>(&Bl[tk * RS + part]) = rl[c];
+    }
+  };
+  const auto frag = [](const _Float16* p) {
+    const v8h lo = *reinterpret_cast<const v8h*>(p), hi = *reinterpret_cast<const v8h*>(p + 8);
+    halo_v16h r;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      r[e] = lo[e];
+      r[e + 8] = hi[e];
+    }
+    return r;
+  };
+  halo_v8f acc[MI][NK] = {};
+  load(0);
+  for (std::uint32_t k0 = 0; k0 < cols; k0 += BK) {
+    __syncthreads();
+    store();
+    __syncthreads();
+    if (k0 + BK < cols) load(k0 + BK);
+#pragma unroll
+    for (std::uint32_t hs = 0; hs < BK / 16; ++hs) {
+      halo_v16h a[MI], bh[NK], bl[NK];
+#pragma unroll
+      for (std::uint32_t i = 0; i < MI; ++i) a[i] = frag(&As[(wr * MI * 16 + i * 16 + lane % 16) * RS + hs * 16]);
+#pragma unroll
+      for (std::uint32_t k = 0; k < NK; ++k) {
+        const std::uint32_t bo = (wt * NK * 16 + k * 16 + lane % 16) * RS + hs * 16;
+        bh[k] = frag(&Bh[bo]);
+        bl[k] = frag(&Bl[bo]);
+      }
+#pragma unroll
+      for (std::uint32_t i = 0; i < MI; ++i)
+#pragma unroll
+        for (std::uint32_t k = 0; k < NK; ++k) {
+          acc[i][k] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], bl[k], acc[i][k]);
+          acc[i][k] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], bh[k], acc[i][k]);
+        }
+    }
+  }
+#pragma unroll
+  for (std::uint32_t i = 0; i < MI; ++i)
+#pragma unroll
+    for (std::uint32_t k = 0; k < NK; ++k) {
+      const std::uint32_t t = t0 + wt * NK * 16 + k * 16 + lane % 16;
+      if (t >= tokens) continue;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const std::uint32_t r = r0 + wr * MI * 16 + i * 16 + 2 * j + lane / 16;
+        y[static_cast<std::size_t>(t) * rows + r] = acc[i][k][j];
+      }
+    }
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_h_hl_128x64(const _Float16* w, const _Float16* xh, const _Float16* xl, float* y, std::uint32_t rows,
+                          std::uint32_t cols, std::uint32_t tokens) {
+  GemmHHL<128, 64, 64, 4, 2>(w, xh, xl, y, rows, cols, tokens);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_h_hl_128x64k32(const _Float16* w, const _Float16* xh, const _Float16* xl, float* y, std::uint32_t rows,
+                             std::uint32_t cols, std::uint32_t tokens) {
+  GemmHHL<128, 64, 32, 4, 2>(w, xh, xl, y, rows, cols, tokens);
+}
+extern "C" __global__ void __launch_bounds__(128)
+    halo_gemm_h_hl_64x64(const _Float16* w, const _Float16* xh, const _Float16* xl, float* y, std::uint32_t rows,
+                         std::uint32_t cols, std::uint32_t tokens) {
+  GemmHHL<64, 64, 64, 2, 2>(w, xh, xl, y, rows, cols, tokens);
 }
 
 // Repacked Q8_0 rows reordered stream-major -> index-major: destination row

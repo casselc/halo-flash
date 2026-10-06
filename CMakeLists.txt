@@ -31,6 +31,7 @@ add_library(halo_core STATIC
   src/core/gguf.cpp
   src/core/gguf_writer.cpp
   src/core/quant.cpp
+  src/core/lowbit.cpp
   src/core/json.cpp
   src/core/sampling.cpp
 )
@@ -169,6 +170,8 @@ endif()
 add_executable(gguf_inspect tools/gguf_inspect.cpp)
 add_executable(halo_disk_bench tools/disk_bench.cpp)
 target_link_libraries(gguf_inspect PRIVATE halo_core)
+add_executable(halo_requant tools/requant.cpp)
+target_link_libraries(halo_requant PRIVATE halo_core halo_model)
 
 # --- tests ------------------------------------------------------------------
 if(HALO_BUILD_TESTS)
@@ -200,6 +203,7 @@ if(HALO_BUILD_TESTS)
   halo_test(core_tests
     tests/core/gguf_test.cpp
     tests/core/quant_test.cpp
+    tests/core/lowbit_test.cpp
     tests/core/json_test.cpp
     tests/core/sampling_test.cpp)
   target_compile_definitions(core_tests PRIVATE
@@ -251,6 +255,7 @@ if(HALO_BUILD_TESTS)
   halo_test(model_tests
     tests/model/reference_hf_test.cpp
     tests/model/ngram_table_test.cpp
+    tests/model/routing_test.cpp
     tests/model/lora_hf_test.cpp
     tests/model/qwen35_hf_test.cpp)
   target_compile_definitions(text_tests PRIVATE

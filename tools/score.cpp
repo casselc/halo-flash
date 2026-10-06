@@ -10,6 +10,7 @@
 //   halo_score --model <shard-00001.gguf> --fixtures <dir> [--device hip|hrx|cpu] [--limit N]
 //              [--prefill 1] [--prefill-int8 0|1]   (prompts through the batched prefill)
 //              [--start N]   (skip the first N cases: resume an interrupted run)
+//              [--moe-topk N] (route each token to N experts, renormalized; CODESIGN arm B)
 
 #include <chrono>
 #include <cmath>
@@ -66,6 +67,7 @@ int main(int argc, char** argv) {
   bool prefill = false;
   int start = 0;  // --start N: skip the manifest's first N cases (resume an interrupted run)
   bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
+  std::uint32_t moe_topk = 0;  // --moe-topk N: experts per token (0: the file's count; CODESIGN arm B)
   double ngram_cache_gb = 4.0;  // --ngram-cache-gb N: cache of n-gram rows read from disk (0: off)
   setvbuf(stdout, nullptr, _IOLBF, 0);
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -87,12 +89,16 @@ int main(int argc, char** argv) {
       engine::FlashNextGpu::prefill_gdn_c16_u3_ = std::string(argv[i + 1]) != "u2";
     }
     else if (a == "--start") start = std::atoi(argv[i + 1]);
+    else if (a == "--moe-topk") moe_topk = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";
     else if (a == "--small-f16") engine::FlashNextGpu::prefill_small_f16_ = std::string(argv[i + 1]) == "1";
     else if (a == "--mix-h16") engine::FlashNextGpu::prefill_mix_h16_ = std::string(argv[i + 1]) == "1";
     else if (a == "--shexp-w8a8") engine::FlashNextGpu::prefill_shexp_w8a8_ = std::string(argv[i + 1]) == "1";
     else if (a == "--down-w8a8") engine::FlashNextGpu::prefill_down_w8a8_ = std::string(argv[i + 1]) == "1";
     else if (a == "--gdn-io16") engine::FlashNextGpu::prefill_gdn_io16_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--gdn-f16") engine::FlashNextGpu::prefill_gdn_f16_ = std::atoi(argv[i + 1]);
+    else if (a == "--mixed32-skip") engine::FlashNextGpu::prefill_mixed32_skip_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--router-tile") engine::FlashNextGpu::prefill_router_tile_ = std::atoi(argv[i + 1]);
     else if (a == "--res16") engine::FlashNextGpu::prefill_res16_ = std::atoi(argv[i + 1]);
     else if (a == "--gdn-scan-h") engine::FlashNextGpu::prefill_gdn_scan_h_ = std::string(argv[i + 1]) == "1";
     else if (a == "--router-f16") engine::FlashNextGpu::prefill_router_f16_ = std::atoi(argv[i + 1]);
@@ -108,6 +114,8 @@ int main(int argc, char** argv) {
   auto weights = model::ModelWeights::Bind(*reader, &error);
   auto tok = text::Tokenizer::FromGguf(*reader, &error);
   if (!weights || !tok) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+  if (moe_topk && !weights->SetExpertsUsed(moe_topk, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 2;
+  std::printf("experts per token: %u of %u\n", weights->config.num_experts_used, weights->config.num_experts);
   const auto& c = weights->config;
   const auto& t = weights->ple_table;
   auto ngram = model::NgramTable::Open(reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset, t.rows,
