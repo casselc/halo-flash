@@ -46,6 +46,11 @@ header.
     content-addressed llm_payloads, append-only llm_scores with supersedes);
   - otel-chdb/README.md -> the Null staging table plus materialized view
     write pattern.
+  - otel-chdb/research/langfuse.md (sections 2.1 and 7) -> the shape of
+    halo-scope's datasets, dataset runs, evaluators and score sources
+    (src/scope/evals*.{hpp,cpp}, evaluators.{hpp,cpp}, runner.{hpp,cpp});
+    a design reference only, no code copied. Neither repository has
+    dataset or experiment code; that part is new in halo-flash.
 
 Runtime dependencies (not vendored): HRX System, Apache-2.0; libchdb (chDB,
 Apache-2.0), loaded with dlopen by halo-scope when present.

@@ -226,7 +226,7 @@ if(HALO_BUILD_TESTS)
   target_compile_definitions(decide_tests PRIVATE
     HALO_DECIDE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/decide/data")
   if(HALO_GPU)
-    halo_test(gpu_tests tests/gpu/qwen35_gpu_test.cpp tests/gpu/quant_gpu_test.cpp tests/gpu/flash_next_gpu_test.cpp tests/gpu/select_gpu_test.cpp tests/gpu/sample_gpu_test.cpp
+    halo_test(gpu_tests tests/gpu/qwen35_gpu_test.cpp tests/gpu/quant_gpu_test.cpp tests/gpu/flash_next_gpu_test.cpp tests/gpu/select_gpu_test.cpp tests/gpu/decode2_gpu_test.cpp tests/gpu/sample_gpu_test.cpp
       tests/gpu/flash_next_generator_test.cpp)
     target_link_libraries(gpu_tests PRIVATE halo_gpu)
     target_link_libraries(decide_tests PRIVATE halo_gpu)
@@ -330,6 +330,8 @@ if(HALO_SCOPE)
       src/scope/records.cpp
       src/scope/recorder.cpp
       src/scope/metadata.cpp
+      src/scope/sqlite_util.cpp
+      src/scope/evals_schema.cpp
       src/scope/wal.cpp
       src/scope/annotate.cpp
       src/scope/c_api.cpp)
@@ -342,10 +344,27 @@ if(HALO_SCOPE)
     endif()
   endfunction()
   halo_scope_library(halo_scope 0)
+  # Datasets, experiments and evaluators (P12, second half): SQLite ledger,
+  # runner, evaluators and their C ABI.
+  function(halo_scope_evals_library name scope_lib mutant)
+    add_library(${name} STATIC
+      src/scope/evals.cpp
+      src/scope/eval_stats.cpp
+      src/scope/json_schema.cpp
+      src/scope/evaluators.cpp
+      src/scope/http_client.cpp
+      src/scope/runner.cpp
+      src/scope/eval_json.cpp
+      src/scope/c_api_evals.cpp)
+    target_link_libraries(${name} PUBLIC ${scope_lib} halo_core)
+    target_compile_definitions(${name} PRIVATE HALO_SCOPE_MUTANT=${mutant})
+  endfunction()
+  halo_scope_evals_library(halo_scope_evals halo_scope 0)
   # The OpenAI service's generations as observations (links the server).
   add_library(halo_scope_server STATIC src/scope/generation_observer.cpp src/scope/response_store.cpp
-    src/scope/http_annotations.cpp src/scope/trace_reader.cpp src/scope/prompt_routes.cpp)
-  target_link_libraries(halo_scope_server PUBLIC halo_scope halo_server)
+    src/scope/http_annotations.cpp src/scope/trace_reader.cpp src/scope/prompt_routes.cpp
+    src/scope/eval_routes.cpp)
+  target_link_libraries(halo_scope_server PUBLIC halo_scope halo_scope_evals halo_server)
   if(TARGET halo_serve)
     target_link_libraries(halo_serve PRIVATE halo_scope_server)
     target_compile_definitions(halo_serve PRIVATE HALO_WITH_SCOPE=1)
@@ -353,6 +372,10 @@ if(HALO_SCOPE)
 
   add_executable(scope_bench bench/scope/scope_bench.cpp)
   target_link_libraries(scope_bench PRIVATE halo_scope)
+  # halo_scope_eval: datasets, evaluators and experiments from the shell,
+  # over a halo_serve's /v1/scope API.
+  add_executable(halo_scope_eval tools/scope_eval.cpp)
+  target_link_libraries(halo_scope_eval PRIVATE halo_scope_evals)
 
   if(HALO_BUILD_TESTS)
     halo_test(scope_tests
@@ -366,6 +389,11 @@ if(HALO_SCOPE)
       tests/scope/http_annotations_test.cpp
       tests/scope/trace_reader_test.cpp
       tests/scope/prompt_routes_test.cpp
+      tests/scope/evals_test.cpp
+      tests/scope/eval_stats_test.cpp
+      tests/scope/evaluators_test.cpp
+      tests/scope/runner_test.cpp
+      tests/scope/eval_routes_test.cpp
       tests/scope/scope_main.cpp)
     target_link_libraries(scope_tests PRIVATE halo_scope halo_scope_server)
 
@@ -403,6 +431,40 @@ if(HALO_SCOPE)
       set_tests_properties(scope_mutant${m}_is_caught PROPERTIES
         ENVIRONMENT "HALO_SCOPE_TEST_WRITER=manual;HALO_SCOPE_TEST_CASES=2000"
         PASS_REGULAR_EXPRESSION "${_scope_mutant_expect_${m}}")
+    endforeach()
+    # Evaluation positive controls: 11 redoes done items on resume (and
+    # drops the trigger that would refuse it), 12 lets frozen items change,
+    # 13 computes the SE with n instead of n - 1, 14 mirrors scores after the
+    # commit instead of before.
+    set(_evals_mutant_filter_11 ScopeRunner.CrashesAnywhereResumeToTheUninterruptedResult)
+    set(_evals_mutant_expect_11 "final resume|differs|counted twice|did work again")
+    set(_evals_mutant_filter_12 ScopeEvals.FrozenVersionsAreImmutable)
+    set(_evals_mutant_expect_12 "tamper accepted")
+    set(_evals_mutant_filter_13 ScopeEvalStats.PairedComparisonMatchesReference)
+    set(_evals_mutant_expect_13 "differs from the reference")
+    set(_evals_mutant_filter_14 ScopeRunner.CrashesAnywhereResumeToTheUninterruptedResult)
+    set(_evals_mutant_expect_14 "never mirrored")
+    foreach(m 11 12 13 14)
+      if(m EQUAL 11 OR m EQUAL 12)
+        halo_scope_library(halo_scope_mutant${m} ${m})  # the schema lives in halo_scope
+        halo_scope_evals_library(halo_scope_evals_mutant${m} halo_scope_mutant${m} ${m})
+      else()
+        halo_scope_evals_library(halo_scope_evals_mutant${m} halo_scope ${m})
+      endif()
+      add_executable(scope_evals_mutant${m}_tests
+        tests/scope/evals_test.cpp tests/scope/eval_stats_test.cpp tests/scope/runner_test.cpp
+        tests/scope/scope_main.cpp)
+      target_link_libraries(scope_evals_mutant${m}_tests PRIVATE halo_scope_evals_mutant${m} GTest::gtest hegel)
+      target_compile_options(scope_evals_mutant${m}_tests PRIVATE -Wno-missing-designated-field-initializers)
+      add_test(NAME scope_evals_mutant${m}_is_caught
+        COMMAND scope_evals_mutant${m}_tests --gtest_filter=${_evals_mutant_filter_${m}}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+      # Serial and with a larger budget: two mutants share a property (and
+      # its Hegel example database), and each must find its own failure.
+      set_tests_properties(scope_evals_mutant${m}_is_caught PROPERTIES
+        ENVIRONMENT "HALO_SCOPE_TEST_CASES=400"
+        RUN_SERIAL TRUE
+        PASS_REGULAR_EXPRESSION "${_evals_mutant_expect_${m}}")
     endforeach()
     if(HALO_SANITIZE MATCHES "thread")
       # TSan's own positive control: an unpublished ring write must be seen.

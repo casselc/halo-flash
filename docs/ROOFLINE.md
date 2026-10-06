@@ -1233,3 +1233,143 @@ significant** (1599 -> 1644 tok/s). Cumulative quality = the `--gdn-f16` row (th
   not by the expert byte stream, so time per pair is the lever in those kernels.
 - Decode -1.58 / -3.45 ms per token.
 - Quality: k = 8 passes the gate (short +0.0105), k = 6 fails (+0.0565). Default stays 10.
+
+## 10. 2026-10-06 (stream D2, branch `stream/decode2`): decode at 36.9 ms, and what the memory system punishes
+
+Measured with `halo_run --device-sample 1` (steady median of 76 steps; 36 for the per-bit sessions), clock pinned,
+interleaved arms of one binary (`--decode-opt MASK`; 0 is main's decode: its logits equal main's binary).
+Long context: `--prompt-file prose_long.txt --prefill-prompt 1` (6,939 tokens). Working files and every session's
+raw output: `/data/halo-work/streams/D2/` (`PREDICTIONS.md` holds each prediction, written before its run).
+
+**Byte floor per token (short context, 240 GB/s): 6.55 GB = 27.3 ms.** Dual qkv + z 1.605 GB, ssm_out 0.601,
+attn_q 0.401, attn k/v 0.033, attn_out 0.200, hyper-connection mixers 0.690, routed gate/up 0.865 (Q4_K) +
+0.023 (Q5_K layer), routed down 0.529 (Q5_1) + 0.087 (Q8), shared expert 0.250, F32 router 0.252, alpha/beta 0.035,
+LM head 0.676, indexer 0.039, DeltaNet state read + write 0.226, PLE 0.035. Main: 42.7 ms = 64% of the floor
+rate; this branch: 36.9 ms = 74%.
+
+| Bit | Change (all bit-identical; a property test per kernel against the launch it replaces) | Predicted (ms/step) | Measured | Kept |
+|---|---|---|---|---|
+| 1 | Layer 2's experts are Q5_K: the generic per-expert path (5 launches an expert, byte-at-a-time `halo_matvec_q5_k_expert`, ~1.05 ms). One launch for all 10 experts' gate + up + SiLU (`halo_moe_gate_up_q5_k_rows`: a lane's super-block pieces loaded first, LoadQ5_K's arithmetic, matvec_q5_k's order), then `halo_moe_down_q8r_r4` + `halo_moe_combine` (same sums as the r4 down + axpy chain) | -0.75..-0.9 | -0.75 | yes |
+| 2 | QSA indexer q/k (BF16, generic matvec: 37 + 26 us a layer) in one launch with 16 loads in flight a lane (`halo_matvec_bf16_dual`) | -0.5..-0.6 | -0.5 (24 us a layer) | yes |
+| 8 | `hc_mix_a` declared 48 KB of LDS for a 1536-column chunk: 40 of its 168 blocks resident. Chunk-sized LDS (`halo_hc_mix_a_c`) | -0.8..-1.3 | -0.85 (37.5 -> 28.6 us) | yes |
+| 64 | `halo_qsa_scores`: one thread a block, 512 dependent FMA + L1 loads (35 us even at 1 block). q in LDS, rows as float4, the heads' chains side by side (`_b`) | -0.37..-0.4 | -0.19 (36.9 -> 7.9 us eager) | yes |
+| 256 | Routed combine folded into the shared-expert down launch (`halo_shexp_down_combine`) | -0.2..-0.25 | -0.12 | yes |
+| 2048 | Graph split before the PLE layer (layer 1): params uploaded, part 1 launched, the n-gram rows read meanwhile into pinned memory and uploaded stream-ordered, part 2 launched. The host gap (D2H token, O_DIRECT n-gram read on a cache miss, H2D, launch) was 0.23-1.4 ms in the trace and the reason step medians sat ~0.85 ms over the minimum | -0.5..-0.9 | -0.15..-0.6; median now on the minimum | yes |
+| 32768 | The routed gate/up quantized x in every one of its 400 blocks (ISA: 8 warps x 10 serial rounds of an L2 load + ~20 dependent shuffles) before its first weight load. The router launch (same x) now quantizes it once (80 of its 512 blocks, one warp each) into a global Q8Act; gate/up copies 5 KB into LDS (`halo_moe_gate_up_q4_k_dot_g`). D's P1 hypothesis, confirmed | -0.5..-1.4 | **-1.02** (130 -> 104 us) | yes |
+| 65536 | Block-per-row F32 dots (router, alpha/beta, shared-expert gate logit) compile to load, wait, FMA per iteration (10 serial DRAM rounds a thread). Loads hoisted (`_u`, `RowDotHoisted`), the chain explicitly `fmaf` | -0.6..-0.9 | -0.43 | yes |
+| 131072 | The same hoisting in the norm scales, combines, mix_b's partial sums, mix_a's staging and inject rows | -0.6..-0.9 | -0.24 | yes |
+| 262144 | `halo_gdn_step_d128_norm` held its 128-float state column in registers (256 VGPRs, 152 spilled). `_r`: read it in chunks of 32 for A and B, again (L2) for the update: 87 VGPRs, no spills | -0.2..-0.35 | -0.06 / -0.92 (39.3 -> 25.4 us eager) | yes |
+| 524288 | Router top-k selection by warp shuffles (`halo_router_topk_w`) instead of 10 block rounds | -0.4..-0.5 | -0.12 (15.7 -> 12.8 us: the softmax is the rest) | yes |
+| 4 | Q8 GEMVs with cols <= 6144 staging x in 24 KB (r4n / r2n): all 80 blocks of the 2560 x 6144 projections resident | -0.9..-1.5 | **+1.15** (103.7 -> 121 us; LM head 2796 -> 2896) | no |
+| 16 | DeltaNet qkv + z GEMV with 16 KB LDS: 160 blocks resident instead of 40 | 0..-0.4 | **+2.4** (201 -> 267 us) | no |
+| 32 | Gate/up with each lane's 15 weight loads issued before quantizing (`_dot_p5`) | -0.9..-1.6 | **+2.6** (129 -> 179 us) | no |
+| 128 | Combine + the next mixer's norm scales in one launch (4 blocks) | -0.3..-0.4 | ~0 | no |
+| 512 | DeltaNet alpha/beta rows as extra blocks of the qkv + z launch | -0.25..-0.35 | ~0 | no |
+| 1024 | One-chunk register prefetch in the Q8 GEMVs (two load rounds in flight a wave) | -1.2..-2.1 | **+0.45** (80-block 103 -> 107.5, dual 200 -> 209) | no |
+| 4096 | Weights before the prologue in the Q5_1 expert down and mix_b | -0.8..-1.3 | **+2.2** (down 75 -> 117 us) | no |
+| 8192 / 16384 | 2 / 1 rows a wave for the 2560 x 6144 GEMVs | -0.5..+0.5 | -0.04 / +0.6 | no |
+| 1048576 | mix_a's three weight rounds a lane issued as one (pinned with `sched_barrier`; the scheduler sinks hoisted loads back otherwise) | -0.35..-0.7 | **+0.25** | no |
+| 2097152 | mix_b's weights before its (hoisted) partial sums | -0.2..-0.3 | **+0.3** | no |
+| 4194304 | Shared-expert gate and up rows in one column loop (4 loads a round, 5 rounds instead of 2 x 5) | -0.25..-0.35 | -0.01 | no |
+
+**End to end (final A/B, 3 rounds, pinned, 76 steps; main's binary, this binary at `--decode-opt 0`, default):**
+short context 42.73 / 42.77 / **36.91 ms (23.4 -> 27.1 tok/s, -5.82 ms, -13.6%)**; 6,939-token context 44.25 /
+44.24 / **38.95 ms (22.6 -> 25.7 tok/s, -5.29 ms, -12.0%)**; round spreads <= 0.46 ms (short default 37.37 /
+36.91 / 36.90). Exactness: decode logits byte-identical to main's binary over 65 steps at short and 66 steps at 7K
+context, greedy text identical in all 9 device-sampled runs, prefill logits (prose_1, 2048) identical to
+`logits_main_5e5466e.bin`, every new kernel bitwise against its original (Hegel properties, both backends); gpu_tests 57 passed with the small-model fixture, and SmallQuantizedModelRunsFastPathsAndMatchesReference, ChunkedPrefillMatchesStepping and GreedyMatchesEngineStepsAndReuseIsExact pass with both fixtures.
+
+**What the measurements say about this memory system.** Five changes that issue a kernel's *weight* loads earlier
+or more of them at once (more resident blocks, a register prefetch, weights before a prologue, one-round loads)
+each made the kernel slower, by 4-50%, even with the same bytes per wave; the hwprobe sweep reproduces the
+residency direction in steady state (6 KB rows: 235 GB/s at 40 resident blocks, 213 at 100; 2.5 KB rows: 245 vs
+223) but not its size. Hoisting a thread's *loop* loads (small, L2/MALL-resident or few-page reads that the
+compiler had serialized with a wait each) helped every time. Concurrent distinct DRAM pages (or their address
+translation: all 79 GiB live in GTT, 4 KB pages, VRAM is 512 MB) is the working hypothesis; HARDWARE.md's flat
+~34 GB/s for random 4 KB pages fits it. Not tested further here. Launch fusion is worth ~0-1 us a launch inside the
+graph (rocprof's 2.4 us gaps are the profiler's); bits 128 and 512 removed 96 and 36 launches for nothing.
+
+**Where the 36.9 ms go (final, eager kernel timing; floor at 240 GB/s):**
+
+| Kernel | ms/step | calls | us/call | MB/call | GB/s | floor ms | gap ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `gemv_q8r_r4` 2560 x 6144 (ssm_out, attn_out, 80 blocks) | 5.05 | 49 | 103.1 | 16.7 | 162 | 3.41 | 1.64 |
+| `moe_gate_up_q4_k_dot_g` | 4.89 | 47 | 104.1 | 18.4 | 177 | 3.61 | 1.28 |
+| `hc_mix_a_cu` | 2.65 | 96 | 27.6 | 3.65 | 132 | 1.46 | 1.19 |
+| `hc_mix_b_u` | 2.54 | 97 | 26.2 | 3.48 | 133 | 1.41 | 1.13 |
+| `moe_down_q5_1_r4` | 3.15 | 43 | 73.2 | 12.3 | 168 | 2.20 | 0.95 |
+| `gemv_q8r_dual` (qkv + z) | 7.21 | 36 | 200.2 | 44.6 | 223 | 6.68 | 0.52 |
+| `shexp_gate_up_u` + `shexp_down_combine_u` | 1.85 | 96 | 23.1 / 15.4 | 3.48 / 1.74 | 151 / 113 | 1.05 | 0.80 |
+| `router_rowblock_q8act` | 1.35 | 47 | 28.7 | 5.24 | 183 | 1.03 | 0.32 |
+| LM head, attn_q, DeltaNet step, Q8 / Q5_K experts, indexer, alpha/beta, k/v, PLE | 7.22 | | | | 94-248 | 6.44 | 0.78 |
+| small kernels (norm scales, combine, top-k 12.8 us, attention prep, copies) + eager stamps | ~4.1 | | | | | | |
+
+Streaming kernels 35.9 ms against a 27.3 ms floor (eager; the graph runs ~3 ms faster than the stamps).
+
+**Remaining levers (ms/step, short context):** the 80-block 2560 x 6144 GEMVs 1.6 (two lock-stepped rounds of 40
+blocks, one 2 KB load round in flight a wave; more residency and prefetch both lost, so the next try is a different
+row-to-block mapping, measured, not predicted from bandwidth); routed gate/up 1.3 and down 0.95 (same family); the
+mixers 2.3 (lock-stepped one-to-three rounds of ~1.4 MB); shared expert 0.8; small kernels ~2 in the graph
+(attention prep chain of ~15 launches a layer, top-k softmax 12.8 us x 48); 7K attention 1.8 (floor ~0.5). A
+page-locality / translation probe (same bytes in flight over 4 KB vs 64 KB vs 2 MB spans, at 40 / 100 / 160
+resident blocks) should come before any of these.
+## 11. 2026-10-06 (stream L, branch `stream/longctx`): long-prompt prefill (8K)
+
+8K = the first 8192 tokens of `streams/S/prose_10k.txt`, pinned unless noted. End-to-end metric: `ab_bench.py
+--chunks 0` sums every chunk's device time of a rep (whole prefill; the old metric kept only the last chunk).
+
+**Profile of main 19d80bb.** Device per 2048-token chunk 1243 / 1319 / 1348 / 1425 ms (5335 total; the 2048 prompt
+alone 1243); wall 5.38 s pinned (1522 tok/s), 5.37 s default clock (1527 tok/s). The QSA path (positions >= 2048)
+costs `qsel_h` 386.6, `qsa_select_rows` 52.3, `qsa_scores_wmma` ~21, `union4` 3.4 = 463 ms, in place of what dense
+`fa_hg` would cost at 2048 (3 x 39.8): ~+345 ms long-context-specific; everything else is the per-chunk cost a
+2048 prompt also pays. Halogen claims 1584 tok/s at 8K (one 32K chunk); no gufo 8K number in the docs.
+
+**Selection statistics** (debug dump of every token's selection, 12 layers x 6144 tokens): the union of 4 tokens
+is 3042 keys (1.49 x 2048) at block granularity; a tile mask with 16-key tiles already covers 0.89 of the causal
+context, 32 tokens x 64-key tiles 1.00. Halogen's sparse path (`k_sel_tilemask` + `k_attn_fa2`) is therefore dense
+attention at 8K: at our dense efficiency ~594 ms for chunks 2-4 (halogen's 1.19x per-key edge: ~500) vs the QSA
+path's 463. Not a lever for this model at 8K; the FaSel layout was not needed to decide it.
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| `halo_qsa_select_rows256`: 256-thread blocks; each radix pass's threshold digit found by one wave (8 digits a lane, shuffle prefix sum, ballot) instead of thread 0 walking up to 256 bins one dependent LDS read at a time; compaction by wave ballots + 8 per-wave totals (2 barriers an iteration) instead of Hillis-Steele scans (20 barriers each at 1024 threads). Same lists (ties, order); property test vs the reference rule (heavy ties, up to 70K blocks) | 52.3 -> 4-7 ms | 52.3 -> 10.3-10.9 ms (71 us a call); end to end inside noise (-24.7, spreads 90 / 127) | yes |
+| `halo_attention_wmma_qsel_h2`: V loaded 4 bytes (2 dims) of one key a lane and instruction, 8 keys a task, packed by v_perm into the transposed tile (2 x 16-byte stores instead of 32 two-byte stores a thread); softmax reads its 8 scores as 2 x 16 bytes and stores its 8 p as one 16-byte store. Hypothesis: qsel_h LDS-throughput bound (~80% by HARDWARE.md rates) | -60..-105 (fallback -10..-25) | 386.5 -> 372.0 ms (-14.5); span: softmax 0.99 -> 0.60 us, staging 0.51 -> 0.63, others unchanged; ATT barrier 61 -> 64% | yes (small) |
+| qsel_h3: h2 with 3 scoring waves (row tile x both key tiles, each Q fragment read once for 2 WMMAs) | -17..-27 | 387.2 ms (+15 vs h2) | no (removed) |
+| Long chunks, exact: `--prefill-chunk 8192` with the `_l` / `_s` / router / k128 GEMMs on 2048-token slices (`--gemm-slice`, default 2048) and a chunk crossing position 2048 running its prefix on `fa_h` and the QSA loop from position 2048 (`--dense-prefix`, default on) | -300..-400 kernel at 8K | **-371.9 ms end to end, significant** (5329 -> 4957, 1537 -> 1653 tok/s); logits byte-identical to 2048-token chunks | flags kept; default chunk unchanged (+4.3 GB, below) |
+
+*Why qsel_h2 missed:* the hypothesis that the kernel is LDS-throughput bound overall is refuted. Each phase is bound
+by its own fragment stream and latency and the phases do not overlap within a block (barrier 64%); removing the
+16-bit V stores did not shorten the staging (the 16 four-byte V loads with uniform per-key addresses replaced 4
+16-byte ones). The remaining design that differs from qsel_w (wave-owned rows) and from these: warp specialization
+across chunks (scorers holding Q in registers, P.V waves separate, scores(c+1) overlapping P.V(c), 2 barriers a
+chunk, no Q tile in LDS: ~42.6 KB, 3 blocks a WGP). Not built: no skeleton probe yet, and the floor-style estimate
+(~2x) is the kind that failed for qsel_w.
+
+*Long chunks.* Unmodified, chunk 4096 / 8192 gave 5.39 / 5.34 s (no gain) and different logits: the MoE kernels
+amortize per-pair work (gate/up -162, down -105, the q8r / q5_k variants -54 ms at 8192) and lr8 -52, but `_l`
++208, `_s` +120, router +80, k128 +36: their T x cols fp16 activations stop fitting the 32 MB MALL past 2048
+tokens and are re-read per row tile from DRAM; and the first 2048 positions went through the QSA path. Slicing those
+GEMMs keeps their per-token cost (per-token results do not depend on the slice) and the dense prefix keeps the flash
+kernel for positions < 2048, so chunk 4096 and 8192 give logits byte-identical to main's 2048-token chunks (8K and a
+3485-token prompt checked; new engine test `LongChunksMatchDenseRangeChunks`, negative control: with the prefix off
+it fails). Kernel-timed rep at 8192: 5286 -> 4958 ms; residual losses `_l` +30, k128 +17, `_s` +14 after slicing.
+Memory: chunk scratch ~0.7 MB a token: MemAvailable minimum during an 8K prefill 29.3 GB at chunk 2048, 25.0 GB at
+8192 (+4.3 GB). Chunk 4096 (one run): 5.10 s.
+
+Stream L total, against main 19d80bb (ab_bench, 4 rounds x 3 reps, pinned, whole-prefill device sum, 8192 tokens):
+main 5329.2 ms (1537 tok/s); L defaults 5285.9 (-43.3, within noise; qsel_h2 + select256 -57 kernel); L with
+`--prefill-chunk 8192` **4957.3 ms, -371.9, significant (1653 tok/s)**.
+2048 tokens (same A/B): main 1249.6, L 1242.2 (-7.4), L with `--prefill-chunk 8192` 1243.2 (-6.4), both within noise;
+logits byte-identical to `logits_main_5e5466e.bin`; gpu_tests 49 passed with the small-model fixtures.
+Default clock, wall, 8K (6 reps over two processes each, after a warm prefill; other streams idle but the host
+was not quiet): main median 5.39 s (min 5.34, 1534 tok/s), L chunk 8192 median 5.07 s (min 5.02, **1631 tok/s**),
+above halogen's claimed 1584.
+
+Remaining long-prompt levers, by size: (1) chunk 8192 as the default for long prompts (-372 ms at 8K, +4.3 GB; the
+scratch is sized min(chunk, max context), so a 262K server pays it once); (2) qsel at 372 ms against a ~0.74 ms a
+call WMMA floor (2.58 ms measured): warp specialization across chunks (above), prove with a skeleton first;
+(3) `_l` / `_s` / k128 still +60 ms at chunk 8192 after slicing (a MALL-aware tile order for T > 2048 instead of
+slices); (4) select256 at 71 us a call writes 4 MB of visible lists that only `union4` reads: fusing selection
+into the union (bitmaps straight from the radix threshold) ~-8 ms; (5) decode: `halo_qsa_select` (1024 threads,
+serial digit walk) runs 12 times a decode step, ~28 us each at 7K: the 256-thread kernel would save ~0.25 ms a
+token (stream D2's area, not changed here).

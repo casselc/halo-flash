@@ -88,6 +88,9 @@ struct GenerationRequest {
   std::string user;
   // Observability context (set by the service from X-Halo-* headers).
   std::string trace_id, session_id;
+  std::string prompt_name;      // X-Halo-Prompt: name@version (a managed prompt)
+  std::uint32_t prompt_version = 0;
+  std::string variant_id;       // X-Halo-Variant-Id
 };
 
 struct RequestError {

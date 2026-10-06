@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <utility>
 
@@ -124,6 +125,12 @@ namespace {
 void SetContext(const HttpRequest& http, GenerationRequest& req) {
   if (const std::string* t = http.Header("x-halo-trace-id")) req.trace_id = *t;
   if (const std::string* s = http.Header("x-halo-session-id")) req.session_id = *s;
+  if (const std::string* p = http.Header("x-halo-prompt")) {
+    const auto at = p->rfind('@');
+    req.prompt_name = p->substr(0, at);
+    if (at != std::string::npos) req.prompt_version = static_cast<std::uint32_t>(std::strtoul(p->c_str() + at + 1, nullptr, 10));
+  }
+  if (const std::string* v = http.Header("x-halo-variant-id")) req.variant_id = *v;
 }
 
 std::int64_t NowNs() {
@@ -281,6 +288,12 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
       rec.request_id = id;
       rec.trace_id = run->req.trace_id;
       rec.session_id = run->req.session_id;
+      rec.prompt_name = run->req.prompt_name;
+      rec.prompt_version = run->req.prompt_version;
+      // The variant that actually ran (the "variant" field or a
+      // "base:variant" alias) is authoritative; the X-Halo-Variant-Id
+      // header labels requests that name none.
+      rec.variant_id = run->req.variant.empty() ? run->req.variant_id : run->req.variant;
       rec.user = run->req.user;
       rec.model = run->req.model;
       rec.prompt_tokens = result.prompt_tokens;

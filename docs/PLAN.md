@@ -739,8 +739,61 @@ trip. The same API is served over HTTP for harnesses in other processes
 chat in a harness trace, the harness's tool result and score came back as
 one trace. Prompts have versions and labels over HTTP
 (`POST /v1/scope/prompts`, `GET /v1/scope/prompts/{name}?label=|version=`,
-`POST /v1/scope/prompts/{name}/labels`). Search (the query language),
-datasets and experiments, and the UI are next.
+`POST /v1/scope/prompts/{name}/labels`). Search (the query language) and
+the UI are next.
+
+**Status (2026-10-06): datasets, experiments and evaluators** (stream X).
+- **Storage.** SQLite migrations 3-5 in the metadata database: datasets
+  with numbered versions (one draft; a frozen version records its content
+  hash and item count, and triggers refuse every write to it and to an
+  archived dataset), immutable evaluator versions, and runs with a per-item
+  ledger. The ledger is the run's checkpoint, so it lives in SQLite: an
+  item's output and all its scores commit in one transaction, a done item is
+  immutable, and the primary keys make a double count impossible. Every
+  target and judge generation (and its payloads) goes to chDB under the
+  attempt's trace, and each score is mirrored as an `llm_scores` fact with an
+  id derived from run, item and attempt, written before the commit.
+- **Runs** pin a frozen dataset version, a target (prompt version x model /
+  variant id x decoding parameters x extra request fields) and evaluator
+  versions; their binding hashes all of that content, is recomputed before
+  every execution, and a reused name with another binding is refused. Each
+  attempt gets its own trace id; requests carry `X-Halo-Trace-Id`,
+  `X-Halo-Session-Id` (the run), and the new `X-Halo-Prompt` /
+  `X-Halo-Variant-Id`, which the server now records on the GENERATION
+  observation. Seeds are fixed per item. Transient failures (unreachable,
+  429, 5xx) leave the item for a resume, bounded by `max_attempts`.
+- **Evaluators:** exact (trim, case, whitespace, first line, JSON), regex,
+  json_schema (a checked subset; unknown keywords refused), numeric
+  tolerance, code hooks (C ABI), llm_judge (a pinned prompt version through
+  the engine's own or any OpenAI-compatible endpoint; the judge model,
+  prompt version, trace id and raw reply are kept with the score; an
+  unparseable or out-of-range verdict is a recorded failure, never a value)
+  and decider (`/v1/systemone`).
+- **Interfaces:** `/v1/scope/datasets`, `.../items`, `.../import` (JSONL),
+  `.../from_traces`, `.../freeze`, `.../archive`, `/v1/scope/evaluators`,
+  `/v1/scope/runs` (create or resume, background execution, progress,
+  `items`, `scores`, `resume`, `cancel`) and `/v1/scope/compare` (paired
+  per-item deltas, mean +- SE, wins/losses/ties); C ABI
+  `halo_scope_evals_*`, `halo_scope_dataset_*`, `halo_scope_evaluator_create`,
+  `halo_scope_run_experiment` (HTTP or in-process target), hooks,
+  `halo_scope_run_compare`; CLI `halo_scope_eval`.
+- **Tests:** a Hegel state machine for freeze immutability with direct-SQL
+  tampering, injected crashes at every checkpoint boundary and real
+  fork/`_exit` crashes resuming to the uninterrupted ledger, racing
+  executors, the paired statistics against Python and a reference, evaluator
+  properties, pinned migration checksums and an upgrade from a pre-dataset
+  database; four mutants as positive controls (redo done items, editable
+  frozen items, SE over n, mirror after commit). ASan+UBSan, UBSan (Debug)
+  and TSan builds pass (without chDB, which these builds do not load).
+- **On the real model** (20 cases of the short quality set, Flash-Next as
+  target and judge, the strands-decider as a third evaluator): greedy
+  against temperature 1.0 / top-p 0.95, paired over 20 items (b - a): strict
+  judge -0.15 +- 0.17 (4.30 vs 4.15; 4 wins, 7 losses), lenient judge -0.25 +-
+  0.14 (5.00 vs 4.75: the lenient rubric saturates), decider P(on topic)
+  -0.009 +- 0.020, exact first line 0.05 vs 0.00. The greedy run was killed
+  with SIGKILL after 8 items and resumed by name on a restarted server: 19
+  items took one attempt, the one in flight took two, and every score equals
+  the uninterrupted first run's.
 The server's own generations are recorded too (`halo_serve --scope-dir`,
 in builds with HALO_SCOPE=ON): one GENERATION observation per request with
 usage and cache reads, time to first text, per-piece latency percentiles,

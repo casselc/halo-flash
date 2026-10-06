@@ -20,6 +20,9 @@ struct GenerationRecord {
   std::string request_id;  // the response / completion id
   std::string trace_id;    // X-Halo-Trace-Id, else empty
   std::string session_id;  // X-Halo-Session-Id, else empty
+  std::string prompt_name;  // X-Halo-Prompt (name@version), else empty
+  std::uint32_t prompt_version = 0;
+  std::string variant_id;   // the request's resolved P10 variant, else X-Halo-Variant-Id, else empty
   std::string user;
   std::string model;
   std::int64_t start_ns = 0, first_text_ns = 0, end_ns = 0;  // first_text_ns 0: no text

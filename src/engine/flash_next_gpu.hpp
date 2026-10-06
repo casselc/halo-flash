@@ -64,6 +64,24 @@ class FlashNextGpu {
   static inline bool fused_moe_ = true;   ///< P3 routed experts in three launches
   /// Decode attention with batched loads (halo_attention_select_b; bit-identical to halo_attention_select).
   static inline bool decode_attn_batched_ = true;
+  /// Stream D2 decode options, one bit each, every one bit-identical to the launches it replaces (0 is main's
+  /// decode; docs/ROOFLINE.md section 10 has the measured bits that were not kept and their numbers).
+  enum DecodeOpt : unsigned {
+    kDecodeQ5kExperts = 1u,       ///< the Q5_K layer's experts in 3 launches (halo_moe_gate_up_q5_k_rows)
+    kDecodeIndexerDual = 2u,      ///< QSA indexer q + k projections in one launch (halo_matvec_bf16_dual)
+    kDecodeHcMixLds = 8u,         ///< hc_mix_a stages only its column chunk (halo_hc_mix_a_c)
+    kDecodeQsaScores = 64u,       ///< QSA block scores with q in LDS and the heads' chains side by side
+    kDecodeShexpCombine = 256u,   ///< routed combine folded into the shared expert's down launch
+    kDecodeSplitGraph = 2048u,    ///< graph split before the PLE layer: the n-gram read overlaps the layers before it
+    kDecodeQ8ActOnce = 32768u,    ///< routed gate/up activations quantized once, in the router launch
+    kDecodeHoistRowLoads = 65536u,  ///< block-per-row F32 dots (router, alpha/beta, shexp gate) issue all loads first
+    kDecodeHoistSmall = 131072u,    ///< norm scales, combines, the mixers' prologues: loop loads issued first
+    kDecodeGdnNoSpill = 262144u,    ///< DeltaNet step reads its state column twice instead of spilling it
+    kDecodeTopkWarp = 524288u,      ///< router top-k by warp shuffles (halo_router_topk_w)
+  };
+  static inline unsigned decode_opt_ = kDecodeQ5kExperts | kDecodeIndexerDual | kDecodeHcMixLds | kDecodeQsaScores |
+                                       kDecodeShexpCombine | kDecodeSplitGraph | kDecodeQ8ActOnce | kDecodeHoistRowLoads |
+                                       kDecodeHoistSmall | kDecodeGdnNoSpill | kDecodeTopkWarp;
   static inline bool small_row_kernels_ = true;  ///< P3 block-per-row F32 matvec for few rows
   /// P3 expert gate+up with int8 activations (llama.cpp-style Q8_1); false
   /// keeps the float kernel. A quality-gated choice (docs/BENCHMARKS.md).
@@ -76,6 +94,13 @@ class FlashNextGpu {
   /// this and the context when first needed). Large chunks let each routed
   /// expert see enough tokens to reuse its weights.
   static inline std::uint32_t prefill_chunk_ = 2048;
+  /// GEMMs whose per-token cost rises with the token count (their activations stop fitting the MALL past
+  /// ~2048 tokens: `_l`, `_s`, the router and the small fp32 projections) run on slices of this many tokens
+  /// when a chunk is longer (0: never). Per-token results do not depend on the slicing.
+  static inline std::uint32_t prefill_gemm_slice_ = 2048;
+  /// A chunk crossing the end of the dense range runs its dense prefix on the flash kernel (as 2048-token
+  /// chunks do) instead of all of it on the QSA path.
+  static inline bool prefill_dense_prefix_ = true;
   static inline bool batched_prefill_ = true;
   /// Debug: chunk projections through the decode GEMVs (token by token)
   /// instead of the int8 GEMMs, so a chunk equals stepping up to float order.
@@ -151,6 +176,10 @@ class FlashNextGpu {
   /// Past the QSA budget, attention for 4 tokens at a time over the union of
   /// their selections (shared K/V reads) instead of token by token.
   static inline bool prefill_qsel_attention_ = true;
+  // QSA top-k selection on 256-thread blocks (halo_qsa_select_rows256; same lists as the 1024-thread kernel).
+  static inline bool prefill_select256_ = true;
+  // QSA attention with V packed in registers and 16-byte softmax LDS accesses (halo_attention_wmma_qsel_h2; bit-identical).
+  static inline bool prefill_qsel_h2_ = true;
   /// The router GEMM on bf16 WMMA with hi/lo-split operands (~2^-15 per
   /// product) instead of fp32 VALU.
   static inline bool prefill_router_bf16x3_ = true;
@@ -294,7 +323,8 @@ class FlashNextGpu {
   /// Emits one whole step (everything after the host upload) as device
   /// work; run eagerly or captured into a graph.
   enum class Head { kNone, kLogits, kSample };
-  bool Record(Head head, std::string* error);
+  /// part 0: the whole step; 1: embedding and the layers before the PLE layer; 2: the rest.
+  bool Record(Head head, std::string* error, int part = 0);
   bool Run(std::int32_t token, Head head, const SampleRequest* request, std::span<float> logits,
            SampleResult* result, std::string* error);
   bool Linear(const model::LayerWeights& l, LinearState& s, std::string* error);
@@ -359,6 +389,15 @@ class FlashNextGpu {
   bool MixFused(const model::HcMixer& m) const;
   bool MixUp(const model::HcMixer& m, std::uint32_t T, std::string* error);
   bool Half(const rt::Buffer& x, const rt::Buffer& out, std::uint32_t n, std::string* error);
+  /// f(t0, n) over the token slices of a chunk (prefill_gemm_slice_); one call for short chunks.
+  template <class F>
+  bool ForGemmSlices(std::uint32_t T, F&& f) {
+    const std::uint32_t S = prefill_gemm_slice_;
+    if (S == 0 || T <= S) return f(0u, T);
+    for (std::uint32_t t0 = 0; t0 < T; t0 += S)
+      if (!f(t0, T - t0 < S ? T - t0 : S)) return false;
+    return true;
+  }
   bool MixedHalf(std::uint32_t T, std::string* error);
   bool RouterHL(const model::LayerWeights& l);
   const rt::Buffer* MixedH() const;
@@ -390,6 +429,9 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   std::size_t stamp_cap_ = 0;
   std::chrono::steady_clock::time_point timing_start_;
   rt::Graph graphs_[3];  ///< by Head: none, logits, sample
+  rt::Buffer q8act_;  ///< kDecodeQ8ActOnce: the layer's int8 activations (5 KB)
+  rt::Graph pre_graph_, post_graphs_[3];  ///< kDecodeSplitGraph: Record parts 1 and 2
+  float* ple_rows_host_ = nullptr;        ///< pinned n-gram rows for the split step's async upload
   SamplingMode sampling_mode_ = SamplingMode::kFast;
   /// One upload per step: n-gram rows, step parameters, sampling parameters,
   /// penalties (only the used prefix is sent).

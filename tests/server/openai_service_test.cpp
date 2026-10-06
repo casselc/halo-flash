@@ -385,6 +385,29 @@ TEST(OpenAiService, VariantsAreSelectedPerRequestAndUnknownOnesRefused) {
   auto [s4, t4] = chat("");
   ASSERT_EQ(s4, 200) << t4;
   EXPECT_EQ(rig.gen.variants, (std::vector<std::string>{"sentiment-ab", "tools-v2", "tools-v2", ""}));
+  // The resolved variant reaches the generation record (halo-scope's variant_id);
+  // the X-Halo-Variant-Id header labels only requests without one.
+  {
+    std::lock_guard<std::mutex> lk(rig.observed.mu);
+    ASSERT_EQ(rig.observed.records.size(), 4u);
+    EXPECT_EQ(rig.observed.records[0].variant_id, "sentiment-ab");
+    EXPECT_EQ(rig.observed.records[1].variant_id, "tools-v2");
+    EXPECT_EQ(rig.observed.records[3].variant_id, "");
+  }
+  const auto with_header = [&](const std::string& extra) {
+    return Post(rig.server.port(), "POST", "/v1/chat/completions",
+                R"({"messages": [{"role": "user", "content": "hi"}])" + extra + "}", true,
+                "X-Halo-Variant-Id: harness-label\r\n");
+  };
+  ASSERT_EQ(with_header(R"(, "variant": "tools-v2")").first, 200);
+  ASSERT_EQ(with_header("").first, 200);
+  {
+    std::lock_guard<std::mutex> lk(rig.observed.mu);
+    ASSERT_EQ(rig.observed.records.size(), 6u);
+    EXPECT_EQ(rig.observed.records[4].variant_id, "tools-v2");
+    EXPECT_EQ(rig.observed.records[5].variant_id, "harness-label");
+  }
+  rig.gen.variants.resize(4);
   // Unknown, conflicting and malformed variants never reach the generator.
   auto [s5, t5] = chat(R"(, "variant": "missing")");
   EXPECT_EQ(s5, 404) << t5;

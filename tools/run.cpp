@@ -191,12 +191,17 @@ int main(int argc, char** argv) {
     else if (a == "--kv16") engine::FlashNextGpu::prefill_kv16_ = std::string(argv[i + 1]) == "1";
     else if (a == "--scores-wmma") engine::FlashNextGpu::prefill_scores_wmma_ = std::string(argv[i + 1]) == "1";
     else if (a == "--qsel") engine::FlashNextGpu::prefill_qsel_attention_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--qsa-select256") engine::FlashNextGpu::prefill_select256_ = std::string(argv[i + 1]) != "0";
+    else if (a == "--qsel-h2") engine::FlashNextGpu::prefill_qsel_h2_ = std::string(argv[i + 1]) != "0";
+    else if (a == "--gemm-slice") engine::FlashNextGpu::prefill_gemm_slice_ = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--dense-prefix") engine::FlashNextGpu::prefill_dense_prefix_ = std::string(argv[i + 1]) != "0";
     else if (a == "--prefill-chunk") engine::FlashNextGpu::prefill_chunk_ = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--router-bf16x3") engine::FlashNextGpu::prefill_router_bf16x3_ = std::string(argv[i + 1]) == "1";
     else if (a == "--prompt-file") prompt_file = argv[i + 1];
     else if (a == "--prefill-prompt") prefill_prompt = std::string(argv[i + 1]) == "1";
     else if (a == "--decode-logits-out") decode_logits_out = argv[i + 1];
     else if (a == "--decode-attn-b") engine::FlashNextGpu::decode_attn_batched_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--decode-opt") engine::FlashNextGpu::decode_opt_ = static_cast<unsigned>(std::strtoul(argv[i + 1], nullptr, 0));
     else if (a == "--decode-timing") decode_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--kernel-timing") kernel_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";

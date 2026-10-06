@@ -221,6 +221,22 @@ Outcome Annotator::TraceMeta(std::string_view trace_id, std::string_view key, st
   return ThisThread()->Record(t) ? Outcome::kOk : Outcome::kDropped;
 }
 
+Outcome Annotator::RecordScore(struct Score s) {
+  if (s.score_id.empty() || s.name.empty() || (s.trace_id.empty() && s.session_id.empty())) return Outcome::kInvalid;
+  s.project = project_;
+  if (s.kind.empty()) s.kind = "assert";
+  if (s.event_ns == 0) s.event_ns = Now();
+  return ThisThread()->Record(s) ? Outcome::kOk : Outcome::kDropped;
+}
+
+Outcome Annotator::RecordTrace(TraceFact t) {
+  if (t.trace_id.empty()) return Outcome::kInvalid;
+  t.project = project_;
+  if (t.start_ns == 0) t.start_ns = Now();
+  if (t.end_ns == 0) t.end_ns = t.start_ns;
+  return ThisThread()->Record(t) ? Outcome::kOk : Outcome::kDropped;
+}
+
 std::size_t Annotator::OpenSteps() const {
   std::lock_guard<std::mutex> lk(mu_);
   return open_.size();

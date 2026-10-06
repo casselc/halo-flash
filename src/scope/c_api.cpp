@@ -50,7 +50,18 @@ void SetError(char* error, std::size_t size, const std::string& msg) {
   error[n] = '\0';
 }
 
-bool ValidStatus(halo_scope_status s) { return s == HALO_SCOPE_STATUS_OK || s == HALO_SCOPE_STATUS_ERROR; }
+// A C caller may pass any int as an enum; read it as an int (a typed load of
+// an out-of-range enum is undefined in C++).
+template <typename E>
+int AsInt(const E& e) {
+  int v;
+  std::memcpy(&v, &e, sizeof v);
+  return v;
+}
+
+bool ValidStatus(const halo_scope_status& s) {
+  return AsInt(s) == HALO_SCOPE_STATUS_OK || AsInt(s) == HALO_SCOPE_STATUS_ERROR;
+}
 
 halo::scope::Status ToStatus(halo_scope_status s) {
   return s == HALO_SCOPE_STATUS_OK ? halo::scope::Status::kOk : halo::scope::Status::kError;
@@ -80,7 +91,7 @@ extern "C" {
 halo_scope* halo_scope_open(const char* data_path, const char* project, halo_scope_capture capture,
                             const char* wal_path, char* error, size_t error_size) {
   using namespace halo::scope;
-  if (!data_path || !*data_path || capture < HALO_SCOPE_CAPTURE_OFF || capture > HALO_SCOPE_CAPTURE_FULL) {
+  if (!data_path || !*data_path || AsInt(capture) < HALO_SCOPE_CAPTURE_OFF || AsInt(capture) > HALO_SCOPE_CAPTURE_FULL) {
     SetError(error, error_size, "halo_scope_open: data_path required and capture must be OFF, DIGEST or FULL");
     return nullptr;
   }
@@ -116,7 +127,7 @@ void halo_scope_flush(halo_scope* scope) {
 
 int halo_scope_step_begin(halo_scope* scope, const char* trace_id, const char* parent, halo_scope_step_kind kind,
                           const char* name, char step_id[HALO_SCOPE_ID_SIZE]) {
-  if (!scope || !step_id || kind < HALO_SCOPE_STEP_TOOL || kind > HALO_SCOPE_STEP_CUSTOM) return HALO_SCOPE_INVALID;
+  if (!scope || !step_id || AsInt(kind) < HALO_SCOPE_STEP_TOOL || AsInt(kind) > HALO_SCOPE_STEP_CUSTOM) return HALO_SCOPE_INVALID;
   std::string id;
   const auto o = scope->annotator->StepBegin(Sv(trace_id), Sv(parent), static_cast<halo::scope::StepKind>(kind),
                                              Sv(name), &id);
