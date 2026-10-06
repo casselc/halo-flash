@@ -1277,7 +1277,7 @@ short context 42.73 / 42.77 / **36.91 ms (23.4 -> 27.1 tok/s, -5.82 ms, -13.6%)*
 44.24 / **38.95 ms (22.6 -> 25.7 tok/s, -5.29 ms, -12.0%)**; round spreads <= 0.46 ms (short default 37.37 /
 36.91 / 36.90). Exactness: decode logits byte-identical to main's binary over 65 steps at short and 66 steps at 7K
 context, greedy text identical in all 9 device-sampled runs, prefill logits (prose_1, 2048) identical to
-`logits_main_5e5466e.bin`, every new kernel bitwise against its original (15 Hegel properties, both backends).
+`logits_main_5e5466e.bin`, every new kernel bitwise against its original (Hegel properties, both backends); gpu_tests 57 passed with the small-model fixture, and SmallQuantizedModelRunsFastPathsAndMatchesReference, ChunkedPrefillMatchesStepping and GreedyMatchesEngineStepsAndReuseIsExact pass with both fixtures.
 
 **What the measurements say about this memory system.** Five changes that issue a kernel's *weight* loads earlier
 or more of them at once (more resident blocks, a register prefetch, weights before a prologue, one-round loads)
