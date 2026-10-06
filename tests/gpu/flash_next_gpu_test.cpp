@@ -163,6 +163,41 @@ TEST(FlashNextGpu, RandomSequencesMatchReference) {
   }, {.test_cases = 25});
 }
 
+// CODESIGN arm B: the engine routes each token to config.num_experts_used
+// experts (ModelWeights::SetExpertsUsed), every path taking k from there.
+// For each k below the trained count, GPU stepping equals the CPU reference
+// at the same k (same bound as the trained k), and k changes the logits.
+TEST(FlashNextGpu, ReducedTopKMatchesReference) {
+  Tiny* t = LoadTiny();
+  if (!t) GTEST_SKIP() << "set HALO_TINY_HF_DIR";
+  auto devices = Devices();
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  auto& w = *t->weights;
+  const std::uint32_t trained = w.config.num_experts_used;
+  if (trained < 2) GTEST_SKIP() << "the tiny model routes to one expert";
+  struct Restore {  // the fixture is shared by every test
+    model::ModelWeights& w;
+    std::uint32_t k;
+    ~Restore() { w.config.num_experts_used = k; }
+  } restore{w, trained};
+  const auto tokens = ReadTokens(t->dir + "/tokens.i32");
+  const std::size_t V = w.config.vocab_size;
+  std::vector<float> full(V), reduced(V);
+  {
+    model::ReferenceModel cpu(w, t->ngram.get(), static_cast<std::uint32_t>(tokens.size()));
+    std::string error;
+    for (auto tok : tokens) ASSERT_TRUE(cpu.Step(tok, full, {}, &error)) << error;
+  }
+  for (std::uint32_t k = 1; k < trained; ++k) {
+    std::string error;
+    ASSERT_TRUE(w.SetExpertsUsed(k, &error)) << error;
+    for (auto& dev : devices) Compare(*dev, *t, nullptr, tokens);
+    model::ReferenceModel cpu(w, t->ngram.get(), static_cast<std::uint32_t>(tokens.size()));
+    for (auto tok : tokens) ASSERT_TRUE(cpu.Step(tok, reduced, {}, &error)) << error;
+    EXPECT_GT(RelL2(reduced, full.data()), 1e-6) << "k = " << k << " left the logits unchanged";
+  }
+}
+
 // Session state, swarm style (graph replay and eager launches mixed): each case enables a random subset of the
 // operations, then runs a random program of them. The model is the CPU
 // reference, copied into the same snapshot slots. Every logits output must

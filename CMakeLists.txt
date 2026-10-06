@@ -251,6 +251,7 @@ if(HALO_BUILD_TESTS)
   halo_test(model_tests
     tests/model/reference_hf_test.cpp
     tests/model/ngram_table_test.cpp
+    tests/model/routing_test.cpp
     tests/model/lora_hf_test.cpp
     tests/model/qwen35_hf_test.cpp)
   target_compile_definitions(text_tests PRIVATE

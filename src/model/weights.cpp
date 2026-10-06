@@ -296,6 +296,19 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
   return w;
 }
 
+bool ModelWeights::SetExpertsUsed(std::uint32_t k, std::string* error_msg) {
+  if (k == 0 || k > config.num_experts) {
+    if (error_msg != nullptr) {
+      *error_msg = "experts per token must be 1.." +
+                   std::to_string(config.num_experts) + ", got " +
+                   std::to_string(k);
+    }
+    return false;
+  }
+  config.num_experts_used = k;
+  return true;
+}
+
 std::optional<MtpWeights> MtpWeights::Bind(const core::GgufReader& reader,
                                            const Config& trunk,
                                            std::string* error_msg) {

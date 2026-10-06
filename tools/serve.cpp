@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
                     decider_device = "hip", scope_dir, scope_project = "halo-flash", scope_capture = "digest",
                     scope_wal;
   int port = 8080;
+  std::uint32_t moe_topk = 0;  // --moe-topk N: experts per token (0: the file's count; CODESIGN arm B)
   double ngram_cache_gb = 4.0;  // cache of n-gram rows read from disk, GiB (0: off)
   std::uint32_t max_context = 32768;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -79,6 +80,7 @@ int main(int argc, char** argv) {
     else if (a == "--port") port = std::atoi(v.c_str());
     else if (a == "--max-context") max_context = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--ngram-cache-gb") ngram_cache_gb = std::atof(v.c_str());
+    else if (a == "--moe-topk") moe_topk = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--api-key") api_key = v;
     else if (a == "--model-id") model_id = v;
     else if (a == "--decider-dir") decider_dir = v;
@@ -96,6 +98,7 @@ int main(int argc, char** argv) {
   auto weights = model::ModelWeights::Bind(*reader, &error);
   auto tok = text::Tokenizer::FromGguf(*reader, &error);
   if (!weights || !tok) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+  if (moe_topk && !weights->SetExpertsUsed(moe_topk, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 2;
   const auto& t = weights->ple_table;
   auto ngram = model::NgramTable::Open(reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset, t.rows,
                                        weights->config.ple_head_dim, t.type, &error,

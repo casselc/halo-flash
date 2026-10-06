@@ -137,6 +137,16 @@ struct ModelWeights {
   /// untouched; only headers are read.
   [[nodiscard]] static std::optional<ModelWeights> Bind(
       const core::GgufReader& reader, std::string* error_msg = nullptr);
+
+  /// Routes every token to `k` experts instead of the file's
+  /// expert_used_count (CODESIGN section 5, arm B: top-k reduction without
+  /// training). The router keeps its softmax over all experts and
+  /// renormalizes the k largest probabilities to sum to 1 (cpu::RouteTopK,
+  /// halo_router_topk). Every engine path and kernel takes k from
+  /// config.num_experts_used, so call this before building an engine or a
+  /// reference. Rejects k == 0 and k > num_experts.
+  [[nodiscard]] bool SetExpertsUsed(std::uint32_t k,
+                                    std::string* error_msg = nullptr);
 };
 
 /// The MTP draft block from the `shared-*` sidecar: one attention layer with
