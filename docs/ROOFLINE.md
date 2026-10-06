@@ -1172,3 +1172,18 @@ Remaining decode levers, by size (short context, ms/token): the hyper-connection
 80-block 2560-row GEMVs at 161 GB/s (~1.4, more row groups or split-K); host gap ~1 (prefetching the n-gram rows
 is not possible before the token is known; overlapping it with the LM head and sampling would need the token
 earlier); attention at long context after this change ~1.9 at 7K (floor ~0.5).
+
+**Precision options, second round (stream R, 2026-10-06, branch stream/precision2).** Same gate and A/B protocol as
+stream P (`ab_bench.py`, 4 rounds x 3 reps, pinned, prose_1 at 2048 tokens; quality: docs/BENCHMARKS.md).
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| Shared-expert W8A8 with the quantize folded into the mix epilogue (P's open item) | ~0 (-1..+1): the ceiling is the GEMMs' 22.5 vs `_s` 24.5 ms = -2.0, the producer pays ~+1.9..2.4 (5.9 MB more written a call x 48 by a DRAM-bound epilogue, per-32 absmax across 32 rows); even a 64-row W8A8 tile gives -3..-5 | not built (below the ~10 ms noise, not free). The int8 copy of `mixed` cannot feed the mixer down (it reads xn, another tensor); for the routed Q4_K gate/up an iu8 path needs a cvt + scale + fma per int32 accumulator per 32 K (~12 VALU a WMMA vs ~3-5 dequant today; iu8 runs at the f16 rate) | no |
+| DeltaNet data path in fp16 (`--gdn-f16 1`): P's fp16 qkv / z GEMMs, the conv writes fp16 q / k / v (`halo_conv_l2norm_prefill8_hh`), prep2 reads them (`_h`), the scan takes K and Q exact in fp16 so K S0, Q S0 and the update drop the lo halves (2 WMMAs instead of 3, 78 -> 54 a chunk; `halo_gdn_c16_scanf`, 232 VGPRs), reads V and writes O in fp16, and E's one-wave gated norm reads fp16 o and z (`halo_gated_norm_h128w_hh`). Differs from P's `--gdn-io16` (no gain: it also turned E's one-wave norm off) by the output side and the scan | -27..-40 kernel (conv -12..-15, norm -7..-10, scan -7..-13, prep -1..-2) | conv 28.9 -> 20.7, gated norm 20.5 -> 12.2, scan 42.6 -> 34.0, prep2 13.3 -> 9.7, GEMMs unchanged: -35.3 kernel; end to end **-35.1 ms, significant** (1278.0 -> 1242.9); max \|Δlogit\| 0.64, same argmax; quality passes | yes (default on) |
+| The same with the update's K^T from a transposed fp16 copy staged once a chunk (`halo_gdn_c16_scanft`, `--gdn-f16 2`; LDS freed by the dropped lo halves) | -3..-6 on the scan | scan 38.5 -> 45.9 ms (unpinned, one rep): slower (16 bank-conflicting 16-bit stores a thread, 236 VGPRs) | no |
+| Router mode 4 (`--router-f16 4`): the MoE-half mix epilogue writes the fp16 lo of `mixed` (`halo_gemm_q8r_f16_mixthl`) and skips the fp32 copy nobody then reads, the experts' permuted copy comes from mh (`halo_f16_perm_rows_h`), the router reads fp16 hi / lo with fp16 W converted once on 128 x 64 tiles (`halo_gemm_h_hl_128x64`; L2 traffic 335 -> 168 MB a call). Bit-identical to mode 3 (same products, same order) | -6..-10 kernel; tiles BK 32 <= BK 64 < 64 x 64 | router 31.1 -> 25.5 (BK 64; BK 32 48.6, 64 x 64 33.8), mixthl -0.5 against mixth, perm 6.0 -> 7.1; kernel sum +1.6 (downstream GEMMs moved within their spreads), end to end +0.6 ms (noise) | no (code kept, default mode 3) |
+
+
+Stream R total (stream/precision2 with main a9e0af3 merged, against main 56693d8's binary, same A/B): main 1280.7, R with
+`--gdn-f16 0` 1278.2 (within noise; logits byte-identical to main's defaults), R defaults **1246.0 ms, -34.7 ms
+significant** (1599 -> 1644 tok/s). Cumulative quality = the `--gdn-f16` row (the only kept change).
