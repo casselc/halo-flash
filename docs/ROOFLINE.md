@@ -1194,6 +1194,12 @@ wave at 3 waves/SIMD (0.57 us of issue; qsel_h's took 0.71 with the same chain),
 overlapped. Same lesson as `fa`: owning rows removes barriers but not the LDS-latency-bound fragment traffic.
 Halogen's sparse path (`k_sel_tilemask` + `k_attn_fa2` with a tile mask) was not run: its FaSel layout is not known.
 
+End to end, merged main 5e5466e vs this branch (ab_bench, 4 rounds x 3 reps, pinned): 8192 tokens, ab_bench's device
+metric (it keeps the last `device` line of each rep, i.e. the last 2048-token chunk, positions 6144-8191)
+1346.7 -> 1324.0 ms, **-22.7 ms, significant** (spreads 8.0 / 5.2); over the whole 8K prefill the kernel-timed rep
+gives qsel_h 460.4 -> 386.7 ms (-73.7, spread 0.6). 2048 tokens (qsel_h does not run): 1243.7 -> 1245.3, +1.7
+within noise. Logits byte-identical to main at 8K and 2048 (`logits_main_5e5466e.bin`); gpu_tests 45 passed.
+
 *Dense GEMMs over pre-dequantized fp16 weights (probe `--w16`, 642bd91, removed).* The fp16 copy holds the values
 the staging computes (fp16(q x scale) by the same fp16 operations; q x scale itself is not always representable),
 so all `_w16` GEMMs are bit-identical (property test over the whole fp16 scale range; 2048 logits identical).
