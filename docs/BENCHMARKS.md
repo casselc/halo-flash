@@ -90,6 +90,12 @@ mean over cases of the per-case NLL difference ± its standard error.
 | DeltaNet scan with fp16 two-way splits (`--gdn-scan-h 1`; paired against the merged kept set, short 0.285504 / 92.64%, long 0.122071 / 97.00%) | 0.285501 / 92.51% | +0.00036 ± 0.00045 (47/51) | 0.122639 / 97.39% | +0.00056 ± 0.00091 (7/5), +0.0060 | **passes** (default on) |
 | Shared-expert gate/up as W8A8 (`--shexp-w8a8 1`) | 0.285309 / 92.60% | −0.00081 ± 0.00093 (56/42) | 0.121921 / 97.26% | +0.00064 ± 0.00095 (7/5), +0.0058 | passes (kept, then turned off after merging stream E's `_s` tiles: no speed gain left) |
 
+**Cumulative, everything kept** (stream/precision after merging main: `--router-f16 3`, `--small-f16`, `--mix-h16`,
+`--res16 1`, `--gdn-scan-h`), paired against the original baseline: short 0.286185 / 92.51% (paired
++0.000015 ± 0.000453, 56/42, agreement −0.07 pp), long 0.121673 / 96.87% (paired +0.00039 ± 0.00072, 6/6, worst case
++0.0053, agreement −0.39 pp): passes the same gate. Speed (`ab_bench.py`, 4 rounds, pinned, 2048 tokens, against main
+4ad6410): 1433.2 -> 1295.1 ms, **-138.1 ms (-9.6%), significant** (1429 -> 1581 tok/s).
+
 The F32 router, DeltaNet alpha/beta and shared-expert gate weights hold exact bf16 values (all of them),
 and 99.95-99.97% are exact in fp16 (the rest have fp16-subnormal magnitudes): rounding these weights to fp16
 loses (almost) nothing. The plain-fp16 router's long-set loss came from rounding the activations; keeping them

@@ -1079,4 +1079,13 @@ and an in-engine A/B (`ab_bench.py`, 4 rounds x 3 reps, pinned, prose_1 at 2048 
 | Hyper-connection residual stored in 16 bits: every prefill reader / writer (broadcast, combine, combine_norm and E's per-token variants, both row norms, PLE norm + conv, last-token widening) templated on the element type, the norm fed the stored value (`--res16 1` fp16, `2` bf16; user-assigned from CODESIGN / halogen) | -30..-60 end to end (CODESIGN: -80..-150, which counted the mix's residual reads that `--mix-h16` had already removed) | fp16: combine_norm 107.8 -> 84.3 ms (-23.5, spreads 1.6 / 5.0), end to end -24.2; bf16: the same (-24.5, significant). No overflow (max \|Δlogit\| 0.75 fp16, 0.52 bf16, all finite); `--res16 0` bit-identical to the fp32 build. Long set: fp16 -0.0006, bf16 +0.0015 | yes, fp16 (default `--res16 1`) |
 | Shared-expert W8A8 re-measured after merging main (stream E runs these GEMMs on `_s` 64-row tiles, exact) | — | `_s` 24.9 ms vs W8A8 22.5 + quantize 7.6 = 30.1; kernel sum +0.1, end to end -9.4 (noise, base spread 43) | no (default off again) |
 | DeltaNet scan with K, Q and the state split two-way in **fp16** (~22 bits) for K S0, Q S0 and the update, 3 WMMAs each instead of 6 / 3 / 5; Delta and O keep bf16 hi / lo (`halo_gdn_c16_scanh`, `--gdn-scan-h`; coordinator's candidate from halogen's f16 state mirror, which as a single fp16 copy would be ~2^-11, far below the failed two-way bf16) | -15..-25 (WMMAs a chunk 118 -> 78, issue-bound ~80%) | scan 77.2 -> 42.7 ms (-34.5, spreads 0.3 / 0.1); end to end -34.2 (inside ab_bench's spread rule: spreads 36 / 33); 256 VGPRs, 0 spills (scan3u 6); quality passes (long +0.0006 ± 0.0009) | yes (default on) |
+| fp16 residual re-measured on the merged build (stream E's per-token combine kernels) | — | `combine_norm_tok_moe` 89.2 -> 76.4 ms, rows 55.6 -> 42.3; end to end -27.4 ms, significant | yes |
+
+Stream P total, everything kept, against main 4ad6410 (ab_bench, 4 rounds, pinned, 2048 tokens): 1433.2 -> 1295.1 ms,
+**-138.1 ms, significant** (1429 -> 1581 tok/s). By role (kernel-timed rep): mix 108.2 -> 70.2, MoE-half combine
+87.7 -> 76.4, attention-half combine 55.6 -> 42.3, DeltaNet scan 80.3 -> 42.7, router 41.3 -> 32.0, small F32
+projections 28 -> 9. Cumulative quality passes the gate against the original baseline (docs/BENCHMARKS.md).
+Not kept: plain fp16 router (long set), fp16-weight-split router (= plain), mixer down W8A8 and shared-expert W8A8
+(after the merge), DeltaNet qkv/z fp16 I/O (no speed). Open: the quantize pass that sank shared-expert W8A8
+(fold it into the mix epilogue), and bf16 instead of fp16 residual (same speed, worse long set).
 
