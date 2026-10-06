@@ -72,6 +72,58 @@ void MicroKernel(std::size_t kb, const float* a, const float* b, float* C, std::
   }
 }
 
+// Few rows (M <= kSkinny): a packed GEMM would copy all of B for a handful
+// of rows, so B is streamed once instead (the LM head over a few loss
+// positions is 2 GB of weights per call on Qwen3.5-2B).
+constexpr std::size_t kSkinny = 4;
+
+void SkinnyNT(ThreadPool& pool, std::size_t M, std::size_t N, std::size_t K, float alpha, const float* A,
+              std::size_t lda, const float* B, std::size_t ldb, float beta, float* C, std::size_t ldc) {
+  constexpr std::size_t kCols = 64;
+  pool.ParallelFor((N + kCols - 1) / kCols, [&](std::size_t blk) {
+    for (std::size_t j = blk * kCols; j < std::min(N, (blk + 1) * kCols); ++j) {
+      const float* b = B + j * ldb;
+      for (std::size_t i = 0; i < M; ++i) {
+        const float* a = A + i * lda;
+        V16 acc(0.0F);
+        std::size_t k = 0;
+        for (; k + 16 <= K; k += 16) {
+          V16 av, bv;
+          std::memcpy(&av, a + k, sizeof(V16));
+          std::memcpy(&bv, b + k, sizeof(V16));
+          acc += av * bv;
+        }
+        float sum = 0;
+        for (int l = 0; l < 16; ++l) sum += acc[l];
+        for (; k < K; ++k) sum += a[k] * b[k];
+        float& c = C[i * ldc + j];
+        c = alpha * sum + (beta == 0.0F ? 0.0F : beta * c);
+      }
+    }
+  });
+}
+
+void SkinnyNN(ThreadPool& pool, std::size_t M, std::size_t N, std::size_t K, float alpha, const float* A,
+              std::size_t lda, const float* B, std::size_t ldb, float beta, float* C, std::size_t ldc) {
+  constexpr std::size_t kCols = 64;
+  pool.ParallelFor((N + kCols - 1) / kCols, [&](std::size_t blk) {
+    const std::size_t j0 = blk * kCols, cols = std::min(kCols, N - j0);
+    float acc[kSkinny][kCols] = {};
+    for (std::size_t k = 0; k < K; ++k) {
+      const float* b = B + k * ldb + j0;
+      for (std::size_t i = 0; i < M; ++i) {
+        const float a = A[i * lda + k];
+        for (std::size_t j = 0; j < cols; ++j) acc[i][j] += a * b[j];
+      }
+    }
+    for (std::size_t i = 0; i < M; ++i)
+      for (std::size_t j = 0; j < cols; ++j) {
+        float& c = C[i * ldc + j0 + j];
+        c = alpha * acc[i][j] + (beta == 0.0F ? 0.0F : beta * c);
+      }
+  });
+}
+
 }  // namespace
 
 void Gemm(ThreadPool& pool, Op ta, Op tb, std::size_t M, std::size_t N, std::size_t K, float alpha, const float* A,
@@ -81,6 +133,10 @@ void Gemm(ThreadPool& pool, Op ta, Op tb, std::size_t M, std::size_t N, std::siz
     for (std::size_t i = 0; i < M; ++i)
       for (std::size_t j = 0; j < N; ++j) C[i * ldc + j] = beta == 0.0F ? 0.0F : beta * C[i * ldc + j];
     return;
+  }
+  if (M <= kSkinny && ta == Op::kN && K >= 256) {
+    if (tb == Op::kT) return SkinnyNT(pool, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+    return SkinnyNN(pool, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
   }
   const std::size_t mblocks = (M + kMc - 1) / kMc, nblocks = (N + kNc - 1) / kNc;
   const std::size_t mpad = mblocks * kMc;
