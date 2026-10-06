@@ -1084,4 +1084,35 @@ per block (48 rows). Kernel timing of a 6940-token prefill (pinned): `fa_hg` 12 
 `qsel_h` 120 calls, 357 ms; `qsa_select_rows` 41.5 ms. So the 8K saving (-70..-90 ms) does not exist for this model, and
 at 2048 tokens the ceiling is 12 x (3.28 - ~2.9) = ~-4.5 ms (0.3% of the prefill, below the A/B noise of 10-20 ms).
 Not built. The long-prompt attention lead is `qsel_h` (3.08 ms a 512-token call, ~6% of an 8K prefill).
+**Precision options (stream P, 2026-10-05, branch stream/precision).** The roles in the table above where gufo
+rounds more than we do, one flag each, gated by the quality sets (docs/BENCHMARKS.md, "Precision options")
+and an in-engine A/B (`ab_bench.py`, 4 rounds x 3 reps, pinned, prose_1 at 2048 tokens):
 
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| Router on plain fp16 WMMA (`halo_gemm_f32h_f16_k128`: fp32 W rounded to fp16 while staging, the fp16 `mh`; `--router-f16 1`) | -15..-20 kernel; quality neutral | router 40.7 -> 21.9 ms (-18.8); end to end -20.6 ms; long set **+0.0021 ± 0.0007** (9 of 12 cases worse) | no (quality) |
+| DeltaNet alpha/beta + shared-expert gate on the same kernel (`--small-f16`) | -18..-24 kernel; quality neutral | 27.9 -> 7.6 ms (-20.3, spreads 0.9 / 0.2); end to end -14.8 ms (inside ab_bench's spread rule: new spread 22.7); quality passes | yes (default on) |
+| Mix epilogue reads xn as combine_norm's fp16 K-blocked copy, one 8-byte load per (token, stream) and lane, float4 / half2 stores (`halo_gemm_q8r_f16_mixth`, `--mix-h16`; coordinator's candidate from gufo's ATT: gufo mixes from fp16 xn) | -10..-25 kernel (the earlier fp16 probe, with per-element gathers, was +10) | mix 107.9 -> 71.9 ms (-36.0); end to end **-36.0 ms, significant** (spreads 10.9 / 1.8); max \|Δlogit\| 0.57 of 16.8 on prose_1, same argmax; quality passes | yes (default on) |
+| Shared-expert gate/up as W8A8: `halo_quantize_q8_kblocked` (mixed -> int8 K-blocked, per-32 scales) + 2x `halo_gemm_q8a8_128x128` (new int8 GEMM with GemmQ8rF16's register prefetch; study: 0.236 ms after writes vs `_l` 0.405) (`--shexp-w8a8`) | -7..-11 kernel | gate/up 34.2 -> 22.6 ms, but the quantize pass costs 7.5 ms (0.16 ms a call, ~134 GB/s after mixth's writes): net -4.1 kernel (spreads <= 0.6); end to end -8.7 ms within noise; quality passes | yes (marginal; next: quantize in the mix epilogue or from `mh`) |
+| Router with fp16 W hi/lo + fp16 activations (`halo_gemm_f32h_f16_w2`, `--router-f16 2`) | -11..-15 kernel; long ~+0.001 | router 43.4 -> 24.4 ms; end to end -19.1 (noise); scores bit-identical to `--router-f16 1`: the weights are exact bf16 and 99.97% exact fp16, so the lo half is ~0 | no (quality) |
+| Router with fp16 W + fp32 `mixed` split hi/lo (`halo_gemm_f32_f16_x2`, two WMMAs, K stage 64; `--router-f16 3`) | -11..-15 kernel; long ~+0.001 | router 42.9 -> 30.3 ms (-12.6); end to end **-23.7 ms, significant**; long +0.00009 ± 0.00057 | yes (default `--router-f16 3`) |
+| Mixer down as W8A8: combine_norm (template kQ8) writes xn as int8 K-blocked + per-32 scales, `halo_gemm_q8a8_160x64` replaces `_mb` (study: 0.583 vs 0.644 ms after writes) (`--down-w8a8`) | -8..-15 | `_mb` 59.1 -> 50.8 ms (-8.3), combine_norm unchanged (108.3 -> 108.5: the bytes it no longer wrote bought nothing), kernel sum -3.5, end to end -0.6 (noise); quality passes. With `--mix-h16` on, combine_norm must write the fp16 copy anyway | no |
+| DeltaNet qkv and z GEMMs write fp16 (`halo_gemm_q8r_f16_lr8h`), conv8 / state advance / gated norm read fp16 (`--gdn-io16`; coordinator's halogen finding, input side only, the scan untouched; ROOFLINE 4g's fp16 conv output was -1 ms with the old conv) | -8..-20 (134 MB fewer per layer) | conv 28.8 -> 23.2, gated norm 26.5 -> 25.5, the GEMMs unchanged (177.6 -> 177.7: their fp16 stores are not what bounds them); end to end +9.3 ms (noise, spreads 15 / 50); quality passes | no |
+| Hyper-connection residual stored in 16 bits: every prefill reader / writer (broadcast, combine, combine_norm and E's per-token variants, both row norms, PLE norm + conv, last-token widening) templated on the element type, the norm fed the stored value (`--res16 1` fp16, `2` bf16; user-assigned from CODESIGN / halogen) | -30..-60 end to end (CODESIGN: -80..-150, which counted the mix's residual reads that `--mix-h16` had already removed) | fp16: combine_norm 107.8 -> 84.3 ms (-23.5, spreads 1.6 / 5.0), end to end -24.2; bf16: the same (-24.5, significant). No overflow (max \|Δlogit\| 0.75 fp16, 0.52 bf16, all finite); `--res16 0` bit-identical to the fp32 build. Long set: fp16 -0.0006, bf16 +0.0015 | yes, fp16 (default `--res16 1`) |
+| Shared-expert W8A8 re-measured after merging main (stream E runs these GEMMs on `_s` 64-row tiles, exact) | — | `_s` 24.9 ms vs W8A8 22.5 + quantize 7.6 = 30.1; kernel sum +0.1, end to end -9.4 (noise, base spread 43) | no (default off again) |
+| DeltaNet scan with K, Q and the state split two-way in **fp16** (~22 bits) for K S0, Q S0 and the update, 3 WMMAs each instead of 6 / 3 / 5; Delta and O keep bf16 hi / lo (`halo_gdn_c16_scanh`, `--gdn-scan-h`; coordinator's candidate from halogen's f16 state mirror, which as a single fp16 copy would be ~2^-11, far below the failed two-way bf16) | -15..-25 (WMMAs a chunk 118 -> 78, issue-bound ~80%) | scan 77.2 -> 42.7 ms (-34.5, spreads 0.3 / 0.1); end to end -34.2 (inside ab_bench's spread rule: spreads 36 / 33); 256 VGPRs, 0 spills (scan3u 6); quality passes (long +0.0006 ± 0.0009) | yes (default on) |
+| fp16 residual re-measured on the merged build (stream E's per-token combine kernels) | — | `combine_norm_tok_moe` 89.2 -> 76.4 ms, rows 55.6 -> 42.3; end to end -27.4 ms, significant | yes |
+
+Stream P total, everything kept, against main 4ad6410 (ab_bench, 4 rounds, pinned, 2048 tokens): 1433.2 -> 1295.1 ms,
+**-138.1 ms, significant** (1429 -> 1581 tok/s). By role (kernel-timed rep): mix 108.2 -> 70.2, MoE-half combine
+87.7 -> 76.4, attention-half combine 55.6 -> 42.3, DeltaNet scan 80.3 -> 42.7, router 41.3 -> 32.0, small F32
+projections 28 -> 9. Cumulative quality passes the gate against the original baseline (docs/BENCHMARKS.md).
+Not kept: plain fp16 router (long set), fp16-weight-split router (= plain), mixer down W8A8 and shared-expert W8A8
+(after the merge), DeltaNet qkv/z fp16 I/O (no speed). Open: the quantize pass that sank shared-expert W8A8
+(fold it into the mix epilogue), and bf16 instead of fp16 residual (same speed, worse long set).
+
+
+**Main after merging streams E and P (2026-10-06).** Stream E's vectorized MoE sum now also has 16-bit residual variants
+(`halo_hc_combine_norm_tok_moev_r16` / `_rb`), bit-identical to the scalar `tok_moe` ones; with the precision options
+off, logits are bit-identical to the pre-stream baseline; gpu_tests 42 passed. ab_bench (4 rounds x 3 reps, pinned,
+prose_1 at 2048 tokens): precision options off 1406.3 ms, defaults **1279.7 ms (1600 tok/s), -126.7 ms, significant**.
