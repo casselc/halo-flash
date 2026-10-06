@@ -536,6 +536,27 @@ TEST(FlashNextGpu, SmallQuantizedModelRunsFastPathsAndMatchesReference) {
 //     which is also why no strict int8-vs-float twin bound holds end to
 //     end. Whether int8 dense prefill is accurate enough is decided on the
 //     real model's NLL (halo_score), not here.
+//     The worst drift is a tail, not a level: in these modes the stepped
+//     oracle runs int8 expert activations too (logits 2-6e-3 from the CPU
+//     reference), and a top-k choice near a tie (the router's last chosen
+//     expert, or a QSA block at the budget) flips in one engine and not the
+//     other, moving that position's logits by 0.025-0.134. Stream F
+//     (2026-10-06) replayed seven outliers (0.026-0.134) against the CPU
+//     reference; swapping exactly one choice in the reference brought the
+//     outlying engine back to its noise floor (6e-4 to 3e-3) every time:
+//     five flips in stepping (router logit gaps 3.6e-5 to 1.3e-3 of
+//     ~0.25; QSA score gaps 0.024 of 34.9 and 0.44 of 18.4, the latter
+//     with one block's score read back 0.70 low), one router flip in fp16
+//     prefill (gap 1.4e-4 of 0.66, from --router-f16 3), one QSA flip in
+//     int8 prefill (gap 0.055 of 20.7). With float expert activations,
+//     stepping matched the reference to 2.7e-7 and the fp16 prefill stayed
+//     within 6e-4 of it on the same cases (chunks of 1 / 17 / 64, up to
+//     594 tokens); c95db3e, before the precision defaults, gave the same
+//     stepped outliers. About 3% of fp16-mode checks exceed 0.02, hence the
+//     count in the summary. A flip can also separate the chunked and split
+//     engines (0.086 in int8 mode once stepping took float activations), as
+//     large as a one-row error (0.07-0.11 for one changed token at a chunk
+//     boundary), so the split bound below cannot tell the two apart there.
 //   HALO_SMALL_QUANT_DIR  holds small-q.gguf
 TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
   const char* dir = std::getenv("HALO_SMALL_QUANT_DIR");
@@ -562,7 +583,7 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
   const std::uint32_t saved_chunk = E::prefill_chunk_;
   enum Mode { kExact, kFloatGemm, kInt8Gemm, kModes };
   const char* names[kModes] = {"exact", "fp16 GEMMs", "int8 GEMMs"};
-  std::size_t compared[kModes] = {}, agreed[kModes] = {};
+  std::size_t compared[kModes] = {}, agreed[kModes] = {}, jumps[kModes] = {};
   double worst[kModes] = {}, worst_split[kModes] = {};
   hegel::test([&](hegel::TestCase& tc) {
     auto& dev = *devices[tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = devices.size() - 1}))];
@@ -589,6 +610,7 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
       worst[mode] = std::max(worst[mode], rel);
       worst_split[mode] = std::max(worst_split[mode], rel_split);
       ++compared[mode];
+      jumps[mode] += rel > 0.01;  // mostly near-tie top-k flips in one engine (see above)
       const bool same = Argmax(a.data(), V) == Argmax(b.data(), V);
       agreed[mode] += same;
       const auto at = [&] { return std::string(what) + " at position " + std::to_string(chunked->Position()) + ", " + names[mode]; };
@@ -652,6 +674,7 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
   E::prefill_chunk_ = saved_chunk;
   E::prefill_wmma_attention_ = saved_wmma_attn;
   for (int m = 0; m < kModes; ++m)
-    std::printf("%s: %zu compared, argmax agreed %zu, worst relative L2 vs stepping %.3g, vs a split prefill %.3g\n",
-                names[m], compared[m], agreed[m], worst[m], worst_split[m]);
+    std::printf("%s: %zu compared, argmax agreed %zu, worst relative L2 vs stepping %.3g (%zu above 0.01), vs a split "
+                "prefill %.3g\n",
+                names[m], compared[m], agreed[m], worst[m], jumps[m], worst_split[m]);
 }
