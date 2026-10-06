@@ -151,7 +151,23 @@ int main(int argc, char** argv) {
   // token by token and at every position drafts --mtp-depth tokens with the MTP block (greedy: the block's own
   // argmax chain, exact acceptance; sampled: the chain teacher-forced on the target path, acceptance
   // sum_x min(p, q) per depth). --mtp-check N compares the first N draft logits with the CPU reference.
-  std::string mtp_model, mtp_prompts, mtp_out;
+  std::string mtp_model, mtp_prompts, mtp_out, mtp_vocab;
+  // --mtp-dump PREFIX: pass 2 writes PREFIX.<prompt>.{tok,hid,dft}: the token sequence (int32), the prompt length
+  // and every position's trunk hidden (hc_dim floats), and the GPU's greedy drafts per draft position (K int32).
+  // --mtp-cpu-replay PREFIX.<prompt> --mtp-cpu-n N (with --device cpu): the CPU reference draft block (fp32
+  // arithmetic on the dequantized sidecar weights) on those hiddens, greedy chains at the first N draft positions,
+  // acceptance against the same tokens, and agreement with the GPU's drafts.
+  std::string mtp_dump, mtp_cpu_replay;
+  std::uint32_t mtp_cpu_n = 40;  // --mtp-vocab FILE: int32 ids of the trimmed draft head
+  // --wmma-probe a.bin,b.bin (route traces): PROBE ONLY. Per B = 1..8, six decode steps (eager, kernel timing on)
+  // each followed by the batch-shaped WMMA probe kernels for B columns; routing of the B columns drawn from the
+  // traces (different traces / positions, or --wmma-probe-consec 1: B consecutive steps of one trace).
+  std::string wmma_probe;
+  // --count-files LIST --count-top N --mtp-vocab OUT: the N most frequent tokens over the files named in LIST
+  // (one path a line), filled up by lowest id (BPE merge order), plus the chat-control tokens; int32 ids to OUT.
+  std::string count_files;
+  std::uint32_t count_top = 32768;
+  bool wmma_consec = false;
   std::uint32_t mtp_depth = 4, mtp_check = 0;
   double mtp_temp = 0;  // --route-trace FILE: routed expert ids of every step ([layers][k] uint32)
   std::uint32_t span_sample = 1;
@@ -232,6 +248,14 @@ int main(int argc, char** argv) {
     else if (a == "--mtp-temp") mtp_temp = std::atof(argv[i + 1]);
     else if (a == "--mtp-check") mtp_check = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--mtp-out") mtp_out = argv[i + 1];
+    else if (a == "--mtp-vocab") mtp_vocab = argv[i + 1];
+    else if (a == "--mtp-dump") mtp_dump = argv[i + 1];
+    else if (a == "--mtp-cpu-replay") mtp_cpu_replay = argv[i + 1];
+    else if (a == "--mtp-cpu-n") mtp_cpu_n = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--count-files") count_files = argv[i + 1];
+    else if (a == "--count-top") count_top = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--wmma-probe") wmma_probe = argv[i + 1];
+    else if (a == "--wmma-probe-consec") wmma_consec = std::string(argv[i + 1]) == "1";
     else if (a == "--batch-check") batch_check = std::string(argv[i + 1]) == "1";
     else if (a == "--batch-decode") engine::FlashNextGpu::batch_decode_ = std::string(argv[i + 1]) == "1";
     else if (a == "--decode-timing") decode_timing = std::string(argv[i + 1]) == "1";
@@ -483,6 +507,156 @@ int main(int argc, char** argv) {
     (void)fr;
     return 0;
   }
+  if (!count_files.empty()) {
+    std::ifstream list(count_files);
+    std::vector<std::uint64_t> cnt(c.vocab_size, 0);
+    std::string path;
+    std::size_t files = 0, total = 0;
+    while (std::getline(list, path)) {
+      std::ifstream f(path);
+      const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+      for (auto t : tok->Encode(text, true))
+        if (static_cast<std::uint32_t>(t) < c.vocab_size) ++cnt[t], ++total;
+      ++files;
+    }
+    std::vector<std::int32_t> order(c.vocab_size);
+    for (std::uint32_t i = 0; i < c.vocab_size; ++i) order[i] = static_cast<std::int32_t>(i);
+    std::stable_sort(order.begin(), order.end(), [&](std::int32_t a, std::int32_t b) { return cnt[a] > cnt[b]; });
+    std::vector<std::int32_t> keep;
+    std::vector<char> in(c.vocab_size, 0);
+    for (const char* s : {"<|im_start|>", "<|im_end|>", "<|endoftext|>", "<think>", "</think>", "<tool_call>", "</tool_call>"}) {
+      const auto ids = tok->Encode(s, true);
+      if (ids.size() == 1 && !in[ids[0]]) in[ids[0]] = 1, keep.push_back(ids[0]);
+    }
+    std::size_t seen = 0;
+    for (auto t : order) {
+      if (keep.size() >= count_top || cnt[t] == 0) break;
+      if (!in[t]) in[t] = 1, keep.push_back(t), seen += cnt[t];
+    }
+    for (std::uint32_t t = 0; t < c.vocab_size && keep.size() < count_top; ++t)
+      if (!in[t]) in[t] = 1, keep.push_back(static_cast<std::int32_t>(t));
+    std::sort(keep.begin(), keep.end());
+    std::ofstream o(mtp_vocab, std::ios::binary);
+    o.write(reinterpret_cast<const char*>(keep.data()), static_cast<std::streamsize>(keep.size() * 4));
+    std::printf("counted %zu tokens in %zu files; kept %zu ids covering %.4f of the corpus tokens\n", total, files,
+                keep.size(), double(seen) / double(std::max<std::size_t>(total, 1)));
+    return 0;
+  }
+  if (!mtp_cpu_replay.empty()) {
+    if (mtp_model.empty()) return std::fprintf(stderr, "--mtp-cpu-replay needs --mtp-model\n"), 2;
+    auto mreader = core::GgufReader::OpenFile(mtp_model, &error);
+    if (!mreader) return 1;
+    auto mtp = model::MtpWeights::Bind(*mreader, c, &error);
+    if (!mtp) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    const auto read_all = [](const std::string& f, auto& v) {
+      std::ifstream in(f, std::ios::binary | std::ios::ate);
+      v.resize(static_cast<std::size_t>(in.tellg()) / sizeof(v[0]));
+      in.seekg(0);
+      in.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(v.size() * sizeof(v[0])));
+    };
+    std::vector<std::int32_t> tk, gd;
+    std::vector<float> hid;
+    read_all(mtp_cpu_replay + ".tok", tk);
+    read_all(mtp_cpu_replay + ".hid", hid);
+    read_all(mtp_cpu_replay + ".dft", gd);
+    const std::size_t L = static_cast<std::size_t>(tk[0]), D = c.HcDim(), V = c.vocab_size, K = std::max(1u, mtp_depth);
+    std::vector<std::int32_t> toks(tk.begin() + 1, tk.end());
+    const std::size_t npos = hid.size() / D;
+    auto ref = std::make_unique<model::ReferenceModel>(*weights, ngram.get(), static_cast<std::uint32_t>(npos + K + 2));
+    std::vector<float> l(V);
+    const auto argmax_v = [&](const std::vector<float>& v) { return static_cast<std::int32_t>(std::max_element(v.begin(), v.end()) - v.begin()); };
+    std::vector<double> cond_num(K, 0), cond_den(K, 0), chain(K, 0);
+    std::size_t positions = 0, agree = 0, compared = 0;
+    for (std::size_t t = 0; t + 1 < toks.size() && t < npos; ++t) {
+      const std::span<const float> h(hid.data() + t * D, D);
+      const bool draft = t + 1 >= L && positions < mtp_cpu_n && t + 1 + K < toks.size();
+      if (!draft) {
+        if (!ref->MtpStep(*mtp, toks[t + 1], h, {}, nullptr, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+        if (t + 1 >= L && positions >= mtp_cpu_n) break;
+        continue;
+      }
+      std::vector<std::int32_t> d(K);
+      if (!ref->MtpStep(*mtp, toks[t + 1], h, l, nullptr, &error)) return 1;
+      auto chain_ref = std::make_unique<model::ReferenceModel>(*ref);  // the chain runs on a copy
+      d[0] = argmax_v(l);
+      for (std::size_t j = 1; j < K; ++j) {
+        if (!chain_ref->MtpStep(*mtp, d[j - 1], {}, l, nullptr, &error)) return 1;
+        d[j] = argmax_v(l);
+      }
+      double run = 1;
+      for (std::size_t j = 0; j < K; ++j) {
+        const double a = d[j] == toks[t + 2 + j] ? 1.0 : 0.0;
+        if (run > 0) cond_num[j] += a, cond_den[j] += 1;
+        run *= a;
+        chain[j] += run;
+        const std::size_t gi = positions * K + j;
+        if (gi < gd.size()) compared++, agree += gd[gi] == d[j];
+      }
+      ++positions;
+      std::fprintf(stderr, "cpu position %zu done\n", positions);
+    }
+    std::printf("cpu reference drafts (%s): %zu positions; GPU drafts agree %zu of %zu\n", mtp_cpu_replay.c_str(), positions,
+                agree, compared);
+    double e = 1;
+    for (std::size_t j = 0; j < K; ++j) {
+      e += chain[j] / std::max<std::size_t>(positions, 1);
+      std::printf("  depth %zu: conditional acceptance %.3f (%.0f of %.0f), E[tokens/cycle] %.3f\n", j + 1,
+                  cond_num[j] / std::max(1.0, cond_den[j]), cond_num[j], cond_den[j], e);
+    }
+    return 0;
+  }
+  if (!wmma_probe.empty()) {
+    if (!gpu) return 2;
+    std::vector<std::vector<std::uint32_t>> traces;  // [file][steps * L * k]
+    for (std::size_t p = 0; p < wmma_probe.size();) {
+      const auto q = wmma_probe.find(',', p);
+      std::ifstream f(wmma_probe.substr(p, q == std::string::npos ? std::string::npos : q - p), std::ios::binary | std::ios::ate);
+      std::vector<std::uint32_t> v(static_cast<std::size_t>(f.tellg()) / 4);
+      f.seekg(0);
+      f.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(v.size() * 4));
+      traces.push_back(std::move(v));
+      p = q == std::string::npos ? wmma_probe.size() : q + 1;
+    }
+    const std::uint32_t L = c.num_layers, k = c.num_experts_used;
+    const std::size_t per = std::size_t{L} * k;
+    std::mt19937 rng(7);
+    const auto ids_tok = tok->Encode("The quick brown fox jumps over the lazy dog. In the beginning");
+    std::vector<std::int32_t> warm(ids_tok.begin(), ids_tok.end());
+    if (!gpu->Prefill(warm, {}, &error)) return 1;
+    std::int32_t token = warm.back();
+    for (std::uint32_t B = 1; B <= 8; ++B) {
+      std::vector<std::vector<std::uint32_t>> ids(L);
+      const auto& t0 = traces[rng() % traces.size()];
+      const std::size_t base = rng() % (t0.size() / per - 8);
+      for (std::uint32_t b = 0; b < B; ++b) {
+        const auto& tr = wmma_consec ? t0 : traces[rng() % traces.size()];
+        const std::size_t step = wmma_consec ? base + b : rng() % (tr.size() / per);
+        for (std::uint32_t l = 0; l < L; ++l)
+          ids[l].insert(ids[l].end(), tr.begin() + static_cast<std::ptrdiff_t>(step * per + l * k),
+                        tr.begin() + static_cast<std::ptrdiff_t>(step * per + (l + 1) * k));
+      }
+      double U = 0;
+      for (const auto& v : ids) {
+        std::vector<std::uint32_t> s(v);
+        std::sort(s.begin(), s.end());
+        U += static_cast<double>(std::unique(s.begin(), s.end()) - s.begin());
+      }
+      if (!gpu->ProbeSetRouting(B, ids, &error) || (B == 1 && !gpu->ProbeRun(1, true, &error)) ||
+          !gpu->StartKernelTiming(1 << 20, &error))
+        return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      constexpr int kSteps = 6;
+      for (int s = 0; s < kSteps; ++s)
+        if (!gpu->Step(token, {}, &error) || !gpu->ProbeRun(B, false, &error))
+          return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      double span = 0, rate = 0;
+      const auto times = gpu->StopKernelTiming(&span, &rate, &error);
+      std::printf("probe B %u (expert union %.1f a layer)\n", B, U / L);
+      for (const auto& kt : times)
+        std::printf("  B%u %-58s %8.3f ms/step %6.1f calls/step %8.1f us/call\n", B, kt.key.c_str(), kt.ms / kSteps,
+                    kt.calls / double(kSteps), 1e3 * kt.ms / kt.calls);
+    }
+    return 0;
+  }
   if (!mtp_model.empty()) {
     if (!gpu) return std::fprintf(stderr, "--mtp-model needs a GPU device\n"), 2;
     auto mreader = core::GgufReader::OpenFile(mtp_model, &error);
@@ -492,6 +666,17 @@ int main(int argc, char** argv) {
     if (!gpu->LoadMtp(*mtp, &error)) return std::fprintf(stderr, "LoadMtp: %s\n", error.c_str()), 1;
     const std::uint32_t K = std::max(1u, mtp_depth);
     const std::size_t V = c.vocab_size;
+    std::vector<std::int32_t> sub;  // trimmed draft vocabulary (empty: full)
+    if (!mtp_vocab.empty()) {
+      std::ifstream f(mtp_vocab, std::ios::binary | std::ios::ate);
+      sub.resize(static_cast<std::size_t>(f.tellg()) / 4);
+      f.seekg(0);
+      f.read(reinterpret_cast<char*>(sub.data()), static_cast<std::streamsize>(sub.size() * 4));
+      if (!gpu->SetDraftVocab(sub, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      std::printf("trimmed draft head: %zu tokens\n", sub.size());
+    }
+    const std::size_t QV = sub.empty() ? V : sub.size();
+    const auto qid = [&](std::int32_t i) { return sub.empty() ? i : sub[static_cast<std::size_t>(i)]; };
     std::vector<std::string> files;
     for (std::size_t p = 0; p < mtp_prompts.size();) {
       const auto q = mtp_prompts.find(',', p);
@@ -544,14 +729,28 @@ int main(int argc, char** argv) {
       gpu->MtpRewind(0);
       std::unique_ptr<model::ReferenceModel> ref;
       if (mtp_check > 0) ref = std::make_unique<model::ReferenceModel>(*weights, ngram.get(), mtp_check + 1);
-      std::vector<std::vector<float>> q(K, std::vector<float>(V));
+      std::vector<std::vector<float>> q(K, std::vector<float>(QV));
       std::vector<float> hidden, cpu_l(V);
       // greedy: hits[j] = positions whose drafts 1..j+1 all matched; sampled: sum over positions of prod alpha
       std::vector<double> chain(K, 0.0), cond_num(K, 0.0), cond_den(K, 0.0);
       std::size_t positions = 0;
       using clk = std::chrono::steady_clock;
+      std::ofstream dhid, ddft;
+      const std::string pname = file.substr(file.find_last_of('/') + 1);
+      if (!mtp_dump.empty()) {
+        std::ofstream dt(mtp_dump + "." + pname + ".tok", std::ios::binary);
+        const std::int32_t lp = static_cast<std::int32_t>(L);
+        dt.write(reinterpret_cast<const char*>(&lp), 4);
+        dt.write(reinterpret_cast<const char*>(toks.data()), static_cast<std::streamsize>(toks.size() * 4));
+        dhid.open(mtp_dump + "." + pname + ".hid", std::ios::binary);
+        ddft.open(mtp_dump + "." + pname + ".dft", std::ios::binary);
+      }
       for (std::size_t t = 0; t + 1 < toks.size(); ++t) {
         if (!gpu->Step(toks[t], {}, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+        if (dhid.is_open()) {
+          if (!gpu->TrunkHidden(&hidden, &error)) return 1;
+          dhid.write(reinterpret_cast<const char*>(hidden.data()), static_cast<std::streamsize>(hidden.size() * 4));
+        }
         const std::size_t g0 = t + 1 >= L ? t + 1 - L : SIZE_MAX;  // tl index of the step at position t
         // Drafts only where the targets of all K depths are known: q_j vs tl[g0 + j].
         const bool draft = t + 1 >= L && g0 + K < static_cast<std::size_t>(n);
@@ -576,22 +775,26 @@ int main(int argc, char** argv) {
               !ref->MtpStep(*mtp, toks[t + 1], hidden, cpu_l, nullptr, &error))
             return std::fprintf(stderr, "check: %s\n", error.c_str()), 1;
           double d = 0, m = 0;
-          for (std::size_t i = 0; i < V; ++i) d += (q[0][i] - cpu_l[i]) * double(q[0][i] - cpu_l[i]), m += cpu_l[i] * double(cpu_l[i]);
+          for (std::size_t i = 0; i < V && QV == V; ++i) d += (q[0][i] - cpu_l[i]) * double(q[0][i] - cpu_l[i]), m += cpu_l[i] * double(cpu_l[i]);
           std::printf("mtp check position %zu: relL2 %.3g, argmax gpu %d cpu %d\n", t, std::sqrt(d / m), argmax(q[0].data()),
                       argmax(cpu_l.data()));
         }
         if (!draft) continue;
         const std::uint32_t base = gpu->MtpPosition();
         std::vector<std::int32_t> d(K);
-        d[0] = argmax(q[0].data());
+        const auto qarg = [&](const std::vector<float>& l) {
+          return qid(static_cast<std::int32_t>(std::max_element(l.begin(), l.end()) - l.begin()));
+        };
+        d[0] = qarg(q[0]);
         for (std::uint32_t j = 1; j < K; ++j) {
           const std::int32_t in = mtp_temp > 0 ? toks[t + 1 + j] : d[j - 1];
           const auto sc = clk::now();
           if (!gpu->MtpStep(in, false, q[j], &error)) return std::fprintf(stderr, "mtp: %s\n", error.c_str()), 1;
           t_chain_sum += std::chrono::duration<double, std::milli>(clk::now() - sc).count(), ++t_chain_n;
-          d[j] = argmax(q[j].data());
+          d[j] = qarg(q[j]);
         }
         gpu->MtpRewind(base);
+        if (ddft.is_open()) ddft.write(reinterpret_cast<const char*>(d.data()), static_cast<std::streamsize>(d.size() * 4));
         ++positions;
         double run = 1;
         for (std::uint32_t j = 0; j < K; ++j) {
@@ -599,9 +802,17 @@ int main(int argc, char** argv) {
           if (mtp_temp > 0) {
             std::vector<double> pq;
             probs(tl.data() + (g0 + 1 + j) * V, p);
-            probs(q[j].data(), pq);
             a = 0;
-            for (std::size_t i = 0; i < V; ++i) a += std::min(p[i], pq[i]);
+            if (sub.empty()) {
+              probs(q[j].data(), pq);
+              for (std::size_t i = 0; i < V; ++i) a += std::min(p[i], pq[i]);
+            } else {  // q over the subset only
+              double mx = -1e300, sum = 0;
+              for (float v : q[j]) mx = std::max(mx, double(v));
+              pq.resize(QV);
+              for (std::size_t i = 0; i < QV; ++i) sum += pq[i] = std::exp((q[j][i] - mx) / mtp_temp);
+              for (std::size_t i = 0; i < QV; ++i) a += std::min(p[static_cast<std::size_t>(sub[i])], pq[i] / sum);
+            }
           } else {
             a = d[j] == toks[t + 2 + j] ? 1.0 : 0.0;
           }

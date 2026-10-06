@@ -916,3 +916,406 @@ extern "C" __global__ void __launch_bounds__(256)
     for (std::uint32_t slot = 0; slot < k; ++slot) weights[slot] /= sum;
   }
 }
+
+// ---- PROBE ONLY (not used by any decode path): batch-shaped WMMA GEMVs for the X measurement ------------------
+// Weights dequantized to fp16 per 32-value block (fp16(q * scale) for Q8; fp16(d sc q - dmin m) for Q4_K;
+// fp16(d q + m) for Q5_1), activations rounded to fp16, FP16 WMMA 16x16x16 with fp32 accumulation, split-K
+// partials summed in split order: a column's result does not depend on how many columns run (batch-invariant),
+// but it differs from the fp32 single-token kernels (fp16 activations and weights, WMMA sum order, split-K).
+// A wave owns 16 rows; columns 0..B-1 of the 16-wide tile are live.
+namespace {
+__device__ inline void ProbeStore(halo_v8f acc, float* out, std::uint32_t r0, std::uint32_t rows, std::uint32_t ncols,
+                                  std::size_t col_stride) {
+  const std::uint32_t lane = threadIdx.x % kWarp, col = lane % 16;
+  if (col >= ncols) return;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const std::uint32_t r = r0 + 2 * j + lane / 16;
+    if (r < rows) out[col * col_stride + r] = acc[j];
+  }
+}
+}  // namespace
+
+// part[s][b][rows] = W[rows, k-split s] . x[b]; grid (ceil(rows / 128), S), 256 threads.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_probe_q8r_wmma(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* part, std::uint32_t rows,
+                        std::uint32_t cols, std::uint32_t qstride, std::uint32_t B, std::uint32_t kspan,
+                        std::uint32_t xstride) {
+  __shared__ _Float16 xs[16 * 1024];
+  const std::uint32_t s = blockIdx.y, k0 = s * kspan, k1 = min(cols, k0 + kspan), n = k1 - k0;
+  for (std::uint32_t b = 0; b < B; ++b)
+    for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) xs[b * kspan + i] = static_cast<_Float16>(x[b * xstride + k0 + i]);
+  __syncthreads();
+  const std::uint32_t lane = threadIdx.x % kWarp, r0 = (blockIdx.x * 8 + threadIdx.x / kWarp) * 16;
+  if (r0 >= rows) return;
+  const std::uint32_t row = min(r0 + lane % 16, rows - 1), col = lane % 16, nblk = cols / 32;
+  halo_v8f acc = {};
+  for (std::uint32_t k = 0; k < n; k += 32) {
+    const int4 q0 = *reinterpret_cast<const int4*>(qs + static_cast<std::size_t>(row) * qstride + k0 + k);
+    const int4 q1 = *reinterpret_cast<const int4*>(qs + static_cast<std::size_t>(row) * qstride + k0 + k + 16);
+    const float sc = F16(d[static_cast<std::size_t>(row) * nblk + (k0 + k) / 32]);
+    const std::int8_t* v0 = reinterpret_cast<const std::int8_t*>(&q0);
+    const std::int8_t* v1 = reinterpret_cast<const std::int8_t*>(&q1);
+    halo_v16h a0, a1, b0 = {}, b1 = {};
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      a0[i] = static_cast<_Float16>(static_cast<float>(v0[i]) * sc);
+      a1[i] = static_cast<_Float16>(static_cast<float>(v1[i]) * sc);
+    }
+    if (col < B) {
+      b0 = *reinterpret_cast<const halo_v16h*>(xs + col * kspan + k);
+      b1 = *reinterpret_cast<const halo_v16h*>(xs + col * kspan + k + 16);
+    }
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc);
+  }
+  ProbeStore(acc, part + static_cast<std::size_t>(s) * B * rows, r0, rows, B, rows);
+}
+
+// y[b][r] = sum over s of part[s][b][r], in split order.
+extern "C" __global__ void halo_probe_reduce(const float* part, float* y, std::uint32_t rows, std::uint32_t B,
+                                             std::uint32_t S) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * B) return;
+  float a = 0.0f;
+  for (std::uint32_t s = 0; s < S; ++s) a += part[static_cast<std::size_t>(s) * rows * B + i];
+  y[i] = a;
+}
+
+// Routed gate/up, Q4_K, grouped by expert: block (row group of 128, u); pair activations x[pair / k] (fp32 [*][cols]).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_probe_q4k_gu_wmma(const std::uint8_t* gate, const std::uint8_t* up, const std::uint32_t* ucount,
+                           const std::uint32_t* uexp, const std::uint32_t* unum, const std::uint32_t* upair,
+                           const float* x, float* h, std::uint64_t expert_bytes, std::uint32_t rows, std::uint32_t cols,
+                           std::uint64_t row_bytes, std::uint32_t k) {
+  __shared__ _Float16 xs[8 * 2560];
+  const std::uint32_t u = blockIdx.y;
+  if (u >= *ucount) return;
+  const std::uint32_t m = unum[u];
+  for (std::uint32_t j = 0; j < m; ++j) {
+    const std::uint32_t col = upair[u * 8 + j] / k;
+    for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[j * cols + i] = static_cast<_Float16>(x[col * cols + i]);
+  }
+  __syncthreads();
+  const std::uint32_t lane = threadIdx.x % kWarp, r0 = (blockIdx.x * 8 + threadIdx.x / kWarp) * 16;
+  if (r0 >= rows) return;
+  const std::uint32_t row = min(r0 + lane % 16, rows - 1), col = lane % 16;
+  const std::size_t e = uexp[u];
+  const std::uint8_t* gr = gate + e * expert_bytes + row * row_bytes;
+  const std::uint8_t* ur = up + e * expert_bytes + row * row_bytes;
+  halo_v8f ag = {}, au = {};
+  for (std::uint32_t kk = 0; kk < cols; kk += 64) {  // one Q4_K item: 64 values, sub-blocks 2c (low) and 2c+1 (high)
+    const std::uint32_t sb = kk / 256, c = (kk % 256) / 64;
+    halo_v16h bl0 = {}, bl1 = {}, bh0 = {}, bh1 = {};
+    if (col < m) {
+      bl0 = *reinterpret_cast<const halo_v16h*>(xs + col * cols + kk);
+      bl1 = *reinterpret_cast<const halo_v16h*>(xs + col * cols + kk + 16);
+      bh0 = *reinterpret_cast<const halo_v16h*>(xs + col * cols + kk + 32);
+      bh1 = *reinterpret_cast<const halo_v16h*>(xs + col * cols + kk + 48);
+    }
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+      const std::uint8_t* b = (g == 0 ? gr : ur) + sb * 144;
+      const int4 hdr = *reinterpret_cast<const int4*>(b);
+      const int4 qa = *reinterpret_cast<const int4*>(b + 16 + c * 32);
+      const int4 qb = *reinterpret_cast<const int4*>(b + 16 + c * 32 + 16);
+      std::uint32_t sc0, m0, sc1, m1;
+      ScaleMinK4Words(2 * c, static_cast<std::uint32_t>(hdr.y), static_cast<std::uint32_t>(hdr.z),
+                      static_cast<std::uint32_t>(hdr.w), sc0, m0);
+      ScaleMinK4Words(2 * c + 1, static_cast<std::uint32_t>(hdr.y), static_cast<std::uint32_t>(hdr.z),
+                      static_cast<std::uint32_t>(hdr.w), sc1, m1);
+      const float dd = F16(static_cast<std::uint16_t>(hdr.x & 0xFFFF));
+      const float dm = F16(static_cast<std::uint16_t>(static_cast<std::uint32_t>(hdr.x) >> 16));
+      const float s0 = dd * static_cast<float>(sc0), o0 = dm * static_cast<float>(m0);
+      const float s1 = dd * static_cast<float>(sc1), o1 = dm * static_cast<float>(m1);
+      const std::uint8_t* q0 = reinterpret_cast<const std::uint8_t*>(&qa);
+      const std::uint8_t* q1 = reinterpret_cast<const std::uint8_t*>(&qb);
+      halo_v16h l0, l1, h0, h1;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        l0[i] = static_cast<_Float16>(s0 * static_cast<float>(q0[i] & 0xF) - o0);
+        l1[i] = static_cast<_Float16>(s0 * static_cast<float>(q1[i] & 0xF) - o0);
+        h0[i] = static_cast<_Float16>(s1 * static_cast<float>(q0[i] >> 4) - o1);
+        h1[i] = static_cast<_Float16>(s1 * static_cast<float>(q1[i] >> 4) - o1);
+      }
+      halo_v8f& acc = g == 0 ? ag : au;
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(l0, bl0, acc);
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(l1, bl1, acc);
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(h0, bh0, acc);
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(h1, bh1, acc);
+    }
+  }
+  if (col >= m) return;
+  const std::uint32_t pair = upair[u * 8 + col];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const std::uint32_t r = r0 + 2 * j + lane / 16;
+    if (r < rows) h[static_cast<std::size_t>(pair) * rows + r] = Silu(ag[j]) * au[j];
+  }
+}
+
+// Routed down, Q5_1, grouped by expert: block (row group of 128, u); h[pair][cols] in, part[pair][rows] out.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_probe_q51_down_wmma(const std::uint8_t* down, const std::uint32_t* ucount, const std::uint32_t* uexp,
+                             const std::uint32_t* unum, const std::uint32_t* upair, const float* h, float* part,
+                             std::uint64_t expert_bytes, std::uint32_t rows, std::uint32_t cols, std::uint64_t row_bytes) {
+  __shared__ _Float16 xs[8 * 1024];
+  const std::uint32_t u = blockIdx.y;
+  if (u >= *ucount) return;
+  const std::uint32_t m = unum[u];
+  for (std::uint32_t j = 0; j < m; ++j) {
+    const std::uint32_t p = upair[u * 8 + j];
+    for (std::uint32_t i = threadIdx.x; i < cols; i += blockDim.x) xs[j * cols + i] = static_cast<_Float16>(h[p * cols + i]);
+  }
+  __syncthreads();
+  const std::uint32_t lane = threadIdx.x % kWarp, r0 = (blockIdx.x * 8 + threadIdx.x / kWarp) * 16;
+  if (r0 >= rows) return;
+  const std::uint32_t row = min(r0 + lane % 16, rows - 1), col = lane % 16;
+  const std::uint8_t* wr = down + uexp[u] * expert_bytes + row * row_bytes;
+  halo_v8f acc = {};
+  for (std::uint32_t kk = 0; kk < cols; kk += 32) {
+    const std::uint8_t* b = wr + (kk / 32) * 24;
+    const uint2 hd = *reinterpret_cast<const uint2*>(b);
+    const uint2 qa = *reinterpret_cast<const uint2*>(b + 8);
+    const uint2 qb = *reinterpret_cast<const uint2*>(b + 16);
+    std::uint8_t q[16];
+    *reinterpret_cast<uint2*>(q) = qa;
+    *reinterpret_cast<uint2*>(q + 8) = qb;
+    const float dd = F16(static_cast<std::uint16_t>(hd.x & 0xFFFF)), mm = F16(static_cast<std::uint16_t>(hd.x >> 16));
+    const std::uint32_t qh = hd.y;
+    halo_v16h a0, a1, b0 = {}, b1 = {};
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      a0[j] = static_cast<_Float16>(dd * static_cast<float>((q[j] & 0xF) | (((qh >> j) & 1) << 4)) + mm);
+      a1[j] = static_cast<_Float16>(dd * static_cast<float>((q[j] >> 4) | (((qh >> (j + 16)) & 1) << 4)) + mm);
+    }
+    if (col < m) {
+      b0 = *reinterpret_cast<const halo_v16h*>(xs + col * cols + kk);
+      b1 = *reinterpret_cast<const halo_v16h*>(xs + col * cols + kk + 16);
+    }
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc);
+  }
+  if (col >= m) return;
+  const std::uint32_t pair = upair[u * 8 + col];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const std::uint32_t r = r0 + 2 * j + lane / 16;
+    if (r < rows) part[static_cast<std::size_t>(pair) * rows + r] = acc[j];
+  }
+}
+
+// PROBE ONLY, v2: the weight tile goes through LDS so that global loads stay row-contiguous (each load instruction
+// reads 256 contiguous bytes of one row, as the decode GEMVs do) instead of 16 rows x 16 bytes. Per wave: 16 rows,
+// K tiles of 256; the next tile's loads are issued before the current tile's WMMAs. Same numerics as v1.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_probe_q8r_wmma2(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* part, std::uint32_t rows,
+                         std::uint32_t cols, std::uint32_t qstride, std::uint32_t B, std::uint32_t kspan,
+                         std::uint32_t xstride) {
+  __shared__ _Float16 xs[8 * 1024];
+  __shared__ int2 wt[8][16][32];  // per wave: 16 rows x 256 bytes
+  const std::uint32_t s = blockIdx.y, k0 = s * kspan, k1 = min(cols, k0 + kspan), n = k1 - k0;
+  for (std::uint32_t b = 0; b < B; ++b)
+    for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) xs[b * kspan + i] = static_cast<_Float16>(x[b * xstride + k0 + i]);
+  __syncthreads();
+  const std::uint32_t lane = threadIdx.x % kWarp, w = threadIdx.x / kWarp, r0 = (blockIdx.x * 8 + w) * 16;
+  if (r0 >= rows) return;
+  const std::uint32_t col = lane % 16, nblk = cols / 32, myrow = min(r0 + lane % 16, rows - 1);
+  int2 cur[16], nxt[16];
+  const auto load = [&](std::uint32_t kt, int2 (&v)[16]) {
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+      const std::uint32_t row = min(r0 + r, rows - 1);
+      const std::uint32_t c = k0 + kt + lane * 8;
+      v[r] = c < k1 ? *reinterpret_cast<const int2*>(qs + static_cast<std::size_t>(row) * qstride + c) : int2{0, 0};
+    }
+  };
+  halo_v8f acc = {};
+  load(0, cur);
+  for (std::uint32_t kt = 0; kt < n; kt += 256) {
+    if (kt + 256 < n) load(kt + 256, nxt);
+#pragma unroll
+    for (int r = 0; r < 16; ++r) wt[w][r][lane] = cur[r];
+    __builtin_amdgcn_wave_barrier();
+    const std::int8_t* rowt = reinterpret_cast<const std::int8_t*>(&wt[w][lane % 16][0]);
+    const std::uint32_t kn = min(256u, n - kt);
+    for (std::uint32_t kk = 0; kk < kn; kk += 32) {
+      const int4 q0 = *reinterpret_cast<const int4*>(rowt + kk);
+      const int4 q1 = *reinterpret_cast<const int4*>(rowt + kk + 16);
+      const float sc = F16(d[static_cast<std::size_t>(myrow) * nblk + (k0 + kt + kk) / 32]);
+      const std::int8_t* v0 = reinterpret_cast<const std::int8_t*>(&q0);
+      const std::int8_t* v1 = reinterpret_cast<const std::int8_t*>(&q1);
+      halo_v16h a0, a1, b0 = {}, b1 = {};
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        a0[i] = static_cast<_Float16>(static_cast<float>(v0[i]) * sc);
+        a1[i] = static_cast<_Float16>(static_cast<float>(v1[i]) * sc);
+      }
+      if (col < B) {
+        b0 = *reinterpret_cast<const halo_v16h*>(xs + col * kspan + kt + kk);
+        b1 = *reinterpret_cast<const halo_v16h*>(xs + col * kspan + kt + kk + 16);
+      }
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc);
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc);
+    }
+    __builtin_amdgcn_wave_barrier();
+#pragma unroll
+    for (int r = 0; r < 16; ++r) cur[r] = nxt[r];
+  }
+  ProbeStore(acc, part + static_cast<std::size_t>(s) * B * rows, r0, rows, B, rows);
+}
+
+// PROBE ONLY, v3: v2 with the tile's scales loaded with the tile (v2 loaded one per 32 values inside the WMMA loop).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_probe_q8r_wmma3(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* part, std::uint32_t rows,
+                         std::uint32_t cols, std::uint32_t qstride, std::uint32_t B, std::uint32_t kspan,
+                         std::uint32_t xstride) {
+  __shared__ _Float16 xs[8 * 1024];
+  __shared__ int2 wt[8][16][32];  // per wave: 16 rows x 256 bytes
+  const std::uint32_t s = blockIdx.y, k0 = s * kspan, k1 = min(cols, k0 + kspan), n = k1 - k0;
+  for (std::uint32_t b = 0; b < B; ++b)
+    for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) xs[b * kspan + i] = static_cast<_Float16>(x[b * xstride + k0 + i]);
+  __syncthreads();
+  const std::uint32_t lane = threadIdx.x % kWarp, w = threadIdx.x / kWarp, r0 = (blockIdx.x * 8 + w) * 16;
+  if (r0 >= rows) return;
+  const std::uint32_t col = lane % 16, nblk = cols / 32, myrow = min(r0 + lane % 16, rows - 1);
+  int2 cur[16], nxt[16];
+  float scur[8], snxt[8];  // this lane's row's 8 scales of a tile, loaded with the tile (no load in the inner loop)
+  const auto load = [&](std::uint32_t kt, int2 (&v)[16], float (&sc)[8]) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const std::uint32_t blk = (k0 + kt) / 32 + j;
+      sc[j] = blk < nblk ? F16(d[static_cast<std::size_t>(myrow) * nblk + blk]) : 0.0f;
+    }
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+      const std::uint32_t row = min(r0 + r, rows - 1);
+      const std::uint32_t c = k0 + kt + lane * 8;
+      v[r] = c < k1 ? *reinterpret_cast<const int2*>(qs + static_cast<std::size_t>(row) * qstride + c) : int2{0, 0};
+    }
+  };
+  halo_v8f acc = {};
+  load(0, cur, scur);
+  for (std::uint32_t kt = 0; kt < n; kt += 256) {
+    if (kt + 256 < n) load(kt + 256, nxt, snxt);
+#pragma unroll
+    for (int r = 0; r < 16; ++r) wt[w][r][lane] = cur[r];
+    __builtin_amdgcn_wave_barrier();
+    const std::int8_t* rowt = reinterpret_cast<const std::int8_t*>(&wt[w][lane % 16][0]);
+    const std::uint32_t kn = min(256u, n - kt);
+#pragma unroll
+    for (std::uint32_t kk = 0; kk < 256; kk += 32) {
+      if (kk >= kn) break;
+      const int4 q0 = *reinterpret_cast<const int4*>(rowt + kk);
+      const int4 q1 = *reinterpret_cast<const int4*>(rowt + kk + 16);
+      const float sc = scur[kk / 32];
+      const std::int8_t* v0 = reinterpret_cast<const std::int8_t*>(&q0);
+      const std::int8_t* v1 = reinterpret_cast<const std::int8_t*>(&q1);
+      halo_v16h a0, a1, b0 = {}, b1 = {};
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        a0[i] = static_cast<_Float16>(static_cast<float>(v0[i]) * sc);
+        a1[i] = static_cast<_Float16>(static_cast<float>(v1[i]) * sc);
+      }
+      if (col < B) {
+        b0 = *reinterpret_cast<const halo_v16h*>(xs + col * kspan + kt + kk);
+        b1 = *reinterpret_cast<const halo_v16h*>(xs + col * kspan + kt + kk + 16);
+      }
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc);
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc);
+    }
+    __builtin_amdgcn_wave_barrier();
+#pragma unroll
+    for (int r = 0; r < 16; ++r) cur[r] = nxt[r];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) scur[j] = snxt[j];
+  }
+  ProbeStore(acc, part + static_cast<std::size_t>(s) * B * rows, r0, rows, B, rows);
+}
+
+// PROBE ONLY, v4: W8A8. Weights int8 straight into the iu8 WMMA (no dequantization: the fp16 probes spend ~4 VALU
+// per weight, twice, since both half-waves hold the A tile), activations quantized per column and 32 values to int8
+// (amax / 127, as the routed experts' Q8Act), int32 sums per 32-value block scaled by row scale x column scale into
+// fp32. Numerics: int8 activations for the dense projections (a precision change), block sums exact in int32, the
+// fp32 accumulation order over blocks fixed (independent of the column count).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_probe_q8r_wmma4(const std::int8_t* qs, const std::uint16_t* d, const float* x, float* part, std::uint32_t rows,
+                         std::uint32_t cols, std::uint32_t qstride, std::uint32_t B, std::uint32_t kspan,
+                         std::uint32_t xstride) {
+  __shared__ std::int8_t xq[8 * 1024];
+  __shared__ float xsc[8 * 32];
+  __shared__ int2 wt[8][16][32];
+  __shared__ float wsc[8][16][8];
+  const std::uint32_t s = blockIdx.y, k0 = s * kspan, k1 = min(cols, k0 + kspan), n = k1 - k0;
+  // Quantize: thread t handles one (column, 32-value block).
+  for (std::uint32_t t = threadIdx.x; t < B * ((n + 31) / 32); t += blockDim.x) {
+    const std::uint32_t b = t / ((n + 31) / 32), blk = t % ((n + 31) / 32);
+    float v[32], amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+      const std::uint32_t k = blk * 32 + i;
+      v[i] = k < n ? x[b * xstride + k0 + k] : 0.0f;
+      amax = fmaxf(amax, fabsf(v[i]));
+    }
+    const float sc = amax / 127.0f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i)
+      xq[b * kspan + blk * 32 + i] = static_cast<std::int8_t>(sc > 0.0f ? static_cast<int>(rintf(v[i] / sc)) : 0);
+    xsc[b * 32 + blk] = sc;
+  }
+  __syncthreads();
+  const std::uint32_t lane = threadIdx.x % kWarp, w = threadIdx.x / kWarp, r0 = (blockIdx.x * 8 + w) * 16;
+  if (r0 >= rows) return;
+  const std::uint32_t col = lane % 16, nblk = cols / 32;
+  int2 cur[16], nxt[16];
+  float scur[4], snxt[4];  // lane l holds scales of row l % 16, blocks 4 (l / 16) .. +3 of the tile
+  const auto load = [&](std::uint32_t kt, int2 (&v)[16], float (&sc)[4]) {
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+      const std::uint32_t row = min(r0 + r, rows - 1);
+      const std::uint32_t c = k0 + kt + lane * 8;
+      v[r] = c < k1 ? *reinterpret_cast<const int2*>(qs + static_cast<std::size_t>(row) * qstride + c) : int2{0, 0};
+    }
+    const std::uint32_t row = min(r0 + lane % 16, rows - 1);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const std::uint32_t blk = (k0 + kt) / 32 + 4 * (lane / 16) + j;
+      sc[j] = blk < nblk ? F16(d[static_cast<std::size_t>(row) * nblk + blk]) : 0.0f;
+    }
+  };
+  halo_v8f acc = {};
+  load(0, cur, scur);
+  for (std::uint32_t kt = 0; kt < n; kt += 256) {
+    if (kt + 256 < n) load(kt + 256, nxt, snxt);
+#pragma unroll
+    for (int r = 0; r < 16; ++r) wt[w][r][lane] = cur[r];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) wsc[w][lane % 16][4 * (lane / 16) + j] = scur[j];
+    __builtin_amdgcn_wave_barrier();
+    const std::int8_t* rowt = reinterpret_cast<const std::int8_t*>(&wt[w][lane % 16][0]);
+    const std::uint32_t kn = min(256u, n - kt);
+#pragma unroll
+    for (std::uint32_t kk = 0; kk < 256; kk += 32) {
+      if (kk >= kn) break;
+      const halo_v4i a0 = *reinterpret_cast<const halo_v4i*>(rowt + kk);
+      const halo_v4i a1 = *reinterpret_cast<const halo_v4i*>(rowt + kk + 16);
+      halo_v4i b0 = {}, b1 = {};
+      float xs = 0.0f;
+      if (col < B) {
+        b0 = *reinterpret_cast<const halo_v4i*>(xq + col * kspan + kt + kk);
+        b1 = *reinterpret_cast<const halo_v4i*>(xq + col * kspan + kt + kk + 16);
+        xs = xsc[col * 32 + (kt + kk) / 32];
+      }
+      halo_v8i c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, halo_v8i{}, false);
+      c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, c, false);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[j] += static_cast<float>(c[j]) * (wsc[w][2 * j + lane / 16][kk / 32] * xs);
+    }
+    __builtin_amdgcn_wave_barrier();
+#pragma unroll
+    for (int r = 0; r < 16; ++r) cur[r] = nxt[r];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) scur[j] = snxt[j];
+  }
+  ProbeStore(acc, part + static_cast<std::size_t>(s) * B * rows, r0, rows, B, rows);
+}
