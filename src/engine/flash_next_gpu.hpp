@@ -114,6 +114,9 @@ class FlashNextGpu {
   /// 64-row tiles (halo_gemm_q8r_f16_s) up to 640 rows instead of 512: the shared expert's 640-row gate/up
   /// otherwise take three 256-row tiles (the last half empty).
   static inline bool prefill_s640_ = true;
+  /// Producers whose fp32 output only feeds an FP16 GEMM write the fp16 copy directly (attention context,
+  /// mixer SiLU, shared-expert SiLU product) instead of a separate halo_f16_rows pass.
+  static inline bool prefill_f16_out_ = true;
   static std::uint32_t SmallRows() { return prefill_s640_ ? 640 : 512; }
   static inline bool prefill_ple_overlap_ = true;
   /// Prototype: Q4_K gate/up experts repacked K-blocked on first prefill use (decode does not read that layout).
@@ -352,7 +355,8 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   bool xn_skipped_ = false;  // the last combine_norm wrote rscale instead of xn
   bool moe_defer_ = false;    // the next SharedExpertChunk leaves the routed + shared sum to combine_norm
   bool moe_pending_ = false;  // ... and it did: block_out was not written
-  bool q_roped_ = false;      // this layer's q rows came out of halo_split_qgate_norm_rope
+  bool q_roped_ = false;
+  bool lo_half_ = false;      // the mixer's SiLU pass already left lo in fp16 (in xh)      // this layer's q rows came out of halo_split_qgate_norm_rope
   rt::FileUploader* loader_ = nullptr;  ///< during Init: weights read from their files
   std::unordered_map<const void*, DevLora> lora_;
   std::unordered_map<std::string, rt::KernelId> kernels_;

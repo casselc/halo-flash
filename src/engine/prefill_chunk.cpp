@@ -268,10 +268,17 @@ bool FlashNextGpu::HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_
                    {rt::Arg::Buf(ck_.res), rt::Arg::Buf(tensors_.at(m.norm.data).buf), rt::Arg::Buf(ck_.xn),
                     rt::Arg::Val(H), rt::Arg::Val(c.rms_eps), rt::Arg::Val(H), rt::Arg::Val(c.hc_count)},
                    error));
+  // With the fused mix, lo is read only as fp16: the SiLU pass writes just that copy.
+  lo_half_ = prefill_f16_out_ && MixFused(m);
   return norm_ok && Gemm(m.down, ck_.xn, ck_.lo, T, error, h16 ? &ck_.xh : nullptr, h16 && BlockedXh(m)) &&
-         Launch("halo_scale_silu", {Blocks(std::size_t{T} * low)}, {kBlock},
-                {rt::Arg::Buf(ck_.lo), rt::Arg::Val(1.0F / static_cast<float>(c.hc_count)), rt::Arg::Val(T * low)},
-                error) &&
+         (lo_half_ ? Launch("halo_scale_silu_h", {Blocks(std::size_t{T} * low)}, {kBlock},
+                            {rt::Arg::Buf(ck_.lo), rt::Arg::Buf(ck_.xh),
+                             rt::Arg::Val(1.0F / static_cast<float>(c.hc_count)), rt::Arg::Val(T * low)},
+                            error)
+                   : Launch("halo_scale_silu", {Blocks(std::size_t{T} * low)}, {kBlock},
+                            {rt::Arg::Buf(ck_.lo), rt::Arg::Val(1.0F / static_cast<float>(c.hc_count)),
+                             rt::Arg::Val(T * low)},
+                            error)) &&
          MixUp(m, T, error) &&
          (!inject ||
           (fused_inject ? Launch("halo_inject_reduce", {Blocks(std::size_t{T} * irows)}, {kBlock},
@@ -294,7 +301,9 @@ bool FlashNextGpu::MixUp(const model::HcMixer& m, std::uint32_t T, std::string* 
     const auto rows = static_cast<std::uint32_t>(m.up.rows);
     const bool rebuild = xn_skipped_;  // xn was not written: rebuild it from res
     xn_skipped_ = false;
-    return Half(ck_.lo, ck_.xh, T * low, error) &&
+    const bool lo_half = lo_half_;
+    lo_half_ = false;
+    return (lo_half || Half(ck_.lo, ck_.xh, T * low, error)) &&
            // Row tiles fastest: resident blocks read whole residual rows of the same
            // tokens (token tiles fastest: 1.41 vs 1.15 ms warm, 1.62 vs 1.19 after
            // its input was just written).
@@ -328,8 +337,10 @@ bool FlashNextGpu::PleChunk(const model::LayerWeights& l, std::uint32_t T, std::
                    rt::Arg::Val(c.rms_eps), rt::Arg::Val(H), rt::Arg::Val(hc)},
                   error);
   };
+  // Both projections read the same rows: on the FP16 route the value GEMM reuses the key GEMM's fp16 copy.
+  const bool share = prefill_f16_out_ && F16Route(l.ple_key) && F16Route(l.ple_value) && l.ple_key.cols == l.ple_value.cols;
   return Gemm(l.ple_key, ck_.host, ck_.pa, T, error) &&
-         Gemm(l.ple_value, ck_.host, ck_.mixed, T, error) && norm(ck_.pa, l.ple_norm_key, ck_.pa) &&
+         Gemm(l.ple_value, ck_.host, ck_.mixed, T, error, share ? &ck_.xh : nullptr) && norm(ck_.pa, l.ple_norm_key, ck_.pa) &&
          norm(ck_.res, l.ple_norm_query, ck_.xn) &&
          Launch("halo_ple_gate_rows", {T * hc}, {kBlock},
                 {rt::Arg::Buf(ck_.pa), rt::Arg::Buf(ck_.xn), rt::Arg::Buf(ck_.mixed), rt::Arg::Buf(ck_.gate),
@@ -588,13 +599,17 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   // own rows and softmax (halo_attention_fa).
   if (wmma && prefill_mq_attention_ && prefill_fa_attention_ && prefill_kv16_ && s.k16 &&
       (pos0 + T) / ratio <= budget)
+  {
+    // The context in fp16 only when the out projection reads it that way.
+    const bool ctx_half = prefill_f16_out_ && F16Route(l.attn_out);
     return kv16_current() &&
-           Launch("halo_attention_fa", {(T + 15) / 16, nkv * ((G + 3) / 4)}, {256},
+           Launch(ctx_half ? "halo_attention_fa_h" : "halo_attention_fa", {(T + 15) / 16, nkv * ((G + 3) / 4)}, {256},
                   {rt::Arg::Buf(ck_.q), rt::Arg::Buf(s.k16), rt::Arg::Buf(s.v16), rt::Arg::Buf(ck_.gate_a),
-                   rt::Arg::Buf(ck_.ctx), rt::Arg::Buf(ck_.host, ck_.params_offset), rt::Arg::Val(nh),
-                   rt::Arg::Val(nkv), rt::Arg::Val(T)},
+                   rt::Arg::Buf(ctx_half ? ck_.xh : ck_.ctx), rt::Arg::Buf(ck_.host, ck_.params_offset),
+                   rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(T)},
                   error) &&
-           Gemm(l.attn_out, ck_.ctx, ck_.block_out, T, error);
+           Gemm(l.attn_out, ck_.ctx, ck_.block_out, T, error, ctx_half ? &ck_.xh : nullptr);
+  }
   if (wmma && prefill_mq_attention_ && (pos0 + T) / ratio <= budget && 4 * G <= 48)
     return Launch("halo_attention_wmma_mq", {nkv, (T + 3) / 4}, {256},
                   {rt::Arg::Buf(ck_.q), rt::Arg::Buf(s.k), rt::Arg::Buf(s.v), rt::Arg::Buf(ck_.gate_a),
@@ -870,11 +885,15 @@ bool FlashNextGpu::SharedExpertChunk(const model::LayerWeights& l, std::uint32_t
   const auto& c = w_.config;
   const std::uint32_t H = c.hidden_size;
   const std::uint32_t sff = c.shared_expert_ff;
+  const bool eg_half = prefill_f16_out_ && F16Route(l.shexp_down);  // the SiLU product written in fp16 only
   return MixedHalf(T, error) && Gemm(l.shexp_gate, ck_.mixed, ck_.eg, T, error, MixedH()) &&
          Gemm(l.shexp_up, ck_.mixed, ck_.eu, T, error, MixedH()) &&
-         Launch("halo_silu_mul", {Blocks(std::size_t{T} * sff)}, {kBlock},
-                {rt::Arg::Buf(ck_.eg), rt::Arg::Buf(ck_.eu), rt::Arg::Val(T * sff)}, error) &&
-         Gemm(l.shexp_down, ck_.eg, ck_.ed, T, error) && Gemm(l.shexp_gate_inp, ck_.mixed, ck_.sgate, T, error) &&
+         (eg_half ? Launch("halo_silu_mul_h", {Blocks(std::size_t{T} * sff)}, {kBlock},
+                           {rt::Arg::Buf(ck_.eg), rt::Arg::Buf(ck_.eu), rt::Arg::Buf(ck_.xh), rt::Arg::Val(T * sff)},
+                           error)
+                  : Launch("halo_silu_mul", {Blocks(std::size_t{T} * sff)}, {kBlock},
+                           {rt::Arg::Buf(ck_.eg), rt::Arg::Buf(ck_.eu), rt::Arg::Val(T * sff)}, error)) &&
+         Gemm(l.shexp_down, ck_.eg, ck_.ed, T, error, eg_half ? &ck_.xh : nullptr) && Gemm(l.shexp_gate_inp, ck_.mixed, ck_.sgate, T, error) &&
          (fused_combine && moe_defer_ ? (moe_pending_ = true)  // summed by the combine_norm that follows
           : fused_combine  // the routed experts' weighted sum and this expert in one pass
               ? Launch("halo_moe_combine_shared", {Blocks(H), T}, {kBlock},
@@ -995,7 +1014,8 @@ bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<
     const bool moe = moe_pending_;
     moe_pending_ = false;
     if (moe || TokCombine(next)) {
-      const auto irows = static_cast<std::uint32_t>(next.inject.rows);
+      static const bool probe_noinject = std::getenv("HALO_PROBE_NOINJECT") != nullptr;  // PROBE (wrong results)
+      const auto irows = probe_noinject ? 0u : static_cast<std::uint32_t>(next.inject.rows);
       const auto norm = rt::Arg::Buf(tensors_.at(next.norm.data).buf), iw = rt::Arg::Buf(tensors_.at(next.inject.data).buf);
       const auto blocked = rt::Arg::Val(BlockedXh(next) ? T : 0u);
       if (moe)

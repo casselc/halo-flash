@@ -8,6 +8,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <type_traits>
 
 #include "kernels/span_trace.h"
 #include "kernels/step_params.h"
@@ -304,6 +305,14 @@ extern "C" __global__ void halo_silu_mul(float* g, const float* up, std::uint32_
   for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
     g[i] = Silu(g[i]) * up[i];
 }
+// halo_silu_mul then halo_f16_rows in one pass: only the fp16 copy is written.
+extern "C" __global__ void halo_silu_mul_h(const float* g, const float* up, _Float16* y, std::uint32_t n) {
+  for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+    float v = Silu(g[i]) * up[i];
+    __asm__ volatile("" : "+v"(v));  // the fp32 value, rounded, as the separate pass reads it
+    y[i] = static_cast<_Float16>(v);
+  }
+}
 
 // x *= sigmoid(gate)
 extern "C" __global__ void halo_sigmoid_gate(float* x, const float* gate, std::uint32_t n) {
@@ -515,6 +524,14 @@ extern "C" __global__ void halo_attention_prefill(const float* q, const float* k
 extern "C" __global__ void halo_scale_silu(float* x, float scale, std::uint32_t n) {
   for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
     x[i] = Silu(x[i] * scale);
+}
+// halo_scale_silu then halo_f16_rows in one pass: only the fp16 copy is written.
+extern "C" __global__ void halo_scale_silu_h(const float* x, _Float16* y, float scale, std::uint32_t n) {
+  for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+    float v = Silu(x[i] * scale);
+    __asm__ volatile("" : "+v"(v));  // the fp32 value, rounded, as the separate pass reads it
+    y[i] = static_cast<_Float16>(v);
+  }
 }
 
 // mixed[i] = mean_s xn[s*H+i] * sigmoid(gate[s*H+i]).
@@ -6635,10 +6652,12 @@ extern "C" __global__ void __launch_bounds__(256)
 // contiguous. P goes through the wave's own LDS slice (aliasing the K tile,
 // which every wave has finished with by then).
 //   grid (ceil(T / 16), num_kv_heads * ceil(G / 4)), block 256; head_dim 256.
-extern "C" __global__ void __launch_bounds__(256)
-    halo_attention_fa(const float* q, const _Float16* kc, const _Float16* vc, const float* gate, float* out,
-                      const std::uint32_t* params, std::uint32_t num_heads, std::uint32_t num_kv_heads,
-                      std::uint32_t tokens) {
+// OutT _Float16 (halo_attention_fa_h): the context leaves in fp16 for the out projection's FP16 GEMM, the same
+// bits a separate halo_f16_rows pass over the fp32 result gives (the fp32 value is rounded first).
+template <typename OutT>
+__device__ __forceinline__ void AttentionFa(const float* q, const _Float16* kc, const _Float16* vc, const float* gate,
+                                            OutT* out, const std::uint32_t* params, std::uint32_t num_heads,
+                                            std::uint32_t num_kv_heads, std::uint32_t tokens) {
   constexpr std::uint32_t HD = 256, QT = 16, KC = 32, KR = HD + 8, VR = KC + 8, PR = KC + 8, NT = 256;
   __shared__ __attribute__((aligned(16))) _Float16 Ks[KC * KR];
   __shared__ __attribute__((aligned(16))) _Float16 Vt[HD * VR];
@@ -6779,8 +6798,26 @@ extern "C" __global__ void __launch_bounds__(256)
       const std::uint32_t t = qt0 + 2 * j + hi;
       if (t >= tokens) continue;
       const std::size_t idx = (static_cast<std::size_t>(t) * num_heads + h) * HD + half * 128 + dt * 16 + lane % 16;
-      out[idx] = o[dt][j] / ml[wave][1][2 * j + hi] * Sigmoid(gate[idx]);
+      float v = o[dt][j] / ml[wave][1][2 * j + hi] * Sigmoid(gate[idx]);
+      if constexpr (std::is_same_v<OutT, float>) {
+        out[idx] = v;
+      } else {
+        __asm__ volatile("" : "+v"(v));  // round to fp32 first (no v_fma_mix folding into the conversion)
+        out[idx] = static_cast<_Float16>(v);
+      }
     }
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_attention_fa(const float* q, const _Float16* kc, const _Float16* vc, const float* gate, float* out,
+                      const std::uint32_t* params, std::uint32_t num_heads, std::uint32_t num_kv_heads,
+                      std::uint32_t tokens) {
+  AttentionFa<float>(q, kc, vc, gate, out, params, num_heads, num_kv_heads, tokens);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_attention_fa_h(const float* q, const _Float16* kc, const _Float16* vc, const float* gate, _Float16* out,
+                        const std::uint32_t* params, std::uint32_t num_heads, std::uint32_t num_kv_heads,
+                        std::uint32_t tokens) {
+  AttentionFa<_Float16>(q, kc, vc, gate, out, params, num_heads, num_kv_heads, tokens);
 }
 
 // halo_attention_wmma_mq's structure for QSA-selected keys: the 4 tokens of

@@ -1024,6 +1024,10 @@ compared with `cmp` against the unmodified build; gpu_tests property tests bitwi
 | Attention q: split, q norm and RoPE in one pass (`halo_split_qgate_norm_rope`; q written once instead of three times, ~200 MB a layer) | -9..-13 | split + norm + rope 22.6 -> 11.2 ms; end to end -14.5 (significant) | yes |
 | Shared expert gate/up (640 rows) on 64-row tiles (`_s`, 160 blocks) instead of three 256-row tiles (48 blocks, last half empty); stream P's finding | -5 (study: 0.405 -> 0.349 ms after writes) | 34.3 -> 24.9 ms (-9.4 kernel); end to end -17.5 (off arm spread 18) | yes |
 
+| Producers write the fp16 copy their FP16 GEMM reads instead of fp32 + `halo_f16_rows` (`halo_attention_fa_h` context, `halo_scale_silu_h` mixer lo, `halo_silu_mul_h` shared expert; PLE value GEMM reuses the key GEMM's copy); `--f16-out` | -8..-10 | conversions 4.42 + 1.90 + (lo) gone, producers +0.2..+0.5; kernel sum -7.3, end to end -5.5 (within noise, spreads 10) | yes |
+| tok_moe inject phase ablated (irows 0; timing only) | — | 87.4 -> 82.4 ms: the inject partials are ~5 ms of it | n/a |
+| Deferred n-gram read vs layer 0 (`HALO_PREFILL_TIMING`) | — | read 67-73 ms warm (155 cold) while layer 0 takes ~30: ~35 ms of GPU idle per 2048-token prefill, charged to the PLE `halo_f16_rows`. `halo_disk_bench`: 4K random reads saturate at ~217K IOPS from QD 16 (PCIe Gen3 x4): IOPS-bound, so the levers are a larger row cache or a Gen4 link, not kernels | open (policy) |
+
 Exactness trap found on the way: with one element per thread, the backend fused the norm's `x * x` into
 WarpSum's first butterfly add (`v_fmac` across the `ds_bpermute`), a different rounding from `halo_rmsnorm`
 (whose loop keeps the product rounded). An empty `asm volatile("" : "+v"(ss))` keeps the rounding. A per-element
