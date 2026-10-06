@@ -9492,3 +9492,5 @@ extern "C" __global__ void __launch_bounds__(256)
     for (std::uint32_t slot = 0; slot < k; ++slot) weights[slot] /= sum;
   }
 }
+
+#include "batch_decode.hip"

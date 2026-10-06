@@ -292,6 +292,54 @@ class FlashNextGpu {
   /// Rewinds to an empty sequence.
   [[nodiscard]] bool Reset(std::string* error);
 
+  /// Routing trace (analysis): when on before the first step (graphs are captured with it), every step
+  /// copies each layer's routed expert ids into a device buffer; RouteTrace() downloads the last step's
+  /// ids, [num_layers][num_experts_used].
+  static inline bool route_trace_ = false;
+
+  // ---- P6 sessions (docs/SESSIONS.md) ----
+  /// The engine holds any number of sequences. One is bound at a time: Step, StepSample, Prefill, Save,
+  /// Restore, Reset and Position act on it. Binding swaps host-side handles only (no device copies): each
+  /// session owns its recurrent state, its KV pages and its captured decode graphs. Session 0 exists from
+  /// Create and is bound initially, so single-sequence callers see no change.
+  using SessionId = std::uint32_t;
+  [[nodiscard]] bool NewSession(SessionId* id, std::string* error);
+  /// An exact copy of `src` at its current position: recurrent state copied, KV pages below the position
+  /// shared copy-on-write (the page holding the position is copied; later writes go to fresh pages).
+  [[nodiscard]] bool ForkSession(SessionId src, SessionId* id, std::string* error);
+  [[nodiscard]] bool BindSession(SessionId id, std::string* error);
+  /// Frees a session's state, graphs and its references to shared KV pages. The bound session cannot be dropped.
+  [[nodiscard]] bool DropSession(SessionId id, std::string* error);
+  [[nodiscard]] SessionId BoundSession() const noexcept { return bound_; }
+  [[nodiscard]] bool HasSession(SessionId id) const noexcept;
+  [[nodiscard]] std::uint32_t SessionPositionOf(SessionId id) const;
+  /// Device bytes of physical memory the session's state holds, counting shared KV pages once per holder
+  /// (`exclusive`: pages only this session references) - for the memory tables.
+  struct SessionBytes {
+    std::size_t recurrent = 0, kv_mapped = 0, kv_exclusive = 0;
+  };
+  [[nodiscard]] SessionBytes SessionMemory(SessionId id) const;
+
+  /// One decode step for several sessions at once (P6 batched decode): every weight is read once for the
+  /// batch, routed experts grouped across sessions. Each entry's logits / sampled token / state are byte-identical
+  /// to a Step / StepSample of that session alone. Sessions must be distinct; 1..kMaxBatch entries; every
+  /// entry the same kind (logits wanted, sampled, or neither). Shapes or options the batched kernels do not
+  /// cover run the entries one after another (same results).
+  static constexpr std::uint32_t kMaxBatch = 8;
+  struct BatchEntry {
+    SessionId session = 0;
+    std::int32_t token = 0;
+    std::span<float> logits;                   ///< filled when non-empty
+    const SampleRequest* sample = nullptr;     ///< sampled on the device when set (then `result` too)
+    SampleResult* result = nullptr;
+  };
+  [[nodiscard]] bool StepBatch(std::span<const BatchEntry> entries, std::string* error);
+  /// Whether StepBatch would run the batched kernels (else it steps the entries in turn).
+  [[nodiscard]] bool BatchSupported() const;
+  [[nodiscard]] std::string BatchUnsupported() const;  ///< why not (empty: supported)
+  static inline bool batch_decode_ = true;  ///< false: StepBatch always steps the entries in turn
+  [[nodiscard]] bool RouteTrace(std::vector<std::uint32_t>* ids, std::string* error);
+
  private:
   struct DevTensor {
     rt::Buffer buf;
@@ -307,6 +355,17 @@ class FlashNextGpu {
   };
   struct LinearState {
     rt::Buffer conv, state;
+  };
+  /// One KV tensor of one attention layer: a virtual range for max_context positions whose physical pages are
+  /// mapped on demand and shared between forks (rt::Device paging), or one allocation at full capacity when the
+  /// backend cannot map pages. `row_bytes` per `row_tokens` positions (block_k: one row per compress_ratio).
+  struct KvPage;
+  struct KvRegion {
+    rt::Buffer va;  // device address range of the whole capacity
+    std::size_t row_bytes = 0;
+    std::uint32_t row_tokens = 1;
+    std::vector<std::shared_ptr<KvPage>> pages;  // mapped pages, from offset 0 (paged mode)
+    bool paged = false;
   };
   struct AttnState {
     rt::Buffer k, v, index_k, block_k;
@@ -428,6 +487,8 @@ std::unordered_set<const void*> moe_blocked_;
   bool mixed32_dead_ = false;  // this layer's MoE half reads no fp32 `mixed` (RouterHL)  // RouterHL held for this layer: mh / ml are the router's input  // the next mix epilogue also writes ml (the MoE-half mixer, router mode 4)  // tensors repacked K-blocked (prefill_moe_blocked_)
 
 rt::Buffer moe_blocked_tmp_;
+  rt::Buffer route_trace_buf_;
+  std::uint32_t cur_layer_ = 0;
 
 std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: not armed
     rt::Device& dev_;
@@ -472,6 +533,51 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   rt::FileUploader* loader_ = nullptr;  ///< during Init: weights read from their files
   std::unordered_map<const void*, DevLora> lora_;
   std::unordered_map<std::string, rt::KernelId> kernels_;
+  // ---- P6: sessions. The bound session's state lives in the members below (linear_, attn_, ple_history_,
+  // ngram_history_, position_ and the decode graphs); the others are parked in sessions_. Binding swaps.
+  struct SeqState {
+    std::vector<LinearState> linear;
+    std::vector<AttnState> attn;
+    rt::Buffer ple_history;
+    model::NgramHistory ngram_history;
+    std::uint32_t position = 0;
+    rt::Graph graphs[3], pre_graph, post_graphs[3];
+    std::vector<KvRegion> kv;  // every KV region of the session (attention layers x kinds)
+  };
+  std::vector<std::unique_ptr<SeqState>> sessions_;  // by id; null: dropped; sessions_[bound_] is the swapped-out shell
+  SessionId bound_ = 0;
+  std::vector<KvRegion> kv_;  // the bound session's KV regions
+  void SwapBound(SeqState& s) noexcept;
+  bool AllocSeq(SeqState& s, std::string* error);
+  void FreeSeq(SeqState& s) noexcept;
+  /// Maps KV pages so the bound session can hold `tokens` positions.
+  bool EnsureKv(std::uint32_t tokens, std::string* error);
+  // ---- P6 batched decode (batch_decode.cpp) ----
+  struct BatchBuffers {
+    rt::Buffer res, xn, mixed, block_out, embd, inject, scale, lo_part, inject_part;
+    rt::Buffer qkv, conv_out, z, alpha, beta, gdn_out;
+    rt::Buffer qg, q, gate, k, v, ctx, iq, ik, pooled;
+    rt::Buffer router, ids, wts, q8act, ucount, uexp, unum, upair, moe_h, moe_part, eg, sgate;
+    rt::Buffer logits, sample_out, params;  // params: per entry, the single step's upload layout (entry_stride)
+    std::size_t entry_stride = 0;
+    std::vector<std::uint8_t> host;
+  };
+  BatchBuffers bb_;
+  bool bb_ready_ = false;
+  bool AllocBatch(std::string* error);
+  bool BatchedMoe(const model::LayerWeights& l) const;
+  struct BatchGraph {
+    std::vector<SessionId> sessions;
+    int head = 0;
+    rt::Graph graph;
+    std::uint64_t used = 0;
+  };
+  std::vector<BatchGraph> batch_graphs_;
+  std::uint64_t batch_clock_ = 0;
+  bool RecordBatch(std::span<const SessionId> sessions, Head head, std::string* error);
+  /// Points the per-token scratch members at entry b's slices of bb_ and binds its session (recording only).
+  void BatchEntryScope(std::uint32_t b, std::span<const SessionId> sessions, bool enter);
+  bool skip_attn_proj_ = false;  // Attention(): projections done by the batched caller
   std::vector<LinearState> linear_;
   std::vector<AttnState> attn_;
   std::vector<rt::Buffer> owned_;

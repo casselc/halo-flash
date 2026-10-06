@@ -28,6 +28,25 @@ bool Device::WriteGlobal(std::string_view, const void*, std::size_t, std::string
   return false;
 }
 
+namespace {
+bool NoPaging(std::string* error) {
+  if (error) *error = "page mapping: not supported by this backend";
+  return false;
+}
+}  // namespace
+Buffer Device::ReserveRange(std::size_t, std::string* error) {
+  NoPaging(error);
+  return {};
+}
+void Device::ReleaseRange(Buffer& range) noexcept { range = {}; }
+void* Device::CreatePage(std::string* error) {
+  NoPaging(error);
+  return nullptr;
+}
+void Device::ReleasePage(void*) noexcept {}
+bool Device::MapPage(const Buffer&, std::size_t, void*, std::string* error) { return NoPaging(error); }
+bool Device::UnmapPage(const Buffer&, std::size_t, std::string* error) { return NoPaging(error); }
+
 const char* BackendName(Backend b) noexcept { return b == Backend::kHip ? "hip" : "hrx"; }
 
 std::unique_ptr<Device> Device::Create(Backend backend, std::string* error) {
