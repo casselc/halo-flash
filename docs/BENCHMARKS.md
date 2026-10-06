@@ -79,9 +79,16 @@ mean over cases of the per-case NLL difference ± its standard error.
 |---|---|---|---|---|---|
 | baseline | 0.286079 / 92.58% | — | 0.121277 / 97.26% | — | — |
 | Router on plain fp16 WMMA (`--router-f16 1`) | 0.285933 / 92.62% | −0.00058 ± 0.00043 (45/53) | 0.123398 / 97.00% | **+0.00213 ± 0.00072** (9/3), +0.0074 | fails (long) |
+| Router, weights split hi/lo, fp16 activations (`--router-f16 2`) | bit-identical to `--router-f16 1` on every case (the weights are exact in fp16, see below) | | | | fails (long) |
+| Router, fp16 weights, fp32 activations split hi/lo (`--router-f16 3`) | 0.286079 / 92.55% | −0.00026 ± 0.00040 (48/50) | 0.121366 / 97.26% | +0.00009 ± 0.00057 (8/4), +0.0027 | **passes** (default) |
 | DeltaNet alpha/beta + shared-expert gate on fp16 WMMA (`--small-f16 1`) | 0.285613 / 92.60% | −0.00038 ± 0.00041 (44/54) | 0.122459 / 96.87% | +0.00118 ± 0.00105 (6/6), +0.0089 | **passes** (default on) |
 | Mix epilogue reads the norm's fp16 K-blocked xn (`--mix-h16 1`) | 0.285795 / 92.58% | −0.00024 ± 0.00041 (46/52) | 0.122384 / 97.52% | +0.00111 ± 0.00076 (7/5), +0.0046 | **passes** (default on) |
 | Shared-expert gate/up as W8A8 (`--shexp-w8a8 1`) | 0.285309 / 92.60% | −0.00081 ± 0.00093 (56/42) | 0.121921 / 97.26% | +0.00064 ± 0.00095 (7/5), +0.0058 | **passes** (default on) |
+
+The F32 router, DeltaNet alpha/beta and shared-expert gate weights hold exact bf16 values (all of them),
+and 99.95-99.97% are exact in fp16 (the rest have fp16-subnormal magnitudes): rounding these weights to fp16
+loses (almost) nothing. The plain-fp16 router's long-set loss came from rounding the activations; keeping them
+as an fp16 hi/lo pair (`--router-f16 3`) removes it (`/data/halo-work/streams/P/f16exact.py`).
 
 ### Greedy identity with gufo
 

@@ -382,11 +382,29 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
   const auto& c = w_.config;
   const std::uint32_t nch = (T + 15) / 16;
   const std::uint32_t ch = c.SsmConvChannels(), kd = c.SsmKeyDim(), vd = c.SsmValueDim();
-  return MixedHalf(T, error) && Gemm(l.ssm_qkv, ck_.mixed, ck_.qkv, T, error, MixedH()) &&
-         Gemm(l.ssm_gate, ck_.mixed, ck_.z, T, error, MixedH()) &&
+  // Precision option: qkv and z written in fp16 (their readers: the conv, the state advance, the gated norm).
+  const auto banded_h = [&](const model::TensorRef& t) {
+    const auto rows = static_cast<std::uint32_t>(t.rows);
+    return F16Route(t) && prefill_banded_gemm_ && prefill_reg_gemm_ && rows > 512 && rows % 256 == 0 &&
+           (rows / 256) % 8 == 0 && !(rows <= 320 && t.cols >= 4096);
+  };
+  const bool io16 = prefill_gdn_io16_ && c.ssm_conv_kernel == 4 && prefill_split_gdn_ && !prefill_exact_projections_ &&
+                    F16Route(l.ssm_out) && banded_h(l.ssm_qkv) && banded_h(l.ssm_gate);
+  const auto gemm_h = [&](const model::TensorRef& t, const rt::Buffer& y) {
+    const auto& d = tensors_.at(t.data);
+    const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
+    return Launch("halo_gemm_q8r_f16_lr8h", {(T + 127) / 128, rows / 256}, {256},
+                  {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(ck_.mh), rt::Arg::Buf(y), rt::Arg::Val(rows),
+                   rt::Arg::Val(cols), rt::Arg::Val(d.qstride), rt::Arg::Val(T)},
+                  error);
+  };
+  return MixedHalf(T, error) &&
+         (io16 ? gemm_h(l.ssm_qkv, ck_.qkv) && gemm_h(l.ssm_gate, ck_.z)
+               : Gemm(l.ssm_qkv, ck_.mixed, ck_.qkv, T, error, MixedH()) &&
+                     Gemm(l.ssm_gate, ck_.mixed, ck_.z, T, error, MixedH())) &&
          MixedGemmF16(l.ssm_alpha, ck_.alpha, T, error) && MixedGemmF16(l.ssm_beta, ck_.beta, T, error) &&
          (c.ssm_conv_kernel == 4  // 8 tokens a block, the same bits
-              ? Launch("halo_conv_l2norm_prefill8", {ch / 128, (T + 7) / 8}, {128},
+              ? Launch(io16 ? "halo_conv_l2norm_prefill8_h" : "halo_conv_l2norm_prefill8", {ch / 128, (T + 7) / 8}, {128},
                        {rt::Arg::Buf(ck_.qkv), rt::Arg::Buf(s.conv), rt::Arg::Buf(tensors_.at(l.ssm_conv1d.data).buf),
                         rt::Arg::Buf(ck_.conv), rt::Arg::Val(ch), rt::Arg::Val(T), rt::Arg::Val(2 * kd),
                         rt::Arg::Val(c.rms_eps)},
@@ -396,7 +414,7 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
                         rt::Arg::Buf(ck_.conv), rt::Arg::Val(ch), rt::Arg::Val(c.ssm_conv_kernel), rt::Arg::Val(2 * kd),
                         rt::Arg::Val(c.rms_eps)},
                        error)) &&
-         Launch("halo_conv_state_advance", {Blocks(ch)}, {kBlock},
+         Launch(io16 ? "halo_conv_state_advance_h" : "halo_conv_state_advance", {Blocks(ch)}, {kBlock},
                 {rt::Arg::Buf(ck_.qkv), rt::Arg::Buf(s.conv), rt::Arg::Val(ch), rt::Arg::Val(c.ssm_conv_kernel),
                  rt::Arg::Val(T)},
                 error) &&
@@ -445,7 +463,7 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
                         rt::Arg::Val(vd)},
                        error)) &&
                     (F16Route(l.ssm_out)
-                         ? Launch("halo_gated_norm_h", {T * c.ssm_num_v_heads}, {128},
+                         ? Launch(io16 ? "halo_gated_norm_hz" : "halo_gated_norm_h", {T * c.ssm_num_v_heads}, {128},
                                   {rt::Arg::Buf(ck_.gdn), rt::Arg::Buf(tensors_.at(l.ssm_norm.data).buf),
                                    rt::Arg::Buf(ck_.z), rt::Arg::Buf(ck_.xh), rt::Arg::Val(c.ssm_head_dim),
                                    rt::Arg::Val(c.rms_eps), rt::Arg::Val<std::uint32_t>(1)},

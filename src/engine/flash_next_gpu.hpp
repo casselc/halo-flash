@@ -140,7 +140,7 @@ class FlashNextGpu {
   /// instead of bf16x3. Takes precedence over prefill_router_bf16x3_.
   /// 1: plain fp16; 2: weights split hi/lo (two WMMAs), fp16 `mh`; 3: fp16
   /// weights, fp32 `mixed` split hi/lo.
-  static inline int prefill_router_f16_ = 0;
+  static inline int prefill_router_f16_ = 3;
   /// Precision option (stream P): the small F32 projections over `mixed`
   /// (DeltaNet alpha/beta, shared-expert gate) on FP16 WMMA like the router
   /// option, instead of the fp32 tiled GEMM.
@@ -154,6 +154,9 @@ class FlashNextGpu {
   /// Precision option (stream P): the mixers' down projection as W8A8
   /// (halo_gemm_q8a8_160x64 over an int8 copy of xn written by combine_norm).
   static inline bool prefill_down_w8a8_ = false;
+  /// Precision option (stream P): DeltaNet qkv and z GEMM outputs in fp16,
+  /// read as fp16 by the conv, the conv state advance and the gated norm.
+  static inline bool prefill_gdn_io16_ = false;
   /// Attention of a chunk's tokens in batched launches (same arithmetic as
   /// stepping) instead of token by token.
   static inline bool prefill_batched_attention_ = true;

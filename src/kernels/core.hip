@@ -3033,9 +3033,11 @@ extern "C" __global__ void halo_conv_l2norm_prefill(const float* in, const float
 // form ran 163,840 blocks of 4 loads each per 2048 tokens: 1.28 ms against
 // ~0.7 ms of traffic.
 //   grid (ceil(channels / 128), ceil(T / 8)), block 128; kern == 4
-extern "C" __global__ void __launch_bounds__(128)
-    halo_conv_l2norm_prefill8(const float* in, const float* state, const float* w, float* out,
-                              std::uint32_t channels, std::uint32_t tokens, std::uint32_t l2_channels, float eps) {
+template <typename IT>
+__device__ __attribute__((always_inline)) inline void ConvL2normPrefill8(const IT* in, const float* state,
+                                                                        const float* w, float* out,
+                                                                        std::uint32_t channels, std::uint32_t tokens,
+                                                                        std::uint32_t l2_channels, float eps) {
   constexpr std::uint32_t TT = 8, kern = 4;
   __shared__ float part[TT][4];
   const std::uint32_t ch = blockIdx.x * blockDim.x + threadIdx.x, t0 = blockIdx.y * TT;
@@ -3048,7 +3050,7 @@ extern "C" __global__ void __launch_bounds__(128)
   for (std::uint32_t j = 0; j < TT + kern - 1; ++j) {
     const std::int64_t i = static_cast<std::int64_t>(t0) - static_cast<std::int64_t>(kern - 1) + j;
     x[j] = i >= static_cast<std::int64_t>(tokens) ? 0.0f
-           : i >= 0 ? in[static_cast<std::size_t>(i) * channels + c]
+           : i >= 0 ? static_cast<float>(in[static_cast<std::size_t>(i) * channels + c])
                     : state[static_cast<std::size_t>(i + kern - 1) * channels + c];
   }
   const float w0 = w[c * kern], w1 = w[c * kern + 1], w2 = w[c * kern + 2], w3 = w[c * kern + 3];
@@ -3079,6 +3081,17 @@ extern "C" __global__ void __launch_bounds__(128)
   for (std::uint32_t t = 0; t < TT; ++t)
     if (t0 + t < tokens) out[static_cast<std::size_t>(t0 + t) * channels + ch] = v[t];
 }
+extern "C" __global__ void __launch_bounds__(128)
+    halo_conv_l2norm_prefill8(const float* in, const float* state, const float* w, float* out,
+                              std::uint32_t channels, std::uint32_t tokens, std::uint32_t l2_channels, float eps) {
+  ConvL2normPrefill8(in, state, w, out, channels, tokens, l2_channels, eps);
+}
+// Precision option (stream P): the same over fp16 inputs (qkv written in fp16).
+extern "C" __global__ void __launch_bounds__(128)
+    halo_conv_l2norm_prefill8_h(const _Float16* in, const float* state, const float* w, float* out,
+                                std::uint32_t channels, std::uint32_t tokens, std::uint32_t l2_channels, float eps) {
+  ConvL2normPrefill8(in, state, w, out, channels, tokens, l2_channels, eps);
+}
 
 // The conv state after a chunk of T inputs: the last kern - 1 inputs, the
 // older ones from the previous state when T < kern - 1.
@@ -3091,6 +3104,19 @@ extern "C" __global__ void halo_conv_state_advance(const float* in, float* state
   for (std::uint32_t k = 0; k + 1 < kern; ++k) {
     const std::int64_t i = static_cast<std::int64_t>(tokens) - static_cast<std::int64_t>(kern - 1) + k;
     next[k] = i >= 0 ? in[static_cast<std::size_t>(i) * channels + ch]
+                     : state[static_cast<std::size_t>(i + kern - 1) * channels + ch];
+  }
+  for (std::uint32_t k = 0; k + 1 < kern; ++k) state[static_cast<std::size_t>(k) * channels + ch] = next[k];
+}
+// The same over fp16 inputs (precision option, stream P).
+extern "C" __global__ void halo_conv_state_advance_h(const _Float16* in, float* state, std::uint32_t channels,
+                                                     std::uint32_t kern, std::uint32_t tokens) {
+  const std::uint32_t ch = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ch >= channels || kern < 2) return;
+  float next[8];  // kern <= 9
+  for (std::uint32_t k = 0; k + 1 < kern; ++k) {
+    const std::int64_t i = static_cast<std::int64_t>(tokens) - static_cast<std::int64_t>(kern - 1) + k;
+    next[k] = i >= 0 ? static_cast<float>(in[static_cast<std::size_t>(i) * channels + ch])
                      : state[static_cast<std::size_t>(i + kern - 1) * channels + ch];
   }
   for (std::uint32_t k = 0; k + 1 < kern; ++k) state[static_cast<std::size_t>(k) * channels + ch] = next[k];
@@ -3749,6 +3775,22 @@ extern "C" __global__ void halo_gated_norm_h(const float* o, const float* w, con
   const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
   for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) {
     const float g = mode == 0 ? Silu(zv[i]) : Sigmoid(zv[i]);
+    y16[static_cast<std::size_t>(blockIdx.x) * d + i] = static_cast<_Float16>(ov[i] * scale * w[i] * g);
+  }
+}
+// halo_gated_norm_h over an fp16 z (precision option, stream P).
+extern "C" __global__ void halo_gated_norm_hz(const float* o, const float* w, const _Float16* z, _Float16* y16,
+                                              std::uint32_t d, float eps, std::uint32_t mode) {
+  __shared__ float scratch[32];
+  const float* ov = o + static_cast<std::size_t>(blockIdx.x) * d;
+  const _Float16* zv = z + static_cast<std::size_t>(blockIdx.x) * d;
+  float ss = 0.0f;
+  for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) ss += ov[i] * ov[i];
+  ss = BlockSum(ss, scratch);
+  const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
+  for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) {
+    const float zf = static_cast<float>(zv[i]);
+    const float g = mode == 0 ? Silu(zf) : Sigmoid(zf);
     y16[static_cast<std::size_t>(blockIdx.x) * d + i] = static_cast<_Float16>(ov[i] * scale * w[i] * g);
   }
 }
@@ -6462,8 +6504,8 @@ __device__ inline halo_v16h DequantI8x16(const halo_v4i& w, _Float16 sc) {
   return v;
 }
 }  // namespace
-template <std::uint32_t RG>
-__device__ void GemmQ8rF16Reg(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
+template <std::uint32_t RG, typename OT = float>
+__device__ void GemmQ8rF16Reg(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, OT* y,
                               std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
   constexpr std::uint32_t BM = 256, BN = 128, KS = 64, RS = KS + 8, NT = 256, TM = 2, TN = 8, KK = KS / 16;
   constexpr std::uint32_t BPR = KS / 8, BP = BN * BPR / NT;  // activation pieces (8 halves) per thread
@@ -6551,7 +6593,7 @@ __device__ void GemmQ8rF16Reg(const std::int8_t* qs, const std::uint16_t* d, con
     for (std::uint32_t idx = lane; idx < 16 * TM * 16; idx += 32) {
       const std::uint32_t ti = idx / (TM * 16), rr = idx % (TM * 16);
       const std::uint32_t t = t0 + n * 16 + ti, r = r0 + wave * TM * 16 + rr;
-      if (t < tokens && r < rows) y[static_cast<std::size_t>(t) * rows + r] = slice[ti * (TM * 16) + rr];
+      if (t < tokens && r < rows) y[static_cast<std::size_t>(t) * rows + r] = static_cast<OT>(slice[ti * (TM * 16) + rr]);
     }
     __builtin_amdgcn_wave_barrier();
   }
@@ -6560,6 +6602,13 @@ extern "C" __global__ void __launch_bounds__(256)
     halo_gemm_q8r_f16_lr8(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y, std::uint32_t rows,
                           std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
   GemmQ8rF16Reg<8>(qs, d, x, y, rows, cols, qstride, tokens);
+}
+// Precision option (stream P): halo_gemm_q8r_f16_lr8 writing fp16 (the DeltaNet qkv and z
+// projections, read only by the conv and the gated norm).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_gemm_q8r_f16_lr8h(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, _Float16* y,
+                           std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
+  GemmQ8rF16Reg<8, _Float16>(qs, d, x, y, rows, cols, qstride, tokens);
 }
 
 // halo_gemm_q8r_f16_l walked in bands of 8 row tiles (every token tile of

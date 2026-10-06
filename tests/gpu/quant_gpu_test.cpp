@@ -1658,6 +1658,49 @@ TEST(GpuQuant, SplitOperandF16GemmsMatchSums) {
   }, {.test_cases = 30});
 }
 
+// Precision option (stream P): halo_gemm_q8r_f16_lr8h stores fp16(the fp32
+// result of halo_gemm_q8r_f16_lr8), bit for bit (same tiles, same sums).
+TEST(GpuQuant, HalfOutputBandedGemmIsRoundedFp32Gemm) {
+  std::string error;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &error);
+  if (!dev) GTEST_SKIP() << error;
+  ASSERT_TRUE(dev->LoadModule(kernels::CoreHsaco(), &error)) << error;
+  hegel::test([&](hegel::TestCase& tc) {
+    const auto rows = 2048u * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 2}));
+    const auto cols = 64 * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 20}));
+    const auto T = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 300}));
+    std::uint32_t seed = tc.draw(gs::integers<std::uint32_t>());
+    const auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    std::vector<std::int8_t> q(std::size_t{rows} * cols);
+    for (auto& v : q) v = static_cast<std::int8_t>(static_cast<int>(rnd() % 255) - 127);
+    std::vector<std::uint16_t> d(std::size_t{rows} * (cols / 32));
+    for (auto& v : d) { const _Float16 h = static_cast<_Float16>(0.001f * (1 + rnd() % 100)); std::memcpy(&v, &h, 2); }
+    std::vector<_Float16> x(std::size_t{T} * cols);
+    for (auto& v : x) v = static_cast<_Float16>((static_cast<float>(rnd() % 2001) - 1000.0f) / 500.0f);
+    auto qb = dev->Alloc(q.size(), &error), db = dev->Alloc(d.size() * 2, &error), xb = dev->Alloc(x.size() * 2, &error),
+         yb = dev->Alloc(std::size_t{T} * rows * 4, &error), hb = dev->Alloc(std::size_t{T} * rows * 2, &error);
+    ASSERT_TRUE(qb && db && xb && yb && hb && dev->Upload(qb, 0, q.data(), q.size(), &error) &&
+                dev->Upload(db, 0, d.data(), d.size() * 2, &error) && dev->Upload(xb, 0, x.data(), x.size() * 2, &error))
+        << error;
+    for (const char* k : {"halo_gemm_q8r_f16_lr8", "halo_gemm_q8r_f16_lr8h"}) {
+      const bool h = std::string(k).back() == 'h';
+      const rt::Arg a[] = {rt::Arg::Buf(qb), rt::Arg::Buf(db), rt::Arg::Buf(xb), rt::Arg::Buf(h ? hb : yb),
+                           rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(cols), rt::Arg::Val(T)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel(k, &error), {(T + 127) / 128, rows / 256}, {256}, a, &error)) << error;
+    }
+    std::vector<float> y(std::size_t{T} * rows);
+    std::vector<_Float16> yh(y.size());
+    ASSERT_TRUE(dev->Download(yb, 0, y.data(), y.size() * 4, &error) &&
+                dev->Download(hb, 0, yh.data(), yh.size() * 2, &error))
+        << error;
+    for (auto* b : {&qb, &db, &xb, &yb, &hb}) dev->Free(*b);
+    for (std::size_t i = 0; i < y.size(); ++i) {
+      const _Float16 want = static_cast<_Float16>(y[i]);
+      ASSERT_EQ(std::memcmp(&want, &yh[i], 2), 0) << "i " << i << " rows " << rows << " cols " << cols << " T " << T;
+    }
+  }, {.test_cases = 15});
+}
+
 // Precision option (stream P): activations quantized per token and 32 values
 // into the K-blocked layout (halo_quantize_q8_kblocked: amax / 127, round to
 // nearest, checked bit for bit against the host), then the W8A8 GEMM
