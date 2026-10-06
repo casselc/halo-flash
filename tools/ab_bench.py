@@ -92,6 +92,10 @@ def run_once(cmd, args, env):
     out = p.stdout + p.stderr
     device = [float(m.group(1)) for m in re.finditer(r"device ([0-9.]+) ms", out)]
     n = args.reps + (1 if kernels else 0)
+    if args.chunks > 1:
+        # Whole prefill: each rep prints one device line per chunk; sum them per rep.
+        tail = device[-n * args.chunks:] if len(device) >= n * args.chunks else []
+        device = [sum(tail[i * args.chunks:(i + 1) * args.chunks]) for i in range(len(tail) // args.chunks)]
     if p.returncode != 0 or len(device) < n:
         raise RuntimeError(f"run failed ({p.returncode}): {' '.join(full)}\n{out[-2000:]}")
     # With --prefill-warm the first timed line is the warm-up prefill; the
@@ -115,6 +119,8 @@ def main():
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--tokens", type=int, default=2048)
+    ap.add_argument("--chunks", type=int, default=1,
+                    help="device lines per rep to sum (whole-prefill device time; default: the last chunk only)")
     ap.add_argument("--resident", action="store_true", help="--ngram-resident 1 (needs ~30 GB more)")
     ap.add_argument("--build", help="cmake build dir to build first")
     ap.add_argument("--no-pin", action="store_true", help="leave the GPU clock on auto")

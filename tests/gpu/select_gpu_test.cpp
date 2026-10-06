@@ -67,7 +67,8 @@ std::vector<std::uint32_t> ReferenceVisible(const std::vector<float>& score, std
 
 }  // namespace
 
-TEST(GpuSelect, QsaSelectionMatchesReferenceRule) {
+namespace {
+void QsaSelectionCheck(const char* kernel, std::uint32_t block) {
   auto devices = Devices();
   if (devices.empty()) GTEST_SKIP() << "no GPU backend";
   hegel::test([&](hegel::TestCase& tc) {
@@ -93,9 +94,9 @@ TEST(GpuSelect, QsaSelectionMatchesReferenceRule) {
     params[kHaloNkv] = n_kv;
     auto pb = dev.Alloc(sizeof(params), &error);
     ASSERT_TRUE(pb && dev.Upload(pb, 0, params, sizeof(params), &error)) << error;
-    const auto kid = dev.Kernel("halo_qsa_select", &error);
+    const auto kid = dev.Kernel(kernel, &error);
     const rt::Arg args[] = {rt::Arg::Buf(sb), rt::Arg::Buf(vb), rt::Arg::Buf(pb), rt::Arg::Val(k), rt::Arg::Val(ratio)};
-    ASSERT_TRUE(dev.Launch(kid, {1}, {1024}, args, &error)) << error;
+    ASSERT_TRUE(dev.Launch(kid, {1}, {block}, args, &error)) << error;
     dev.Free(pb);
     std::vector<std::uint32_t> got(want.size() + 1);
     ASSERT_TRUE(dev.Download(vb, 0, got.data(), got.size() * 4, &error)) << error;
@@ -103,9 +104,15 @@ TEST(GpuSelect, QsaSelectionMatchesReferenceRule) {
     dev.Free(vb);
     ASSERT_EQ(got[want.size()], 0xEEEEEEEEu) << "wrote past the visible list";
     got.pop_back();
-    ASSERT_EQ(got, want) << "n=" << n << " k=" << k << " ratio=" << ratio << " levels=" << levels;
+    ASSERT_EQ(got, want) << kernel << " n=" << n << " k=" << k << " ratio=" << ratio << " levels=" << levels;
   }, {.test_cases = 150});
 }
+}  // namespace
+
+TEST(GpuSelect, QsaSelectionMatchesReferenceRule) { QsaSelectionCheck("halo_qsa_select", 1024); }
+
+// The 256-thread restructure (wave digit search, ballot compaction) must give the same lists.
+TEST(GpuSelect, QsaSelection256MatchesReferenceRule) { QsaSelectionCheck("halo_qsa_select256", 256); }
 
 TEST(GpuSelect, RouterTopkMatchesReferenceRule) {
   auto devices = Devices();
@@ -385,15 +392,27 @@ TEST(GpuSelect, QsaUnionAttentionMatchesSelectKernel) {
                             rt::Arg::Buf(pb), rt::Arg::Buf(ub), rt::Arg::Buf(mb), rt::Arg::Buf(cb), rt::Arg::Val(max_u),
                             rt::Arg::Val(ratio), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(T)};
       ASSERT_TRUE(dev->Launch(dev->Kernel("halo_attention_wmma_qsel_h", &error), {nkv, groups}, {256}, ha, &error)) << error;
-      std::vector<float> want(q.size()), got(q.size()), got16(q.size());
+      // qsel_h2 (V packed in registers, 16-byte softmax LDS accesses): bit-identical to qsel_h.
+      auto o4 = dev->Alloc(q.size() * 4, &error);
+      ASSERT_TRUE(o4) << error;
+      const rt::Arg h2a[] = {rt::Arg::Buf(qb), rt::Arg::Buf(k16b), rt::Arg::Buf(v16b), rt::Arg::Buf(gb), rt::Arg::Buf(o4),
+                             rt::Arg::Buf(pb), rt::Arg::Buf(ub), rt::Arg::Buf(mb), rt::Arg::Buf(cb), rt::Arg::Val(max_u),
+                             rt::Arg::Val(ratio), rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(T)};
+      ASSERT_TRUE(dev->Launch(dev->Kernel("halo_attention_wmma_qsel_h2", &error), {nkv, groups}, {256}, h2a, &error))
+          << error;
+      std::vector<float> want(q.size()), got(q.size()), got16(q.size()), got2(q.size());
       ASSERT_TRUE(dev->Download(o1, 0, want.data(), want.size() * 4, &error) &&
                   dev->Download(o2, 0, got.data(), got.size() * 4, &error) &&
-                  dev->Download(o3, 0, got16.data(), got16.size() * 4, &error))
+                  dev->Download(o3, 0, got16.data(), got16.size() * 4, &error) &&
+                  dev->Download(o4, 0, got2.data(), got2.size() * 4, &error))
           << error;
-      for (auto* b : {&qb, &gb, &kb, &vb, &sb, &pb, &o1, &o2, &sc, &ub, &mb, &cb, &k16b, &v16b, &o3}) dev->Free(*b);
-      for (std::size_t i = 0; i < got.size(); ++i)
+      for (auto* b : {&qb, &gb, &kb, &vb, &sb, &pb, &o1, &o2, &sc, &ub, &mb, &cb, &k16b, &v16b, &o3, &o4}) dev->Free(*b);
+      for (std::size_t i = 0; i < got.size(); ++i) {
         ASSERT_EQ(std::bit_cast<std::uint32_t>(got16[i]), std::bit_cast<std::uint32_t>(got[i]))
             << "fp16-cache variant " << i << ": " << got16[i] << " vs " << got[i];
+        ASSERT_EQ(std::bit_cast<std::uint32_t>(got2[i]), std::bit_cast<std::uint32_t>(got16[i]))
+            << "qsel_h2 " << i << ": " << got2[i] << " vs " << got16[i];
+      }
       for (std::uint32_t t = 0; t < T; ++t) {
         double d = 0, m = 0;
         for (std::size_t i = std::size_t{t} * nh * hd; i < std::size_t{t + 1} * nh * hd; ++i) {

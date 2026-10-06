@@ -235,14 +235,19 @@ bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt
     if (!x16 && !Half(x, ck_.xh, T * cols, error)) return false;
     // Large tiles walk in bands of 8 row tiles when they divide evenly.
     const bool banded = !tall && !small && prefill_banded_gemm_ && (rows / 256) % 8 == 0 && rows % 256 == 0;
-    return Launch(tall    ? (x16 && x16_blocked ? "halo_gemm_q8r_f16_mb" : "halo_gemm_q8r_f16_m")
-                  : small ? "halo_gemm_q8r_f16_s"
-                  : banded ? (prefill_reg_gemm_ ? "halo_gemm_q8r_f16_lr8" : "halo_gemm_q8r_f16_lg8")
-                           : "halo_gemm_q8r_f16_l",
-                  {(T + bn - 1) / bn, (rows + bm - 1) / bm}, {256},
-                  {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(x16 ? *x16 : ck_.xh), rt::Arg::Buf(y),
-                   rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride), rt::Arg::Val(T)},
-                  error);
+    const char* name = tall    ? (x16 && x16_blocked ? "halo_gemm_q8r_f16_mb" : "halo_gemm_q8r_f16_m")
+                       : small ? "halo_gemm_q8r_f16_s"
+                       : banded ? (prefill_reg_gemm_ ? "halo_gemm_q8r_f16_lr8" : "halo_gemm_q8r_f16_lg8")
+                                : "halo_gemm_q8r_f16_l";
+    const auto run = [&](std::uint32_t t0, std::uint32_t n) {
+      return Launch(name, {(n + bn - 1) / bn, (rows + bm - 1) / bm}, {256},
+                    {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(x16 ? *x16 : ck_.xh, std::size_t{t0} * cols * 2),
+                     rt::Arg::Buf(y, std::size_t{t0} * rows * 4), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                     rt::Arg::Val(d.qstride), rt::Arg::Val(n)},
+                    error);
+    };
+    // The row-banded and tall kernels keep their activations streaming (and _mb's input is K-blocked).
+    return tall || banded ? run(0, T) : ForGemmSlices(T, run);
   }
   if (!per_token && prefill_int8_gemm_ && d.qs && cols % 32 == 0 && d.qstride % 16 == 0) {
     return Launch("halo_quantize_q8_rows", {T}, {256},
@@ -253,10 +258,12 @@ bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt
                   error);
   }
   if (!per_token && t.type == core::GgmlType::kBF16 && cols % 128 == 0)
-    return Launch("halo_gemm_bf16_f16_k128", {(T + 63) / 64, (rows + 63) / 64}, {128},
-                  {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols),
-                   rt::Arg::Val(T)},
-                  error);
+    return ForGemmSlices(T, [&](std::uint32_t t0, std::uint32_t n) {
+      return Launch("halo_gemm_bf16_f16_k128", {(n + 63) / 64, (rows + 63) / 64}, {128},
+                    {rt::Arg::Buf(d.buf), rt::Arg::Buf(x, std::size_t{t0} * cols * 4),
+                     rt::Arg::Buf(y, std::size_t{t0} * rows * 4), rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(n)},
+                    error);
+    });
   if (!per_token && t.type == core::GgmlType::kF32 && rows <= 16 && prefill_skinny_f32_)
     return Launch("halo_gemm_f32_skinny", {(T + 7) / 8}, {256},
                   {rt::Arg::Buf(d.buf), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows), rt::Arg::Val(cols),
@@ -282,11 +289,13 @@ bool FlashNextGpu::MixedGemmF16(const model::TensorRef& t, const rt::Buffer& y, 
   if (!(prefill_small_f16_ && prefill_f16_gemm_ && !prefill_exact_projections_ && !lora_.contains(t.data) &&
         t.type == core::GgmlType::kF32 && cols % 128 == 0))
     return Gemm(t, ck_.mixed, y, T, error);
-  return MixedHalf(T, error) &&
-         Launch("halo_gemm_f32h_f16_k128", {(T + 63) / 64, (rows + 63) / 64}, {128},
-                {rt::Arg::Buf(tensors_.at(t.data).buf), rt::Arg::Buf(ck_.mh), rt::Arg::Buf(y), rt::Arg::Val(rows),
-                 rt::Arg::Val(cols), rt::Arg::Val(T)},
-                error);
+  return MixedHalf(T, error) && ForGemmSlices(T, [&](std::uint32_t t0, std::uint32_t n) {
+           return Launch("halo_gemm_f32h_f16_k128", {(n + 63) / 64, (rows + 63) / 64}, {128},
+                         {rt::Arg::Buf(tensors_.at(t.data).buf), rt::Arg::Buf(ck_.mh, std::size_t{t0} * cols * 2),
+                          rt::Arg::Buf(y, std::size_t{t0} * rows * 4), rt::Arg::Val(rows), rt::Arg::Val(cols),
+                          rt::Arg::Val(n)},
+                         error);
+         });
 }
 
 bool FlashNextGpu::HcMixChunk(const model::HcMixer& m, bool inject, std::uint32_t T, std::string* error,
@@ -789,7 +798,25 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
   // anything decode wrote since), then the union attention reads it.
   const bool kv16 = qsel && prefill_kv16_ && s.k16;
   if (kv16 && !kv16_current()) return false;
-  for (std::uint32_t t0 = 0; t0 < T; t0 += kAttnSub) {
+  // A chunk that starts inside the dense range and runs past it (chunks longer than the budget's
+  // positions): its dense prefix takes the flash kernel exactly as a chunk ending there would, the rest
+  // the QSA path from the same position (sub-chunk and 4-token group boundaries as in 2048-token chunks).
+  const std::uint32_t dense_end = budget * ratio;
+  std::uint32_t tq0 = 0;
+  bool prefix_half = false;
+  if (wmma && prefill_mq_attention_ && prefill_fa_attention_ && prefill_kv16_ && s.k16 && kv16 &&
+      prefill_dense_prefix_ && pos0 < dense_end && pos0 + T > dense_end) {
+    tq0 = dense_end - pos0;
+    prefix_half = prefill_f16_out_ && F16Route(l.attn_out);
+    if (!Launch(prefix_half ? "halo_attention_fa_h" : "halo_attention_fa", {(tq0 + 15) / 16, nkv * ((G + 3) / 4)},
+                {256},
+                {rt::Arg::Buf(ck_.q), rt::Arg::Buf(s.k16), rt::Arg::Buf(s.v16), rt::Arg::Buf(ck_.gate_a),
+                 rt::Arg::Buf(prefix_half ? ck_.xh : ck_.ctx), rt::Arg::Buf(ck_.host, ck_.params_offset),
+                 rt::Arg::Val(nh), rt::Arg::Val(nkv), rt::Arg::Val(tq0)},
+                error))
+      return false;
+  }
+  for (std::uint32_t t0 = tq0; t0 < T; t0 += kAttnSub) {
     const std::uint32_t n = std::min(kAttnSub, T - t0);
     const rt::Arg params = rt::Arg::Buf(ck_.host, ck_.params_offset + std::size_t{t0} * 64);
     // Block scores as one bf16x3 WMMA GEMM per sub-chunk (rows: token x head,
@@ -806,7 +833,8 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
                         rt::Arg::Buf(ck_.bscores), params, rt::Arg::Val(ih), rt::Arg::Val(idim),
                         rt::Arg::Val(max_blocks)},
                        error)) ||
-        !Launch("halo_qsa_select_rows", {n}, {1024},
+        !Launch(prefill_select256_ ? "halo_qsa_select_rows256" : "halo_qsa_select_rows", {n},
+                {prefill_select256_ ? 256u : 1024u},
                 {rt::Arg::Buf(ck_.bscores), rt::Arg::Buf(ck_.vis), params, rt::Arg::Val(budget), rt::Arg::Val(ratio),
                  rt::Arg::Val(max_blocks), rt::Arg::Val(vstride)},
                 error) ||
@@ -815,7 +843,8 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
                          rt::Arg::Val(max_blocks), rt::Arg::Val(n), rt::Arg::Buf(ck_.ublk), rt::Arg::Buf(ck_.umask),
                          rt::Arg::Buf(ck_.ucount), rt::Arg::Val(max_u)},
                         error) &&
-                     Launch(kv16 ? "halo_attention_wmma_qsel_h" : "halo_attention_wmma_qsel", {nkv, (n + 3) / 4}, {256},
+                     Launch(kv16 ? (prefill_qsel_h2_ ? "halo_attention_wmma_qsel_h2" : "halo_attention_wmma_qsel_h")
+                                 : "halo_attention_wmma_qsel", {nkv, (n + 3) / 4}, {256},
                             {rt::Arg::Buf(ck_.q, std::size_t{t0} * qdim * 4), rt::Arg::Buf(kv16 ? s.k16 : s.k),
                              rt::Arg::Buf(kv16 ? s.v16 : s.v),
                              rt::Arg::Buf(ck_.gate_a, std::size_t{t0} * qdim * 4),
@@ -837,6 +866,12 @@ bool FlashNextGpu::AttentionBatched(const model::LayerWeights& l, AttnState& s, 
                 error)))
       return false;
   }
+  if (prefix_half)  // the QSA rows to fp16 beside the flash kernel's, as the out projection's Half would
+    return Launch("halo_f16_rows", {Blocks((T - tq0) * qdim)}, {kBlock},
+                  {rt::Arg::Buf(ck_.ctx, std::size_t{tq0} * qdim * 4), rt::Arg::Buf(ck_.xh, std::size_t{tq0} * qdim * 2),
+                   rt::Arg::Val((T - tq0) * qdim)},
+                  error) &&
+           Gemm(l.attn_out, ck_.ctx, ck_.block_out, T, error, &ck_.xh);
   return Gemm(l.attn_out, ck_.ctx, ck_.block_out, T, error);
 }
 
@@ -879,12 +914,15 @@ bool FlashNextGpu::MoeChunk(const model::LayerWeights& l, std::uint32_t T, std::
                  rt::Arg::Val(rrows), rt::Arg::Val(rcols), rt::Arg::Val(T)},
                 error))
       return false;
-  } else if (rf16 && !((rmode == 3 || MixedHalf(T, error)) &&
-                Launch(rmode == 2 ? "halo_gemm_f32h_f16_w2" : rmode == 3 ? "halo_gemm_f32_f16_x2" : "halo_gemm_f32h_f16_k128",
-                       {(T + 63) / 64, (rrows + 63) / 64}, {128},
-                       {rt::Arg::Buf(rt_.buf), rt::Arg::Buf(rmode == 3 ? ck_.mixed : ck_.mh), rt::Arg::Buf(ck_.router),
-                        rt::Arg::Val(rrows), rt::Arg::Val(rcols), rt::Arg::Val(T)},
-                       error)))
+  } else if (rf16 && !((rmode == 3 || MixedHalf(T, error)) && ForGemmSlices(T, [&](std::uint32_t t0, std::uint32_t n) {
+                return Launch(rmode == 2 ? "halo_gemm_f32h_f16_w2" : rmode == 3 ? "halo_gemm_f32_f16_x2" : "halo_gemm_f32h_f16_k128",
+                       {(n + 63) / 64, (rrows + 63) / 64}, {128},
+                       {rt::Arg::Buf(rt_.buf), rmode == 3 ? rt::Arg::Buf(ck_.mixed, std::size_t{t0} * rcols * 4)
+                                                          : rt::Arg::Buf(ck_.mh, std::size_t{t0} * rcols * 2),
+                        rt::Arg::Buf(ck_.router, std::size_t{t0} * rrows * 4),
+                        rt::Arg::Val(rrows), rt::Arg::Val(rcols), rt::Arg::Val(n)},
+                       error);
+              })))
     return false;
   if (!rf16 && !(bx3 ? Launch("halo_gemm_f32_bf16x3", {(T + 63) / 64, (rrows + 63) / 64}, {256},
                      {rt::Arg::Buf(rt_.buf), rt::Arg::Buf(ck_.mixed), rt::Arg::Buf(ck_.router), rt::Arg::Val(rrows),

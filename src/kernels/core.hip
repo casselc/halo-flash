@@ -1073,6 +1073,130 @@ extern "C" __global__ void halo_qsa_select_rows(const float* score, std::uint32_
   QsaSelect(score + t * score_stride, visible + t * visible_stride, params + t * 16, k, ratio);
 }
 
+// QsaSelect with the same result (same threshold, same tie rule, same list order), restructured
+// for a 256-thread block (8 waves): the threshold digit of each radix pass is found by one wave
+// (8 digits a lane, a prefix sum over lanes) instead of thread 0 walking up to 256 histogram
+// bins one dependent LDS read at a time, and the compaction's two prefix sums use wave ballots
+// plus 8 per-wave totals (2 barriers an iteration) instead of a Hillis-Steele scan (20 barriers
+// each). blockDim.x must be 256.
+__device__ void QsaSelect256(const float* score, std::uint32_t* visible, const std::uint32_t* params,
+                             std::uint32_t k, std::uint32_t ratio) {
+  constexpr std::uint32_t BS = 256, NW = BS / 32;
+  const std::uint32_t n = params[kHaloComplete], n_kv = params[kHaloNkv];
+  __shared__ std::uint32_t hist[256];
+  __shared__ std::uint32_t wtot[2][NW];
+  __shared__ std::uint32_t sh_prefix, sh_remaining;
+  const std::uint32_t tid = threadIdx.x, lane = tid % 32, wave = tid / 32;
+  if (k >= n) {  // under budget: every position is visible
+    for (std::uint32_t p = tid; p < n_kv; p += BS) visible[p] = p;
+    return;
+  }
+  std::uint32_t prefix = 0, prefix_mask = 0, remaining = k;
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    hist[tid] = 0;
+    __syncthreads();
+    for (std::uint32_t b = tid; b < n; b += BS) {
+      const std::uint32_t key = ScoreKey(score[b]);
+      if ((key & prefix_mask) == prefix) atomicAdd(&hist[(key >> shift) & 0xFF], 1u);
+    }
+    __syncthreads();
+    if (wave == 0) {
+      // Lane l holds digits 255 - 8 l - i, i = 0..7 (descending, the order the serial walk visits).
+      std::uint32_t c[8], s = 0;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        c[i] = hist[255 - 8 * lane - i];
+        s += c[i];
+      }
+      std::uint32_t incl = s;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const std::uint32_t v = __shfl_up(incl, o, 32);
+        if (lane >= static_cast<std::uint32_t>(o)) incl += v;
+      }
+      // The serial walk stops at the first digit (from 255 down) where the count above it plus its
+      // own count reaches `remaining`, else at digit 0; `acc` is the count above the stop.
+      std::uint32_t a = incl - s, dig = 0, acc = 0;
+      bool found = false;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        if (!found && a + c[i] >= remaining) {
+          found = true;
+          dig = 255 - 8 * lane - i;
+          acc = a;
+        }
+        a += c[i];
+      }
+      const std::uint32_t fm = __builtin_amdgcn_ballot_w32(found);
+      const int src = fm != 0 ? __builtin_ctz(fm) : 0;
+      const std::uint32_t total = __shfl(incl, 31, 32);
+      std::uint32_t d = __shfl(dig, src, 32), ac = __shfl(acc, src, 32);
+      if (fm == 0) {
+        d = 0;
+        ac = total - hist[0];
+      }
+      if (lane == 0) {
+        sh_prefix = prefix | (d << shift);
+        sh_remaining = remaining - ac;
+      }
+    }
+    __syncthreads();
+    prefix = sh_prefix;
+    remaining = sh_remaining;
+    prefix_mask |= 0xFFu << shift;
+  }
+  const std::uint32_t threshold = prefix, take_equal = remaining;
+  const std::uint32_t below = (1u << lane) - 1u;
+  std::uint32_t written = 0, equal_seen = 0;
+  for (std::uint32_t base = 0; base < n; base += BS) {
+    const std::uint32_t b = base + tid;
+    const std::uint32_t key = b < n ? ScoreKey(score[b]) : 0u;
+    const bool eq = b < n && key == threshold;
+    const std::uint32_t me = __builtin_amdgcn_ballot_w32(eq);
+    if (lane == 0) wtot[0][wave] = __builtin_popcount(me);
+    __syncthreads();
+    std::uint32_t eq_off = 0, eq_total = 0;
+#pragma unroll
+    for (std::uint32_t w = 0; w < NW; ++w) {
+      const std::uint32_t v = wtot[0][w];
+      eq_off += w < wave ? v : 0u;
+      eq_total += v;
+    }
+    const std::uint32_t eq_rank = equal_seen + eq_off + __builtin_popcount(me & below);
+    const bool keep = b < n && (key > threshold || (eq && eq_rank < take_equal));
+    const std::uint32_t mk = __builtin_amdgcn_ballot_w32(keep);
+    if (lane == 0) wtot[1][wave] = __builtin_popcount(mk);
+    __syncthreads();
+    std::uint32_t k_off = 0, kept = 0;
+#pragma unroll
+    for (std::uint32_t w = 0; w < NW; ++w) {
+      const std::uint32_t v = wtot[1][w];
+      k_off += w < wave ? v : 0u;
+      kept += v;
+    }
+    if (keep) {
+      const std::uint32_t at = written + k_off + __builtin_popcount(mk & below);
+      for (std::uint32_t t = 0; t < ratio; ++t) visible[at * ratio + t] = b * ratio + t;
+    }
+    written += kept;
+    equal_seen += eq_total;
+  }
+  for (std::uint32_t p = n * ratio + tid; p < n_kv; p += BS) visible[k * ratio + p - n * ratio] = p;
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_qsa_select256(const float* score, std::uint32_t* visible, const std::uint32_t* params, std::uint32_t k,
+                       std::uint32_t ratio) {
+  QsaSelect256(score, visible, params, k, ratio);
+}
+// grid (T), block 256: halo_qsa_select_rows' arguments and result.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_qsa_select_rows256(const float* score, std::uint32_t* visible, const std::uint32_t* params,
+                            std::uint32_t k, std::uint32_t ratio, std::uint32_t score_stride,
+                            std::uint32_t visible_stride) {
+  const std::size_t t = blockIdx.x;
+  QsaSelect256(score + t * score_stride, visible + t * visible_stride, params + t * 16, k, ratio);
+}
+
 // P4: the union of 4 consecutive tokens' QSA selections, for attention that
 // shares K/V reads between them (halo_attention_wmma_qsel). Token q selects
 // its k chosen blocks (all complete blocks when under budget) and its
@@ -8295,11 +8419,17 @@ extern "C" __global__ void __launch_bounds__(256)
 // halo_attention_wmma_qsel over the fp16 copy of the K/V cache (the WMMA
 // path rounds K/V to fp16 anyway, so the result is the same): K and V of
 // the next chunk prefetched together, K staged in LDS for the scoring waves.
-extern "C" __global__ void __launch_bounds__(256)
-    halo_attention_wmma_qsel_h(const float* q, const _Float16* kc, const _Float16* vc, const float* gate, float* out,
-                             const std::uint32_t* params, const std::uint32_t* ublk, const std::uint8_t* umask,
-                             const std::uint32_t* ucount, std::uint32_t max_u, std::uint32_t ratio,
-                             std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t tokens) {
+// kV2 (halo_attention_wmma_qsel_h2): the same arithmetic with fewer LDS instruction cycles. V is loaded
+// 4 bytes (2 dims) of one key a lane and instruction, 8 keys a task, and packed in registers (v_perm) into
+// the transposed tile, so the staging stores 16 bytes a lane instead of 32 two-byte stores (16-bit LDS
+// accesses run at a tenth of the 16-byte rate); the softmax reads its 8 scores as two 16-byte loads once
+// and stores its 8 probabilities as one 16-byte store.
+template <bool kV2>
+__device__ __forceinline__ void QselH(const float* q, const _Float16* kc, const _Float16* vc, const float* gate,
+                                      float* out, const std::uint32_t* params, const std::uint32_t* ublk,
+                                      const std::uint8_t* umask, const std::uint32_t* ucount, std::uint32_t max_u,
+                                      std::uint32_t ratio, std::uint32_t num_heads, std::uint32_t num_kv_heads,
+                                      std::uint32_t tokens) {
   constexpr std::uint32_t HD = 256, QT = 4, KC = 32, QR = HD + 8, VR = HD + 8, PR = KC + 8, MR = 48;
   __shared__ __attribute__((aligned(16))) _Float16 Qs[MR * QR];
   // V transposed, [key / 16][dim][key % 16] (+32 bytes between the halves: their banks differ), so a P . V
@@ -8394,6 +8524,9 @@ extern "C" __global__ void __launch_bounds__(256)
   const auto pos_a = [&](const Idx& x) { return x.ua * ratio + min(x.c + lane, n - 1) % ratio; };
   const std::uint32_t swave = __builtin_amdgcn_readfirstlane(wave);
   uint4 rk[KP], rv[KP];
+  // kV2: task t = wave + 8 q (q = 0, 1): keys 8 (t % 4) .. + 8, dims 64 (t / 4) + 2 lane, + 1.
+  std::uint32_t rv2[16];
+  const std::uint32_t vkg = swave % 4;
   const auto load_kv = [&](const Idx& x) {
     const std::uint32_t pl = pos_l(x);
 #pragma unroll
@@ -8403,7 +8536,18 @@ extern "C" __global__ void __launch_bounds__(256)
           (static_cast<std::size_t>(__builtin_amdgcn_readlane(pl, j)) * num_kv_heads + g) * HD + lane * 8;
       rk[p] = *reinterpret_cast<const uint4*>(kc + at);
       // V: lane = key, values (wave + 8 p) * 8 .. (the transposed stores of a wave are 2 x 32 contiguous bytes)
-      rv[p] = *reinterpret_cast<const uint4*>(vc + (static_cast<std::size_t>(pl) * num_kv_heads + g) * HD + j * 8);
+      if constexpr (!kV2)
+        rv[p] = *reinterpret_cast<const uint4*>(vc + (static_cast<std::size_t>(pl) * num_kv_heads + g) * HD + j * 8);
+    }
+    if constexpr (kV2) {
+#pragma unroll
+      for (std::uint32_t qq = 0; qq < 2; ++qq)
+#pragma unroll
+        for (std::uint32_t kk = 0; kk < 8; ++kk) {
+          const std::uint32_t pk = __builtin_amdgcn_readlane(pl, vkg * 8 + kk);
+          rv2[qq * 8 + kk] = *reinterpret_cast<const std::uint32_t*>(
+              vc + (static_cast<std::size_t>(pk) * num_kv_heads + g) * HD + (swave / 4 + 2 * qq) * 64 + 2 * lane);
+        }
     }
   };
   Idx cur{}, nxt{};
@@ -8422,14 +8566,34 @@ extern "C" __global__ void __launch_bounds__(256)
       const std::uint32_t j = swave + 8 * p, d = lane * 8;
       const bool live = (lives >> j) & 1u;
       *reinterpret_cast<uint4*>(Ks + j * VR + d) = live ? rk[p] : make_uint4(0, 0, 0, 0);
-      const uint4 w = (lives >> lane) & 1u ? rv[p] : make_uint4(0, 0, 0, 0);
-      _Float16* vdst = Vt + (lane / 16) * VH + j * 8 * 16 + lane % 16;
-      const std::uint32_t wv[4] = {w.x, w.y, w.z, w.w};
+      if constexpr (!kV2) {
+        const uint4 w = (lives >> lane) & 1u ? rv[p] : make_uint4(0, 0, 0, 0);
+        _Float16* vdst = Vt + (lane / 16) * VH + j * 8 * 16 + lane % 16;
+        const std::uint32_t wv[4] = {w.x, w.y, w.z, w.w};
 #pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        const halo_h2 h2 = AsH2(wv[e]);
-        vdst[(2 * e) * 16] = h2.x;
-        vdst[(2 * e + 1) * 16] = h2.y;
+        for (int e = 0; e < 4; ++e) {
+          const halo_h2 h2 = AsH2(wv[e]);
+          vdst[(2 * e) * 16] = h2.x;
+          vdst[(2 * e + 1) * 16] = h2.y;
+        }
+      }
+    }
+    if constexpr (kV2) {
+#pragma unroll
+      for (std::uint32_t qq = 0; qq < 2; ++qq) {
+        std::uint32_t lo[4], hi[4];
+#pragma unroll
+        for (std::uint32_t m = 0; m < 4; ++m) {
+          const std::uint32_t k0 = vkg * 8 + 2 * m;
+          const std::uint32_t x0 = (lives >> k0) & 1u ? rv2[qq * 8 + 2 * m] : 0u;
+          const std::uint32_t x1 = (lives >> (k0 + 1)) & 1u ? rv2[qq * 8 + 2 * m + 1] : 0u;
+          lo[m] = __builtin_amdgcn_perm(x1, x0, 0x05040100u);  // dim 2 lane: keys 2 m, 2 m + 1
+          hi[m] = __builtin_amdgcn_perm(x1, x0, 0x07060302u);  // dim 2 lane + 1
+        }
+        const std::uint32_t dim = (swave / 4 + 2 * qq) * 64 + 2 * lane;
+        _Float16* vdst = Vt + (vkg / 2) * VH + dim * 16 + (vkg % 2) * 8;
+        *reinterpret_cast<uint4*>(vdst) = make_uint4(lo[0], lo[1], lo[2], lo[3]);
+        *reinterpret_cast<uint4*>(vdst + 16) = make_uint4(hi[0], hi[1], hi[2], hi[3]);
       }
     }
     const std::uint32_t kpa = pos_a(cur), kma = cur.m;  // this chunk's keys, one a lane
@@ -8463,17 +8627,33 @@ extern "C" __global__ void __launch_bounds__(256)
     // Online softmax: 4 threads per row (192 of 256), 8 keys each.
     if (tid < MR * 4) {
       const std::uint32_t row = tid / 4, part = tid % 4;
+      float sv[8];
+      if constexpr (kV2) {
+        const float4 s0 = *reinterpret_cast<const float4*>(Ss + row * KC + part * 8);
+        const float4 s1 = *reinterpret_cast<const float4*>(Ss + row * KC + part * 8 + 4);
+        sv[0] = s0.x, sv[1] = s0.y, sv[2] = s0.z, sv[3] = s0.w;
+        sv[4] = s1.x, sv[5] = s1.y, sv[6] = s1.z, sv[7] = s1.w;
+      }
       float mx = -INFINITY;
       if (row < rows)
-        for (std::uint32_t c = part * 8; c < part * 8 + 8; ++c) mx = fmaxf(mx, Ss[row * KC + c]);
+        for (std::uint32_t c = part * 8; c < part * 8 + 8; ++c)
+          mx = fmaxf(mx, kV2 ? sv[c - part * 8] : Ss[row * KC + c]);
       for (int o = 2; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 32));
       const float m_old = mrow[row], m_new = fmaxf(m_old, mx);
       float sum = 0.0f;
+      _Float16 ph[8];
+#pragma unroll
       for (std::uint32_t c = part * 8; c < part * 8 + 8; ++c) {
-        const float p = row < rows && m_new != -INFINITY ? expf(Ss[row * KC + c] - m_new) : 0.0f;
-        Ps[row * PR + c] = static_cast<_Float16>(p);
+        const float p = row < rows && m_new != -INFINITY
+                            ? expf((kV2 ? sv[c - part * 8] : Ss[row * KC + c]) - m_new)
+                            : 0.0f;
+        if constexpr (kV2)
+          ph[c - part * 8] = static_cast<_Float16>(p);
+        else
+          Ps[row * PR + c] = static_cast<_Float16>(p);
         sum += p;
       }
+      if constexpr (kV2) *reinterpret_cast<uint4*>(Ps + row * PR + part * 8) = __builtin_bit_cast(uint4, ph);
       for (int o = 2; o > 0; o >>= 1) sum += __shfl_xor(sum, o, 32);
       if (part == 0) {
         const float a = m_old == -INFINITY ? 0.0f : expf(m_old - m_new);
@@ -8531,6 +8711,21 @@ extern "C" __global__ void __launch_bounds__(256)
         out[idx] = acc[r][dt][j] / lrow[row] * Sigmoid(gv[r][dt][j]);
       }
   HALO_SPAN_END(8);  // outputs stored
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_attention_wmma_qsel_h(const float* q, const _Float16* kc, const _Float16* vc, const float* gate, float* out,
+                               const std::uint32_t* params, const std::uint32_t* ublk, const std::uint8_t* umask,
+                               const std::uint32_t* ucount, std::uint32_t max_u, std::uint32_t ratio,
+                               std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t tokens) {
+  QselH<false>(q, kc, vc, gate, out, params, ublk, umask, ucount, max_u, ratio, num_heads, num_kv_heads, tokens);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_attention_wmma_qsel_h2(const float* q, const _Float16* kc, const _Float16* vc, const float* gate,
+                                float* out, const std::uint32_t* params, const std::uint32_t* ublk,
+                                const std::uint8_t* umask, const std::uint32_t* ucount, std::uint32_t max_u,
+                                std::uint32_t ratio, std::uint32_t num_heads, std::uint32_t num_kv_heads,
+                                std::uint32_t tokens) {
+  QselH<true>(q, kc, vc, gate, out, params, ublk, umask, ucount, max_u, ratio, num_heads, num_kv_heads, tokens);
 }
 
 // F32 GEMM for few rows (<= 16: the mixer's 4-row inject, the shared
