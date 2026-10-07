@@ -304,7 +304,10 @@ not one-off checks:
   `halo_run --spec 1`); not in the server (proposal in docs/MTP.md).
   - Greedy: output identical to AR on every run (9 prompts x 512 / 256, 7K x 384); regression tests
     `Sessions.SpecStepDraftsEqualsGreedyStepping` (small model, caller's drafts) and
-    `MtpSpec.GreedyEqualsArOnRealModel` (gated on the real model).
+    `MtpSpec.GreedyEqualsArOnRealModel` (gated on the real model); the small-model test fails on all three
+    rollback/history mutants and passes a benign one.
+  - Sampling: the real-model audit (2 contexts x 2,000 trials, T 0.8) matches the exact first- and second-token
+    distributions (all p >= 0.19 first token; the raw draft proposals as control are rejected at once).
   - Speed, pinned, measured-cost depth chooser: 1.29x AR over the 9-prompt set, 1.40x mean on GSM8K / HumanEval
     chat, 1.12x on raw code / doc. **The 1.5x gate is not met**: the exact multi-row verify costs 1.45-2.7x a step.
   - Rollback is a snapshot copy per verified row (as planned); the draft block runs its own QSA indexer (the
