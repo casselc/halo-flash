@@ -153,6 +153,7 @@ if(HALO_GPU)
     src/engine/batch_decode.cpp
     src/engine/mtp.cpp
     src/engine/probe.cpp
+    src/engine/spec_decode.cpp
     ${HALO_GEN}/kernels/core_hsaco.cpp)
   target_include_directories(halo_gpu PUBLIC ${HALO_GEN})
   target_compile_definitions(halo_gpu PUBLIC __HIP_PLATFORM_AMD__ HALO_WITH_HIP=1)
@@ -208,6 +209,7 @@ if(HALO_BUILD_TESTS)
     tests/core/quant_test.cpp
     tests/core/lowbit_test.cpp
     tests/core/json_test.cpp
+    tests/core/mtp_sampling_test.cpp
     tests/core/sampling_test.cpp)
   target_compile_definitions(core_tests PRIVATE
     HALO_CORE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/core/data")

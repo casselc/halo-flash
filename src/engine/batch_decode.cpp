@@ -255,7 +255,11 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
   for (std::uint32_t il = 0; ok && il < c.num_layers; ++il) {
     const auto& l = w_.layers[il];
     cur_layer_ = il;
-    if (c.IsPleLayer(il) && !each([&](std::uint32_t) { return Ple(l, error); })) return false;
+    if (c.IsPleLayer(il) && !each([&](std::uint32_t e) {
+          return Ple(l, error) && (!verify_ || e + 1 >= B ||
+                                   CopyFloats(verify_snap_[e][2 * c.num_layers], ple_history_, ple_history_.bytes / 4, error));
+        }))
+      return false;
     if (!mix(l.hc_attn, true)) return false;
     if (l.linear) {
       const auto& tq = tensors_.at(l.ssm_qkv.data);
@@ -274,8 +278,15 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
                    rt::Arg::Val(c.ssm_num_v_heads), rt::Arg::Val(H), rt::Arg::Val(H), rt::Arg::Val(c.ssm_num_v_heads),
                    rt::Arg::Val(NGS)},
                   error) &&
-           each([&](std::uint32_t) {
+           each([&](std::uint32_t e) {
              auto& s = linear_[il];
+             // Verify rows: the state after row e (all rows but the last) for rollback.
+             const auto snap = [&]() {
+               if (!verify_ || e + 1 >= B) return true;
+               const auto& v = verify_snap_[e];
+               return CopyFloats(v[2 * il], s.state, s.state.bytes / 4, error) &&
+                      CopyFloats(v[2 * il + 1], s.conv, s.conv.bytes / 4, error);
+             };
              return Launch("halo_conv_l2norm", {ch / 128}, {128},
                            {rt::Arg::Buf(qkv_), rt::Arg::Buf(s.conv), rt::Arg::Buf(tensors_.at(l.ssm_conv1d.data).buf),
                             rt::Arg::Buf(conv_out_), rt::Arg::Val(ch), rt::Arg::Val(c.ssm_conv_kernel),
@@ -288,7 +299,8 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
                             rt::Arg::Buf(s.state), rt::Arg::Buf(tensors_.at(l.ssm_norm.data).buf), rt::Arg::Buf(z_),
                             rt::Arg::Buf(gdn_out_), rt::Arg::Val(c.ssm_num_k_heads), rt::Arg::Val(c.rms_eps),
                             rt::Arg::Val<std::uint32_t>(1)},
-                           error);
+                           error) &&
+                    snap();
            }) &&
            gemv(l.ssm_out, bb_.gdn_out, c.SsmValueDim(), bb_.block_out, H);
     } else {
@@ -416,6 +428,8 @@ bool FlashNextGpu::StepBatch(std::span<const BatchEntry> entries, std::string* e
     if (!e.logits.empty() && e.logits.size() < c.vocab_size) return fail("logits span too small");
   }
   const SessionId bound = bound_;
+  for (const auto& e : entries)
+    if (mtp_track_ && e.session == mtp_owner_) mtp_pos_ = 0;  // its draft history no longer follows: no drafting
   // One session, or no batched kernels for this model / these options: the entries in turn.
   if (B == 1 || !BatchSupported()) {
     for (const auto& e : entries) {
@@ -509,7 +523,7 @@ bool FlashNextGpu::StepBatch(std::span<const BatchEntry> entries, std::string* e
   if (use_graphs_ && !timing_) {
     BatchGraph* g = nullptr;
     for (auto& bg : batch_graphs_)
-      if (bg.head == static_cast<int>(head) && bg.sessions == ids) g = &bg;
+      if (bg.head == static_cast<int>(head) && !bg.verify && bg.sessions == ids) g = &bg;
     if (!g) {
       constexpr std::size_t kMaxGraphs = 16;
       if (batch_graphs_.size() >= kMaxGraphs) {  // least recently used out
