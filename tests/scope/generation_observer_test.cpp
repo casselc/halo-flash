@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <mutex>
 #include <vector>
 
@@ -89,6 +90,18 @@ TEST(ScopeGenerations, RecordBecomesATypedGenerationObservation) {
   auto r = Record();
   r.trace_id.clear();
   EXPECT_EQ(GenerationObserver::ToObservation(r).trace_id, "chatcmpl-1");
+  // Without MTP the usage is input / output / cache_read; with it the draft counts ride along.
+  EXPECT_EQ(o.usage_details.size(), 3u);
+  r.spec.depth[3] = 2;
+  r.spec.cycles = 2;
+  r.spec.drafted = 6;
+  r.spec.accepted = 4;
+  r.spec.catchup_tokens = 128;
+  const auto u = GenerationObserver::ToObservation(r).usage_details;
+  const std::vector<std::pair<std::string, std::uint64_t>> mtp{
+      {"mtp_cycles", 2}, {"mtp_drafted", 6}, {"mtp_accepted", 4}, {"mtp_catchup", 128}};
+  ASSERT_EQ(u.size(), 7u);
+  EXPECT_TRUE(std::equal(mtp.begin(), mtp.end(), u.begin() + 3));
 }
 
 TEST(ScopeGenerations, CapturePolicyAndAHarnessToolStepJoinOneTrace) {

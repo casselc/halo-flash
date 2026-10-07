@@ -46,3 +46,31 @@ TEST(Metrics, CountersAndHistogramsInPrometheusText) {
   m.Finished();
   EXPECT_NE(m.Render().find("vllm:num_requests_running{model_name=\"flash\"} 0\n"), std::string::npos);
 }
+
+// MTP speculative decoding: vLLM's spec-decode counters summed over records, per-position acceptance and the
+// halo depth histogram; requests without MTP add nothing.
+TEST(Metrics, SpecDecodeCountersSumOverRequests) {
+  Metrics m("flash");
+  GenerationRecord r;
+  r.finish_reason = "stop";
+  m.OnGeneration(r);  // MTP off
+  r.spec.cycles = 3;
+  r.spec.drafted = 7;
+  r.spec.accepted = 5;
+  r.spec.catchup_tokens = 512;
+  r.spec.depth = {2, 0, 2, 1, 0, 0, 0, 0};  // two ordinary steps, cycles of 2, 2 and 3 drafts
+  r.spec.accepted_at = {3, 2, 0, 0, 0, 0, 0};
+  m.OnGeneration(r);
+  m.OnGeneration(r);
+  const std::string t = m.Render();
+  const auto has = [&](const std::string& line) { return t.find(line + "\n") != std::string::npos; };
+  EXPECT_TRUE(has("vllm:spec_decode_num_drafts_total{model_name=\"flash\"} 6"));
+  EXPECT_TRUE(has("vllm:spec_decode_num_draft_tokens_total{model_name=\"flash\"} 14"));
+  EXPECT_TRUE(has("vllm:spec_decode_num_accepted_tokens_total{model_name=\"flash\"} 10"));
+  EXPECT_TRUE(has("vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name=\"flash\",position=\"0\"} 6"));
+  EXPECT_TRUE(has("vllm:spec_decode_num_accepted_tokens_per_pos_total{model_name=\"flash\",position=\"1\"} 4"));
+  EXPECT_TRUE(has("halo:mtp_decode_steps_total{model_name=\"flash\",depth=\"0\"} 4"));
+  EXPECT_TRUE(has("halo:mtp_decode_steps_total{model_name=\"flash\",depth=\"3\"} 2"));
+  EXPECT_TRUE(has("halo:mtp_catchup_tokens_total{model_name=\"flash\"} 1024"));
+  EXPECT_TRUE(has("# TYPE vllm:spec_decode_num_draft_tokens_total counter"));
+}
