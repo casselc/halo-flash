@@ -154,7 +154,7 @@ HttpResponse OpenAiService::Completions(const HttpRequest& http) {
   auto req = ParseCompletionsRequest(*body, opt_.defaults, &e);
   if (!req) return Error(400, e);
   SetContext(http, *req);
-  return Generate(Api::kCompletions, std::move(*req), nullptr);
+  return Generate(Api::kCompletions, std::move(*req), nullptr, http.connected);
 }
 
 HttpResponse OpenAiService::Chat(const HttpRequest& http) {
@@ -164,7 +164,7 @@ HttpResponse OpenAiService::Chat(const HttpRequest& http) {
   auto req = ParseChatRequest(*body, opt_.defaults, &e);
   if (!req) return Error(400, e);
   SetContext(http, *req);
-  return Generate(Api::kChat, std::move(*req), nullptr);
+  return Generate(Api::kChat, std::move(*req), nullptr, http.connected);
 }
 
 HttpResponse OpenAiService::Responses(const HttpRequest& http) {
@@ -186,7 +186,7 @@ HttpResponse OpenAiService::Responses(const HttpRequest& http) {
                          "previous_response_id"});
     prior = std::move(stored->conversation);
   }
-  return Generate(Api::kResponses, std::move(*req), prior ? &*prior : nullptr);
+  return Generate(Api::kResponses, std::move(*req), prior ? &*prior : nullptr, http.connected);
 }
 
 HttpResponse OpenAiService::GetResponse(const std::string& id) {
@@ -195,7 +195,8 @@ HttpResponse OpenAiService::GetResponse(const std::string& id) {
   return HttpResponse::Json(200, CompactJson(stored->response));
 }
 
-HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value* prior) {
+HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value* prior,
+                                     const std::function<bool()>& connected) {
   if (req.model.empty()) req.model = opt_.model_id;
   if (!req.variant.empty()) {
     const auto names = opt_.variants ? opt_.variants() : std::vector<std::string>{};
@@ -240,7 +241,9 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
     Value conversation;
   };
   auto run = std::make_shared<Run>(Run{std::move(req), std::move(prompt), std::move(popt), std::move(conversation)});
-  const auto execute = [this, api, id, run](std::vector<Value>* events, const std::function<bool()>& flush) {
+  // The client closed its end (or the server is stopping): nobody will receive the rest.
+  const auto gone = [connected] { return connected && !connected(); };
+  const auto execute = [this, api, id, run, gone](std::vector<Value>* events, const std::function<bool()>& flush) {
     OutputBuilder builder(run->req, id, opt_.now_s(), opt_.new_id);
     text::ToolCallStreamParser parser(run->popt);
     StopMatcher stops(run->req.stop);
@@ -255,7 +258,7 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
         builder.Add(parsed, events);
       }
     };
-    TextGenerator::Params params{run->prompt, run->req.variant, run->req.sampling, run->req.max_tokens};
+    TextGenerator::Params params{run->prompt, run->req.variant, run->req.sampling, run->req.max_tokens, gone};
     if (opt_.on_activity) opt_.on_activity(true);
     struct Done {
       const std::function<void(bool)>& f;
@@ -277,7 +280,7 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
       }
       emit(stops.Push(piece));
       if (stops.stopped()) return false;
-      if (!flush()) return client_gone = true, false;
+      if (!flush() || gone()) return client_gone = true, false;
       return true;
     });
     emit(stops.Flush());
@@ -292,7 +295,7 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
     // Delivered in full only if the client was there for every event, the terminal one included. Otherwise the
     // response was cut short or never received: it is cancelled, never "completed" or "stop" (a truncated
     // generation must not look like a finished one to the store, the trace or a training set).
-    const bool cancelled = client_gone || !flush();
+    const bool cancelled = client_gone || result.cancelled || !flush() || gone();
     if (cancelled) builder.MarkCancelled();
     Value final = builder.Final();
     if (opt_.observer) {
@@ -355,6 +358,8 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
   if (!run->req.stream) {
     auto [error, final] = execute(nullptr, [] { return true; });
     if (!error.empty()) return HttpResponse::Json(500, CompactJson(ErrorBody({"generation failed: " + error, ""})));
+    if (gone())  // nobody is there to read it, unless the server is stopping
+      return HttpResponse::Json(503, CompactJson(ErrorBody({"generation cancelled: the client left or the server is stopping", ""})));
     return HttpResponse::Json(200, CompactJson(final));
   }
   return HttpResponse::EventStream([api, run, execute](const BodyWriter& write) {

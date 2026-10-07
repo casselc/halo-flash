@@ -1261,10 +1261,41 @@ why = "a client that stays connected but stops reading holds its handler (and th
 [[mutant]]
 name = "svc-departure-as-stop"
 file = "src/server/openai_service.cpp"
-find = 'const bool cancelled = client_gone || !flush();'
+find = 'const bool cancelled = client_gone || result.cancelled || !flush() || gone();'
 replace = 'const bool cancelled = false;'
 suite = "cpu-asan"
 binary = "server_tests"
 filter = "OpenAiService.ADepartedStreamIsRecordedAndStoredAsCancelled"
 timeout = 120
 why = "a client that left mid-stream is recorded as finish_reason stop and its truncated turn stored as completed"
+
+[[mutant]]
+name = "svc-no-liveness-check"
+file = "src/server/openai_service.cpp"
+find = 'const auto gone = [connected] { return connected && !connected(); };'
+replace = 'const auto gone = [connected] { return connected && false; };'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.ADepartedNonStreamingClientStopsGeneration"
+timeout = 300
+why = "a request whose client left before its first byte (queued, prefilling) or a non-streaming one runs to completion"
+
+[[mutant]]
+name = "svc-queue-ignores-departure"
+file = "src/server/flash_next_generator.cpp"
+find = '    if (gone()) return r.cancelled = true, r;'
+replace = '    (void)0;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.AQueuedRequestWhoseClientLeftNeverRuns"
+why = "a request whose client left while it waited for the engine still runs once the engine is free"
+
+[[mutant]]
+name = "engine-prefill-ignores-cancel"
+file = "src/engine/flash_next_gpu.cpp"
+find = '    if (i > 0 && stop()) {'
+replace = '    if (false) {'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.ACancelStopsThePrefillAtTheNextChunk"
+why = "a client that left mid-prefill gets the rest of its prefill (minutes at long context) computed for nobody"

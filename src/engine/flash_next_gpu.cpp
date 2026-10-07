@@ -1479,10 +1479,18 @@ bool FlashNextGpu::Reset(std::string* error) {
   return dev_.Fill(ple_history_, 0, error) && dev_.Synchronize(error);
 }
 
-bool FlashNextGpu::Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error) {
+bool FlashNextGpu::Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error,
+                           const std::function<bool()>& cancelled) {
+  const auto stop = [&] {
+    if (!cancelled || !cancelled()) return false;
+    if (error) *error = "cancelled";
+    return true;
+  };
   if (!batched_prefill_ || !ChunkSupported()) {
-    for (std::size_t i = 0; i < tokens.size(); ++i)
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      if (i > 0 && stop()) return false;
       if (!Step(tokens[i], i + 1 == tokens.size() ? logits : std::span<float>{}, error)) return false;
+    }
     return true;
   }
   const std::uint32_t want =
@@ -1495,6 +1503,10 @@ bool FlashNextGpu::Prefill(std::span<const std::int32_t> tokens, std::span<float
   const auto& c = w_.config;
   std::future<std::vector<float>> next;
   for (std::size_t i = 0; i < tokens.size(); i += chunk) {
+    if (i > 0 && stop()) {
+      if (next.valid()) next.wait();  // never leave a read running past the call
+      return false;
+    }
     const std::size_t n = std::min(chunk, tokens.size() - i);
     std::vector<float> pre;
     if (next.valid()) pre = next.get();  // empty when the prefetch failed: the chunk reads itself

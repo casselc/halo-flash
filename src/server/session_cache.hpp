@@ -27,6 +27,7 @@
 // to a cold run only up to the prefill-vs-decode rounding.
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -62,12 +63,16 @@ class SessionCache {
     std::size_t reused = 0;     ///< prompt tokens whose state came from a retained session
     std::size_t prefilled = 0;  ///< prompt tokens prefilled now
     bool checkpointed = false;  ///< a checkpoint was parked during the prefill
+    bool cancelled = false;     ///< `cancelled` stopped it (Prepare returned false; not an error)
   };
   /// Binds a session whose state is `prompt` minus its last token (the caller runs that token with sampling).
   /// `stable`: prompt positions later requests are expected to share (a checkpoint is parked there, rounded down
   /// to `align` in exact mode). `positions`: the prompt plus the generation budget (the memory check).
+  /// `cancelled` (optional) is polled before the prefill and between its chunks; when it stops the prefill the
+  /// live session is dropped (its state is partly advanced) and only states equal to a cold prefill of their
+  /// tokens stay retained (a checkpoint parked before the stop is one).
   [[nodiscard]] bool Prepare(std::span<const std::int32_t> prompt, std::size_t stable, std::uint32_t positions,
-                             Prepared* out, std::string* error);
+                             Prepared* out, std::string* error, const std::function<bool()>& cancelled = {});
   /// The bound session ran `token` (a decode step).
   void Ran(std::int32_t token);
   /// The generation ended: fast mode retains the live session, exact mode drops it.

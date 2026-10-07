@@ -7,6 +7,11 @@
 #include <hegel/gtest.h>
 
 #include <algorithm>
+#include <atomic>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <set>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -399,4 +404,227 @@ TEST(SessionCache, ReleasedPageChargeProbe) {
     ASSERT_TRUE(engine->DropSession(s, &e)) << e;
     eshow(round ? "second session dropped" : "first session dropped");
   }
+}
+
+// ---- Serving under departures and memory pressure (audit streams/A/AUDIT.md F3, F5) -------------------------------
+
+namespace {
+
+/// Prefill chunks of `tokens` (and no long-prompt chunks) for the scope, restoring the defaults: prompts on the
+/// small model then have several chunks, so a cancellation can land between them.
+struct PrefillChunk {
+  explicit PrefillChunk(std::uint32_t tokens)
+      : saved(engine::FlashNextGpu::prefill_chunk_), saved_long(engine::FlashNextGpu::prefill_long_chunk_) {
+    engine::FlashNextGpu::prefill_chunk_ = tokens;
+    engine::FlashNextGpu::prefill_long_chunk_ = 0;
+  }
+  ~PrefillChunk() {
+    engine::FlashNextGpu::prefill_chunk_ = saved;
+    engine::FlashNextGpu::prefill_long_chunk_ = saved_long;
+  }
+  std::uint32_t saved, saved_long;
+};
+
+/// Params whose `cancelled` turns true at its `at`-th poll (and stays true); `polls` counts them.
+struct CancelAt {
+  std::size_t at = SIZE_MAX, polls = 0;
+  server::TextGenerator::Params Params(server::TextGenerator::Params p) {
+    p.cancelled = [this] { return ++polls >= at; };
+    return p;
+  }
+};
+
+}  // namespace
+
+// Requests cancelled at any point (before the prefill, between its chunks, between decode steps) leave the cache as
+// cold replays would. Exact mode: every later request's tokens equal a cold engine's, and a cancelled request's
+// tokens are a prefix of its full run. Fast mode: a request stopped after k decode steps leaves the same state as
+// the same request with max_tokens = k (a second fast-mode cache runs that instead), and one cancelled before its
+// prefill the same as no request at all; a stop with no token emitted is ambiguous (before the first step, or
+// mid-prefill), so the fast comparison ends there (an unknown is not treated as either).
+TEST(SessionCache, CancelledRequestsLeaveStateEqualToAColdReplay) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  constexpr std::uint32_t kCtx = 4096;
+  PrefillChunk chunk(256);
+  std::string e;
+  std::vector<std::unique_ptr<engine::FlashNextGpu>> eng;
+  for (int i = 0; i < 4; ++i) {
+    eng.push_back(engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e));
+    ASSERT_TRUE(eng.back()) << e;
+  }
+  const auto V = static_cast<std::int32_t>(m->weights->config.vocab_size);
+  std::size_t cancels = 0, decode_cancels = 0, fast_checked = 0, before_prefill = 0;
+  hegel::test([&](hegel::TestCase& tc) {
+    using Mode = server::SessionCacheOptions::Mode;
+    server::FlashNextGenerator a(*eng[0], std::vector<text::TokenId>{}, kCtx, {.mode = Mode::kExact, .align = kAlign});
+    server::FlashNextGenerator b(*eng[1], std::vector<text::TokenId>{}, kCtx, {.mode = Mode::kOff});
+    server::FlashNextGenerator c(*eng[2], std::vector<text::TokenId>{}, kCtx, {.mode = Mode::kFast});
+    server::FlashNextGenerator d(*eng[3], std::vector<text::TokenId>{}, kCtx, {.mode = Mode::kFast});
+    bool fast_comparable = true;
+    const auto tokens = [&](std::uint32_t lo, std::uint32_t hi) {
+      std::vector<std::int32_t> v(tc.draw(gs::integers<std::uint32_t>({.min_value = lo, .max_value = hi})));
+      for (auto& t : v) t = tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = V - 1}));
+      return v;
+    };
+    const auto collect = [](std::vector<std::int32_t>* out) {
+      return [out](text::TokenId t) { return out->push_back(static_cast<std::int32_t>(t)), true; };
+    };
+    const std::vector<std::int32_t> gen_prompt = {7, 11, 13};
+    std::vector<std::int32_t> prompt = tokens(200, 900);
+    std::size_t stable = prompt.size();
+    prompt.insert(prompt.end(), gen_prompt.begin(), gen_prompt.end());
+    const int turns = tc.draw(gs::integers<int>({.min_value = 2, .max_value = 5}));
+    for (int turn = 0; turn < turns && prompt.size() + 40 < kCtx; ++turn) {
+      server::TextGenerator::Params p;
+      p.max_tokens = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 10}));
+      // The poll at which the client leaves: 1 is before the prefill; later ones fall between prefill chunks or
+      // decode steps (how many of each depends on the reuse); none: it stays.
+      const bool leaves = tc.draw(gs::booleans());
+      const std::size_t at = leaves ? tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 14})) : SIZE_MAX;
+      CancelAt ca{at}, cc{at};
+      std::vector<std::int32_t> got, want, fast, ref;
+      const auto ra = a.GenerateIds(prompt, stable, ca.Params(p), collect(&got));
+      const auto rb = b.GenerateIds(prompt, stable, p, collect(&want));
+      ASSERT_TRUE(ra.error.empty() && rb.error.empty()) << ra.error << rb.error;
+      ASSERT_FALSE(rb.cancelled);
+      if (ra.cancelled) {
+        ++cancels;
+        ASSERT_LE(got.size(), want.size());
+        ASSERT_TRUE(std::equal(got.begin(), got.end(), want.begin())) << "a cancelled request's tokens";
+        ASSERT_FALSE(ra.length_limited);
+      } else {
+        ASSERT_EQ(got, want) << "turn " << turn << ", prompt " << prompt.size() << ", reused " << ra.cached_tokens;
+      }
+      const auto rc = c.GenerateIds(prompt, stable, cc.Params(p), collect(&fast));
+      ASSERT_TRUE(rc.error.empty()) << rc.error;
+      if (fast_comparable) {
+        if (!rc.cancelled) {
+          ASSERT_TRUE(d.GenerateIds(prompt, stable, p, collect(&ref)).error.empty());
+          ASSERT_EQ(fast, ref) << "fast mode after a cancel differs from the same history without it";
+          ++fast_checked;
+        } else if (cc.polls == 1) {
+          ++before_prefill;  // cancelled before its prefill: as if it never ran (d runs nothing)
+        } else if (!fast.empty()) {
+          ++decode_cancels;
+          server::TextGenerator::Params q = p;
+          q.max_tokens = static_cast<std::uint32_t>(fast.size());
+          ASSERT_TRUE(d.GenerateIds(prompt, stable, q, collect(&ref)).error.empty());
+          ASSERT_EQ(fast, ref) << "a stop after " << fast.size() << " tokens";
+        } else {
+          fast_comparable = false;
+        }
+      }
+      // The next prompt, as in ReuseIsByteIdenticalToColdPrefill (echoing the full run's tokens).
+      std::vector<std::int32_t> next(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(stable));
+      next.insert(next.end(), gen_prompt.begin(), gen_prompt.end());
+      if (tc.draw(gs::booleans())) next.insert(next.end(), want.begin(), want.end());
+      else {
+        const auto other = tokens(1, 20);
+        next.insert(next.end(), other.begin(), other.end());
+      }
+      const auto tool = tokens(1, 300);
+      next.insert(next.end(), tool.begin(), tool.end());
+      stable = next.size();
+      next.insert(next.end(), gen_prompt.begin(), gen_prompt.end());
+      prompt = std::move(next);
+    }
+  }, {.test_cases = 30});
+  std::printf("cancelled %zu requests (fast: %zu after decode steps, %zu before the prefill); %zu fast requests compared\n",
+              cancels, decode_cancels, before_prefill, fast_checked);
+  EXPECT_GT(cancels, 5u) << "too few cancellations to mean anything";
+  EXPECT_GT(decode_cancels, 0u);
+}
+
+// A client that leaves mid-prefill stops it at the next chunk boundary: no further chunk and no decode step runs.
+// (CancelAt counts the polls: the first is before the prefill, then one before each later chunk.)
+TEST(SessionCache, ACancelStopsThePrefillAtTheNextChunk) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  constexpr std::uint32_t kCtx = 4096;
+  PrefillChunk chunk(256);
+  std::string e;
+  auto engine = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(engine) << e;
+  for (const auto mode : {server::SessionCacheOptions::Mode::kExact, server::SessionCacheOptions::Mode::kFast}) {
+    server::FlashNextGenerator g(*engine, std::vector<text::TokenId>{}, kCtx, {.mode = mode});
+    std::vector<std::int32_t> ids(2000);  // 8 chunks
+    for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = static_cast<std::int32_t>((i * 7919) % 1000);
+    server::TextGenerator::Params p;
+    p.max_tokens = 4;
+    for (const std::size_t at : {1u, 2u, 4u, 7u}) {
+      CancelAt ca{at};
+      std::vector<std::int32_t> got;
+      const auto r = g.GenerateIds(ids, ids.size() - 1, ca.Params(p), [&](text::TokenId t) { return got.push_back(t), true; });
+      EXPECT_TRUE(r.cancelled) << "at " << at;
+      EXPECT_TRUE(r.error.empty()) << r.error;
+      EXPECT_TRUE(got.empty()) << "decoded after a cancel at poll " << at;
+      EXPECT_EQ(ca.polls, at) << "polled on after the cancel";
+      EXPECT_EQ(g.cache().retained(), 0u) << "a partly prefilled state was retained";
+    }
+  }
+}
+
+// A queued request whose client leaves never runs: it gives up while waiting for the generator (the other request
+// is held mid-decode), so its compute and the queue slot go at once; the held request then completes unaffected.
+TEST(SessionCache, AQueuedRequestWhoseClientLeftNeverRuns) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  constexpr std::uint32_t kCtx = 2048;
+  std::string e;
+  auto engine = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  auto cold = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(engine && cold) << e;
+  server::FlashNextGenerator g(*engine, std::vector<text::TokenId>{}, kCtx, {});
+  server::FlashNextGenerator ref(*cold, std::vector<text::TokenId>{}, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
+  std::vector<std::int32_t> pa(300), pb(200);
+  for (std::size_t i = 0; i < pa.size(); ++i) pa[i] = static_cast<std::int32_t>((i * 7919) % 1000);
+  for (std::size_t i = 0; i < pb.size(); ++i) pb[i] = static_cast<std::int32_t>((i * 104729) % 1000);
+  server::TextGenerator::Params p;
+  p.max_tokens = 6;
+  std::atomic<bool> in_decode{false}, release{false}, left{false};
+  std::vector<std::int32_t> got_a, want_a;
+  std::thread holder([&] {
+    (void)g.GenerateIds(pa, pa.size() - 1, p, [&](text::TokenId t) {
+      got_a.push_back(static_cast<std::int32_t>(t));
+      in_decode = true;
+      while (!release) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      return true;
+    });
+  });
+  while (!in_decode) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  server::TextGenerator::Params q = p;
+  q.cancelled = [&] { return left.load(); };
+  std::atomic<std::size_t> ran{0};
+  std::atomic<bool> returned{false};
+  server::TextGenerator::Result rq;
+  std::thread queued([&] {
+    rq = g.GenerateIds(pb, pb.size() - 1, q, [&](text::TokenId) { return ++ran, true; });
+    returned = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  const auto t0 = std::chrono::steady_clock::now();
+  left = true;
+  // The holder stays held until the queued request returns (or 2 s pass, so a request that waits for the
+  // engine fails the test instead of deadlocking it).
+  while (!returned && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2))
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const auto waited = std::chrono::steady_clock::now() - t0;
+  const bool returned_while_held = returned.load();
+  release = true;
+  queued.join();
+  holder.join();
+  EXPECT_TRUE(returned_while_held) << "the queued request waited for the holder";
+  EXPECT_LT(waited, std::chrono::milliseconds(500));
+  EXPECT_TRUE(rq.cancelled);
+  EXPECT_TRUE(rq.error.empty()) << rq.error;
+  EXPECT_EQ(ran.load(), 0u);
+  ASSERT_TRUE(ref.GenerateIds(pa, pa.size() - 1, p, [&](text::TokenId t) {
+                   return want_a.push_back(static_cast<std::int32_t>(t)), true;
+                 }).error.empty());
+  EXPECT_EQ(got_a, want_a);
+  std::vector<std::int32_t> got_b, want_b;
+  ASSERT_TRUE(g.GenerateIds(pb, pb.size() - 1, p, [&](text::TokenId t) { return got_b.push_back(t), true; }).error.empty());
+  ASSERT_TRUE(ref.GenerateIds(pb, pb.size() - 1, p, [&](text::TokenId t) { return want_b.push_back(t), true; }).error.empty());
+  EXPECT_EQ(got_b, want_b);
 }

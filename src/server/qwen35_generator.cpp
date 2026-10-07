@@ -48,6 +48,7 @@ TextGenerator::Result Qwen35Generator::Generate(const Params& params,
                      std::to_string(max_context_), r;
   const std::uint32_t budget =
       std::min<std::uint32_t>(params.max_tokens, max_context_ - static_cast<std::uint32_t>(ids.size()));
+  if (params.cancelled && params.cancelled()) return r.cancelled = true, r;
   if (!engine_.Reset(&error)) return r.error = error, r;
   if (ids.size() > 1 && !engine_.Prefill(std::span<const std::int32_t>(ids).first(ids.size() - 1), {}, &error))
     return r.error = error, r;
@@ -57,6 +58,10 @@ TextGenerator::Result Qwen35Generator::Generate(const Params& params,
   std::string pending;
   bool cancelled = false;
   while (r.completion_tokens < budget) {
+    if (params.cancelled && params.cancelled()) {
+      cancelled = r.cancelled = true;
+      break;
+    }
     if (!engine_.Step(token, {}, logits, &error)) return r.error = error, r;
     const auto next = state.Sample(logits);
     if (std::find(stops_.begin(), stops_.end(), next) != stops_.end()) break;

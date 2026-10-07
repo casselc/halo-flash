@@ -18,6 +18,10 @@
 #include <hegel/gtest.h>
 
 #include <atomic>
+#include <cctype>
+#include <deque>
+#include <map>
+#include <memory>
 #include <chrono>
 #include <mutex>
 #include <optional>
@@ -60,6 +64,10 @@ class ScriptedGenerator : public TextGenerator {
     Result r;
     r.prompt_tokens = p.prompt.size();
     for (std::size_t i = 0; i < script.size(); i += piece) {
+      if (p.cancelled && p.cancelled()) {  // as the engine's generator polls before each step
+        r.cancelled = stopped_early = true;
+        break;
+      }
       if (r.completion_tokens == p.max_tokens) {
         r.length_limited = true;
         break;
@@ -500,4 +508,20 @@ TEST(OpenAiService, ADepartedStreamIsRecordedAndStoredAsCancelled) {
   EXPECT_EQ(s2, 400) << t2;
   EXPECT_EQ(J(t2).find("error")->find("param")->str(), "previous_response_id");
   EXPECT_EQ(rig.gen.prompts.size(), 1u) << "a refused continuation reached the generator";
+}
+
+// A non-streaming request whose client leaves: the generation stops (audit F5); before the fix it ran every token.
+TEST(OpenAiService, ADepartedNonStreamingClientStopsGeneration) {
+  Rig rig;
+  rig.gen.scripts = {std::string(3000, 'a')};
+  rig.gen.piece = 1;
+  rig.gen.delay_ms = 1;
+  int fd = -1;
+  (void)SendAndReadUntil(rig.server.port(), "/v1/completions", R"({"prompt": "x", "max_tokens": 5000})", "", &fd);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  ::close(fd);
+  const auto rec = AwaitRecord(rig.observed, 1);
+  ASSERT_TRUE(rec);
+  EXPECT_EQ(rec->finish_reason, "cancelled");
+  EXPECT_LT(rec->completion_tokens, 1500u) << "the generation ran on after its client left";
 }

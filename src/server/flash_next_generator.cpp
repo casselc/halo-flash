@@ -67,16 +67,20 @@ TextGenerator::Result FlashNextGenerator::Generate(const Params& params,
     }
     return !cancelled;
   });
-  if (r.error.empty() && !cancelled && !pending.empty()) (void)on_text(pending);
+  if (r.error.empty() && !cancelled && !r.cancelled && !pending.empty()) (void)on_text(pending);
   return r;
 }
 
 TextGenerator::Result FlashNextGenerator::GenerateIds(std::span<const std::int32_t> ids, std::size_t stable,
                                                       const Params& params,
                                                       const std::function<bool(text::TokenId)>& on_token) {
-  std::lock_guard<std::mutex> lk(mu_);
   Result r;
   r.prompt_tokens = ids.size();
+  const auto gone = [&] { return params.cancelled && params.cancelled(); };
+  // Queued behind another generation: give up as soon as the requester is gone (the work would be for nobody).
+  std::unique_lock<std::timed_mutex> lk(mu_, std::defer_lock);
+  while (!lk.try_lock_for(std::chrono::milliseconds(20)))
+    if (gone()) return r.cancelled = true, r;
   if (ids.empty()) return r.error = "empty prompt", r;
   if (ids.size() >= max_context_)
     return r.error = "prompt of " + std::to_string(ids.size()) + " tokens exceeds the context of " +
@@ -89,8 +93,10 @@ TextGenerator::Result FlashNextGenerator::GenerateIds(std::span<const std::int32
   static const bool trace = std::getenv("HALO_CACHE_TRACE") != nullptr;  // per-request timing on stderr
   const auto t0 = Clock::now();
   SessionCache::Prepared prep;
-  if (!cache_.Prepare(ids, stable, static_cast<std::uint32_t>(ids.size()) + budget, &prep, &error))
+  if (!cache_.Prepare(ids, stable, static_cast<std::uint32_t>(ids.size()) + budget, &prep, &error, gone)) {
+    if (prep.cancelled) return r.cancelled = true, r;
     return r.error = error, r;
+  }
   r.cached_tokens = prep.reused;
   const auto t1 = Clock::now();
   auto t2 = t1;
@@ -100,6 +106,10 @@ TextGenerator::Result FlashNextGenerator::GenerateIds(std::span<const std::int32
   std::int32_t token = ids.back();
   bool cancelled = false;
   while (r.completion_tokens < budget) {
+    if (gone()) {  // the session holds exactly what ran: retained as a request with max_tokens = completion_tokens
+      cancelled = r.cancelled = true;
+      break;
+    }
     engine::FlashNextGpu::SampleRequest req{&params.sampling, state.penalties(), state.rng_state()};
     engine::FlashNextGpu::SampleResult res;
     if (!engine_.StepSample(token, req, &res, &error)) {

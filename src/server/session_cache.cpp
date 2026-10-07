@@ -45,9 +45,11 @@ void SessionCache::Evict() {
 }
 
 bool SessionCache::Prepare(std::span<const std::int32_t> prompt, std::size_t stable, std::uint32_t positions,
-                           Prepared* out, std::string* error) {
+                           Prepared* out, std::string* error, const std::function<bool()>& cancelled) {
   *out = {};
   if (has_live_) Abandon();  // a Prepare without Finish: the previous state is not trusted
+  const auto stop = [&] { return out->cancelled = out->cancelled || (cancelled && cancelled()); };
+  if (stop()) return *error = "cancelled", false;
   const std::size_t n = prompt.empty() ? 0 : prompt.size() - 1;
   const bool exact = opt_.mode == SessionCacheOptions::Mode::kExact;
 
@@ -106,7 +108,7 @@ bool SessionCache::Prepare(std::span<const std::int32_t> prompt, std::size_t sta
   std::size_t at = out->reused;
   const auto run = [&](std::size_t to) {
     if (to <= at) return true;
-    if (!e_.Prefill(prompt.subspan(at, to - at), {}, error)) return false;
+    if (!e_.Prefill(prompt.subspan(at, to - at), {}, error, stop)) return false;
     live_.tokens.insert(live_.tokens.end(), prompt.begin() + static_cast<std::ptrdiff_t>(at),
                         prompt.begin() + static_cast<std::ptrdiff_t>(to));
     out->prefilled += to - at;

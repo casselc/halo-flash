@@ -45,9 +45,14 @@ class TextGenerator {
     std::string variant;  // P10 variant ("" = base); the service only passes ones `variants` lists
     sampling::SamplingConfig sampling;
     std::uint32_t max_tokens = 0;
+    /// Optional: true once the requester is gone (its client left, or the server is stopping). The generator
+    /// polls it while queued, between prefill chunks and between decode steps, and gives up (Result::cancelled)
+    /// rather than compute for nobody; a request abandoned so leaves no state that differs from a cold replay.
+    std::function<bool()> cancelled;
   };
   struct Result {
     bool length_limited = false;  // stopped at max_tokens
+    bool cancelled = false;       // stopped because Params::cancelled said so (not an error)
     std::uint64_t prompt_tokens = 0;
     std::uint64_t cached_tokens = 0;
     std::uint64_t completion_tokens = 0;
@@ -55,7 +60,8 @@ class TextGenerator {
   };
   virtual ~TextGenerator() = default;
   /// Generates, calling `on_text` with each new piece of text (whole UTF-8
-  /// characters); stops early when it returns false.
+  /// characters); stops early when it returns false or Params::cancelled
+  /// returns true.
   virtual Result Generate(const Params& params, const std::function<bool(std::string_view)>& on_text) = 0;
 };
 
@@ -118,7 +124,9 @@ class OpenAiService {
   HttpResponse GetResponse(const std::string& id);
 
  private:
-  HttpResponse Generate(Api api, GenerationRequest req, const json::Value* prior);
+  /// `connected` (optional): whether the client is still there (HttpRequest::connected).
+  HttpResponse Generate(Api api, GenerationRequest req, const json::Value* prior,
+                        const std::function<bool()>& connected);
 
   TextGenerator& gen_;
   ServiceOptions opt_;
