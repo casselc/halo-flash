@@ -25,11 +25,14 @@
 #include <chrono>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "core/json.hpp"
+#include "engine/mtp_depth.hpp"
+#include "server/decode_loop.hpp"
 #include "server/http.hpp"
 #include "server/openai_response.hpp"
 #include "server/openai_service.hpp"
@@ -553,15 +556,23 @@ class SteppedGenerator : public TextGenerator {
     int hold_at = -1;  // the unit to wait before (-1: none)
     int words = 3;
     std::size_t big = 0;  // bytes per decode piece (0: short words)
+    // Speculative decoding (server/decode_loop.hpp, as FlashNextGenerator with --mtp-model): a decode unit is a
+    // cycle that emits 1 + accepted pieces (accepted drawn from `seed`); the departure is checked between them.
+    bool spec = false;
+    std::uint64_t seed = 0;
     std::atomic<bool> release{false}, held{false}, cancelled{false};
-    std::atomic<int> phase{kPlanned}, work{0};
+    std::atomic<int> phase{kPlanned}, work{0}, work_at_hold{-1};
   };
+  bool spec = false;          // plans decode speculatively
+  std::uint64_t spec_seed = 0;
   /// The next request whose prompt contains `marker` runs under this plan.
   std::shared_ptr<Run> Plan(const std::string& marker, int hold_at, int words, std::size_t big = 0) {
     auto run = std::make_shared<Run>();
     run->hold_at = hold_at;
     run->words = words;
     run->big = big;
+    run->spec = spec;
+    run->seed = spec_seed++;
     std::lock_guard<std::mutex> lk(mu);
     plans[marker].push_back(run);
     return run;
@@ -589,12 +600,14 @@ class SteppedGenerator : public TextGenerator {
     std::unique_lock<std::timed_mutex> lk(engine, std::defer_lock);
     while (!lk.try_lock_for(std::chrono::milliseconds(1)))
       if (gone()) return end(true);
+    const auto hold = [&] {
+      run->work_at_hold = run->work.load();
+      run->held = true;
+      while (!run->release && !gone()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      run->held = false;
+    };
     const auto unit = [&](int u) {
-      if (u == run->hold_at) {
-        run->held = true;
-        while (!run->release && !gone()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        run->held = false;
-      }
+      if (u == run->hold_at) hold();
       if (gone()) return false;
       std::this_thread::sleep_for(std::chrono::microseconds(300));
       ++run->work;
@@ -604,6 +617,39 @@ class SteppedGenerator : public TextGenerator {
     for (int c = 0; c < kChunks; ++c)
       if (!unit(c)) return end(true);
     run->phase = kDecode;
+    const auto piece = [&](int w) {
+      return w == 0     ? std::string("r\n</think>\n\n")
+             : run->big ? std::string(run->big, static_cast<char>('a' + w % 26))
+                        : "w" + std::to_string(w) + " ";
+    };
+    if (run->spec) {
+      // Piece w is token w; token words + 1 is the stop (it can sit inside an accepted run). A hold at unit
+      // kChunks + w waits after piece w - 1 went out, so the leave lands between a cycle's tokens or between cycles.
+      engine::MtpDepthChooser chooser(engine::MtpMeasuredCosts(), {.limit = 4});
+      std::mt19937_64 rng(run->seed);
+      std::int32_t next = 0;
+      DecodeIo io;
+      io.step = [&](std::int32_t, std::uint32_t drafts, DecodeCycle* c, std::string*) {
+        std::this_thread::sleep_for(std::chrono::microseconds(300));
+        ++run->work;
+        c->drafted = drafts;
+        c->accepted = drafts ? static_cast<std::uint32_t>(rng() % (drafts + 1)) : 0;
+        for (std::uint32_t i = 0; i <= c->accepted; ++i) c->tokens.push_back(next++);
+        return true;
+      };
+      io.ran = [](std::int32_t) {};
+      io.gone = gone;
+      io.is_stop = [&](text::TokenId t) { return t > run->words; };
+      io.emit = [&](text::TokenId t) {
+        const bool more = on_text(piece(t));
+        if (run->hold_at == kChunks + t + 1) hold();
+        return more;
+      };
+      const DecodeOutcome out = RunDecode(0, static_cast<std::uint32_t>(p.max_tokens), &chooser, io, &r.spec);
+      r.completion_tokens = out.completion;
+      r.length_limited = out.length_limited;
+      return end(out.cancelled);
+    }
     for (int w = 0; w <= run->words; ++w) {
       if (r.completion_tokens == p.max_tokens) {
         r.length_limited = true;
@@ -611,10 +657,7 @@ class SteppedGenerator : public TextGenerator {
       }
       if (!unit(kChunks + w)) return end(true);
       ++r.completion_tokens;
-      const std::string piece = w == 0     ? std::string("r\n</think>\n\n")
-                                : run->big ? std::string(run->big, static_cast<char>('a' + w % 26))
-                                           : "w" + std::to_string(w) + " ";
-      if (!on_text(piece)) break;
+      if (!on_text(piece(w))) break;
     }
     return end(false);
   }
@@ -769,6 +812,8 @@ bool Await(const std::function<bool()>& f, int ms = 5000) {
 TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
   hegel::test([](hegel::TestCase& tc) {
     ServingRig rig;
+    rig.gen.spec = tc.draw(gs::booleans());  // decode in speculative cycles (--mtp-model)
+    rig.gen.spec_seed = tc.draw(gs::integers<std::uint64_t>());
     const int port = rig.server.port();
     std::vector<Finished> done;
     std::map<std::string, int> attempts;
@@ -873,7 +918,7 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
         {
           Conn c(port, f.body);
           ASSERT_TRUE(Await([&] { return f.run->held.load(); }));
-          f.work_at_leave = at;
+          f.work_at_leave = f.run->work_at_hold.load();  // `at` stepping; the cycles done so far speculating
         }
         finish(std::move(f));
       } else if (rule == "stall") {

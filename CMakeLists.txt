@@ -48,6 +48,7 @@ target_link_libraries(halo_text PUBLIC halo_core)
 
 # --- server: OpenAI request and response formats -----------------------------
 add_library(halo_server STATIC
+  src/server/decode_loop.cpp
   src/server/openai_request.cpp
   src/server/openai_response.cpp
   src/server/http.cpp
@@ -225,7 +226,8 @@ if(HALO_BUILD_TESTS)
     tests/server/openai_service_test.cpp
     tests/server/systemone_service_test.cpp
     tests/server/metrics_test.cpp
-    tests/server/kv_choice_test.cpp)
+    tests/server/kv_choice_test.cpp
+    tests/server/decode_loop_test.cpp)
   target_link_libraries(server_tests PRIVATE halo_server)
   halo_test(decide_tests
     tests/decide/systemone_test.cpp

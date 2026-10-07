@@ -57,6 +57,7 @@ class TextGenerator {
     std::uint64_t cached_tokens = 0;
     std::uint64_t completion_tokens = 0;
     std::string error;  // non-empty: generation failed
+    SpecDecodeStats spec;  // MTP speculative decoding (zero when off)
   };
   virtual ~TextGenerator() = default;
   /// Generates, calling `on_text` with each new piece of text (whole UTF-8
