@@ -1,7 +1,9 @@
 // halo_serve: the OpenAI-compatible server on Flash-Next.
 //   halo_serve --model <shard-00001.gguf> [--host 127.0.0.1] [--port 8080]
 //              [--device hip|hrx] [--max-context 32768] [--kv-f16 0|1] [--kv-f16-above 150000] [--api-key KEY]
-//              [--model-id NAME] [--decider-dir DIR [--decider-device hip|hrx|cpu]]
+//              [--model-id NAME] [--decider-dir DIR [--decider-device hip|hrx|cpu]] [--send-timeout 30]
+// --send-timeout S: a write to a client that makes no progress for S seconds fails, and the request is cancelled
+// as if the client had left (a client that stops reading cannot hold the engine for longer).
 // With halo-scope built in (HALO_SCOPE=ON): --scope-dir DIR records every
 // generation as a GENERATION observation in DIR/chdb and keeps stored
 // /v1/responses in DIR/metadata.sqlite, so they survive restarts; harnesses
@@ -29,6 +31,7 @@
 // pointer_head part, on /v1/systemone. A variant built for another base is
 // refused at startup.
 
+#include <algorithm>
 #include <csignal>
 #include <filesystem>
 #include <cstdio>
@@ -93,6 +96,7 @@ int main(int argc, char** argv) {
                     scope_wal, scope_eval_endpoint, qwen35_model, qwen35_tokenizer;
   std::vector<std::string> variant_paths;
   int port = 8080;
+  double send_timeout_s = 30;
   std::uint32_t moe_topk = 0;  // --moe-topk N: experts per token (0: the file's count; CODESIGN arm B)
   double ngram_cache_gb = 4.0;  // cache of n-gram rows read from disk, GiB (0: off)
   std::uint32_t max_context = 32768;
@@ -104,6 +108,7 @@ int main(int argc, char** argv) {
       std::printf(
           "usage: halo_serve --model <shard-00001.gguf> | --qwen35-model <gguf> --qwen35-tokenizer <gguf> [options]\n"
           "  --host 127.0.0.1 --port 8080 --device hip|hrx --max-context 32768 --api-key KEY --model-id NAME\n"
+          "  --send-timeout S      a client write with no progress for S seconds (default 30) cancels the request\n"
           "  --kv-f16 0|1          KV kind: 1 fp16-only (26.2 KB/token), 0 default kinds (75.3 KB/token).\n"
           "                        Not given: fp16-only when --max-context > --kv-f16-above, else default.\n"
           "  --kv-f16-above N      threshold for the automatic fp16-only choice (default 150000; 0: never).\n"
@@ -122,6 +127,10 @@ int main(int argc, char** argv) {
     else if (a == "--device") device = v;
     else if (a == "--host") host = v;
     else if (a == "--port") port = std::atoi(v.c_str());
+    else if (a == "--send-timeout") {
+      send_timeout_s = std::atof(v.c_str());
+      if (!(send_timeout_s > 0)) return std::fprintf(stderr, "--send-timeout must be positive seconds\n"), 2;
+    }
     else if (a == "--max-context") max_context = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--ngram-cache-gb") ngram_cache_gb = std::atof(v.c_str());
     else if (a == "--kv-f16") {  // fp16-only KV (docs/SESSIONS.md); not given: by --kv-f16-above
@@ -274,7 +283,10 @@ int main(int argc, char** argv) {
   }
   if (q35_generator) so.variants = [q35_generator] { return q35_generator->Variants(); };
   server::OpenAiService service(*generator, so);
-  server::HttpServer http({.host = host, .port = port, .api_key = api_key});
+  server::HttpServer http({.host = host,
+                           .port = port,
+                           .send_timeout_ms = static_cast<int>(std::min(send_timeout_s * 1000, 3.6e6)),
+                           .api_key = api_key});
   service.Register(http);
   metrics.Register(http);
 #if HALO_WITH_SCOPE

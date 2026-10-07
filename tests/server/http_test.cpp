@@ -4,7 +4,9 @@
 //     never crash it;
 //   - server over loopback: keep-alive, chunked SSE streams, routing errors,
 //     API keys, concurrent clients, a client leaving mid-stream (the writer
-//     reports it), the connection limit, and Stop() with idle connections.
+//     reports it), a client that stops reading (cut off after the send
+//     timeout, so others sharing its lock proceed), the connection limit,
+//     and Stop() with idle connections.
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -14,6 +16,7 @@
 #include <hegel/gtest.h>
 
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -240,11 +243,30 @@ struct TestServer {
         (void)w("data: [DONE]\n\n");
       });
     });
+    // One "generator" shared by every request (the engine's lock): /flood streams 64 KB frames while holding it,
+    // /locked answers once it gets it.
+    server.Route("GET", "/flood", [this](const HttpRequest&) {
+      return HttpResponse::EventStream([this](const BodyWriter& w) {
+        std::lock_guard<std::mutex> lk(engine);
+        const std::string frame = "data: " + std::string(64 * 1024, 'x') + "\n\n";
+        for (int i = 0; i < 100000; ++i)
+          if (!w(frame)) {
+            flood_stopped = true;
+            return;
+          }
+      });
+    });
+    server.Route("GET", "/locked", [this](const HttpRequest&) {
+      std::lock_guard<std::mutex> lk(engine);
+      return HttpResponse::Json(200, R"({"ok": true})");
+    });
     std::string err;
     if (!server.Start(&err)) throw std::runtime_error(err);
   }
   HttpServer server;
   std::atomic<bool> stream_stopped{false};
+  std::mutex engine;
+  std::atomic<bool> flood_stopped{false};
 };
 
 }  // namespace
@@ -329,4 +351,42 @@ TEST(Http, ConnectionLimitAndStopWithIdleConnections) {
   EXPECT_EQ(t.server.active_connections(), 0u);
   ::close(a);
   ::close(b);
+}
+
+// A client that stays connected but stops reading must not hold the server (audit F4): the stalled stream's writer
+// fails once a send makes no progress for send_timeout_ms (the client-gone path), so a second client waiting on the
+// same lock is answered within about that bound.
+TEST(Http, AStalledReaderIsCutOffAfterTheSendTimeout) {
+  TestServer t({.send_timeout_ms = 300});
+  const int port = t.server.port();
+  const int stalled = ::socket(AF_INET, SOCK_STREAM, 0);
+  const int small = 4096;
+  ::setsockopt(stalled, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_port = htons(static_cast<std::uint16_t>(port));
+  ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+  ASSERT_EQ(::connect(stalled, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+  const std::string req = "GET /flood HTTP/1.1\r\n\r\n";
+  ASSERT_EQ(::send(stalled, req.data(), req.size(), 0), static_cast<ssize_t>(req.size()));
+  char b[256];
+  ASSERT_GT(::recv(stalled, b, sizeof b, 0), 0);  // the head arrived; now it never reads again
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  const auto start = std::chrono::steady_clock::now();
+  const int fd = Connect(port);
+  const timeval tv{5, 0};
+  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  const std::string q = "GET /locked HTTP/1.1\r\n\r\n";
+  ASSERT_EQ(::send(fd, q.data(), q.size(), 0), static_cast<ssize_t>(q.size()));
+  std::string extra;
+  Reply r;
+  const bool answered = ReadReply(fd, extra, &r);
+  const auto waited = std::chrono::steady_clock::now() - start;
+  ::close(fd);
+  ::close(stalled);  // unblocks a server without a deadline, so the test ends either way
+  EXPECT_TRUE(answered) << "the second client got no answer within 5 s";
+  EXPECT_EQ(r.status, 200);
+  EXPECT_LT(waited, std::chrono::seconds(3));
+  for (int i = 0; i < 500 && !t.flood_stopped.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_TRUE(t.flood_stopped.load());
 }

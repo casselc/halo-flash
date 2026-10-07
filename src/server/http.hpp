@@ -5,7 +5,11 @@
 // parser (bytes in any chunking give the same requests), keep-alive, bounded
 // connections (one thread each; a few sessions, not thousands), fixed-length
 // responses and streamed ones (chunked transfer encoding, for SSE), and
-// cancellation when the client goes away.
+// cancellation when the client goes away: a handler can ask whether its
+// client is still connected (HttpRequest::connected), a streamed body's
+// writer fails once the client is gone, and a send that makes no progress
+// for send_timeout_ms fails the same way (a client that stays connected but
+// stops reading is treated as gone instead of holding its handler forever).
 //
 // Request bodies need Content-Length; chunked request bodies are refused
 // (411), as are oversized heads (431) and bodies (413).
@@ -32,6 +36,11 @@ struct HttpRequest {
   std::vector<std::pair<std::string, std::string>> headers;  // names lowercased
   std::string body;
   bool keep_alive = true;
+  /// Set by HttpServer: false once the client has closed or reset its end of
+  /// the connection, or the server is stopping. A handler polls it to abandon
+  /// work nobody will receive (a half-closed connection counts as gone).
+  /// Empty for requests that do not come from a server connection.
+  std::function<bool()> connected;
 
   /// The first header with this (lowercase) name, or null.
   [[nodiscard]] const std::string* Header(std::string_view lower_name) const;
@@ -95,6 +104,9 @@ struct HttpServerOptions {
   std::size_t max_connections = 32;
   HttpLimits limits;
   int idle_timeout_ms = 60000;  // keep-alive connection with no request
+  /// A write to a client that makes no progress for this long fails (the client is treated as gone): one client
+  /// that stops reading cannot hold its handler, nor whatever the handler holds, for longer.
+  int send_timeout_ms = 30000;
   std::string api_key;          // non-empty: require "Authorization: Bearer <key>"
 };
 

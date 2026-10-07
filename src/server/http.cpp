@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -54,16 +55,33 @@ std::string ErrorJson(std::string_view message) {
          R"(, "type": "invalid_request_error", "param": null, "code": null}})";
 }
 
-bool SendAll(int fd, std::string_view data) {
+/// Writes all of `data`, or fails: the peer is gone, or the write made no progress for `timeout_ms` (a full send
+/// buffer: the peer stopped reading). Non-blocking sends, so the wait is bounded by the deadline.
+bool SendAll(int fd, std::string_view data, int timeout_ms) {
+  using Clock = std::chrono::steady_clock;
+  const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
   while (!data.empty()) {
-    const ssize_t n = ::send(fd, data.data(), data.size(), MSG_NOSIGNAL);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      return false;
+    const ssize_t n = ::send(fd, data.data(), data.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
+    if (n >= 0) {
+      data.remove_prefix(static_cast<std::size_t>(n));
+      continue;
     }
-    data.remove_prefix(static_cast<std::size_t>(n));
+    if (errno == EINTR) continue;
+    if (errno != EAGAIN && errno != EWOULDBLOCK) return false;
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+    if (left <= 0) return false;
+    pollfd p{fd, POLLOUT, 0};
+    if (::poll(&p, 1, static_cast<int>(left)) < 0 && errno != EINTR) return false;
   }
   return true;
+}
+
+/// Whether the peer still has its end of the connection open (no FIN, reset or error seen yet).
+bool PeerOpen(int fd) {
+  pollfd p{fd, POLLRDHUP, 0};
+  const int r = ::poll(&p, 1, 0);
+  if (r < 0) return errno == EINTR;
+  return (p.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) == 0;
 }
 
 }  // namespace
@@ -266,7 +284,9 @@ void HttpServer::AcceptLoop() {
     if (fd < 0) continue;
     reap(false);
     if (active_.load() >= opt_.max_connections) {
-      (void)SendAll(fd, SerializeResponse(HttpResponse::Json(503, ErrorJson("too many connections")), false));
+      // On the accept thread: a short deadline, so a client that does not read cannot hold up accepting.
+      (void)SendAll(fd, SerializeResponse(HttpResponse::Json(503, ErrorJson("too many connections")), false),
+                    std::min(opt_.send_timeout_ms, 1000));
       ::close(fd);
       continue;
     }
@@ -343,28 +363,32 @@ void HttpServer::Serve(int fd) {
     HttpRequest req;
     const auto st = parser.Next(&req);
     if (st == HttpParser::Status::kError) {
-      (void)SendAll(fd, SerializeResponse(HttpResponse::Json(parser.error_status(), ErrorJson(parser.error())), false));
+      (void)SendAll(fd, SerializeResponse(HttpResponse::Json(parser.error_status(), ErrorJson(parser.error())), false),
+                    opt_.send_timeout_ms);
       return;
     }
     if (st == HttpParser::Status::kRequest) {
       idle_ms = 0;
+      req.connected = [this, fd] { return !stopping_.load() && PeerOpen(fd); };
       HttpResponse resp = Dispatch(req);
       const bool keep = req.keep_alive && !stopping_.load();
       if (!resp.stream) {
-        if (!SendAll(fd, SerializeResponse(resp, keep)) || !keep) return;
+        if (!SendAll(fd, SerializeResponse(resp, keep), opt_.send_timeout_ms) || !keep) return;
         continue;
       }
-      bool alive = SendAll(fd, Head(resp, keep, true));
+      const int t = opt_.send_timeout_ms;
+      bool alive = SendAll(fd, Head(resp, keep, true), t);
       const BodyWriter writer = [&](std::string_view data) {
         if (!alive || stopping_.load()) return alive = false;
         if (data.empty()) return true;  // an empty chunk would end the body
         char size[32];
         const int n = std::snprintf(size, sizeof size, "%zx\r\n", data.size());
-        alive = SendAll(fd, std::string_view(size, static_cast<std::size_t>(n))) && SendAll(fd, data) && SendAll(fd, "\r\n");
+        alive = SendAll(fd, std::string_view(size, static_cast<std::size_t>(n)), t) && SendAll(fd, data, t) &&
+                SendAll(fd, "\r\n", t);
         return alive;
       };
       resp.stream(writer);
-      if (!alive || !SendAll(fd, "0\r\n\r\n") || !keep) return;
+      if (!alive || !SendAll(fd, "0\r\n\r\n", t) || !keep) return;
       continue;
     }
     pollfd p{fd, POLLIN, 0};
