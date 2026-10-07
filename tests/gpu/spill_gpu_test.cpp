@@ -229,7 +229,7 @@ TEST(Spill, RoundTripIsBitIdentical) {
           << ", kv16 " << E::kv_f16_only_ << ")";
     }
     std::filesystem::remove(path);
-  }, {.test_cases = 40});
+  }, {.test_cases = 40, .phases = {hegel::Phase::Explicit, hegel::Phase::Reuse, hegel::Phase::Generate}});
 }
 
 // Long context: 3000+ positions (many QSA blocks, the indexer-key window, multi-page KV), both kinds, a chunked
@@ -460,9 +460,10 @@ TEST(Spill, CrashMidWriteLeavesTheOldFileOrNone) {
 // State machine (Hegel, swarm) over logical sessions: step / prefill / suspend (spill, then drop the engine
 // session) / crash while suspending (the spill fails mid-write and the process's copy is lost) / resume (restore;
 // on failure re-prefill) / evict (drop, delete the file) / corrupt the file. The caller rule under test: after a
-// resume, the state is whatever the file's blob says (the ops it holds), never the caller's own record; a resume
-// that fails falls back to re-prefilling the caller's record of what the file was expected to hold... and in every
-// case the next step's logits equal a fresh engine replaying exactly the ops the state holds.
+// resume, the state is whatever the file's blob says (the ops it holds), never the caller's own record, and an
+// intact file always restores; a resume that fails re-prefills what the last done spill held. In every case the
+// next step's logits equal a fresh engine replaying exactly the ops the state holds. No shrink phase (as the other
+// session machines): a planted mutant fails in seconds, not after minutes of shrinking.
 TEST(Spill, SuspendResumeEvictCrashMachine) {
   Small* s = LoadSmall();
   if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
@@ -613,7 +614,7 @@ TEST(Spill, SuspendResumeEvictCrashMachine) {
           break;
       }
     }
-  }, {.test_cases = 40});
+  }, {.test_cases = 40, .phases = {hegel::Phase::Explicit, hegel::Phase::Reuse, hegel::Phase::Generate}});
   std::filesystem::remove_all(dir);
 }
 

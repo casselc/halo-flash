@@ -340,6 +340,7 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
       return [out](text::TokenId t) { return out->push_back(static_cast<std::int32_t>(t)), true; };
     };
     const std::vector<std::int32_t> gen_prompt = {7, 11, 13};
+    std::set<std::uint64_t> damaged;  // entries whose file had a bit flipped
     std::vector<std::int32_t> prompt = tokens(20, 300);
     std::size_t stable = prompt.size();
     prompt.insert(prompt.end(), gen_prompt.begin(), gen_prompt.end());
@@ -369,7 +370,10 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
         std::string why;
         for (const auto& en : c.List()) {
           if (admin == 1 && !en.spilled) EXPECT_TRUE(c.Spill(en.key, &why)) << why;
-          if (admin == 2 && en.spilled) EXPECT_TRUE(c.Restore(en.key, &why)) << why;
+          if (admin == 2 && en.spilled) {
+            const bool ok = c.Restore(en.key, &why);
+            EXPECT_TRUE(ok || damaged.contains(en.key)) << "an intact spilled entry did not restore: " << why;
+          }
         }
         if (admin == 3)
           for (const auto& f : std::filesystem::directory_iterator(dir)) {
@@ -382,6 +386,8 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
             io.seekp(at);
             io.put(static_cast<char>(ch ^ 0x20));
             ++corrupted;
+            const std::string name = f.path().filename().string();  // s<pid>-<key>.spill
+            damaged.insert(std::strtoull(name.c_str() + name.find('-') + 1, nullptr, 10));
           }
         return true;
       });
@@ -399,7 +405,7 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
     restored += k.restored;
     restore_failed += k.restore_failed;
     spilled += k.spilled;
-  }, {.test_cases = 40});
+  }, {.test_cases = 40, .phases = {hegel::Phase::Explicit, hegel::Phase::Reuse, hegel::Phase::Generate}});
   std::filesystem::remove_all(dir);
   std::printf("spill cache: %zu spilled, %zu restored, %zu restores failed (%zu bit flips), %zu prompt tokens reused\n",
               spilled, restored, restore_failed, corrupted, reused);

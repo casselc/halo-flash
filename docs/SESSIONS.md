@@ -495,6 +495,10 @@ re-prefill from empty, which equals a cold prefill (`Spill.LongContextRoundTripA
   with a drop. A spill briefly allocates 4 x 16 MB of pinned staging (freed before it returns).
 - Exactness: a restored entry is bit-identical to the spilled one, so exact mode's contract holds
   (`SessionCache.SpilledStatesServeByteIdenticalToColdPrefill`).
+- End to end (real model, `streams/SR4/s1.txt`): a 1,237-token chat request parked a 1,216-token checkpoint;
+  `POST /admin/sessions/1/spill` wrote a 179.7 MB file (mode 0600, directory 0700) and freed 319 MB of device memory;
+  the same request again restored it (`cached_tokens` 1216, prepare 258 ms against 1,335 ms cold) and the entry was
+  resident again; an unknown key is a 409.
 
 ### Ambiguity (done / not done / unknown) and the caller rules
 
@@ -540,9 +544,11 @@ later decision for the user** (HARNESS SR0 invariant 4 asks for encrypted datase
 - `SessionCache.SpilledStatesServeByteIdenticalToColdPrefill` (Hegel, 40): exact cache, max_retained 1-2 with
   spill-on-evict, admin spills / restores / bit flips between turns; every request's tokens equal a cache-off engine's.
 - `MtpSpec.SpillRestoreKeepsDraftHistoryOnRealModel` (real model + MTP sidecar, 300 and 2,600 tokens).
-- Mutants (tests/mutants.toml, all killed): `spill-skips-recurrent`, `spill-wrong-position`, `spill-fp16-copy-kept-valid`,
-  `spill-no-payload-checksum`, `spill-no-header-checksum`, `spill-options-unbound`, `spill-writes-in-place`,
-  `spill-mtp-rows-skipped` (suite `gpu-real`), `cache-uses-unrestored-entry`.
+- Mutants (tests/mutants.toml, 9 of 9 killed; `streams/SR4/m1a.txt`, `m1.txt`): `spill-skips-recurrent`,
+  `spill-wrong-position`, `spill-fp16-copy-kept-valid`, `spill-no-payload-checksum`, `spill-no-header-checksum`,
+  `spill-options-unbound`, `spill-writes-in-place`, `spill-mtp-rows-skipped` (new suite `gpu-real`: the real model and
+  the MTP sidecar), `cache-uses-unrestored-entry`. The Hegel tests here run without a shrink phase (as the other
+  session machines), so a mutant fails in seconds; `tools/mutants.py` builds with `HALO_BUILD_JOBS` jobs when set.
 
 ### Open
 
