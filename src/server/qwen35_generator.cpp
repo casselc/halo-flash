@@ -1,6 +1,7 @@
 #include "server/qwen35_generator.hpp"
 
 #include <algorithm>
+#include <chrono>
 
 #include "core/sampling.hpp"
 #include "server/flash_next_generator.hpp"  // CompleteUtf8Prefix
@@ -18,7 +19,7 @@ Qwen35Generator::Qwen35Generator(engine::Qwen35Gpu& engine, const text::Tokenize
 }
 
 bool Qwen35Generator::AddVariant(const model::LoadedVariant& v, std::string* error) {
-  std::lock_guard<std::mutex> lk(mu_);
+  std::lock_guard<std::timed_mutex> lk(mu_);
   if (!v.lora) {
     if (error) *error = "variant " + v.manifest.name + " has no LoRA part (heads are for /v1/systemone)";
     return false;
@@ -29,14 +30,17 @@ bool Qwen35Generator::AddVariant(const model::LoadedVariant& v, std::string* err
 }
 
 std::vector<std::string> Qwen35Generator::Variants() const {
-  std::lock_guard<std::mutex> lk(mu_);
+  std::lock_guard<std::timed_mutex> lk(mu_);
   return variants_;
 }
 
 TextGenerator::Result Qwen35Generator::Generate(const Params& params,
                                                 const std::function<bool(std::string_view)>& on_text) {
-  std::lock_guard<std::mutex> lk(mu_);
   Result r;
+  // Queued behind another generation: give up as soon as the requester is gone (as FlashNextGenerator does).
+  std::unique_lock<std::timed_mutex> lk(mu_, std::defer_lock);
+  while (!lk.try_lock_for(std::chrono::milliseconds(20)))
+    if (params.cancelled && params.cancelled()) return r.cancelled = true, r;
   std::string error;
   if (!engine_.SelectAdapter(params.variant, &error)) return r.error = error, r;
   const auto encoded = tok_.Encode(params.prompt, true);

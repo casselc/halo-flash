@@ -419,3 +419,42 @@ TEST(ScopeWritePath, ChdbEndToEndCounts) {
   ASSERT_TRUE(r.ok) << r.error;
   EXPECT_EQ(r.data, std::to_string(ok.load()) + "," + std::to_string(ok.load()) + "\n");
 }
+
+// A leased producer whose thread exits with records still in its ring (audit F6): the writer drains them before it
+// frees the producer, and the freed producer's counts stay in the accounting. Deterministic (manual writer: nothing
+// is drained until Pump), so a free that skips the final drain loses rows on every run.
+TEST(ScopeWritePath, RetiredProducersAreDrainedThenFreed) {
+  MemorySink sink;
+  Recorder rec(sink, {.ring_bytes = 1 << 16, .batch_rows = 100000, .writer_thread = false});
+  constexpr int kThreads = 64, kPer = 50;
+  for (int t = 0; t < kThreads; ++t) {
+    std::thread([&rec, t] {
+      thread_local ProducerLease lease;  // as Annotator keeps it: released when the thread exits
+      lease = rec.Lease();
+      for (int i = 0; i < kPer; ++i) {
+        Observation o;
+        o.project = "p";
+        o.span_id = std::to_string(t) + "-" + std::to_string(i);
+        ASSERT_TRUE(lease.get()->Record(o));
+      }
+    }).join();
+    if (t % 8 == 7) rec.Pump();  // some retire before a pump, the rest pile up (all still unread)
+  }
+  ASSERT_LE(rec.stats().producers, 7u) << "pumped producers of exited threads were not freed";
+  rec.Flush();
+  const auto st = rec.stats();
+  EXPECT_EQ(st.producers, 0u);
+  EXPECT_EQ(st.producers_freed, static_cast<std::uint64_t>(kThreads));
+  EXPECT_EQ(st.accepted, static_cast<std::uint64_t>(kThreads * kPer));
+  const auto ids = sink.Delivered();
+  EXPECT_EQ(ids.size(), static_cast<std::size_t>(kThreads * kPer)) << "records of retired producers were lost";
+  EXPECT_EQ(std::set<std::string>(ids.begin(), ids.end()).size(), ids.size());
+  // A lease that outlives its recorder does nothing.
+  ProducerLease late;
+  {
+    MemorySink s2;
+    Recorder r2(s2, {.writer_thread = false});
+    late = r2.Lease();
+  }
+  late.Release();
+}

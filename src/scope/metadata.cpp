@@ -119,7 +119,10 @@ std::int64_t MetadataStore::CreatePromptVersion(std::string_view name, std::stri
     Exec("ROLLBACK", &ignored);
     return 0;
   }
-  return Exec("COMMIT", err) ? version : 0;
+  if (Exec("COMMIT", err)) return version;
+  std::string ignored;
+  Exec("ROLLBACK", &ignored);  // a failed COMMIT may leave the transaction open (see PutResponse)
+  return 0;
 }
 
 bool MetadataStore::SetLabel(std::string_view name, std::string_view label, std::int64_t version, std::string* err) {
@@ -192,7 +195,12 @@ bool MetadataStore::PutResponse(std::string_view id, std::string_view conversati
     Exec("ROLLBACK", &ignored);
     return false;
   }
-  return Exec("COMMIT", err);
+  if (Exec("COMMIT", err)) return true;
+  // A failed COMMIT may leave the transaction open (SQLITE_BUSY): roll it back, so false means not written and
+  // the next write can begin (a no-op when SQLite already rolled back).
+  std::string ignored;
+  Exec("ROLLBACK", &ignored);
+  return false;
 }
 
 std::optional<std::pair<std::string, std::string>> MetadataStore::GetResponse(std::string_view id) {

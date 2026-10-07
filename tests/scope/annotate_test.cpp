@@ -377,3 +377,33 @@ TEST(ScopeAnnotate, ScoreAndTraceFactsRoundTripThroughChdb) {
   ASSERT_TRUE(m.ok) << m.error;
   EXPECT_EQ(m.data, "s-new\t['t1','t2']\tb\n");
 }
+
+// One thread per HTTP connection, each recording a little and exiting (audit F6): every exited thread's producer
+// is drained and freed, so the rings held stay bounded by the threads alive (none here, after each flush), and no
+// record is lost. Before the fix every thread left its 1 MiB pre-faulted ring behind for the life of the process.
+TEST(ScopeAnnotate, ShortLivedThreadsLeaveNoRingsBehindAndLoseNothing) {
+  Fixture f(Capture::kDigest, /*writer_thread=*/true);
+  constexpr int kWaves = 25, kThreads = 8, kScores = 20;
+  for (int w = 0; w < kWaves; ++w) {
+    std::vector<std::thread> ts;
+    for (int t = 0; t < kThreads; ++t)
+      ts.emplace_back([&] {
+        for (int i = 0; i < kScores; ++i) {
+          halo_scope_target tg{"t", nullptr, nullptr};
+          ASSERT_EQ(halo_scope_score_boolean(f.scope, &tg, "ok", i % 2, nullptr, nullptr, nullptr, nullptr),
+                    HALO_SCOPE_OK);
+        }
+      });
+    for (auto& th : ts) th.join();
+    f.Flush();
+    const auto st = f.rec->stats();
+    ASSERT_EQ(st.producers, 0u) << "wave " << w << ": exited threads still hold rings";
+    ASSERT_EQ(st.producers_freed, static_cast<std::uint64_t>((w + 1) * kThreads));
+  }
+  const auto st = f.rec->stats();
+  constexpr auto kAll = static_cast<std::uint64_t>(kWaves * kThreads * kScores);
+  EXPECT_EQ(st.accepted, kAll) << "the counts of freed producers carry over";
+  EXPECT_EQ(st.dropped, 0u);
+  std::lock_guard<std::mutex> lk(f.sink.mu);
+  EXPECT_EQ(f.sink.scores.size(), kAll) << "records of exited threads were lost";
+}

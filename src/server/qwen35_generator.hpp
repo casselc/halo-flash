@@ -37,7 +37,7 @@ class Qwen35Generator : public TextGenerator {
   const text::Tokenizer& tok_;
   const std::uint32_t max_context_;
   std::vector<text::TokenId> stops_;
-  mutable std::mutex mu_;
+  mutable std::timed_mutex mu_;  // one generation at a time (timed: a queued request polls Params::cancelled)
   std::vector<std::string> variants_;
 };
 

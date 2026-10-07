@@ -170,3 +170,31 @@ TEST(ScopeEvalRoutes, DatasetToComparisonOverHttp) {
   srv.Stop();
   model.Stop();
 }
+
+// Audit F8: the client's timeout bounds connect too, as its header says. A listener with a full accept queue drops
+// further SYNs, so a blocking connect would wait out the kernel's retries (about 2 min).
+TEST(ScopeHttpClient, ConnectIsBoundedByTheTimeout) {
+  const int l = ::socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+  ASSERT_EQ(::bind(l, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+  ASSERT_EQ(::listen(l, 0), 0);
+  socklen_t len = sizeof a;
+  ASSERT_EQ(::getsockname(l, reinterpret_cast<sockaddr*>(&a), &len), 0);
+  std::vector<int> fill;  // never accepted: the queue fills, then SYNs are dropped
+  for (int i = 0; i < 4; ++i) {
+    const int c = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    (void)::connect(c, reinterpret_cast<sockaddr*>(&a), sizeof a);
+    fill.push_back(c);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto r = halo::scope::HttpRequestJson("GET", "http://127.0.0.1:" + std::to_string(ntohs(a.sin_port)), "/x", "",
+                                              {}, 300);
+  const auto took = std::chrono::steady_clock::now() - t0;
+  EXPECT_FALSE(r.error.empty());
+  EXPECT_LT(took, std::chrono::seconds(3)) << r.error;
+  for (int c : fill) ::close(c);
+  ::close(l);
+}

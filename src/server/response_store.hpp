@@ -25,8 +25,11 @@ struct StoredResponse {
 class ResponseStore {
  public:
   virtual ~ResponseStore() = default;
-  /// Thread-safe. A put of an existing id replaces it.
-  virtual void Put(const std::string& id, const StoredResponse& r) = 0;
+  /// Thread-safe. A put of an existing id replaces it. Returns false, with
+  /// the reason in *error when given, only when nothing was written (an
+  /// implementation settles its own unknowns first, e.g. a failed commit is
+  /// rolled back): the service then answers the request with an error.
+  virtual bool Put(const std::string& id, const StoredResponse& r, std::string* error = nullptr) = 0;
   virtual std::optional<StoredResponse> Get(const std::string& id) = 0;
 };
 
@@ -34,13 +37,14 @@ class ResponseStore {
 class InMemoryResponseStore : public ResponseStore {
  public:
   explicit InMemoryResponseStore(std::size_t capacity = 1000) : capacity_(capacity) {}
-  void Put(const std::string& id, const StoredResponse& r) override {
+  bool Put(const std::string& id, const StoredResponse& r, std::string* = nullptr) override {
     std::lock_guard<std::mutex> lk(mu_);
     if (map_.insert_or_assign(id, r).second) order_.push_back(id);
     while (order_.size() > capacity_) {
       map_.erase(order_.front());
       order_.pop_front();
     }
+    return true;
   }
   std::optional<StoredResponse> Get(const std::string& id) override {
     std::lock_guard<std::mutex> lk(mu_);
