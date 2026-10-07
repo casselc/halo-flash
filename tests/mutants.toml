@@ -1281,7 +1281,7 @@ timeout = 300
 why = "a request whose client left before its first byte (queued, prefilling) or a non-streaming one runs to completion"
 
 [[mutant]]
-name = "svc-queue-ignores-departure"
+name = "gen-queue-ignores-departure"
 file = "src/server/flash_next_generator.cpp"
 find = '    if (gone()) return r.cancelled = true, r;'
 replace = '    (void)0;'

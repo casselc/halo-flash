@@ -354,7 +354,7 @@ mid-prefill, mid-decode / stall / retry / continue over loopback HTTP, with the 
 GPU (small model): `SessionCache.CancelledRequestsLeaveStateEqualToAColdReplay` (cancels at any poll; exact mode
 stays byte-identical to a cold engine, fast mode after a k-token stop equals `max_tokens` = k),
 `ACancelStopsThePrefillAtTheNextChunk`, `AQueuedRequestWhoseClientLeftNeverRuns`. Mutants (tests/mutants.toml):
-`svc-departure-as-stop`, `svc-no-liveness-check`, `svc-queue-ignores-departure`, `engine-prefill-ignores-cancel`,
+`svc-departure-as-stop`, `svc-no-liveness-check`, `gen-queue-ignores-departure`, `engine-prefill-ignores-cancel`,
 `http-send-no-deadline`, `http-stall-ignores-unsent`, `guard-ignores-released`.
 
 End to end (real model, `halo_serve --send-timeout 5`, `HALO_CACHE_TRACE=1`): a streamed Responses request cut
