@@ -1459,3 +1459,17 @@ wave's two consecutive 2 KB load rounds fall in one 4 KB page (row r's 512-byte 
 (i mod 2) x 512 inside the page; same lane arithmetic, same order; probe 195 -> 228 GB/s): a weight relayout that the
 prefill GEMMs must also read or a second copy (2560 x 6144 x 49 layers ~0.77 GB). Do not order a block's rows
 further apart (the 64 KB+ windows lose) and do not raise rows a wave to 16 (no gain).
+
+## 15. 2026-10-06 (stream M, branch `stream/sessions-mtp`): MTP speculative decode (P5)
+
+docs/MTP.md. Pinned, graphs, real model + Q8_0 MTP sidecar, 9 prompts x 256 tokens (six GSM8K / HumanEval chat,
+open-ended chat, raw code, raw doc); AR 26.8 tok/s (37.3 ms). Greedy output identical to AR in every row.
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| Trimmed 32K draft head (`SetDraftVocab`) | draft step 4.2 -> ~1.7 ms, greedy acceptance unchanged | 1.77 ms; greedy E[tokens/cycle] unchanged within noise; T 0.8 loses the mass outside the subset (doc d1 0.82 -> 0.69) | yes |
+| Batch-shaped WMMA verify path (probe only, 4 designs) | X (B=1 step) 37-41 ms | X 60-66 ms: dense GEMVs 43-48 ms vs 21.5 today | no |
+| SpecStep, fixed depth 3 (exact batched verify, snapshot rollback) | 1.16x raw greedy, ~1.50x paper chat | 1.22x total; paper chat mean ~1.38x; raw code / doc 0.97x | base |
+| gufo's adaptive policy (ported) | ~depth 3 | 1.24x total (33.18 tok/s): backs off to AR for 16 tokens after a drop; raw text 1.03-1.05x | no (comparison only) |
+| Verify cost model C[k] (k = 1..5) | 53.4 / 67 / 80.6 / 97 / 111 ms | 54.15 / 69.73 / 84.75 / 102.25 / 113.14 (+1-5%); catch-up 1.37 / accepted draft; rollback 1.46 | (calibration) |
+| Measured-cost depth chooser (`MtpDepthChooser`, argmax E[tokens]/E[cost]) | >= best fixed depth (1.25x), each prompt within 2% of its best | **1.294x** (34.70 tok/s), +3.4% over d2, +0.8% over the per-prompt oracle, each prompt within 1.8%; raw text 1.12x | yes (`--spec-depth -2`) |

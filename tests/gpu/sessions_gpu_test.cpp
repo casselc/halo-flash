@@ -617,3 +617,94 @@ TEST(Sessions, ResetKeepsExclusivePagesExactly) {
     }
   }, {.test_cases = 30, .phases = {hegel::Phase::Explicit, hegel::Phase::Reuse, hegel::Phase::Generate}});
 }
+
+// P5 speculative decoding (docs/MTP.md): a greedy SpecStep cycle verifies [token, d1 .. dk] as k + 1 batched rows,
+// keeps the longest prefix the device greedy sample agrees with, and rolls the recurrent state back from per-row
+// snapshots. Oracle: the tokens it emits are exactly greedy StepSample's, and afterwards the session's logits are
+// bitwise equal to stepping the same tokens one at a time. Drafts come from the oracle's own greedy continuation
+// (accepted) or are random (rejected), at random depths, so every acceptance count 0..k and every rollback row
+// is exercised. The small fixture has no MTP sidecar: SpecStepDrafts takes the drafts from the caller; the draft
+// block itself is covered on the real model (MtpSpec.GreedyEqualsAr in flash_next_gpu_test.cpp).
+// 4 KB pages: the indexer-key window (stream C) releases pages below the live row every few positions; a
+// rejected row must never need one of them (release is below IndexLiveRow(p) and a cycle commits >= p + 1).
+TEST(Sessions, SpecStepDraftsEqualsGreedyStepping) {
+  Small* s = LoadSmall();
+  if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  const char* saved_pb = std::getenv("HALO_PAGE_BYTES");
+  const std::string saved = saved_pb ? saved_pb : "";
+  setenv("HALO_PAGE_BYTES", "4096", 1);
+  auto devices = Devices();
+  if (saved_pb) setenv("HALO_PAGE_BYTES", saved.c_str(), 1);
+  else unsetenv("HALO_PAGE_BYTES");
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  const std::size_t V = s->weights->config.vocab_size;
+  constexpr std::uint32_t kMaxContext = 256;
+  struct Flags {
+    bool kv16 = engine::FlashNextGpu::kv_f16_only_, window = engine::FlashNextGpu::kv_index_window_;
+    ~Flags() {
+      engine::FlashNextGpu::kv_f16_only_ = kv16;
+      engine::FlashNextGpu::kv_index_window_ = window;
+    }
+  } flags_guard;
+  static const sampling::SamplingConfig greedy;
+  hegel::test([&](hegel::TestCase& tc) {
+    auto& dev = *devices[0];
+    std::string error;
+    engine::FlashNextGpu::kv_f16_only_ = tc.draw(gs::booleans());
+    engine::FlashNextGpu::kv_index_window_ = tc.draw(gs::booleans());
+    auto gpu = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+    ASSERT_TRUE(gpu) << error;
+    auto oracle = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+    ASSERT_TRUE(oracle) << error;
+    ASSERT_TRUE(gpu->BatchSupported()) << gpu->BatchUnsupported();
+    gpu->SetUseGraphs(tc.draw(gs::booleans()));
+    const auto token = [&] {
+      return tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = static_cast<std::int32_t>(V - 1)}));
+    };
+    std::vector<std::int32_t> prompt(tc.draw(gs::integers<std::uint32_t>({.min_value = 2, .max_value = 150})));
+    for (auto& t : prompt) t = token();
+    const auto head = std::span<const std::int32_t>(prompt).first(prompt.size() - 1);
+    // The oracle's greedy continuation: y[i] follows y[i - 1] (y[-1] = the prompt's last token).
+    const std::uint32_t n = tc.draw(gs::integers<std::uint32_t>({.min_value = 8, .max_value = 48}));
+    std::vector<std::int32_t> y;
+    ASSERT_TRUE(oracle->Prefill(head, {}, &error)) << error;
+    for (std::int32_t t = prompt.back(); y.size() < n + engine::FlashNextGpu::kMaxDrafts + 1;) {
+      engine::FlashNextGpu::SampleResult r;
+      ASSERT_TRUE(oracle->StepSample(t, {&greedy, {}, 0}, &r, &error)) << error;
+      y.push_back(t = r.token);
+    }
+    // Speculative cycles until n tokens are out.
+    ASSERT_TRUE(gpu->Prefill(head, {}, &error)) << error;
+    std::vector<std::int32_t> out;
+    std::int32_t t = prompt.back();
+    const std::uint32_t kmax = std::min(engine::FlashNextGpu::kMaxDrafts, engine::FlashNextGpu::kMaxBatch - 1);
+    while (out.size() < n) {
+      const std::uint32_t k = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = kmax}));
+      std::vector<std::int32_t> d(k);
+      for (std::uint32_t j = 0; j < k; ++j) d[j] = tc.draw(gs::booleans()) ? y[out.size() + j] : token();
+      engine::FlashNextGpu::SpecResult r;
+      ASSERT_TRUE(gpu->SpecStepDrafts(t, d, &r, &error)) << error;
+      ASSERT_EQ(r.drafted, k);
+      ASSERT_EQ(r.tokens.size(), r.accepted + 1u);
+      std::uint32_t agree = 0;  // the accepted count follows from the drafts and the oracle's tokens
+      while (agree < k && d[agree] == y[out.size() + agree]) ++agree;
+      ASSERT_EQ(r.accepted, agree) << "at output " << out.size();
+      for (const auto x : r.tokens) {
+        ASSERT_EQ(x, y[out.size()]) << "output " << out.size() << " differs from greedy stepping";
+        out.push_back(x);
+      }
+      t = r.tokens.back();
+      ASSERT_EQ(gpu->SessionPositionOf(0), prompt.size() - 1 + out.size());
+    }
+    // The state after the cycles equals stepping: logits of the next steps, bitwise.
+    ASSERT_TRUE(oracle->Reset(&error) && oracle->Prefill(head, {}, &error)) << error;
+    ASSERT_TRUE(oracle->Step(prompt.back(), {}, &error)) << error;
+    for (std::size_t i = 0; i + 1 < out.size(); ++i) ASSERT_TRUE(oracle->Step(out[i], {}, &error)) << error;
+    std::vector<float> got(V), want(V);
+    for (int j = 0; j < 3; ++j) {
+      ASSERT_TRUE(gpu->Step(t, got, &error) && oracle->Step(t, want, &error)) << error;
+      ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0) << "step " << j << " after " << out.size() << " tokens";
+      t = token();
+    }
+  }, {.test_cases = 40});
+}

@@ -28,6 +28,8 @@
 #include "rt/file_upload.hpp"
 
 namespace halo::engine {
+struct MtpProposal;  // mtp_sampling.hpp
+
 
 class FlashNextGpu {
  public:
@@ -366,6 +368,7 @@ class FlashNextGpu {
     std::vector<std::int32_t> tokens;  ///< emitted after `token`, in order; the last one is not yet run
     std::uint32_t drafted = 0, accepted = 0;
     std::uint64_t rng = 0;  ///< greedy: the request's RNG passed through
+    std::vector<std::int32_t> drafts;  ///< the proposed drafts d1 .. dk (diagnostics, the sampling audit)
   };
   /// One speculative cycle. Like StepSample(token): runs `token` and returns what follows it, here 1 + accepted
   /// tokens. `drafts` tokens are drafted with the MTP block (trimmed head when SetDraftVocab was called) and
@@ -377,6 +380,18 @@ class FlashNextGpu {
   [[nodiscard]] bool SpecStep(std::int32_t token, std::uint32_t drafts, sampling::SamplerState* sampler,
                               SpecResult* result, std::string* error);
   static constexpr std::uint32_t kMaxDrafts = 7;
+  /// Test hook (greedy): one cycle like SpecStep with the caller's drafts instead of the draft block's; the same
+  /// verify, acceptance and rollback. Needs the batch path and the draft block not tracking this session.
+  [[nodiscard]] bool SpecStepDrafts(std::int32_t token, std::span<const std::int32_t> drafts, SpecResult* result,
+                                    std::string* error);
+  /// The draft block's per-session state (position and pending hidden) for Save / Restore around SpecStep:
+  /// Snapshot covers the trunk only.
+  struct MtpCheckpoint {
+    std::uint32_t pos = 0;
+    std::vector<float> hpend;
+  };
+  [[nodiscard]] bool MtpSave(MtpCheckpoint* cp, std::string* error);
+  [[nodiscard]] bool MtpRestore(const MtpCheckpoint& cp, std::string* error);
   /// Draft head restricted to `ids` (FR-Spec style, draft logits only): MtpStep then fills logits.size() ==
   /// ids.size() entries, entry i the logit of token ids[i] (the same rows of the LM head, same GEMV). Empty: full.
   [[nodiscard]] bool SetDraftVocab(std::span<const std::int32_t> ids, std::string* error);
@@ -690,6 +705,10 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   bool MtpPending() const noexcept { return mtp_track_ && bound_ == mtp_owner_ && position_ > 0 && mtp_pos_ + 1 == position_; }
   bool MtpAfterPrefillRows(std::span<const std::int32_t> tokens, std::string* error);
   bool AllocVerifySnaps(std::uint32_t rows, std::string* error);
+  /// SpecStep / SpecStepDrafts after drafting: verify rows_tok = [token, d1 .. dk] at position_ .. + k, accept,
+  /// commit, roll back, and (when tracking) the draft block's catch-up. `props`: sampled mode's proposals.
+  bool SpecVerify(std::span<const std::int32_t> rows_tok, std::span<const MtpProposal> props,
+                  sampling::SamplerState* sampler, SpecResult* result, std::string* error);
   rt::Buffer draft_qs_, draft_d_;
   std::uint32_t draft_rows_ = 0;
   std::vector<std::int32_t> draft_ids_;
