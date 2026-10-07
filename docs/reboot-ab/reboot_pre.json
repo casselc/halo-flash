@@ -1,0 +1,817 @@
+{
+ "label": "pre",
+ "system": {
+  "date": "2026-10-06T16:14:29-07:00",
+  "cmdline": "BOOT_IMAGE=/BOOT/ubuntu_jk2x0w@/vmlinuz-7.0.0-34-generic root=ZFS=rpool/ROOT/ubuntu_jk2x0w ro quiet splash",
+  "gpu_iommu_group_type": "identity",
+  "gpu_link": "16.0 GT/s PCIe x16",
+  "iommu_groups": "36",
+  "iommu_types": {
+   "DMA": 1,
+   "DMA-FQ": 33,
+   "identity": 2
+  },
+  "nvme": [
+   "nvme nvme0: CT2000P310SSD8 speed 8.0 GT/s PCIe width 4 (max 16.0 GT/s PCIe x4) group_type DMA-FQ",
+   "nvme nvme1: WD Blue SN5000 4TB speed 8.0 GT/s PCIe width 4 (max 16.0 GT/s PCIe x4) group_type DMA-FQ"
+  ]
+ },
+ "prefill": {
+  "2048": {
+   "rounds_ms": [
+    1255.6,
+    1280.4,
+    1253.4
+   ],
+   "median_ms": 1255.6,
+   "min_ms": 1253.4,
+   "max_ms": 1280.4,
+   "tok_s": 1631.0927046830202,
+   "clock": "od2900"
+  },
+  "8192": {
+   "rounds_ms": [
+    4967.4,
+    4939.5,
+    4949.7
+   ],
+   "median_ms": 4949.7,
+   "min_ms": 4939.5,
+   "max_ms": 4967.4,
+   "tok_s": 1655.0498009980404,
+   "clock": "od2900"
+  }
+ },
+ "decode": {
+  "short": {
+   "rounds_ms": [
+    36.89,
+    36.89,
+    36.89
+   ],
+   "median_ms": 36.89,
+   "mins_ms": [
+    36.8,
+    36.81,
+    36.8
+   ],
+   "eager_kernel_sum_ms": 39.81,
+   "eager_steady_ms": 39.82,
+   "top_kernels": []
+  },
+  "7k": {
+   "rounds_ms": [
+    38.93,
+    38.93,
+    38.95
+   ],
+   "median_ms": 38.93,
+   "mins_ms": [
+    38.79,
+    38.79,
+    38.75
+   ],
+   "eager_kernel_sum_ms": 41.47,
+   "eager_steady_ms": 41.26,
+   "top_kernels": []
+  }
+ },
+ "model_ready_s": {
+  "values": [
+   26.5,
+   26.6,
+   26.6,
+   26.6,
+   26.6,
+   26.6
+  ],
+  "median": 26.6
+ },
+ "ngram": {
+  "ngram_novel_nocache": {
+   "chunks": [
+    {
+     "tokens": 2048,
+     "host_prep": 0.1,
+     "hash": 0.1,
+     "read": 0.0,
+     "deferred": 124.7,
+     "upload": 0.1,
+     "device": 1376.9
+    },
+    {
+     "tokens": 2048,
+     "host_prep": 0.5,
+     "hash": 0.4,
+     "read": 0.0,
+     "deferred": 142.0,
+     "upload": 0.1,
+     "device": 1395.0
+    },
+    {
+     "tokens": 2048,
+     "host_prep": 0.5,
+     "hash": 0.4,
+     "read": 0.0,
+     "deferred": 142.5,
+     "upload": 0.1,
+     "device": 1396.0
+    }
+   ],
+   "read_plus_deferred_ms": [
+    124.7,
+    142.0,
+    142.5
+   ]
+  },
+  "ngram_novel_cache": {
+   "chunks": [
+    {
+     "tokens": 2048,
+     "host_prep": 0.1,
+     "hash": 0.1,
+     "read": 0.0,
+     "deferred": 125.3,
+     "upload": 0.1,
+     "device": 1376.0
+    },
+    {
+     "tokens": 2048,
+     "host_prep": 0.5,
+     "hash": 0.5,
+     "read": 0.0,
+     "deferred": 33.2,
+     "upload": 0.2,
+     "device": 1288.7
+    },
+    {
+     "tokens": 2048,
+     "host_prep": 0.5,
+     "hash": 0.5,
+     "read": 0.0,
+     "deferred": 33.5,
+     "upload": 0.1,
+     "device": 1288.6
+    }
+   ],
+   "read_plus_deferred_ms": [
+    125.3,
+    33.2,
+    33.5
+   ]
+  },
+  "nvme_dd_2GiB_odirect": "3.4 GB/s"
+ },
+ "probe_pageloc_key": [
+  {
+   "mem": "gtt",
+   "K": 1,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 40,
+   "lds": 49152,
+   "us": 50.9,
+   "gbs": 154.6,
+   "mhz": 70
+  },
+  {
+   "mem": "gtt",
+   "K": 2,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 40,
+   "lds": 49152,
+   "us": 65.7,
+   "gbs": 119.7,
+   "mhz": 54
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 40,
+   "lds": 49152,
+   "us": 46.7,
+   "gbs": 168.4,
+   "mhz": 92
+  },
+  {
+   "mem": "gtt",
+   "K": 8,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 40,
+   "lds": 49152,
+   "us": 51.4,
+   "gbs": 153.1,
+   "mhz": 84
+  },
+  {
+   "mem": "gtt",
+   "K": 16,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 40,
+   "lds": 49152,
+   "us": 50.5,
+   "gbs": 155.8,
+   "mhz": 86
+  },
+  {
+   "mem": "gtt",
+   "K": 1,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 89.9,
+   "gbs": 174.9,
+   "mhz": 73
+  },
+  {
+   "mem": "gtt",
+   "K": 2,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 115.2,
+   "gbs": 136.5,
+   "mhz": 56
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 81.0,
+   "gbs": 194.1,
+   "mhz": 91
+  },
+  {
+   "mem": "gtt",
+   "K": 8,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 80.8,
+   "gbs": 194.8,
+   "mhz": 89
+  },
+  {
+   "mem": "gtt",
+   "K": 16,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 87.2,
+   "gbs": 180.3,
+   "mhz": 80
+  },
+  {
+   "mem": "gtt",
+   "K": 1,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 400,
+   "lds": 49152,
+   "us": 397.9,
+   "gbs": 197.7,
+   "mhz": 72
+  },
+  {
+   "mem": "gtt",
+   "K": 2,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 400,
+   "lds": 49152,
+   "us": 429.1,
+   "gbs": 183.3,
+   "mhz": 55
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 400,
+   "lds": 49152,
+   "us": 340.9,
+   "gbs": 230.7,
+   "mhz": 91
+  },
+  {
+   "mem": "gtt",
+   "K": 8,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 400,
+   "lds": 49152,
+   "us": 338.0,
+   "gbs": 232.7,
+   "mhz": 95
+  },
+  {
+   "mem": "gtt",
+   "K": 16,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 400,
+   "lds": 49152,
+   "us": 353.7,
+   "gbs": 222.3,
+   "mhz": 86
+  },
+  {
+   "mem": "gtt",
+   "K": 1,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 0,
+   "us": 87.5,
+   "gbs": 179.8,
+   "mhz": 41
+  },
+  {
+   "mem": "gtt",
+   "K": 2,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 0,
+   "us": 126.3,
+   "gbs": 124.5,
+   "mhz": 30
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 0,
+   "us": 103.3,
+   "gbs": 152.2,
+   "mhz": 42
+  },
+  {
+   "mem": "gtt",
+   "K": 8,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 0,
+   "us": 118.3,
+   "gbs": 133.0,
+   "mhz": 43
+  },
+  {
+   "mem": "gtt",
+   "K": 16,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 0,
+   "us": 96.9,
+   "gbs": 162.3,
+   "mhz": 50
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "4K",
+   "rp": "4K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 69.0,
+   "gbs": 227.9,
+   "mhz": 114
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 80.7,
+   "gbs": 195.0,
+   "mhz": 86
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "64K",
+   "rp": "64K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 88.9,
+   "gbs": 176.9,
+   "mhz": 81
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "2M",
+   "rp": "2M",
+   "NB": 80,
+   "lds": 49152,
+   "us": 91.5,
+   "gbs": 171.9,
+   "mhz": 78
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "32M",
+   "rp": "32M",
+   "NB": 80,
+   "lds": 49152,
+   "us": 88.7,
+   "gbs": 177.3,
+   "mhz": 79
+  },
+  {
+   "mem": "gtt",
+   "K": 16,
+   "Wb": "4K",
+   "rp": "4K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 69.9,
+   "gbs": 224.9,
+   "mhz": 97
+  },
+  {
+   "mem": "gtt",
+   "K": 16,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 87.1,
+   "gbs": 180.5,
+   "mhz": 81
+  },
+  {
+   "mem": "gtt",
+   "K": 16,
+   "Wb": "64K",
+   "rp": "64K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 100.8,
+   "gbs": 156.1,
+   "mhz": 66
+  },
+  {
+   "mem": "gtt",
+   "K": 16,
+   "Wb": "2M",
+   "rp": "2M",
+   "NB": 80,
+   "lds": 49152,
+   "us": 101.3,
+   "gbs": 155.2,
+   "mhz": 69
+  },
+  {
+   "mem": "gtt",
+   "K": 16,
+   "Wb": "32M",
+   "rp": "32M",
+   "NB": 80,
+   "lds": 49152,
+   "us": 104.5,
+   "gbs": 150.6,
+   "mhz": 66
+  },
+  {
+   "mem": "gtt",
+   "K": 1,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 88.5,
+   "gbs": 177.8,
+   "mhz": 74
+  },
+  {
+   "mem": "gtt",
+   "K": 1,
+   "Wb": "24K",
+   "rp": "64K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 89.6,
+   "gbs": 175.5,
+   "mhz": 73
+  },
+  {
+   "mem": "gtt",
+   "K": 1,
+   "Wb": "24K",
+   "rp": "2M",
+   "NB": 80,
+   "lds": 49152,
+   "us": 94.7,
+   "gbs": 166.0,
+   "mhz": 71
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 80.7,
+   "gbs": 194.9,
+   "mhz": 88
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "24K",
+   "rp": "64K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 81.1,
+   "gbs": 193.9,
+   "mhz": 91
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "24K",
+   "rp": "2M",
+   "NB": 80,
+   "lds": 49152,
+   "us": 81.6,
+   "gbs": 192.8,
+   "mhz": 88
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "10K",
+   "rp": "10K",
+   "NB": 544,
+   "lds": 49152,
+   "us": 188.4,
+   "gbs": 236.5,
+   "mhz": 105
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 82.0,
+   "gbs": 191.8,
+   "mhz": 87
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "12K",
+   "rp": "12K",
+   "NB": 160,
+   "lds": 49152,
+   "us": 69.4,
+   "gbs": 226.5,
+   "mhz": 109
+  },
+  {
+   "mem": "gtt",
+   "K": 16,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 86.9,
+   "gbs": 181.0,
+   "mhz": 80
+  },
+  {
+   "mem": "vram",
+   "K": 1,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 90.4,
+   "gbs": 174.0,
+   "mhz": 73
+  },
+  {
+   "mem": "gtt",
+   "K": 1,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 88.9,
+   "gbs": 176.9,
+   "mhz": 74
+  },
+  {
+   "mem": "vram",
+   "K": 4,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 81.7,
+   "gbs": 192.6,
+   "mhz": 86
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 80.5,
+   "gbs": 195.5,
+   "mhz": 91
+  },
+  {
+   "mem": "vram",
+   "K": 16,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 87.2,
+   "gbs": 180.3,
+   "mhz": 81
+  },
+  {
+   "mem": "gtt",
+   "K": 16,
+   "Wb": "24K",
+   "rp": "24K",
+   "NB": 80,
+   "lds": 49152,
+   "us": 86.5,
+   "gbs": 181.8,
+   "mhz": 83
+  },
+  {
+   "mem": "vram",
+   "K": 4,
+   "Wb": "2M",
+   "rp": "2M",
+   "NB": 80,
+   "lds": 49152,
+   "us": 90.9,
+   "gbs": 173.0,
+   "mhz": 75
+  },
+  {
+   "mem": "gtt",
+   "K": 4,
+   "Wb": "2M",
+   "rp": "2M",
+   "NB": 80,
+   "lds": 49152,
+   "us": 91.0,
+   "gbs": 172.9,
+   "mhz": 77
+  }
+ ],
+ "probe_dram": [
+  {
+   "seg": 32,
+   "order": "cols-fast",
+   "read": 157.0,
+   "write": 203.5,
+   "copy": 132.4
+  },
+  {
+   "seg": 32,
+   "order": "rows-fast",
+   "read": 10.0,
+   "write": 12.9,
+   "copy": 6.3
+  },
+  {
+   "seg": 64,
+   "order": "cols-fast",
+   "read": 185.8,
+   "write": 198.8,
+   "copy": 170.6
+  },
+  {
+   "seg": 64,
+   "order": "rows-fast",
+   "read": 12.3,
+   "write": 15.3,
+   "copy": 10.6
+  },
+  {
+   "seg": 128,
+   "order": "cols-fast",
+   "read": 205.4,
+   "write": 199.8,
+   "copy": 185.9
+  },
+  {
+   "seg": 128,
+   "order": "rows-fast",
+   "read": 19.3,
+   "write": 17.4,
+   "copy": 15.7
+  },
+  {
+   "seg": 256,
+   "order": "cols-fast",
+   "read": 216.3,
+   "write": 205.5,
+   "copy": 196.5
+  },
+  {
+   "seg": 256,
+   "order": "rows-fast",
+   "read": 33.2,
+   "write": 32.1,
+   "copy": 26.3
+  },
+  {
+   "seg": 512,
+   "order": "cols-fast",
+   "read": 227.8,
+   "write": 215.5,
+   "copy": 203.1
+  },
+  {
+   "seg": 512,
+   "order": "rows-fast",
+   "read": 66.6,
+   "write": 60.2,
+   "copy": 56.3
+  },
+  {
+   "seg": 1024,
+   "order": "cols-fast",
+   "read": 235.6,
+   "write": 221.4,
+   "copy": 211.5
+  },
+  {
+   "seg": 1024,
+   "order": "rows-fast",
+   "read": 118.4,
+   "write": 101.7,
+   "copy": 102.8
+  },
+  {
+   "seg": 4096,
+   "order": "cols-fast",
+   "read": 238.7,
+   "write": 222.0,
+   "copy": 209.8
+  },
+  {
+   "seg": 4096,
+   "order": "rows-fast",
+   "read": 238.8,
+   "write": 223.1,
+   "copy": 207.3
+  },
+  {
+   "seg": 40960,
+   "order": "cols-fast",
+   "read": 240.3,
+   "write": 221.4,
+   "copy": 208.6
+  }
+ ],
+ "probe_clock": [
+  "     1 blocks x  32 threads:  2900 MHz (min 2900, max 2900), 5.20 cycles per dependent FMA per wave",
+  "    80 blocks x  32 threads:  2895 MHz (min 2894, max 2895), 5.20 cycles per dependent FMA per wave",
+  "    80 blocks x 256 threads:  2876 MHz (min 2875, max 2877), 7.81 cycles per dependent FMA per wave",
+  "   640 blocks x 256 threads:  2878 MHz (min 2873, max 2887), 16.49 cycles per dependent FMA per wave"
+ ],
+ "probe_latency": [
+  "footprint      16 KB:     39 ns per dependent load",
+  "footprint     256 KB:     62 ns per dependent load",
+  "footprint    2048 KB:     92 ns per dependent load",
+  "footprint    8192 KB:    134 ns per dependent load",
+  "footprint   24576 KB:    156 ns per dependent load",
+  "footprint   65536 KB:    245 ns per dependent load",
+  "footprint  262144 KB:    293 ns per dependent load"
+ ]
+}

@@ -1,0 +1,2 @@
+level manual; OD_SCLK: 0:       2900Mhz 1:       2900Mhz 
+level auto; OD_SCLK: 0:        600Mhz 1:       2900Mhz 

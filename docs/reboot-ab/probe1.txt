@@ -1,0 +1,132 @@
+level manual; OD_SCLK: 0:       2900Mhz 1:       2900Mhz 
+shader clock under VALU load (dependent FMA chains; MHz from in-kernel counters)
+     1 blocks x  32 threads:  2900 MHz (min 2900, max 2900), 5.20 cycles per dependent FMA per wave
+    80 blocks x  32 threads:  2898 MHz (min 2897, max 2898), 5.20 cycles per dependent FMA per wave
+    80 blocks x 256 threads:  2884 MHz (min 2883, max 2885), 7.81 cycles per dependent FMA per wave
+   640 blocks x 256 threads:  2884 MHz (min 2881, max 2889), 16.49 cycles per dependent FMA per wave
+buffer A: hipMalloc 192 MB: vram_used +0 MB, gtt_used +334 MB
+buffer B: hipMalloc 2048 MB: vram_used +0 MB, gtt_used +2048 MB
+pageloc: 8 waves a block, 2 KB in flight a wave (4 x 16 B a lane), IT 12 iterations a wave (24 KB);
+  K streams a wave-iteration over a Wb window, regions rp apart; 20 timed launches after 4 warm-up
+A. streams a wave x blocks (row-major rows packed: Wb = 24 KB = the wave's bytes; GEMV r4 = K 4 NB 80)
+  gtt   K  1 Wb   24K rp   24K NB   16 lds 49152      27.8 us   113.2 GB/s  clk  137 MHz  pages/wave-it  1  F     3 MB
+  gtt   K  2 Wb   24K rp   24K NB   16 lds 49152      23.5 us   134.0 GB/s  clk  174 MHz  pages/wave-it  2  F     3 MB
+  gtt   K  4 Wb   24K rp   24K NB   16 lds 49152      19.9 us   157.9 GB/s  clk  230 MHz  pages/wave-it  4  F     3 MB
+  gtt   K  8 Wb   24K rp   24K NB   16 lds 49152      19.4 us   162.0 GB/s  clk  238 MHz  pages/wave-it  6  F     3 MB
+  gtt   K 16 Wb   24K rp   24K NB   16 lds 49152      19.6 us   160.5 GB/s  clk  223 MHz  pages/wave-it  6  F     3 MB
+  gtt   K  1 Wb   24K rp   24K NB   40 lds 49152      48.5 us   162.3 GB/s  clk   75 MHz  pages/wave-it  1  F     7 MB
+  gtt   K  2 Wb   24K rp   24K NB   40 lds 49152      65.6 us   119.9 GB/s  clk   55 MHz  pages/wave-it  2  F     7 MB
+  gtt   K  4 Wb   24K rp   24K NB   40 lds 49152      47.1 us   167.1 GB/s  clk   90 MHz  pages/wave-it  4  F     7 MB
+  gtt   K  8 Wb   24K rp   24K NB   40 lds 49152      51.4 us   153.1 GB/s  clk   85 MHz  pages/wave-it  6  F     7 MB
+  gtt   K 16 Wb   24K rp   24K NB   40 lds 49152      51.8 us   151.8 GB/s  clk   84 MHz  pages/wave-it  6  F     7 MB
+  gtt   K  1 Wb   24K rp   24K NB   80 lds 49152      89.7 us   175.4 GB/s  clk   74 MHz  pages/wave-it  1  F    15 MB
+  gtt   K  2 Wb   24K rp   24K NB   80 lds 49152     115.0 us   136.8 GB/s  clk   55 MHz  pages/wave-it  2  F    15 MB
+  gtt   K  4 Wb   24K rp   24K NB   80 lds 49152      80.8 us   194.7 GB/s  clk   86 MHz  pages/wave-it  4  F    15 MB
+  gtt   K  8 Wb   24K rp   24K NB   80 lds 49152      83.1 us   189.4 GB/s  clk   89 MHz  pages/wave-it  6  F    15 MB
+  gtt   K 16 Wb   24K rp   24K NB   80 lds 49152      86.7 us   181.4 GB/s  clk   80 MHz  pages/wave-it  6  F    15 MB
+  gtt   K  1 Wb   24K rp   24K NB  168 lds 49152     180.6 us   182.9 GB/s  clk   75 MHz  pages/wave-it  1  F    31 MB
+  gtt   K  2 Wb   24K rp   24K NB  168 lds 49152     213.3 us   154.9 GB/s  clk   55 MHz  pages/wave-it  2  F    31 MB
+  gtt   K  4 Wb   24K rp   24K NB  168 lds 49152     153.5 us   215.2 GB/s  clk   89 MHz  pages/wave-it  4  F    31 MB
+  gtt   K  8 Wb   24K rp   24K NB  168 lds 49152     150.1 us   220.1 GB/s  clk   97 MHz  pages/wave-it  6  F    31 MB
+  gtt   K 16 Wb   24K rp   24K NB  168 lds 49152     159.7 us   206.8 GB/s  clk   86 MHz  pages/wave-it  6  F    31 MB
+  gtt   K  1 Wb   24K rp   24K NB  400 lds 49152     403.7 us   194.8 GB/s  clk   72 MHz  pages/wave-it  1  F    75 MB
+  gtt   K  2 Wb   24K rp   24K NB  400 lds 49152     432.8 us   181.7 GB/s  clk   55 MHz  pages/wave-it  2  F    75 MB
+  gtt   K  4 Wb   24K rp   24K NB  400 lds 49152     341.0 us   230.6 GB/s  clk   87 MHz  pages/wave-it  4  F    75 MB
+  gtt   K  8 Wb   24K rp   24K NB  400 lds 49152     337.0 us   233.3 GB/s  clk   98 MHz  pages/wave-it  6  F    75 MB
+  gtt   K 16 Wb   24K rp   24K NB  400 lds 49152     353.2 us   222.7 GB/s  clk   87 MHz  pages/wave-it  6  F    75 MB
+  gtt   K  1 Wb   24K rp   24K NB   16 lds     0      21.4 us   146.8 GB/s  clk  183 MHz  pages/wave-it  1  F     3 MB
+  gtt   K  2 Wb   24K rp   24K NB   16 lds     0      23.9 us   131.8 GB/s  clk  174 MHz  pages/wave-it  2  F     3 MB
+  gtt   K  4 Wb   24K rp   24K NB   16 lds     0      19.7 us   159.9 GB/s  clk  227 MHz  pages/wave-it  4  F     3 MB
+  gtt   K  8 Wb   24K rp   24K NB   16 lds     0      19.5 us   161.6 GB/s  clk  238 MHz  pages/wave-it  6  F     3 MB
+  gtt   K 16 Wb   24K rp   24K NB   16 lds     0      19.5 us   161.7 GB/s  clk  224 MHz  pages/wave-it  6  F     3 MB
+  gtt   K  1 Wb   24K rp   24K NB   40 lds     0      47.4 us   166.0 GB/s  clk   75 MHz  pages/wave-it  1  F     7 MB
+  gtt   K  2 Wb   24K rp   24K NB   40 lds     0      65.6 us   119.9 GB/s  clk   57 MHz  pages/wave-it  2  F     7 MB
+  gtt   K  4 Wb   24K rp   24K NB   40 lds     0      46.7 us   168.3 GB/s  clk   97 MHz  pages/wave-it  4  F     7 MB
+  gtt   K  8 Wb   24K rp   24K NB   40 lds     0      51.0 us   154.2 GB/s  clk   88 MHz  pages/wave-it  6  F     7 MB
+  gtt   K 16 Wb   24K rp   24K NB   40 lds     0      50.9 us   154.4 GB/s  clk   79 MHz  pages/wave-it  6  F     7 MB
+  gtt   K  1 Wb   24K rp   24K NB   80 lds     0      86.7 us   181.4 GB/s  clk   40 MHz  pages/wave-it  1  F    15 MB
+  gtt   K  2 Wb   24K rp   24K NB   80 lds     0     125.7 us   125.1 GB/s  clk   31 MHz  pages/wave-it  2  F    15 MB
+  gtt   K  4 Wb   24K rp   24K NB   80 lds     0     103.2 us   152.4 GB/s  clk   44 MHz  pages/wave-it  4  F    15 MB
+  gtt   K  8 Wb   24K rp   24K NB   80 lds     0     117.2 us   134.2 GB/s  clk   42 MHz  pages/wave-it  6  F    15 MB
+  gtt   K 16 Wb   24K rp   24K NB   80 lds     0      98.8 us   159.3 GB/s  clk   44 MHz  pages/wave-it  6  F    15 MB
+  gtt   K  1 Wb   24K rp   24K NB  168 lds     0     189.5 us   174.3 GB/s  clk  387 MHz  pages/wave-it  1  F    31 MB
+  gtt   K  2 Wb   24K rp   24K NB  168 lds     0     293.4 us   112.6 GB/s  clk  538 MHz  pages/wave-it  2  F    31 MB
+  gtt   K  4 Wb   24K rp   24K NB  168 lds     0     212.6 us   155.3 GB/s  clk  635 MHz  pages/wave-it  4  F    31 MB
+  gtt   K  8 Wb   24K rp   24K NB  168 lds     0     224.0 us   147.5 GB/s  clk  807 MHz  pages/wave-it  6  F    31 MB
+  gtt   K 16 Wb   24K rp   24K NB  168 lds     0     192.8 us   171.3 GB/s  clk  846 MHz  pages/wave-it  6  F    31 MB
+  gtt   K  1 Wb   24K rp   24K NB  400 lds     0     424.1 us   185.5 GB/s  clk  330 MHz  pages/wave-it  1  F    75 MB
+  gtt   K  2 Wb   24K rp   24K NB  400 lds     0     544.3 us   144.5 GB/s  clk  491 MHz  pages/wave-it  2  F    75 MB
+  gtt   K  4 Wb   24K rp   24K NB  400 lds     0     415.3 us   189.4 GB/s  clk  574 MHz  pages/wave-it  4  F    75 MB
+  gtt   K  8 Wb   24K rp   24K NB  400 lds     0     434.4 us   181.0 GB/s  clk  770 MHz  pages/wave-it  6  F    75 MB
+  gtt   K 16 Wb   24K rp   24K NB  400 lds     0     404.4 us   194.5 GB/s  clk  774 MHz  pages/wave-it  6  F    75 MB
+B. window (K pieces of one wave-iteration spread over Wb; rows of Wb/K bytes)
+  gtt   K  2 Wb    4K rp    4K NB   80 lds 49152      70.5 us   223.0 GB/s  clk   95 MHz  pages/wave-it  1  F    15 MB
+  gtt   K  2 Wb   24K rp   24K NB   80 lds 49152     114.8 us   137.0 GB/s  clk   55 MHz  pages/wave-it  2  F    15 MB
+  gtt   K  2 Wb   64K rp   64K NB   80 lds 49152     114.5 us   137.4 GB/s  clk   55 MHz  pages/wave-it  2  F    15 MB
+  gtt   K  2 Wb    2M rp    2M NB   80 lds 49152     116.0 us   135.6 GB/s  clk   55 MHz  pages/wave-it  2  F    16 MB
+  gtt   K  2 Wb   32M rp   32M NB   80 lds 49152     114.8 us   137.0 GB/s  clk   56 MHz  pages/wave-it  2  F    32 MB
+  gtt   K  4 Wb    4K rp    4K NB   80 lds 49152      69.1 us   227.5 GB/s  clk  112 MHz  pages/wave-it  1  F    15 MB
+  gtt   K  4 Wb   24K rp   24K NB   80 lds 49152      80.4 us   195.5 GB/s  clk   88 MHz  pages/wave-it  4  F    15 MB
+  gtt   K  4 Wb   64K rp   64K NB   80 lds 49152      88.8 us   177.1 GB/s  clk   77 MHz  pages/wave-it  4  F    15 MB
+  gtt   K  4 Wb    2M rp    2M NB   80 lds 49152      91.0 us   172.8 GB/s  clk   75 MHz  pages/wave-it  4  F    16 MB
+  gtt   K  4 Wb   32M rp   32M NB   80 lds 49152      89.1 us   176.6 GB/s  clk   77 MHz  pages/wave-it  4  F    32 MB
+  gtt   K 16 Wb    4K rp    4K NB   80 lds 49152      69.9 us   225.1 GB/s  clk   97 MHz  pages/wave-it  1  F    15 MB
+  gtt   K 16 Wb   24K rp   24K NB   80 lds 49152      87.9 us   179.0 GB/s  clk   83 MHz  pages/wave-it  6  F    15 MB
+  gtt   K 16 Wb   64K rp   64K NB   80 lds 49152      99.7 us   157.7 GB/s  clk   69 MHz  pages/wave-it 16  F    15 MB
+  gtt   K 16 Wb    2M rp    2M NB   80 lds 49152     102.1 us   154.0 GB/s  clk   68 MHz  pages/wave-it 16  F    16 MB
+  gtt   K 16 Wb   32M rp   32M NB   80 lds 49152     103.8 us   151.5 GB/s  clk   66 MHz  pages/wave-it 16  F    32 MB
+  gtt   K  2 Wb    4K rp    4K NB  400 lds 49152     329.0 us   239.0 GB/s  clk   97 MHz  pages/wave-it  1  F    75 MB
+  gtt   K  2 Wb   24K rp   24K NB  400 lds 49152     426.9 us   184.2 GB/s  clk   55 MHz  pages/wave-it  2  F    75 MB
+  gtt   K  2 Wb   64K rp   64K NB  400 lds 49152     430.9 us   182.5 GB/s  clk   55 MHz  pages/wave-it  2  F    75 MB
+  gtt   K  2 Wb    2M rp    2M NB  400 lds 49152     428.8 us   183.4 GB/s  clk   55 MHz  pages/wave-it  2  F    76 MB
+  gtt   K  2 Wb   32M rp   32M NB  400 lds 49152     439.3 us   179.0 GB/s  clk   56 MHz  pages/wave-it  2  F    96 MB
+  gtt   K  4 Wb    4K rp    4K NB  400 lds 49152     328.6 us   239.3 GB/s  clk  113 MHz  pages/wave-it  1  F    75 MB
+  gtt   K  4 Wb   24K rp   24K NB  400 lds 49152     340.8 us   230.8 GB/s  clk   87 MHz  pages/wave-it  4  F    75 MB
+  gtt   K  4 Wb   64K rp   64K NB  400 lds 49152     368.8 us   213.2 GB/s  clk   79 MHz  pages/wave-it  4  F    75 MB
+  gtt   K  4 Wb    2M rp    2M NB  400 lds 49152     376.6 us   208.8 GB/s  clk   76 MHz  pages/wave-it  4  F    76 MB
+  gtt   K  4 Wb   32M rp   32M NB  400 lds 49152     372.1 us   211.3 GB/s  clk   76 MHz  pages/wave-it  4  F    96 MB
+  gtt   K 16 Wb    4K rp    4K NB  400 lds 49152     335.0 us   234.7 GB/s  clk   99 MHz  pages/wave-it  1  F    75 MB
+  gtt   K 16 Wb   24K rp   24K NB  400 lds 49152     354.5 us   221.9 GB/s  clk   90 MHz  pages/wave-it  6  F    75 MB
+  gtt   K 16 Wb   64K rp   64K NB  400 lds 49152     411.1 us   191.3 GB/s  clk   78 MHz  pages/wave-it 16  F    75 MB
+  gtt   K 16 Wb    2M rp    2M NB  400 lds 49152     416.0 us   189.0 GB/s  clk   76 MHz  pages/wave-it 16  F    76 MB
+  gtt   K 16 Wb   32M rp   32M NB  400 lds 49152     428.3 us   183.6 GB/s  clk   70 MHz  pages/wave-it 16  F    96 MB
+C. regions padded apart (same bytes, more distinct 4 KB pages / 2 MB fragments live)
+  gtt   K  1 Wb   24K rp   24K NB   40 lds 49152      48.7 us   161.5 GB/s  clk   74 MHz  pages/wave-it  1  F     7 MB
+  gtt   K  1 Wb   24K rp   64K NB   40 lds 49152      48.8 us   161.3 GB/s  clk   75 MHz  pages/wave-it  1  F    20 MB
+  gtt   K  1 Wb   24K rp    2M NB   40 lds 49152      13.1 us   601.7 GB/s  clk  397 MHz  pages/wave-it  1  F   640 MB
+  gtt   K  4 Wb   24K rp   24K NB   40 lds 49152      47.6 us   165.2 GB/s  clk   88 MHz  pages/wave-it  4  F     7 MB
+  gtt   K  4 Wb   24K rp   64K NB   40 lds 49152      47.7 us   165.0 GB/s  clk   91 MHz  pages/wave-it  4  F    20 MB
+  gtt   K  4 Wb   24K rp    2M NB   40 lds 49152      14.4 us   547.7 GB/s  clk  372 MHz  pages/wave-it  4  F   640 MB
+  gtt   K  1 Wb   24K rp   24K NB   80 lds 49152      89.6 us   175.6 GB/s  clk   73 MHz  pages/wave-it  1  F    15 MB
+  gtt   K  1 Wb   24K rp   64K NB   80 lds 49152      91.7 us   171.6 GB/s  clk   72 MHz  pages/wave-it  1  F    40 MB
+  gtt   K  1 Wb   24K rp    2M NB   80 lds 49152      93.4 us   168.3 GB/s  clk   72 MHz  pages/wave-it  1  F  1280 MB
+  gtt   K  4 Wb   24K rp   24K NB   80 lds 49152      80.3 us   196.0 GB/s  clk   90 MHz  pages/wave-it  4  F    15 MB
+  gtt   K  4 Wb   24K rp   64K NB   80 lds 49152      81.0 us   194.1 GB/s  clk   90 MHz  pages/wave-it  4  F    40 MB
+  gtt   K  4 Wb   24K rp    2M NB   80 lds 49152      81.8 us   192.3 GB/s  clk   88 MHz  pages/wave-it  4  F  1280 MB
+E. engine-like shapes (dual qkv+z: rows 2560 B, K 4, IT 5, 544 blocks; r4 2560x6144: K 4, 80 blocks)
+  gtt   K  4 Wb   10K rp   10K NB  544 lds 49152     185.9 us   239.7 GB/s  clk  106 MHz  pages/wave-it  2  F    42 MB
+  gtt   K  4 Wb   24K rp   24K NB   80 lds 49152      80.7 us   194.8 GB/s  clk   85 MHz  pages/wave-it  4  F    15 MB
+  gtt   K  4 Wb   12K rp   12K NB  160 lds 49152      69.1 us   227.8 GB/s  clk  108 MHz  pages/wave-it  3  F    15 MB
+  gtt   K 16 Wb   24K rp   24K NB   80 lds 49152      86.5 us   181.8 GB/s  clk   82 MHz  pages/wave-it  6  F    15 MB
+D. memory type: the same patterns in a 192 MB VRAM (carve-out) buffer vs a 192 MB slice of the GTT buffer
+  vram  K  1 Wb   24K rp   24K NB   80 lds 49152      89.9 us   175.0 GB/s  clk   73 MHz  pages/wave-it  1  F    15 MB
+  gtt   K  1 Wb   24K rp   24K NB   80 lds 49152      89.0 us   176.7 GB/s  clk   74 MHz  pages/wave-it  1  F    15 MB
+  vram  K  4 Wb   24K rp   24K NB   80 lds 49152      80.8 us   194.7 GB/s  clk   89 MHz  pages/wave-it  4  F    15 MB
+  gtt   K  4 Wb   24K rp   24K NB   80 lds 49152      80.7 us   194.9 GB/s  clk   90 MHz  pages/wave-it  4  F    15 MB
+  vram  K 16 Wb   24K rp   24K NB   80 lds 49152      87.2 us   180.4 GB/s  clk   78 MHz  pages/wave-it  6  F    15 MB
+  gtt   K 16 Wb   24K rp   24K NB   80 lds 49152      86.1 us   182.6 GB/s  clk   85 MHz  pages/wave-it  6  F    15 MB
+  vram  K  1 Wb   24K rp   24K NB  400 lds 49152     387.6 us   202.9 GB/s  clk   74 MHz  pages/wave-it  1  F    75 MB
+  gtt   K  1 Wb   24K rp   24K NB  400 lds 49152     390.3 us   201.5 GB/s  clk   74 MHz  pages/wave-it  1  F    75 MB
+  vram  K  4 Wb   24K rp   24K NB  400 lds 49152     340.4 us   231.0 GB/s  clk   91 MHz  pages/wave-it  4  F    75 MB
+  gtt   K  4 Wb   24K rp   24K NB  400 lds 49152     340.5 us   231.0 GB/s  clk   91 MHz  pages/wave-it  4  F    75 MB
+  vram  K 16 Wb   24K rp   24K NB  400 lds 49152     351.9 us   223.5 GB/s  clk   90 MHz  pages/wave-it  6  F    75 MB
+  gtt   K 16 Wb   24K rp   24K NB  400 lds 49152     354.4 us   221.9 GB/s  clk   85 MHz  pages/wave-it  6  F    75 MB
+  vram  K  4 Wb    2M rp    2M NB   80 lds 49152      90.6 us   173.5 GB/s  clk   76 MHz  pages/wave-it  4  F    16 MB
+  gtt   K  4 Wb    2M rp    2M NB   80 lds 49152      91.3 us   172.3 GB/s  clk   74 MHz  pages/wave-it  4  F    16 MB
+rc 0
+shader clock under VALU load (dependent FMA chains; MHz from in-kernel counters)
+     1 blocks x  32 threads:  2896 MHz (min 2896, max 2896), 5.20 cycles per dependent FMA per wave
+    80 blocks x  32 threads:  2888 MHz (min 2888, max 2888), 5.20 cycles per dependent FMA per wave
+    80 blocks x 256 threads:  2859 MHz (min 2858, max 2860), 7.81 cycles per dependent FMA per wave
+   640 blocks x 256 threads:  2881 MHz (min 2875, max 2886), 16.50 cycles per dependent FMA per wave
+level auto; OD_SCLK: 0:        600Mhz 1:       2900Mhz 

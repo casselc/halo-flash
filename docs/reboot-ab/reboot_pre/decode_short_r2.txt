@@ -1,0 +1,103 @@
+toolchain: nix-rocm-7.2.3; HIP version: 7.2.53211-9999; hipcc /nix/store/yb81zhv981n0kxvcsr7ia4fjjd78bsjz-clr-7.2.3/bin/hipcc; runtime /nix/store/yb81zhv981n0kxvcsr7ia4fjjd78bsjz-clr-7.2.3/lib/libamdhip64.so
+model: 48 layers, hidden 2560, vocab 248320, experts 10/512, flash-next geometry yes
+gpu (hip) ready in 26.6 s
+prompt: 5 tokens
+step 0: 0.016 s
+step 1: 0.034 s
+step 4: 0.074 s
+  1   11751  margin   1.000   Paris
+  2      13  margin   1.000  .
+  3     561  margin   1.000   The
+  4    6511  margin   1.000   capital
+  5     314  margin   1.000   of
+  6    9564  margin   1.000   Germany
+  7     369  margin   1.000   is
+  8   19241  margin   1.000   Berlin
+  9      13  margin   1.000  .
+ 10     561  margin   1.000   The
+ 11    6511  margin   1.000   capital
+ 12     314  margin   1.000   of
+ 13   14898  margin   1.000   Italy
+ 14     369  margin   1.000   is
+ 15   21047  margin   1.000   Rome
+ 16      13  margin   1.000  .
+ 17     561  margin   1.000   The
+ 18    6511  margin   1.000   capital
+ 19     314  margin   1.000   of
+ 20   17163  margin   1.000   Spain
+ 21     369  margin   1.000   is
+ 22   23327  margin   1.000   Madrid
+ 23      13  margin   1.000  .
+ 24     561  margin   1.000   The
+ 25    6511  margin   1.000   capital
+ 26     314  margin   1.000   of
+ 27   32208  margin   1.000   Portugal
+ 28     369  margin   1.000   is
+ 29     271  margin   1.000  
+
+
+ 30  248068  margin   1.000  <think>
+ 31     198  margin   1.000  
+
+ 32     760  margin   1.000  The
+ 33    1156  margin   1.000   user
+ 34     369  margin   1.000   is
+ 35   14408  margin   1.000   listing
+ 36   89798  margin   1.000   capitals
+ 37     314  margin   1.000   of
+ 38    7277  margin   1.000   European
+ 39    5656  margin   1.000   countries
+ 40     321  margin   1.000   and
+ 41    9859  margin   1.000   asking
+ 42     728  margin   1.000   me
+ 43     310  margin   1.000   to
+ 44    4434  margin   1.000   complete
+ 45     279  margin   1.000   the
+ 46    5215  margin   1.000   pattern
+ 47     364  margin   1.000   for
+ 48   32208  margin   1.000   Portugal
+ 49      13  margin   1.000  .
+ 50     561  margin   1.000   The
+ 51    6511  margin   1.000   capital
+ 52     314  margin   1.000   of
+ 53   32208  margin   1.000   Portugal
+ 54     369  margin   1.000   is
+ 55   77916  margin   1.000   Lisbon
+ 56      13  margin   1.000  .
+ 57     198  margin   1.000  
+
+ 58  248069  margin   1.000  </think>
+ 59     271  margin   1.000  
+
+
+ 60      43  margin   1.000  L
+ 61     284  margin   1.000  is
+ 62    5782  margin   1.000  bon
+ 63      13  margin   1.000  .
+ 64  248044  margin   1.000  <|endoftext|>
+ 65  248045  margin   1.000  <|im_start|>
+ 66  248045  margin   1.000  <|im_start|>
+ 67  248045  margin   1.000  <|im_start|>
+ 68  248045  margin   1.000  <|im_start|>
+ 69  248045  margin   1.000  <|im_start|>
+ 70  248045  margin   1.000  <|im_start|>
+ 71  248045  margin   1.000  <|im_start|>
+ 72  248045  margin   1.000  <|im_start|>
+ 73  248045  margin   1.000  <|im_start|>
+ 74  248045  margin   1.000  <|im_start|>
+ 75  248045  margin   1.000  <|im_start|>
+ 76  248045  margin   1.000  <|im_start|>
+ 77  248045  margin   1.000  <|im_start|>
+ 78  248045  margin   1.000  <|im_start|>
+ 79  248045  margin   1.000  <|im_start|>
+ 80  248045  margin   1.000  <|im_start|>
+steady decode: median 36.89 ms/step (27.11 tok/s), min 36.81 ms, over 76 steps
+text: The capital of France is Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of Portugal is
+
+<think>
+The user is listing capitals of European countries and asking me to complete the pattern for Portugal. The capital of Portugal is Lisbon.
+</think>
+
+Lisbon.<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|>
+84 steps in 3.12 s (26.94 steps/s)
+total 30.1 s

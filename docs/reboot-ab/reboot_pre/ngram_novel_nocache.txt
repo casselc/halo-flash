@@ -1,0 +1,11 @@
+toolchain: nix-rocm-7.2.3; HIP version: 7.2.53211-9999; hipcc /nix/store/yb81zhv981n0kxvcsr7ia4fjjd78bsjz-clr-7.2.3/bin/hipcc; runtime /nix/store/yb81zhv981n0kxvcsr7ia4fjjd78bsjz-clr-7.2.3/lib/libamdhip64.so
+model: 48 layers, hidden 2560, vocab 248320, experts 10/512, flash-next geometry yes
+gpu (hip) ready in 26.6 s
+prefill chunk 2048 tokens: host prep 0.1 ms (hash 0.1, n-gram read 0.0, deferred 124.7), upload 0.1 ms, device 1376.9 ms
+prefill 2048 tokens: 1.472 s (1391.1 tok/s), argmax 632
+prefill chunk 2048 tokens: host prep 0.5 ms (hash 0.4, n-gram read 0.0, deferred 142.0), upload 0.1 ms, device 1395.0 ms
+prefill 2048 tokens: 1.396 s (1467.3 tok/s), argmax 632
+prefill chunk 2048 tokens: host prep 0.5 ms (hash 0.4, n-gram read 0.0, deferred 142.5), upload 0.1 ms, device 1396.0 ms
+prefill 2048 tokens: 1.397 s (1466.3 tok/s), argmax 632
+n-gram cache: 0.0 GiB, 0 hits, 0 misses (0.0% hits)
+prefill median: 1466.3 tok/s over 3 reps of 2048 tokens (batched 1, int8 GEMMs 1)

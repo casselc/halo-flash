@@ -1,0 +1,146 @@
+toolchain: nix-rocm-7.2.3; HIP version: 7.2.53211-9999; hipcc /nix/store/yb81zhv981n0kxvcsr7ia4fjjd78bsjz-clr-7.2.3/bin/hipcc; runtime /nix/store/yb81zhv981n0kxvcsr7ia4fjjd78bsjz-clr-7.2.3/lib/libamdhip64.so
+model: 48 layers, hidden 2560, vocab 248320, experts 10/512, flash-next geometry yes
+gpu (hip) ready in 26.6 s
+prompt: 5 tokens
+step 0: 0.015 s
+step 1: 0.034 s
+step 4: 0.073 s
+  1   11751  margin   1.634   Paris
+  2      13  margin   0.697  .
+  3     561  margin   0.028   The
+  4    6511  margin   4.554   capital
+  5     314  margin   4.633   of
+  6    9564  margin   1.073   Germany
+  7     369  margin   6.187   is
+  8   19241  margin   6.264   Berlin
+  9      13  margin   5.193  .
+ 10     561  margin   3.618   The
+ 11    6511  margin   7.929   capital
+ 12     314  margin   6.667   of
+ 13   14898  margin   1.587   Italy
+ 14     369  margin   5.705   is
+ 15   21047  margin   1.705   Rome
+ 16      13  margin   6.092  .
+ 17     561  margin   1.799   The
+ 18    6511  margin   7.205   capital
+ 19     314  margin   7.870   of
+ 20   17163  margin   2.706   Spain
+ 21     369  margin   5.629   is
+ 22   23327  margin   1.983   Madrid
+ 23      13  margin   5.384  .
+ 24     561  margin   2.219   The
+ 25    6511  margin   7.417   capital
+ 26     314  margin   7.782   of
+ 27   32208  margin   2.395   Portugal
+ 28     369  margin   5.023   is
+ 29     271  margin   0.805  
+
+
+ 30  248068  margin   2.836  <think>
+ 31     198  margin   1.398  
+
+ 32     760  margin   9.781  The
+ 33    1156  margin  12.625   user
+ 34     369  margin   6.624   is
+ 35   14408  margin   1.107   listing
+ 36   89798  margin   2.106   capitals
+ 37     314  margin  10.836   of
+ 38    7277  margin   4.671   European
+ 39    5656  margin  12.375   countries
+ 40     321  margin   1.332   and
+ 41    9859  margin   2.941   asking
+ 42     728  margin   0.209   me
+ 43     310  margin  13.306   to
+ 44    4434  margin  11.648   complete
+ 45     279  margin  13.707   the
+ 46    5215  margin   3.981   pattern
+ 47     364  margin   0.115   for
+ 48   32208  margin  10.461   Portugal
+ 49      13  margin   5.551  .
+ 50     561  margin   4.848   The
+ 51    6511  margin   8.579   capital
+ 52     314  margin  11.477   of
+ 53   32208  margin  13.013   Portugal
+ 54     369  margin  12.206   is
+ 55   77916  margin   8.852   Lisbon
+ 56      13  margin   6.265  .
+ 57     198  margin   1.035  
+
+ 58  248069  margin  13.548  </think>
+ 59     271  margin  18.243  
+
+
+ 60      43  margin   0.811  L
+ 61     284  margin  12.561  is
+ 62    5782  margin  10.230  bon
+ 63      13  margin   7.639  .
+ 64  248044  margin   1.707  <|endoftext|>
+ 65  248045  margin   6.451  <|im_start|>
+ 66  248045  margin   3.654  <|im_start|>
+ 67  248045  margin   2.011  <|im_start|>
+ 68  248045  margin   1.122  <|im_start|>
+ 69  248045  margin   1.168  <|im_start|>
+ 70  248045  margin   1.400  <|im_start|>
+ 71  248045  margin   2.705  <|im_start|>
+ 72  248045  margin   2.694  <|im_start|>
+ 73  248045  margin   2.721  <|im_start|>
+ 74  248045  margin   3.287  <|im_start|>
+ 75  248045  margin   3.423  <|im_start|>
+ 76  248045  margin   2.654  <|im_start|>
+ 77  248045  margin   2.873  <|im_start|>
+ 78  248045  margin   2.547  <|im_start|>
+ 79  248045  margin   2.988  <|im_start|>
+ 80  248045  margin   2.160  <|im_start|>
+decode kernel timing (sync-free, eager, 76 steps): span 3025.6 ms, kernels 39.81 ms/step
+  halo_gemv_q8r_dual [512x1x1]                                  7.200 ms/step  18.1%   36.0 calls/step    200.0 us/call
+  halo_gemv_q8r_r4 [80x1x1]                                     5.051 ms/step  12.7%   49.0 calls/step    103.1 us/call
+  halo_moe_gate_up_q4_k_dot_g [40x10x1]                         4.892 ms/step  12.3%   47.0 calls/step    104.1 us/call
+  halo_moe_down_q5_1_r4 [80x10x1]                               3.141 ms/step   7.9%   43.0 calls/step     73.1 us/call
+  halo_gemv_q8r_r4 [7760x1x1]                                   2.795 ms/step   7.0%    1.0 calls/step   2794.9 us/call
+  halo_hc_mix_a_cu [24x7x1]                                     2.643 ms/step   6.6%   96.0 calls/step     27.5 us/call
+  halo_hc_mix_b_u [320x1x1]                                     2.557 ms/step   6.4%   97.0 calls/step     26.4 us/call
+  halo_gemv_q8r_r4 [384x1x1]                                    1.829 ms/step   4.6%   12.0 calls/step    152.4 us/call
+  halo_router_rowblock_q8act [512x1x1]                          1.351 ms/step   3.4%   47.0 calls/step     28.7 us/call
+  halo_shexp_gate_up_u [40x1x1]                                 1.115 ms/step   2.8%   48.0 calls/step     23.2 us/call
+  halo_gdn_step_d128_norm_r [48x1x1]                            0.916 ms/step   2.3%   36.0 calls/step     25.5 us/call
+  halo_broadcast [40x1x1]                                       0.745 ms/step   1.9%    1.0 calls/step    744.8 us/call
+  halo_shexp_down_combine_u [80x1x1]                            0.738 ms/step   1.9%   48.0 calls/step     15.4 us/call
+  halo_router_topk_w [1x1x1]                                    0.620 ms/step   1.6%   48.0 calls/step     12.9 us/call
+  halo_hc_norm_scales_u [4x1x1]                                 0.518 ms/step   1.3%   97.0 calls/step      5.3 us/call
+  halo_hc_combine [40x1x1]                                      0.484 ms/step   1.2%   96.0 calls/step      5.0 us/call
+  halo_moe_down_q8r_r4 [80x10x1]                                0.441 ms/step   1.1%    5.0 calls/step     88.3 us/call
+  halo_matvec_f32_rowblock2_u [96x1x1]                          0.378 ms/step   0.9%   36.0 calls/step     10.5 us/call
+  halo_gemv_q8r_r2 [32x1x1]                                     0.301 ms/step   0.8%   24.0 calls/step     12.6 us/call
+  halo_matvec_bf16_dual [80x1x1]                                0.291 ms/step   0.7%   12.0 calls/step     24.2 us/call
+  halo_conv_l2norm [80x1x1]                                     0.285 ms/step   0.7%   36.0 calls/step      7.9 us/call
+  halo_attention_select_b [24x1x1]                              0.181 ms/step   0.5%   12.0 calls/step     15.1 us/call
+  halo_gemv_q8r_r4 [320x1x1]                                    0.132 ms/step   0.3%    1.0 calls/step    132.2 us/call
+  halo_moe_gate_up_q5_k_rows [80x10x1]                          0.129 ms/step   0.3%    1.0 calls/step    129.2 us/call
+  halo_copy_at [2x1x1]                                          0.114 ms/step   0.3%   24.0 calls/step      4.8 us/call
+  halo_copy_at [1x1x1]                                          0.109 ms/step   0.3%   24.0 calls/step      4.5 us/call
+  halo_qsa_scores_b [9x1x1]                                     0.098 ms/step   0.2%   12.0 calls/step      8.2 us/call
+  halo_rmsnorm [4x1x1]                                          0.090 ms/step   0.2%   15.0 calls/step      6.0 us/call
+  halo_pool_block [1x1x1]                                       0.070 ms/step   0.2%   12.0 calls/step      5.9 us/call
+  halo_rmsnorm [24x1x1]                                         0.066 ms/step   0.2%   12.0 calls/step      5.5 us/call
+  halo_rope_neox_p [24x1x1]                                     0.066 ms/step   0.2%   12.0 calls/step      5.5 us/call
+  halo_split_qgate [24x1x1]                                     0.064 ms/step   0.2%   12.0 calls/step      5.3 us/call
+  halo_rmsnorm [2x1x1]                                          0.058 ms/step   0.1%   12.0 calls/step      4.8 us/call
+  halo_rmsnorm [1x1x1]                                          0.057 ms/step   0.1%   12.0 calls/step      4.8 us/call
+  halo_qsa_select [1x1x1]                                       0.057 ms/step   0.1%   12.0 calls/step      4.7 us/call
+  halo_rope_neox_p [4x1x1]                                      0.052 ms/step   0.1%   12.0 calls/step      4.4 us/call
+  halo_rope_neox_p [1x1x1]                                      0.052 ms/step   0.1%   12.0 calls/step      4.3 us/call
+  halo_rope_neox_p [2x1x1]                                      0.051 ms/step   0.1%   12.0 calls/step      4.3 us/call
+  halo_matvec_f32_rowblock_u [512x1x1]                          0.029 ms/step   0.1%    1.0 calls/step     28.5 us/call
+  halo_hc_mix_a_cu [20x7x1]                                     0.027 ms/step   0.1%    1.0 calls/step     27.2 us/call
+  halo_ple_conv [40x1x1]                                        0.010 ms/step   0.0%    1.0 calls/step     10.1 us/call
+  halo_ple_gate [4x1x1]                                         0.008 ms/step   0.0%    1.0 calls/step      8.2 us/call
+steady decode: median 39.82 ms/step (25.11 tok/s), min 39.10 ms, over 76 steps
+text: The capital of France is Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of Portugal is
+
+<think>
+The user is listing capitals of European countries and asking me to complete the pattern for Portugal. The capital of Portugal is Lisbon.
+</think>
+
+Lisbon.<|endoftext|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|><|im_start|>
+84 steps in 3.33 s (25.24 steps/s)
+total 30.3 s

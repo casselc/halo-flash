@@ -30,9 +30,15 @@ a `.done` marker; rerunning skips finished phases, so an interrupted run is resu
 Single phases: `./reboot_ab.sh post decode`, etc. To redo a phase delete `reboot_post/<phase>.done` (prefill:
 `reboot_post/prefill_*.json.done` too).
 
-The first run after boot reads the model from disk (page cache empty): the `model ready` times of the first runs
-are cold-cache loads, not comparable with `pre`'s (pre had ~11 GB of page cache). Prefill / decode are unaffected
-(ab_bench and decode medians exclude load). The n-gram reads are O_DIRECT (XFS), page-cache independent.
+Model load (`gpu (hip) ready in`): pre 26.5-26.7 s in every run = 79 GiB at ~3.2 GB/s, the NVMe Gen3 x4 rate
+(`dd` O_DIRECT 3.4 GB/s): the page cache did not hold the model, so load is NVMe-bound and comparable with post
+(expect ~2x faster on Gen4 if the drive delivers it). Prefill / decode medians exclude load. The n-gram reads are
+O_DIRECT (XFS), page-cache independent.
+
+Pre results (for reference): prefill 2048 1255.6 ms (spread 27.0), 8192 4949.7 ms (spread 27.9); decode short
+36.89 ms/step, 7K 38.93 (spreads <= 0.02); n-gram cold read for a novel 2048-token prompt 125-142 ms (deferred,
+overlapped with the layers before the PLE layer; it still adds ~90-107 ms of device time: 1376-1396 ms cold vs
+1289 with the rows cached); dd 3.4 GB/s; model ready 26.6 s.
 
 ## 3. Compare
 

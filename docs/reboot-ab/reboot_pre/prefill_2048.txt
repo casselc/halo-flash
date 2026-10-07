@@ -1,0 +1,7 @@
+round 0 main50d5a35              device   1255.6 ms  (reps 1328.4, 1254.7, 1255.6)
+round 1 main50d5a35              device   1280.4 ms  (reps 1354.6, 1278.0, 1280.4)
+round 2 main50d5a35              device   1253.4 ms  (reps 1326.1, 1251.8, 1253.4)
+
+clock od2900, 3 rounds x 3 reps, 2048 tokens
+main50d5a35              median   1255.6 ms  spread 1253.4..1280.4 (27.0)   1631.1 tok/s
+rc 0
