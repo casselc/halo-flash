@@ -1,5 +1,6 @@
 #include "scope/http_client.hpp"
 
+#include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -52,6 +53,22 @@ bool WaitFor(int fd, short events, int timeout_ms) {
   return rc > 0;
 }
 
+// connect() bounded by `timeout_ms` (a blocking connect waits out the kernel's SYN retries, about 2 min): a
+// non-blocking connect, a wait for writability, then SO_ERROR. The socket is left blocking. False with errno set.
+bool Connect(int fd, const sockaddr* addr, socklen_t len, int timeout_ms) {
+  const int flags = ::fcntl(fd, F_GETFL);
+  if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return false;
+  if (::connect(fd, addr, len) != 0) {
+    if (errno != EINPROGRESS) return false;
+    if (!WaitFor(fd, POLLOUT, timeout_ms)) return errno = ETIMEDOUT, false;
+    int err = 0;
+    socklen_t n = sizeof err;
+    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &n) < 0) return false;
+    if (err != 0) return errno = err, false;
+  }
+  return ::fcntl(fd, F_SETFL, flags) == 0;
+}
+
 // Decodes a chunked body; false when incomplete or malformed.
 bool Dechunk(std::string_view in, std::string* out) {
   out->clear();
@@ -90,9 +107,11 @@ HttpResult HttpRequestJson(const std::string& method, const std::string& url, co
   for (addrinfo* a = res; a; a = a->ai_next) {
     s.fd = ::socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
     if (s.fd < 0) continue;
-    if (::connect(s.fd, a->ai_addr, a->ai_addrlen) == 0) break;
+    if (Connect(s.fd, a->ai_addr, a->ai_addrlen, timeout_ms)) break;
+    const int e = errno;
     ::close(s.fd);
     s.fd = -1;
+    errno = e;
   }
   ::freeaddrinfo(res);
   if (s.fd < 0) {
