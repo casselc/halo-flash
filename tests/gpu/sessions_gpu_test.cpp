@@ -546,5 +546,7 @@ TEST(Sessions, ForkSurvivesParentResetAndRestore) {
       ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0)
           << "fork step " << j << " after its parent (" << a.size() << " tokens) " << (restore ? "restored" : "reset");
     }
-  }, {.test_cases = 30});
+    // No shrink phase: every case builds two engines, and shrinking a failure ran past any sane timeout (the
+    // broken build timed out instead of failing). The unshrunk report already names the sizes and the mode.
+  }, {.test_cases = 30, .phases = {hegel::Phase::Explicit, hegel::Phase::Reuse, hegel::Phase::Generate}});
 }
