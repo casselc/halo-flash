@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/json.hpp"
@@ -63,6 +64,17 @@ struct GenerationRequest {
   // kChat and kResponses: template input. kCompletions: `prompt`.
   json::Value messages = json::Value::MakeArray();
   json::Value tools;  // null or an array of {"type": "function", "function": {...}}
+  /// Responses namespace tools ({"type": "namespace", "name", "tools": [functions]}, Codex) are flattened into
+  /// function tools named "<namespace>.<function>" (OpenAI's own rendering of a namespaced call); a call the
+  /// model makes to one goes back as a function_call item with "name": <function>, "namespace": <namespace>, the
+  /// form Codex routes by (codex-rs protocol ResponseItem::FunctionCall).
+  struct NamespacedTool {
+    std::string flat, ns, name;
+  };
+  std::vector<NamespacedTool> namespaced_tools;
+  /// The namespaced tool a model-emitted function name refers to: its flat name, or a bare member name that no
+  /// plain tool has and exactly one namespace defines. Null for a plain function.
+  [[nodiscard]] const NamespacedTool* FindNamespaced(std::string_view emitted) const;
   text::ChatTemplateOptions template_options;
   std::string prompt;
 

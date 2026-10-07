@@ -279,6 +279,41 @@ bool TemplateTool(Parser& p, const Value& fn, const std::string& param, Value* o
   return true;
 }
 
+/// A Responses namespace tool: each member function becomes the function tool "<namespace>.<name>", its
+/// description prefixed with the namespace's (the model sees what the namespace is for).
+bool NamespaceTool(Parser& p, const Value& t, const std::string& param, GenerationRequest& r) {
+  const Value* ns = t.find("name");
+  if (!ns || !ns->is(Kind::kString) || ns->str().empty()) return p.Fail(param + ".name", "a namespace tool needs a name");
+  const Value* members = t.find("tools");
+  if (!members || !members->is(Kind::kArray) || members->items().empty())
+    return p.Fail(param + ".tools", "a namespace tool needs a non-empty tools array");
+  std::string ns_description;
+  if (const Value* d = t.find("description"); d && !d->is(Kind::kNull)) {
+    if (!d->is(Kind::kString)) return p.Fail(param + ".description", "description must be a string");
+    ns_description = d->str();
+  }
+  for (std::size_t j = 0; j < members->items().size(); ++j) {
+    const std::string mp = param + ".tools[" + std::to_string(j) + "]";
+    const Value& m = members->items()[j];
+    const Value* type = m.is(Kind::kObject) ? m.find("type") : nullptr;
+    if (!type || !type->is(Kind::kString) || type->str() != "function")
+      return p.Fail(mp + ".type", "only function tools are supported in a namespace");
+    Value tool;
+    if (!TemplateTool(p, m, mp, &tool)) return false;
+    Value* fn = const_cast<Value*>(tool.find("function"));
+    const std::string name = fn->find("name")->str();
+    const std::string flat_name = ns->str() + "." + name;
+    fn->set("name", Value::String(flat_name));
+    if (!ns_description.empty()) {
+      const Value* d = fn->find("description");
+      fn->set("description", Value::String("[" + ns->str() + ": " + ns_description + "] " + (d ? d->str() : "")));
+    }
+    r.namespaced_tools.push_back({flat_name, ns->str(), name});
+    r.tools.push(std::move(tool));
+  }
+  return true;
+}
+
 bool ParseTools(Parser& p, bool flat, GenerationRequest& r) {
   const Value* v = p.Get("tools");
   if (!v) return true;
@@ -289,14 +324,23 @@ bool ParseTools(Parser& p, bool flat, GenerationRequest& r) {
     const std::string param = "tools[" + std::to_string(i) + "]";
     const Value& t = v->items()[i];
     const Value* type = t.is(Kind::kObject) ? t.find("type") : nullptr;
+    if (flat && type && type->is(Kind::kString) && type->str() == "namespace") {
+      if (!NamespaceTool(p, t, param, r)) return false;
+      continue;
+    }
     if (!type || !type->is(Kind::kString) || type->str() != "function")
-      return p.Fail(param + ".type", "only function tools are supported");
+      return p.Fail(param + ".type", "only function and namespace tools are supported");
     const Value* fn = flat ? &t : t.find("function");
     if (!fn || !fn->is(Kind::kObject)) return p.Fail(param + ".function", "a function tool needs a function object");
     Value tool;
     if (!TemplateTool(p, *fn, flat ? param : param + ".function", &tool)) return false;
     r.tools.push(std::move(tool));
   }
+  // Flattened names must not collide with each other or with plain functions (a call could not round-trip).
+  for (std::size_t i = 0; i < r.tools.items().size(); ++i)
+    for (std::size_t j = 0; j < i; ++j)
+      if (r.tools.items()[i].find("function")->find("name")->str() == r.tools.items()[j].find("function")->find("name")->str())
+        return p.Fail("tools", "duplicate tool name: " + r.tools.items()[i].find("function")->find("name")->str());
   return true;
 }
 
@@ -501,7 +545,9 @@ class ResponsesInput {
       any = true;
       break;
     }
-    if (!any && item.find("encrypted_content")) return p_.Fail(param, "encrypted reasoning is not supported");
+    if (const Value* enc = item.find("encrypted_content"); !any && enc && !enc->is(Kind::kNull))
+      return p_.Fail(param, "encrypted reasoning is not supported");
+    // encrypted_content: null (Codex always sends the field) is no encrypted reasoning.
     Value& a = Assistant();
     if (a.find("content") || a.find("tool_calls")) {
       // Reasoning after output starts the next turn.
@@ -521,13 +567,19 @@ class ResponsesInput {
       return p_.Fail(param + ".call_id", "a function call needs a call_id");
     Value args;
     if (!Arguments(p_, item.find("arguments"), param + ".arguments", &args)) return false;
+    // A namespaced call (Codex): rendered under the flat name its tool was given.
+    Value rendered_name = *name;
+    if (const Value* ns = item.find("namespace"); ns && !ns->is(Kind::kNull)) {
+      if (!ns->is(Kind::kString)) return p_.Fail(param + ".namespace", "namespace must be a string");
+      if (!ns->str().empty()) rendered_name = Value::String(ns->str() + "." + name->str());
+    }
     Assistant();
     Value* calls = const_cast<Value*>(open_->find("tool_calls"));
     if (!calls) {
       open_->set("tool_calls", Value::MakeArray());
       calls = const_cast<Value*>(open_->find("tool_calls"));
     }
-    calls->push(ToolCall(call_id->str(), *name, std::move(args)));
+    calls->push(ToolCall(call_id->str(), std::move(rendered_name), std::move(args)));
     return true;
   }
 
@@ -573,6 +625,23 @@ class ResponsesInput {
 };
 
 }  // namespace
+
+const GenerationRequest::NamespacedTool* GenerationRequest::FindNamespaced(std::string_view emitted) const {
+  if (namespaced_tools.empty()) return nullptr;
+  for (const auto& t : namespaced_tools)
+    if (t.flat == emitted) return &t;
+  // A bare member name: only when no plain tool has it and exactly one namespace defines it.
+  if (tools.is(Kind::kArray))
+    for (const auto& t : tools.items())
+      if (t.find("function")->find("name")->str() == emitted) return nullptr;
+  const NamespacedTool* found = nullptr;
+  for (const auto& t : namespaced_tools)
+    if (t.name == emitted) {
+      if (found) return nullptr;
+      found = &t;
+    }
+  return found;
+}
 
 std::optional<GenerationRequest> ParseChatRequest(const json::Value& body, const RequestDefaults& d,
                                                   RequestError* error) {

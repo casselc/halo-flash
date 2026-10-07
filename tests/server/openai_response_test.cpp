@@ -329,3 +329,61 @@ TEST(OpenAiResponse, ResponsesOutputRoundTripsAsInputItems) {
     }
   }, {.test_cases = 300});
 }
+
+// G6 (Codex): a call to a flattened namespace tool goes back as a function_call item carrying the member name
+// and its namespace (Codex routes by ToolName(namespace, name)), in the streamed events and the final object;
+// fed back as an input item it renders as the same flat call the model made. A bare member name that only one
+// namespace defines maps the same way; plain functions carry no namespace; Chat keeps the flat name.
+TEST(OpenAiResponse, NamespacedCallsRoundTripInCodexForm) {
+  RequestError e;
+  const auto req = ParseResponsesRequest(J(R"({"model": "flash", "input": "hi", "tools": [
+      {"type": "function", "name": "exec_command", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}},
+      {"type": "namespace", "name": "multi_agent_v1", "description": "Sub-agents.", "tools": [
+        {"type": "function", "name": "spawn_agent", "parameters": {"type": "object", "properties": {"message": {"type": "string"}}}},
+        {"type": "function", "name": "close_agent", "parameters": {"type": "object", "properties": {"target": {"type": "string"}}}}]}]})"),
+                                         RequestDefaults{}, &e);
+  ASSERT_TRUE(req) << e.param << ": " << e.message;
+  const auto call = [](const std::string& name, const std::string& param, const std::string& v) {
+    return "<tool_call>\n<function=" + name + ">\n<parameter=" + param + ">\n" + v + "\n</parameter>\n</function>\n</tool_call>";
+  };
+  const std::string gen = "plan\n</think>\n\n" + call("multi_agent_v1.spawn_agent", "message", "go") + "\n" +
+                          call("close_agent", "target", "a1") + "\n" + call("exec_command", "cmd", "ls");
+  OutputBuilder b(*req, "resp_1", 1, Counter());
+  std::vector<Value> events;
+  b.Add(text::ParseAssistantText(gen, ParserOptions(*req)), &events);
+  b.Finish(FinishReason::kStop, Usage{}, &events);
+  const Value v = b.Final();
+  std::vector<std::string> got;
+  for (const auto& item : v.find("output")->items())
+    if (item.find("type")->str() == "function_call")
+      got.push_back(item.find("name")->str() + "|" + (item.find("namespace") ? item.find("namespace")->str() : "-"));
+  EXPECT_EQ(got, (std::vector<std::string>{"spawn_agent|multi_agent_v1", "close_agent|multi_agent_v1", "exec_command|-"}));
+  // The streamed item.added / item.done carry the namespace too.
+  std::size_t streamed = 0;
+  for (const auto& ev : events)
+    if (const Value* item = ev.find("item"); item && item->find("namespace")) ++streamed;
+  EXPECT_EQ(streamed, 4u);  // two calls, added and done
+  // Round trip: the output as input items renders flat names again.
+  Value input = J(R"([{"role": "user", "content": "hi"}])");
+  for (const auto& item : v.find("output")->items()) input.push(item);
+  Value body = J(R"({"model": "flash"})");
+  body.set("input", input);
+  body.set("tools", J(R"([{"type": "namespace", "name": "multi_agent_v1", "tools": [
+      {"type": "function", "name": "spawn_agent"}, {"type": "function", "name": "close_agent"}]},
+      {"type": "function", "name": "exec_command"}])"));
+  const auto back = ParseResponsesRequest(body, RequestDefaults{}, &e);
+  ASSERT_TRUE(back) << e.param << ": " << e.message;
+  std::vector<std::string> names;
+  for (const auto& m : back->messages.items())
+    if (const Value* calls = m.find("tool_calls"))
+      for (const auto& c : calls->items()) names.push_back(c.find("function")->find("name")->str());
+  EXPECT_EQ(names, (std::vector<std::string>{"multi_agent_v1.spawn_agent", "multi_agent_v1.close_agent", "exec_command"}));
+  // Chat has no namespaces: a chat builder over the same request shape keeps what the model said.
+  GenerationRequest chat = *req;
+  chat.api = Api::kChat;
+  OutputBuilder c(chat, "chat", 1, Counter());
+  c.Add(text::ParseAssistantText(gen, ParserOptions(chat)), nullptr);
+  c.Finish(FinishReason::kStop, Usage{}, nullptr);
+  EXPECT_EQ(c.Final().find("choices")->items()[0].find("message")->find("tool_calls")->items()[0].find("function")->find("name")->str(),
+            "multi_agent_v1.spawn_agent");
+}
