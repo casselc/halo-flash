@@ -1,0 +1,554 @@
+// -*- mode: Bluespec; -*-
+// scheduler.qnt: the G3 fair scheduler of halo_serve (docs/SCHEDULER.md), as a
+// shared-state machine. One engine thread runs one unit of GPU work at a time
+// (a prefill slice, a batched decode unit or a decider evaluation); between
+// units it fences departed requests and picks the next unit. HTTP threads admit
+// or refuse requests under the same lock. The process boundary is the client's
+// connection, so the clients are modelled with every outcome of an HTTP call:
+// a lost request, a late effect (a request that arrives after its client left;
+// work that runs after it left), a lost answer, and duplicate delivery (the
+// client's retry). Durations are ticks; one tick is half a 2048-token prefill
+// slice (~0.6 s at the measured costs, SCHEDULER.md "Model").
+//
+// The caller and scheduler rules are the fields of `RULES`; the design sets them
+// all true and each mutant (schedTest.qnt) turns one off.
+module scheduler {
+  import basicSpells.* from "./spells/basicSpells"
+
+  type Rules = {
+    preempt: bool,         // units are slices and decode units, picked by fair queuing (false: today's FIFO, run to completion)
+    deciderPrio: bool,     // a decider with credit runs at the next unit boundary (false: a decider is just principal D)
+    deciderBudget: bool,   // decider priority is credit-limited (false: strict priority, unlimited)
+    fenceDeparture: bool,  // a departed request is dropped at the next unit boundary (false: it runs to the end)
+    deadPeerProbe: bool,   // a peer that vanished without FIN is found within ACK_TO (heartbeat unacked, keepalive)
+    heartbeat: bool,       // SSE comments while queued or prefilling keep the client's idle timer alive
+    parkOnCancel: bool,    // a departed prefill parks its slice-aligned progress as a retained prefix (false: dropped)
+    bindAtStart: bool,     // the reused prefix is chosen when the first slice starts (false: at admission)
+    reserveLedger: bool,   // admission against the reservation ledger (false: against the memory reading only)
+    evictSeesFreed: bool,  // the next check sees what an eviction freed (false: F3, released pages stay charged)
+    pinPlanned: bool,      // a retained prefix an admitted request plans to reuse is not evictable
+    atomic429: bool,       // a 429 and the removal from the queue are one critical section (AUDIT N4)
+    idempotency: bool,     // the idempotency key (conversation, turn): a retry of a completed turn replays the stored
+                           // answer; a retry of an in-flight one adopts it (false: every retry is a new request)
+  }
+  const RULES: Rules
+
+  // ---------------------------------------------------------------- numbers
+  pure val SLICE = 2        // ticks per prefill slice (2048 tokens, ~1.25 s)
+  pure val DECODE = 1       // ticks per decode unit (a burst of StepBatch steps for every decoding session)
+  pure val DEC_COST = 1     // ticks per decider evaluation
+  pure val MAXUNIT = 2      // the longest unit: a request waits at most this for the unit in progress
+  pure val CT = 5           // client idle timeout (no byte received for CT ticks)
+  pure val ACK_TO = 2       // a vanished peer is known gone this long after it vanished (heartbeat + keepalive)
+  pure val RA = 3           // Retry-After of a 429
+  pure val DEC_BURST = 1    // decider credit: at most this many prioritised evaluations banked
+  pure val DEC_REFILL = 8   // one credit every DEC_REFILL ticks
+  pure val CAP = 9          // KV units the sessions may hold
+  pure val PLIMIT = 1       // active (not known departed) requests per principal
+  pure val NDEC = 12        // decider requests per run
+  pure val MAXATT = 4       // attempts per conversation (turns and retries)
+  pure val MAXT = 36        // ticks per run
+  pure val MAXFAULTS = 2    // client faults per run (timeouts are not counted: durations cause them)
+  // bounds the properties check (SCHEDULER.md "Model" derives them)
+  pure val WAIT_BOUND = MAXUNIT + 3 + 3 + 2   // in service + catch-up of B and of D + two credited deciders
+  pure val DEC_BOUND = MAXUNIT + 2 * DEC_COST  // in service + one credited decider ahead
+  pure val GONE_BOUND = ACK_TO + MAXUNIT      // work started for a departed client
+
+  pure val CONVS = Set(1, 3)                    // conversation 1 is sandbox A's, 3 is sandbox B's
+  pure def principalOf(c: int): str = if (c == 1) "A" else "B"
+  pure def promptOf(turn: int): int = if (turn == 1) 3 else 5  // in slices; turn 2 extends turn 1
+
+  // ---------------------------------------------------------------- types
+  type Phase = Waiting | Lost | Queued | Running | Finished | Cancelled | Rejected | Merged
+  type Ans = NoAns | Pending | Got | AnsLost | Got429
+  type Kind = Idle | Slice | Batch | Decide
+  type Req = {
+    id: int, p: str, conv: int, turn: int, dec: bool, prompt: int, maxTok: int,
+    reused: int, done: int, decoded: int, inherited: int, need: int,
+    ph: Phase, conn: bool, fin: bool, leftAt: int, heard: int, admittedAt: int, lastServed: int,
+    started: bool, goneWork: int, ans: Ans, prio: bool, served: bool, spurious: bool,
+  }
+  type Client = { turn: int, busy: bool, attempts: int, retryAt: int, lastAns: Ans }
+  type Engine = { kind: Kind, until: int, rs: Set[int] }
+  type Srv = { held: int -> int, charged: int, vtime: str -> int, vnow: int, credit: int }
+  type Ghost = { computed: int -> int, maxPrompt: int -> int, evicted: int -> int, falseRefusals: int, faults: int, selfLimit: int,
+                 events: Set[str] }
+
+  // ---------------------------------------------------------------- state
+  var time: int
+  var reqs: int -> Req
+  var nextId: int
+  var clients: int -> Client
+  var decSent: int
+  var eng: Engine
+  var srv: Srv
+  var gh: Ghost
+
+  // ---------------------------------------------------------------- views
+  pure def isActive(r: Req): bool = r.ph == Queued or r.ph == Running
+  val allReqs: Set[Req] = reqs.keys().map(i => reqs.get(i))
+  val actives: Set[Req] = allReqs.filter(r => isActive(r))
+  // the server's knowledge of a departure: FIN at once; a vanished peer after ACK_TO (if probed)
+  def knownGone(r: Req): bool =
+    not(r.conn) and (r.fin or (RULES.deadPeerProbe and time >= r.leftAt + ACK_TO))
+  def hasWork(r: Req): bool = r.dec or r.done < r.prompt or r.decoded < r.maxTok
+  def runnable(r: Req): bool = isActive(r) and hasWork(r) and not(RULES.fenceDeparture and knownGone(r))
+  val runSet: Set[Req] = actives.filter(r => runnable(r))
+  val fencePending: bool = RULES.fenceDeparture and actives.exists(r => knownGone(r))
+  pure def minId(s: Set[Req]): int = s.fold(1000000, (a, r) => if (r.id < a) r.id else a)
+  pure def sumHeld(h: int -> int): int = CONVS.fold(0, (a, c) => a + h.get(c))
+  // pages actually mapped: retained prefixes plus each active request's own pages
+  // the page a unit in progress writes is mapped when the unit starts (EnsureKv before the chunk or step)
+  def inUnit(r: Req): int = if (eng.rs.contains(r.id) and (eng.kind == Slice or eng.kind == Batch)) 1 else 0
+  val physical: int = sumHeld(srv.held) +
+    actives.filter(r => not(r.dec)).fold(0, (a, r) => a + r.done - r.reused + r.decoded + r.inherited + inUnit(r))
+  // the reservation ledger: retained prefixes plus each active request's reservation
+  pure def ledgerUsed(h: int -> int, rs: Set[Req], charged: int): int =
+    sumHeld(h) + rs.filter(r => isActive(r) and not(r.dec)).fold(0, (a, r) => a + r.need + r.inherited) +
+    (if (RULES.evictSeesFreed) 0 else charged)
+  pure def reuseOf(h: int -> int, c: int, prompt: int): int = if (h.get(c) <= prompt) h.get(c) else 0
+  // free memory for an admission: the reservation ledger (design) or the memory reading (mutant)
+  pure def freeOf(h: int -> int, rs: Set[Req], charged: int, phys: int): int =
+    if (RULES.reserveLedger) CAP - ledgerUsed(h, rs, charged)
+    else CAP - phys - (if (RULES.evictSeesFreed) 0 else charged)
+  def lastByte(r: Req): int = if (RULES.heartbeat and isActive(r)) time else r.heard
+
+  // ---------------------------------------------------------------- init
+  action init = all {
+    time' = 0,
+    reqs' = Map(),
+    nextId' = 1,
+    clients' = CONVS.mapBy(c => { turn: 1, busy: false, attempts: 0, retryAt: 0, lastAns: NoAns }),
+    decSent' = 0,
+    eng' = { kind: Idle, until: 0, rs: Set() },
+    srv' = { held: CONVS.mapBy(c => 0), charged: 0, vtime: Set("A", "B", "D").mapBy(p => 0), vnow: 0,
+             credit: DEC_BURST },
+    gh' = { computed: CONVS.mapBy(c => 0), maxPrompt: CONVS.mapBy(c => 0), evicted: CONVS.mapBy(c => 0),
+            falseRefusals: 0, faults: 0, selfLimit: 0, events: Set() },
+  }
+
+  pure def newReq(id: int, p: str, c: int, turn: int, dec: bool, prompt: int, maxTok: int, t: int): Req = {
+    id: id, p: p, conv: c, turn: turn, dec: dec, prompt: prompt, maxTok: maxTok,
+    reused: 0, done: 0, decoded: 0, inherited: 0, need: 0,
+    ph: Waiting, conn: true, fin: true, leftAt: 0, heard: t, admittedAt: 0, lastServed: 0,
+    started: false, goneWork: 0, ans: NoAns, prio: false, served: false, spurious: false,
+  }
+  def ev(e: str): Ghost = { ...gh, events: gh.events.union(Set(e)) }
+  // a client-side fault (lost request, abort, vanished peer, lost answer): at most MAXFAULTS a run, so that runs
+  // also reach the long happy paths (both turns of both conversations) between faults
+  def fault(e: str): Ghost = { ...gh, faults: gh.faults + 1, events: gh.events.union(Set(e)) }
+
+  // ---------------------------------------------------------------- clients
+  // a sandbox sends its conversation's next turn, or retries the same turn (duplicate delivery)
+  action clientSend(c: int): bool = {
+    val cl = clients.get(c)
+    nondet mt = Set(1, 2).oneOf()
+    all {
+      not(cl.busy), cl.turn <= 2, cl.attempts < MAXATT, time >= cl.retryAt,
+      reqs' = reqs.put(nextId, newReq(nextId, principalOf(c), c, cl.turn, false, promptOf(cl.turn), mt, time)),
+      nextId' = nextId + 1,
+      clients' = clients.set(c, { ...cl, busy: true, attempts: cl.attempts + 1 }),
+      decSent' = decSent, eng' = eng, srv' = srv, time' = time,
+      gh' = if (cl.lastAns == AnsLost) ev("retryAfterLostAnswer")
+            else if (cl.lastAns == Got429) ev("retryAfter429") else gh,
+    }
+  }
+  // a decider call (/v1/systemone; non-streaming, short)
+  action deciderSend: bool = all {
+    decSent < NDEC,
+    reqs' = reqs.put(nextId, newReq(nextId, "D", 0, 0, true, 0, 0, time)),
+    nextId' = nextId + 1, decSent' = decSent + 1,
+    clients' = clients, eng' = eng, srv' = srv, time' = time, gh' = gh,
+  }
+  // lost request: it never reaches the server; the client hears nothing
+  action loseRequest(id: int): bool = {
+    val r = reqs.get(id)
+    all {
+      r.ph == Waiting, not(r.dec), gh.faults < MAXFAULTS,
+      reqs' = reqs.set(id, { ...r, ph: Lost }),
+      nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, srv' = srv, time' = time,
+      gh' = fault("lostRequest"),
+    }
+  }
+  // the client stops waiting and closes its connection (FIN)
+  action leave(id: int, fin: bool, spurious: bool): bool = {
+    val r = reqs.get(id)
+    val cl = clients.get(r.conv)
+    all {
+      reqs' = reqs.set(id, { ...r, conn: false, fin: fin, leftAt: time, spurious: r.spurious or spurious }),
+      clients' = clients.set(r.conv, { ...cl, busy: false, retryAt: time, lastAns: r.ans }),
+      nextId' = nextId, decSent' = decSent, eng' = eng, srv' = srv, time' = time,
+    }
+  }
+  def waitingOn(r: Req): bool = not(r.dec) and r.conn and (r.ans == NoAns or r.ans == AnsLost)
+  // idle timeout: no byte for CT ticks (lost request, lost answer, or a silent queue or prefill)
+  action clientTimeout(id: int): bool = {
+    val r = reqs.get(id)
+    all {
+      waitingOn(r), time - lastByte(r) >= CT,
+      leave(id, true, isActive(r)),
+      gh' = if (isActive(r)) ev("spuriousTimeout") else ev("timeout"),
+    }
+  }
+  // the user aborts (Ctrl-C), at any point
+  action clientAbort(id: int): bool = {
+    val r = reqs.get(id)
+    all { waitingOn(r), gh.faults < MAXFAULTS, leave(id, true, false), gh' = fault("abort") }
+  }
+  // the peer vanishes without FIN (laptop asleep, VM suspended, link down); it may come back and retry
+  action peerVanishes(id: int): bool = {
+    val r = reqs.get(id)
+    all { waitingOn(r), gh.faults < MAXFAULTS, leave(id, false, false), gh' = fault("vanish") }
+  }
+  // the final answer reaches the client, or is lost (lost answer)
+  action deliver(id: int): bool = {
+    val r = reqs.get(id)
+    all {
+      r.ans == Pending, r.conn,
+      reqs' = reqs.set(id, { ...r, ans: Got, heard: time }),
+      clients' = if (r.dec) clients else {
+        val cl = clients.get(r.conv)
+        clients.set(r.conv, { ...cl, busy: false, turn: cl.turn + 1, lastAns: Got })
+      },
+      nextId' = nextId, decSent' = decSent, eng' = eng, srv' = srv, time' = time,
+      gh' = if (r.turn == 2) ev("turn2Done") else gh,
+    }
+  }
+  action loseAnswer(id: int): bool = {
+    val r = reqs.get(id)
+    all {
+      r.ans == Pending, not(r.dec), gh.faults < MAXFAULTS,
+      reqs' = reqs.set(id, { ...r, ans: AnsLost }),
+      nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, srv' = srv, time' = time,
+      gh' = fault("lostAnswer"),
+    }
+  }
+
+  // ---------------------------------------------------------------- admission (HTTP thread, under the scheduler lock)
+  // A request reaches the server, possibly after its client left (late effect). The decision (queue, or 429
+  // with Retry-After) and any eviction it needs are one critical section.
+  // start-time fair queuing: a principal that becomes backlogged joins at the system virtual time `vnow` (the
+  // start tag of the last unit picked), so it banks no credit while idle. (An earlier version joined at the minimum
+  // over the other runnable principals; a principal briefly not runnable -- departed, then adopted -- was left out
+  // of that minimum and then waited for the joiner to catch up: boundedWait broke at 20000 samples.)
+  def joinVtime(p: str): str -> int =
+    if (runSet.exists(x => x.p == p)) srv.vtime
+    else srv.vtime.set(p, max(srv.vtime.get(p), srv.vnow))
+  action arrive(id: int): bool = {
+    val r = reqs.get(id)
+    all { r.ph == Waiting, if (r.dec) admitDecider(r) else admitAgent(r) }
+  }
+  action admitDecider(r: Req): bool = {
+    val prio = not(RULES.deciderBudget) or srv.credit > 0
+    all {
+      reqs' = reqs.set(r.id, { ...r, ph: Queued, admittedAt: time, lastServed: time, prio: prio }),
+      srv' = { ...srv, vtime: joinVtime("D"), credit: if (RULES.deciderBudget and prio) srv.credit - 1 else srv.credit },
+      nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, time' = time,
+      gh' = if (prio) gh else ev("deciderOutOfCredit"),
+    }
+  }
+  action refuse(r: Req, why: str, g: Ghost): bool = {
+    val cl = clients.get(r.conv)
+    all {
+      // the design takes it off the queue with the answer; the mutant answers 429 and leaves it queued
+      reqs' = reqs.set(r.id, { ...r, ph: if (RULES.atomic429) Rejected else Queued, ans: Got429, admittedAt: time,
+                               lastServed: time, need: 0 }),
+      // the 429 reaches only a client still waiting on this attempt (a late attempt's client has moved on)
+      clients' = if (r.conn) clients.set(r.conv, { ...cl, busy: false, retryAt: time + RA, lastAns: Got429 })
+                 else clients,
+      nextId' = nextId, decSent' = decSent, eng' = eng, time' = time,
+      gh' = { ...g, events: g.events.union(Set(why)) },
+    }
+  }
+  // the idempotency key is (conversation, turn): every attempt of a turn carries the same key
+  pure def sameKey(x: Req, r: Req): bool = not(x.dec) and x.id != r.id and x.conv == r.conv and x.turn == r.turn
+  action admitAgent(r: Req): bool = {
+    val prior = allReqs.filter(x => sameKey(x, r))
+    val stored = prior.filter(x => x.ph == Finished and x.served)
+    val inflight = prior.filter(x => isActive(x))
+    val orphaned = inflight.filter(x => not(x.conn))
+    if (RULES.idempotency and stored.size() > 0) all {
+      // replay: the stored answer (the Responses store holds it), no engine work
+      reqs' = reqs.set(r.id, { ...r, ph: Finished, ans: Pending, admittedAt: time }),
+      nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, srv' = srv, time' = time,
+      gh' = ev("replayed"),
+    } else if (RULES.idempotency and inflight.size() > 0 and not(r.conn)) all {
+      // a late duplicate of a key already in flight: dropped (no answer is owed: its client left)
+      reqs' = reqs.set(r.id, { ...r, ph: Merged }),
+      nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, srv' = srv, time' = time,
+      gh' = ev("lateDuplicateDropped"),
+    } else if (RULES.idempotency and orphaned.size() > 0) {
+      // adopt: the retry's connection takes over the in-flight attempt (its stream resumes); no new work
+      val x = reqs.get(minId(orphaned))
+      all {
+        reqs' = reqs.set(x.id, { ...x, conn: true, fin: true, heard: time }).set(r.id, { ...r, ph: Merged, conn: false }),
+        nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, srv' = srv, time' = time,
+        gh' = ev("adopted"),
+      }
+    } else admitNew(r)
+  }
+  action admitNew(r: Req): bool = {
+    val mine = actives.filter(x => x.p == r.p and not(x.dec) and not(knownGone(x)))
+    val reuse0 = reuseOf(srv.held, r.conv, r.prompt)
+    val need = r.prompt - reuse0 + r.maxTok
+    val rq = { ...r, ph: Queued, admittedAt: time, lastServed: time, reused: reuse0, done: reuse0, need: need }
+    // r is still Waiting, so neither the ledger nor the reading counts it yet
+    val free0 = freeOf(srv.held, allReqs, srv.charged, physical)
+    // the one other conversation is the only eviction candidate (LRU among one)
+    val other = if (r.conv == 1) 3 else 1
+    val pinned = actives.exists(x => x.conv == other)
+    val canEvict = srv.held.get(other) > 0 and not(RULES.pinPlanned and pinned)
+    // what an eviction does: the prefix is dropped; a started fork keeps its shared pages (they become its own)
+    val forks = actives.filter(x => x.conv == other and x.started and x.reused > 0 and x.inherited == 0)
+    val h2 = srv.held.set(other, 0)
+    val freed = if (forks.size() > 0) 0 else srv.held.get(other)
+    val charged2 = srv.charged + freed
+    val reqs2 = reqs.keys().mapBy(i => {
+      val x = reqs.get(i)
+      if (forks.contains(x)) { ...x, inherited: x.reused } else x
+    })
+    val all2 = reqs2.keys().map(i => reqs2.get(i))
+    val phys2 = physical - freed
+    val free2 = freeOf(h2, all2, charged2, phys2)
+    // truth: what fits if every evictable prefix went (pins and other reservations are real)
+    val trueFree = CAP - sumHeld(if (canEvict) h2 else srv.held) -
+      all2.filter(x => isActive(x) and not(x.dec) and x.id != r.id).fold(0, (a, x) => a + x.need + x.inherited)
+    val g1 = { ...gh, maxPrompt: gh.maxPrompt.set(r.conv, max(gh.maxPrompt.get(r.conv), r.prompt)) }
+    val gEvict = { ...g1, evicted: gh.evicted.set(other, gh.evicted.get(other) + srv.held.get(other)),
+                   events: gh.events.union(Set("evicted")) }
+    if (mine.size() >= PLIMIT) all {
+      // a refusal caused only by the client's own earlier attempt of this turn is self-inflicted
+      refuse(r, "limit429", { ...gh, selfLimit: gh.selfLimit + (if (r.conn and mine.forall(x => sameKey(x, r))) 1 else 0) }),
+      srv' = srv,
+    }
+    else if (need <= free0) all {
+      reqs' = reqs.set(r.id, rq),
+      srv' = { ...srv, vtime: joinVtime(r.p) },
+      nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, time' = time,
+      gh' = { ...g1, events: gh.events.union(if (r.ans == NoAns and not(r.conn)) Set("lateArrival") else Set()) },
+    }
+    else if (canEvict and need <= free2) all {
+      reqs' = reqs2.set(r.id, rq),
+      srv' = { ...srv, held: h2, charged: charged2, vtime: joinVtime(r.p) },
+      nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, time' = time,
+      gh' = gEvict,
+    }
+    // refused: evictions already made stay made (as SessionCache::Prepare's loop does)
+    else if (canEvict) all {
+      refuse(r, "mem429", { ...gEvict, falseRefusals: gh.falseRefusals + (if (need <= trueFree) 1 else 0) }),
+      srv' = { ...srv, held: h2, charged: charged2 },
+    }
+    else all {
+      refuse(r, "mem429", { ...g1, falseRefusals: gh.falseRefusals + (if (need <= trueFree) 1 else 0) }),
+      srv' = srv,
+    }
+  }
+
+  // ---------------------------------------------------------------- the engine thread
+  // fence: a departed request leaves at a unit boundary; its slice-aligned progress is parked (design)
+  action fence(id: int): bool = {
+    val r = reqs.get(id)
+    val park = RULES.parkOnCancel and not(r.dec) and r.started and r.done > srv.held.get(r.conv)
+    all {
+      eng.kind == Idle, RULES.fenceDeparture, isActive(r), knownGone(r),
+      reqs' = reqs.set(id, { ...r, ph: Cancelled }),
+      srv' = if (park) { ...srv, held: srv.held.set(r.conv, r.done) } else srv,
+      nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, time' = time,
+      gh' = if (park) ev("parkedOnCancel") else if (r.fin) ev("fencedFin") else ev("fencedVanished"),
+    }
+  }
+
+  // the reused prefix a request starts from: bound when its first unit starts (design), or the one chosen at
+  // admission if it is still retained (mutant; an evicted prefix leaves nothing to reuse)
+  def boundOf(x: Req): int =
+    if (x.started or x.dec) x.reused
+    else if (RULES.bindAtStart) reuseOf(srv.held, x.conv, x.prompt)
+    else if (srv.held.get(x.conv) >= x.reused) x.reused else 0
+  // prefill still to do once bound: the unit kind is chosen from it
+  def prefillLeft(x: Req): bool = boundOf(x) + (if (x.started) x.done - x.reused else 0) < x.prompt
+
+  // start a unit for the requests `rs`: bind (first unit), charge, note waste for departed clients
+  action startUnit(k: Kind, rs: Set[int], cost: int, charge: str -> int, g: Ghost): bool = {
+    val midPrefill = actives.exists(x => not(rs.contains(x.id)) and x.started and x.done < x.prompt and runnable(x))
+    all {
+      eng' = { kind: k, until: time + cost, rs: rs },
+      reqs' = reqs.keys().mapBy(i => {
+        val x = reqs.get(i)
+        if (not(rs.contains(i))) x
+        else {
+          val bound = boundOf(x)
+          val y = if (x.started or x.dec) x
+                  else { ...x, reused: bound, done: bound, need: min(x.need, x.prompt - bound + x.maxTok) }
+          { ...y, started: true, ph: Running, served: true, lastServed: time,
+                  goneWork: x.goneWork + (if (not(x.conn) and x.ans != Got429) cost else 0) }
+        }
+      }),
+      srv' = {
+        val ps = runSet.map(x => x.p)
+        val mv = ps.fold(1000000, (a, q) => if (srv.vtime.get(q) < a) srv.vtime.get(q) else a)
+        { ...srv, vtime: charge, vnow: if (ps.size() > 0) max(srv.vnow, mv) else srv.vnow }
+      },
+      nextId' = nextId, clients' = clients, decSent' = decSent, time' = time,
+      gh' = {
+        val e1 = if (midPrefill) Set("preempted") else Set()
+        val e2 = if (rs.size() >= 2) Set("batched") else Set()
+        val e3 = if (rs.exists(i => not(reqs.get(i).started) and not(reqs.get(i).dec) and
+                                   reuseOf(srv.held, reqs.get(i).conv, reqs.get(i).prompt) > reqs.get(i).reused))
+                   Set("boundLater") else Set()
+        val e4 = if (k == Decide and midPrefill) Set("deciderBetweenSlices") else Set()
+        { ...g, events: g.events.union(e1).union(e2).union(e3).union(e4) }
+      },
+    }
+  }
+  action pick: bool = {
+    val rset = runSet
+    val prioDec = rset.filter(r => r.dec and r.prio)
+    val v = srv.vtime
+    all {
+      eng.kind == Idle, not(fencePending), rset.size() > 0,
+      if (RULES.deciderPrio and prioDec.size() > 0) {
+        val i = minId(prioDec)
+        startUnit(Decide, Set(i), DEC_COST, v.set("D", v.get("D") + DEC_COST), ev("deciderPrio"))
+      } else if (not(RULES.preempt)) {
+        // today: one request at a time, to the end (the generator mutex); no batching
+        val cur = rset.filter(r => r.started)
+        val i = if (cur.size() > 0) minId(cur) else minId(rset)
+        val r = reqs.get(i)
+        if (r.dec) startUnit(Decide, Set(i), DEC_COST, v, gh)
+        else if (prefillLeft(r)) startUnit(Slice, Set(i), SLICE, v, gh)
+        else startUnit(Batch, Set(i), DECODE, v, gh)
+      } else {
+        // fair queuing over principals by GPU time (start-time fair queuing)
+        val ps = rset.map(r => r.p)
+        val mv = ps.fold(1000000, (a, p) => if (v.get(p) < a) v.get(p) else a)
+        nondet p = ps.filter(q => v.get(q) == mv).oneOf()
+        val i = minId(rset.filter(r => r.p == p))
+        val r = reqs.get(i)
+        if (r.dec) startUnit(Decide, Set(i), DEC_COST, v.set(p, v.get(p) + DEC_COST), if (r.prio) gh else ev("deciderFair"))
+        else if (prefillLeft(r)) startUnit(Slice, Set(i), SLICE, v.set(p, v.get(p) + SLICE), gh)
+        else {
+          // every decoding session steps in the same batch (StepBatch, up to 8); each principal pays a unit
+          val b = rset.filter(x => not(x.dec) and not(prefillLeft(x)))
+          val bp = b.map(x => x.p)
+          startUnit(Batch, b.map(x => x.id), DECODE,
+                    v.keys().mapBy(q => if (bp.contains(q)) v.get(q) + DECODE else v.get(q)), gh)
+        }
+      }
+    }
+  }
+  // the unit ends: its effects apply (a slice advances the prefill; a decode unit emits a token to each)
+  action unitEnd: bool = {
+    val rs = eng.rs
+    val fin = rs.filter(i => {
+      val x = reqs.get(i)
+      x.dec or (eng.kind == Batch and x.decoded + 1 >= x.maxTok)
+    })
+    all {
+      eng.kind != Idle, time >= eng.until,
+      reqs' = reqs.keys().mapBy(i => {
+        val x = reqs.get(i)
+        if (not(rs.contains(i))) x
+        else if (eng.kind == Slice) { ...x, done: x.done + 1, lastServed: time }
+        else if (eng.kind == Batch) {
+          val y = { ...x, decoded: x.decoded + 1, lastServed: time, heard: if (x.conn) time else x.heard }
+          if (fin.contains(i)) { ...y, ph: Finished, ans: Pending } else y
+        }
+        else { ...x, ph: Finished, ans: Pending, lastServed: time }
+      }),
+      // a finished turn keeps its prompt as a retained prefix (the exact-mode checkpoint)
+      srv' = { ...srv, held: CONVS.mapBy(c => {
+        val f = fin.filter(i => reqs.get(i).conv == c)
+        if (f.size() == 0) srv.held.get(c)
+        else max(srv.held.get(c), f.fold(0, (a, i) => max(a, reqs.get(i).prompt)))
+      }) },
+      gh' = if (eng.kind == Slice) {
+        val c = reqs.get(rs.fold(0, (a, i) => i)).conv
+        { ...gh, computed: gh.computed.set(c, gh.computed.get(c) + 1) }
+      } else gh,
+      eng' = { kind: Idle, until: time, rs: Set() },
+      nextId' = nextId, clients' = clients, decSent' = decSent, time' = time,
+    }
+  }
+  // time passes while a unit runs, or while there is nothing to run (the scheduler is work-conserving)
+  action tick: bool = all {
+    time < MAXT,
+    if (eng.kind != Idle) time < eng.until else not(fencePending or runSet.size() > 0),
+    time' = time + 1,
+    srv' = { ...srv, credit: if ((time + 1) % DEC_REFILL == 0) min(DEC_BURST, srv.credit + 1) else srv.credit },
+    reqs' = reqs, nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, gh' = gh,
+  }
+  action stutter: bool = all {
+    time >= MAXT,
+    time' = time, srv' = srv, reqs' = reqs, nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng,
+    gh' = gh,
+  }
+
+  action step = any {
+    nondet c = CONVS.oneOf()
+    clientSend(c),
+    deciderSend,
+    all {
+      reqs.keys().size() > 0,
+      nondet i = reqs.keys().oneOf()
+      any { loseRequest(i), arrive(i), clientTimeout(i), clientAbort(i), peerVanishes(i), deliver(i), loseAnswer(i),
+            fence(i) },
+    },
+    pick,
+    unitEnd,
+    tick,
+    stutter,
+  }
+
+  // ---------------------------------------------------------------- properties
+  // a 429 means not done: the refused request never gets engine work (AUDIT N4)
+  val rejectedNeverRuns: bool = allReqs.forall(r => not(r.ans == Got429 and r.served))
+  // starvation freedom, as the state property whose violation is its mechanism: a runnable request of a
+  // connected client is served again within WAIT_BOUND ticks
+  val boundedWait: bool = actives.forall(r =>
+    r.dec or not(r.conn) or r.ans == Got429 or not(hasWork(r)) or time - r.lastServed <= WAIT_BOUND)
+  // a credited decider starts within DEC_BOUND of its admission
+  val deciderLatency: bool = actives.forall(r => not(r.dec and r.prio and r.ph == Queued) or time - r.admittedAt <= DEC_BOUND)
+  // late effect bounded: work started for a client that left is at most GONE_BOUND ticks
+  val workAfterGoneBounded: bool = allReqs.forall(r => r.goneWork <= GONE_BOUND)
+  // a streaming client never times out while the server holds its request (the D3 retry trigger)
+  val noSpuriousTimeout: bool = allReqs.forall(r => not(r.spurious))
+  // memory: mapped pages never exceed what the sessions may hold
+  val noOvercommit: bool = physical <= CAP
+  // each request's own mapped pages stay within its reservation (what the ledger counts is what is mapped)
+  val withinReservation: bool = actives.forall(r =>
+    r.dec or r.done - r.reused + r.decoded + inUnit(r) <= r.need)
+  // a retry is never refused because of its own earlier attempt (that 429 is the retry-amplification loop)
+  val noSelfInflicted429: bool = gh.selfLimit == 0
+  // a turn is generated at most once: a retry after a lost answer gets the stored answer, not a new generation
+  val generatedOnce: bool = allReqs.forall(a => allReqs.forall(b =>
+    a.id == b.id or a.dec or b.dec or a.conv != b.conv or a.turn != b.turn or
+    not(a.ph == Finished and a.served and b.ph == Finished and b.served)))
+  // a memory 429 only when evicting every evictable prefix would not make room (F3)
+  val refuseOnlyIfShort: bool = gh.falseRefusals == 0
+  // retries do not recompute: prefill slices per conversation <= its longest prompt + prefixes evicted
+  val noRecompute: bool = CONVS.forall(c => gh.computed.get(c) <= gh.maxPrompt.get(c) + gh.evicted.get(c))
+  val safety: bool = and {
+    rejectedNeverRuns, boundedWait, deciderLatency, workAfterGoneBounded, noSpuriousTimeout, noOvercommit,
+    withinReservation, refuseOnlyIfShort, noRecompute, noSelfInflicted429, generatedOnce,
+  }
+
+  // ---------------------------------------------------------------- witnesses
+  val wPreempted: bool = gh.events.contains("preempted")
+  val wBatched: bool = gh.events.contains("batched")
+  val wDeciderBetweenSlices: bool = gh.events.contains("deciderBetweenSlices")
+  val wDeciderFair: bool = gh.events.contains("deciderFair")
+  val wParkedOnCancel: bool = gh.events.contains("parkedOnCancel")
+  val wBoundLater: bool = gh.events.contains("boundLater")
+  val wEvicted: bool = gh.events.contains("evicted")
+  val wMem429: bool = gh.events.contains("mem429")
+  val wLimit429: bool = gh.events.contains("limit429")
+  val wRetryAfter429: bool = gh.events.contains("retryAfter429")
+  val wRetryAfterLostAnswer: bool = gh.events.contains("retryAfterLostAnswer")
+  val wTimeout: bool = gh.events.contains("timeout")
+  val wFencedFin: bool = gh.events.contains("fencedFin")
+  val wFencedVanished: bool = gh.events.contains("fencedVanished")
+  val wLateArrival: bool = gh.events.contains("lateArrival")
+  val wReplayed: bool = gh.events.contains("replayed")
+  val wAdopted: bool = gh.events.contains("adopted")
+  val wTurn2Done: bool = gh.events.contains("turn2Done")
+}
