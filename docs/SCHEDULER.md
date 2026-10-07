@@ -300,6 +300,11 @@ memory is in abstract units with no page rounding or fork constant; simulation, 
 
 ## 11. Decisions for the user
 
+**Decided 2026-10-07: the user accepted every recommendation below.** D1 2048 contended / 8192 alone; D2 measure
+the decider's GPU contention first (M4), flash-pointer deciders as units; D3 one in-flight turn per sandbox; D4
+burst 4, refill 2/s; D5 default key = digest of (principal, previous_response_id, input); D6 heartbeats on (main
+24cab4b: `halo_serve --sse-keepalive` defaults to 15 s).
+
 - **D1 slice size**: 2048-token slices under contention, 8192 alone (recommended), or always 8192 (7% faster
   contended prefill, 5-8 s preemption bound).
 - **D2 the 2B decider**: keep it concurrent on the GPU (today: no wait for a slice, unmeasured contention) or move
