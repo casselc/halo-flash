@@ -3,7 +3,9 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <linux/sockios.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -377,7 +379,26 @@ void HttpServer::Serve(int fd) {
         continue;
       }
       const int t = opt_.send_timeout_ms;
-      bool alive = SendAll(fd, Head(resp, keep, true), t);
+      const std::string head = Head(resp, keep, true);
+      bool alive = SendAll(fd, head, t);
+      // A client that stops reading: the kernel keeps taking frames until its buffers fill, which at token rates
+      // takes minutes (about 1 MB on loopback), so a send that blocks notices late. Bytes written that the kernel
+      // has not sent yet (the peer's window is closed) and that make no progress for send_timeout_ms mean the
+      // client is not reading: it is treated as gone.
+      std::size_t written = head.size(), accepted = written;
+      auto progress = std::chrono::steady_clock::now();
+      const auto reading = [&] {
+        int unsent = 0;
+        if (::ioctl(fd, SIOCOUTQNSD, &unsent) < 0) return true;  // cannot tell
+        const std::size_t now_accepted = written - std::min<std::size_t>(written, static_cast<std::size_t>(std::max(unsent, 0)));
+        const auto now = std::chrono::steady_clock::now();
+        if (unsent <= 0 || now_accepted > accepted) {
+          accepted = now_accepted;
+          progress = now;
+          return true;
+        }
+        return now - progress < std::chrono::milliseconds(t);
+      };
       const BodyWriter writer = [&](std::string_view data) {
         if (!alive || stopping_.load()) return alive = false;
         if (data.empty()) return true;  // an empty chunk would end the body
@@ -385,7 +406,8 @@ void HttpServer::Serve(int fd) {
         const int n = std::snprintf(size, sizeof size, "%zx\r\n", data.size());
         alive = SendAll(fd, std::string_view(size, static_cast<std::size_t>(n)), t) && SendAll(fd, data, t) &&
                 SendAll(fd, "\r\n", t);
-        return alive;
+        written += static_cast<std::size_t>(n) + data.size() + 2;
+        return alive = alive && reading();
       };
       resp.stream(writer);
       if (!alive || !SendAll(fd, "0\r\n\r\n", t) || !keep) return;

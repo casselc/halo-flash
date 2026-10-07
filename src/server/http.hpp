@@ -105,7 +105,10 @@ struct HttpServerOptions {
   HttpLimits limits;
   int idle_timeout_ms = 60000;  // keep-alive connection with no request
   /// A write to a client that makes no progress for this long fails (the client is treated as gone): one client
-  /// that stops reading cannot hold its handler, nor whatever the handler holds, for longer.
+  /// that stops reading cannot hold its handler, nor whatever the handler holds, for longer. For a streamed body
+  /// "no progress" also means bytes already written that the kernel could not send (the client's receive window
+  /// stayed closed), so a stalled client is noticed about this long after its window closes, not only once the
+  /// server's send buffer is full too.
   int send_timeout_ms = 30000;
   std::string api_key;          // non-empty: require "Authorization: Bearer <key>"
 };

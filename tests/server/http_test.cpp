@@ -256,6 +256,20 @@ struct TestServer {
           }
       });
     });
+    // Small frames at a token-like rate: the kernel would buffer them for a long time before a send blocks.
+    server.Route("GET", "/trickle", [this](const HttpRequest&) {
+      return HttpResponse::EventStream([this](const BodyWriter& w) {
+        std::lock_guard<std::mutex> lk(engine);
+        const std::string frame = "data: " + std::string(200, 'y') + "\n\n";
+        for (int i = 0; i < 5000; ++i) {
+          if (!w(frame)) {
+            trickle_stopped = true;
+            return;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+      });
+    });
     server.Route("GET", "/locked", [this](const HttpRequest&) {
       std::lock_guard<std::mutex> lk(engine);
       return HttpResponse::Json(200, R"({"ok": true})");
@@ -267,6 +281,7 @@ struct TestServer {
   std::atomic<bool> stream_stopped{false};
   std::mutex engine;
   std::atomic<bool> flood_stopped{false};
+  std::atomic<bool> trickle_stopped{false};
 };
 
 }  // namespace
@@ -353,12 +368,11 @@ TEST(Http, ConnectionLimitAndStopWithIdleConnections) {
   ::close(b);
 }
 
-// A client that stays connected but stops reading must not hold the server (audit F4): the stalled stream's writer
-// fails once a send makes no progress for send_timeout_ms (the client-gone path), so a second client waiting on the
-// same lock is answered within about that bound.
-TEST(Http, AStalledReaderIsCutOffAfterTheSendTimeout) {
-  TestServer t({.send_timeout_ms = 300});
-  const int port = t.server.port();
+namespace {
+
+/// A client that requests `path`, reads the response head and then never reads again; a second client then asks
+/// for /locked (which needs the lock the stalled stream holds). Returns how long the second client waited.
+std::chrono::steady_clock::duration StallThenAsk(int port, const std::string& path, bool* answered) {
   const int stalled = ::socket(AF_INET, SOCK_STREAM, 0);
   const int small = 4096;
   ::setsockopt(stalled, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
@@ -366,27 +380,50 @@ TEST(Http, AStalledReaderIsCutOffAfterTheSendTimeout) {
   a.sin_family = AF_INET;
   a.sin_port = htons(static_cast<std::uint16_t>(port));
   ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
-  ASSERT_EQ(::connect(stalled, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
-  const std::string req = "GET /flood HTTP/1.1\r\n\r\n";
-  ASSERT_EQ(::send(stalled, req.data(), req.size(), 0), static_cast<ssize_t>(req.size()));
+  EXPECT_EQ(::connect(stalled, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+  const std::string req = "GET " + path + " HTTP/1.1\r\n\r\n";
+  EXPECT_EQ(::send(stalled, req.data(), req.size(), 0), static_cast<ssize_t>(req.size()));
   char b[256];
-  ASSERT_GT(::recv(stalled, b, sizeof b, 0), 0);  // the head arrived; now it never reads again
+  EXPECT_GT(::recv(stalled, b, sizeof b, 0), 0);  // the head arrived; now it never reads again
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   const auto start = std::chrono::steady_clock::now();
   const int fd = Connect(port);
   const timeval tv{5, 0};
   ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
   const std::string q = "GET /locked HTTP/1.1\r\n\r\n";
-  ASSERT_EQ(::send(fd, q.data(), q.size(), 0), static_cast<ssize_t>(q.size()));
+  EXPECT_EQ(::send(fd, q.data(), q.size(), 0), static_cast<ssize_t>(q.size()));
   std::string extra;
   Reply r;
-  const bool answered = ReadReply(fd, extra, &r);
+  *answered = ReadReply(fd, extra, &r) && r.status == 200;
   const auto waited = std::chrono::steady_clock::now() - start;
   ::close(fd);
-  ::close(stalled);  // unblocks a server without a deadline, so the test ends either way
+  ::close(stalled);  // unblocks a server that never gave up on it, so the test ends either way
+  return waited;
+}
+
+}  // namespace
+
+// A client that stays connected but stops reading must not hold the server (audit F4): the stalled stream's writer
+// fails once a send makes no progress for send_timeout_ms (the client-gone path), so a second client waiting on the
+// same lock is answered within about that bound.
+TEST(Http, AStalledReaderIsCutOffAfterTheSendTimeout) {
+  TestServer t({.send_timeout_ms = 300});
+  bool answered = false;
+  const auto waited = StallThenAsk(t.server.port(), "/flood", &answered);
   EXPECT_TRUE(answered) << "the second client got no answer within 5 s";
-  EXPECT_EQ(r.status, 200);
   EXPECT_LT(waited, std::chrono::seconds(3));
   for (int i = 0; i < 500 && !t.flood_stopped.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
   EXPECT_TRUE(t.flood_stopped.load());
+}
+
+// The same with small frames at a token-like rate: no send blocks for a long time (the kernel would buffer about a
+// megabyte first), but the bytes it cannot send to the closed window make no progress, which is noticed.
+TEST(Http, ASlowStalledReaderIsCutOffToo) {
+  TestServer t({.send_timeout_ms = 300});
+  bool answered = false;
+  const auto waited = StallThenAsk(t.server.port(), "/trickle", &answered);
+  EXPECT_TRUE(answered) << "the second client got no answer within 5 s";
+  EXPECT_LT(waited, std::chrono::seconds(3));
+  for (int i = 0; i < 500 && !t.trickle_stopped.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_TRUE(t.trickle_stopped.load());
 }

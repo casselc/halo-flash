@@ -1309,3 +1309,14 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "SessionCache.EvictionStopsOnceThePromptFits"
 why = "evicting a retained session frees nothing the memory guard can see (its pages stay charged while their range is reserved), so the cache empties itself and still refuses"
+
+[[mutant]]
+name = "http-stall-ignores-unsent"
+file = "src/server/http.cpp"
+find = 'return now - progress < std::chrono::milliseconds(t);'
+replace = 'return true;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Http.ASlowStalledReaderIsCutOffToo"
+timeout = 120
+why = "a client that stops reading a token-rate stream is noticed only once the kernel's buffers are full (about 1 MB: minutes of tokens)"
