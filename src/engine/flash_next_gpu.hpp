@@ -641,7 +641,8 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   /// Maps KV pages so the bound session can hold `tokens` positions, read from `live` on (indexer-key pages wholly
   /// below IndexLiveRow(live) are released, those at or above it mapped).
   bool EnsureKv(std::uint32_t tokens, std::uint32_t live, std::string* error);
-  /// Unmaps every KV page of the bound session (Reset, Restore): pages shared with forks stay with them.
+  /// Unmaps the bound session's KV pages that a fork also holds (Reset, Restore): those stay with the fork; the
+  /// pages it alone holds stay mapped (rewritten in place).
   bool ReleaseKvPages(std::string* error);
   // ---- P6 batched decode (batch_decode.cpp) ----
   struct BatchBuffers {

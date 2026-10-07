@@ -546,5 +546,74 @@ TEST(Sessions, ForkSurvivesParentResetAndRestore) {
       ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0)
           << "fork step " << j << " after its parent (" << a.size() << " tokens) " << (restore ? "restored" : "reset");
     }
-  }, {.test_cases = 30});
+    // No shrink phase: every case builds two engines, and shrinking a failure ran past any sane timeout (the
+    // broken build timed out instead of failing). The unshrunk report already names the sizes and the mode.
+  }, {.test_cases = 30, .phases = {hegel::Phase::Explicit, hegel::Phase::Reuse, hegel::Phase::Generate}});
+}
+
+// Stream C: Reset keeps the pages only the session holds (released pages stayed charged to GTT by the HIP runtime,
+// so the server's memory guard refused prompts the process could hold) and unmaps those a fork shares. A new
+// prompt prefilled over the kept, dirty pages must equal a fresh engine bitwise, and the fork must be untouched.
+// 4 KB pages, so short prompts span several pages and forks share some.
+TEST(Sessions, ResetKeepsExclusivePagesExactly) {
+  Small* s = LoadSmall();
+  if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  const char* saved_pb = std::getenv("HALO_PAGE_BYTES");
+  const std::string saved = saved_pb ? saved_pb : "";
+  setenv("HALO_PAGE_BYTES", "4096", 1);
+  auto devices = Devices();
+  if (saved_pb) setenv("HALO_PAGE_BYTES", saved.c_str(), 1);
+  else unsetenv("HALO_PAGE_BYTES");
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  if (devices[0]->PageBytes() == 0) GTEST_SKIP() << "no page mapping";
+  const auto& c = s->weights->config;
+  const std::size_t V = c.vocab_size;
+  constexpr std::uint32_t kMaxContext = 256;
+  struct Kv16 {
+    bool saved = engine::FlashNextGpu::kv_f16_only_;
+    ~Kv16() { engine::FlashNextGpu::kv_f16_only_ = saved; }
+  } kv16_guard;
+  hegel::test([&](hegel::TestCase& tc) {
+    auto& dev = *devices[0];
+    std::string error;
+    engine::FlashNextGpu::kv_f16_only_ = tc.draw(gs::booleans());
+    auto gpu = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+    ASSERT_TRUE(gpu) << error;
+    auto oracle = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+    ASSERT_TRUE(oracle) << error;
+    gpu->SetUseGraphs(tc.draw(gs::booleans()));
+    const auto token = [&] {
+      return tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = static_cast<std::int32_t>(V - 1)}));
+    };
+    // a, one step, then b: within the 256 positions
+    std::vector<std::int32_t> a(tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 120}))),
+        b(tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 120}))), tail(4);
+    for (auto& t : a) t = token();
+    for (auto& t : b) t = token();
+    for (auto& t : tail) t = token();
+    ASSERT_TRUE(gpu->Prefill(a, {}, &error) && gpu->Step(tail[0], {}, &error)) << error;
+    const bool fork = tc.draw(gs::booleans());
+    engine::FlashNextGpu::SessionId f = 0;
+    if (fork) ASSERT_TRUE(gpu->ForkSession(0, &f, &error)) << error;
+    const auto before = gpu->SessionMemory(0);
+    ASSERT_TRUE(gpu->Reset(&error)) << error;
+    ASSERT_EQ(gpu->SessionMemory(0).kv_mapped, before.kv_exclusive) << "reset keeps exactly the exclusive pages";
+    ASSERT_TRUE(gpu->Prefill(b, {}, &error)) << error;
+    ASSERT_TRUE(oracle->Prefill(b, {}, &error)) << error;
+    std::vector<float> got(V), want(V);
+    for (std::size_t j = 0; j < tail.size(); ++j) {
+      ASSERT_TRUE(gpu->Step(tail[j], got, &error) && oracle->Step(tail[j], want, &error)) << error;
+      ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0)
+          << "step " << j << " of " << b.size() << " tokens over kept pages (" << a.size() << " before)";
+    }
+    if (fork) {  // the fork still holds a + tail[0]
+      ASSERT_TRUE(gpu->BindSession(f, &error)) << error;
+      ASSERT_TRUE(oracle->Reset(&error) && oracle->Prefill(a, {}, &error) && oracle->Step(tail[0], {}, &error))
+          << error;
+      for (std::size_t j = 1; j < tail.size(); ++j) {
+        ASSERT_TRUE(gpu->Step(tail[j], got, &error) && oracle->Step(tail[j], want, &error)) << error;
+        ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0) << "fork step " << j << " after the parent's reset";
+      }
+    }
+  }, {.test_cases = 30, .phases = {hegel::Phase::Explicit, hegel::Phase::Reuse, hegel::Phase::Generate}});
 }

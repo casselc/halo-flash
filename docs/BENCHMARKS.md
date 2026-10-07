@@ -150,6 +150,49 @@ a 2-ulp signed perturbation of every prefill row's embedding fails exact mode's 
 noisy modes catch it only at 131072 ulps (1.6%; 16384 ulps, 0.2%, is below their noise). Ten fresh-database runs
 passed.
 
+### Long context (stream C, 2026-10-06; raw: `/data/halo-work/streams/C/`)
+
+Real model (UD-Q4_K_XL), `halo_longctx` (resumable JSONL), unpinned. Text: `books.txt` (5 Gutenberg novels) for
+needles and consistency; `code.txt` (this repo's own source, unseen by the model) for NLL.
+
+**Needles** (`needle.jsonl`; one "special magic number for <city>" sentence at the given depth, question at the
+end, greedy, thinking off; correct = the number in the answer):
+
+| Prompt tokens | KV | Depths | Correct | Prefill | Decode ms/token |
+|---:|---|---|---:|---:|---:|
+| 32,768 | default | 0..100 step 10 | 11/11 | 22.2-24.6 s | 39.6-41.1 |
+| 32,768 | fp16-only | 0..100 step 10 | 11/11 | 22.4-23.9 s | 39.1-39.6 |
+| 131,072 | default | 0..100 step 10 | 11/11 | 92.9-96.1 s | 42.6-42.8 |
+| 131,072 | fp16-only | 0..100 step 10 | 11/11 | 97.6-108.5 s (before scores_b) | 42.1-42.4 |
+| 261,500 | fp16-only | 0, 10, 25, 50, 75, 90, 100 | 7/7 | 198.7-217.6 s | 45.1 |
+| 261,500 | default | — | does not fit | | |
+
+gufo on the same prompt files (`gufo serve -c <length> --think off -t 0`, alone): 32K 11/11, 128K 11/11, 256K
+7/7. Cold time to the answer 25.1-25.5 s / 104.0-106.0 s / 218.2-220.5 s against our prefill 22.2-24.6 /
+92.9-96.1 / 198.7-202.0 s (post-reboot); gufo's prefix cache served later depths faster, so only cold requests
+compare. gufo exposes no log-probabilities: no NLL comparison.
+
+**Long-document NLL** (1,024 target tokens at the end of `code.txt`, the same targets scored with the context
+truncated to a window; paired difference ± SE vs the full window):
+
+| Window | default KV | fp16-only KV |
+|---:|---:|---:|
+| 130,048 (full, targets 130,048..131,071) | 0.4982 | 0.4975 (paired vs default −0.0007 ± 0.0030) |
+| 32,768 | 0.5550 (+0.057 ± 0.031) | 0.5561 |
+| 8,192 | 0.7906 (+0.29) | 0.7936 |
+| 2,048 | 1.0854 (+0.59) | 1.0802 |
+| 261,120 (full, fp16 only, targets after 261,120) | — | 0.2359 |
+| 131,072 | — | 0.2482 (+0.012 ± 0.014) |
+| 32,768 | — | 0.2926 (+0.057 ± 0.027) |
+
+The model uses the whole context: NLL falls monotonically with the window up to 256K.
+
+**Consistency** (`consist.jsonl`; 8 decode steps compared): prefill in 2,048- vs 8,192-token chunks is
+bit-identical at 32K and 128K in both kinds; a fork equals a fresh replay 8/8 bitwise (32K, 128K, both kinds) and a
+snapshot restore equals it 8/8 (32K both kinds, 128K fp16; a 128K default-KV snapshot does not fit beside the
+session). Prefill of N vs N−8 plus 8 steps differs (rel L2 2.3-4.3%, argmax equal): non-aligned splits are not
+bit-identical by design (DeltaNet 16-token chunks, union4 groups).
+
 ### Greedy identity with gufo
 
 `halo_run --device hip` against `gufo prompt --raw -t 0 --speculative off`
