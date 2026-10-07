@@ -225,6 +225,15 @@ the pages the session alone holds (only fork-shared pages are unmapped, which th
 3 without the pool). Still uncounted: indexer-key pages released below the live window (~6 KB a token, reused by
 the runtime on the next prompt, so the guard under-reports by up to ~0.8 GB after a 128K prompt).
 
+Measured on the eviction path (stream F, 2026-10-07, `SessionCache.ReleasedPageChargeProbe`, ROCm 7.2.3): the
+charge lasts only while a range the page was mapped into stays reserved. 4.29 GB of pages unmapped and released
+stayed charged (and a new create reused them) until `hipMemAddressFree` of their range gave all of it back.
+`DropSession` frees the session's ranges, so dropping a session holding 1.28 GB of KV pages gave 1.38 GB back to
+`AvailableBytes` at once: `SessionCache` eviction sees what it frees (the audit's F3 does not occur).
+`SessionCache.EvictionStopsOnceThePromptFits` keeps it so, on an `rt::Device` ledger that models this runtime
+(mutant `guard-ignores-released`). The charge shows where a range stays reserved: Reset/Restore (fixed above)
+and the indexer-key pages below the live window.
+
 **`halo_serve` default (2026-10-07, option (b) with the threshold rule).** Without `--kv-f16`, `halo_serve` uses
 fp16-only KV when `--max-context` is above `--kv-f16-above` (default 150000, about what default KV reliably holds;
 `0` disables the automatic choice) and the default kinds at or below it. An explicit `--kv-f16 1` or `--kv-f16 0`
@@ -314,3 +323,48 @@ title request remains (one request at a time), the re-prefill is gone. Codex's m
 end (namespace tools, server/openai_request.hpp): asked to delegate, it spawned, waited for and closed a sub-agent
 through `multi_agent_v1.*` calls returned with `"namespace"`, and answered correctly. Single runs per task: task walls move with
 the model's output length (opencode t5 24.7 s exact, 43.5 s fast).
+
+## 9. Serving when the client leaves, stalls or retries (stream F, 2026-10-07; working files `/data/halo-work/streams/F/notes/`)
+
+Every boundary a request crosses now has a done / not done outcome, and the unknowns have a bound
+(`research/agent-platform/ref-observability/AMBIGUITY.md`):
+
+| Where | Done | Not done | Unknown, and its bound |
+|---|---|---|---|
+| Client receives the response | every event, the terminal one included, written | a write failed, the connection closed (`POLLRDHUP`), or the server is stopping: **cancelled** | bytes the kernel accepted after the peer left: found at the next write or poll (one frame) |
+| Client still reading | the kernel keeps sending | no progress for `--send-timeout` (default 30 s): a blocked send, or written bytes the kernel cannot send because the client's window stayed closed (`SIOCOUTQNSD`) | a client whose own buffers still take data is indistinguishable from a reader until they fill |
+| Engine work for the request | ran in full | stopped: while queued (the generator's timed lock is retried every 20 ms), before each prefill chunk after the first (chunks end synchronized: at most one more runs), before each decode step | none past one chunk or step |
+
+What a cancelled request leaves:
+- **Responses object**: status `cancelled` (an API status; `incomplete_details` stays null, its reasons being
+  `max_output_tokens` and `content_filter`). A response is `completed` only when it was written in full.
+- **Store**: only the cancelled object (conversation null), so `GET /v1/responses/{id}` answers definitely and
+  `previous_response_id` on it is a 400 naming the parameter, never a continuation of a turn the client did not get.
+- **Observer** (halo-scope GENERATION): `finish_reason` `cancelled`, so a truncated generation never looks like a
+  finished one in traces or training data.
+- **Engine state**: a request stopped mid-prefill drops its live session (partly advanced); checkpoints parked
+  before the stop stay (each a cold prefill of its tokens). A stop between decode steps keeps exactly what ran,
+  the state of the same request with `max_tokens` equal to the tokens emitted (fast mode retains it, exact mode
+  drops it as usual). A request cancelled while queued never touches the cache.
+- **Non-streaming**: a 503 (only a client of a stopping server can still read it).
+
+Tests: `OpenAiService.ServingModelUnderDeparturesStallsAndRetries` (Hegel rules complete / leave while queued,
+mid-prefill, mid-decode / stall / retry / continue over loopback HTTP, with the invariants above),
+`OpenAiService.ADeparted*`, `Http.AStalledReaderIsCutOffAfterTheSendTimeout`, `Http.ASlowStalledReaderIsCutOffToo`;
+GPU (small model): `SessionCache.CancelledRequestsLeaveStateEqualToAColdReplay` (cancels at any poll; exact mode
+stays byte-identical to a cold engine, fast mode after a k-token stop equals `max_tokens` = k),
+`ACancelStopsThePrefillAtTheNextChunk`, `AQueuedRequestWhoseClientLeftNeverRuns`. Mutants (tests/mutants.toml):
+`svc-departure-as-stop`, `svc-no-liveness-check`, `gen-queue-ignores-departure`, `engine-prefill-ignores-cancel`,
+`http-send-no-deadline`, `http-stall-ignores-unsent`, `guard-ignores-released`.
+
+End to end (real model, `halo_serve --send-timeout 5`, `HALO_CACHE_TRACE=1`): a streamed Responses request cut
+after 20 deltas stopped at 35 tokens, `GET` said `cancelled`, continuing from it was a 400, and a completed
+response continued normally. A client that read nothing of a 6000-token stream held the engine 5.8 s (156 tokens)
+before a second client was served; with the send deadline alone the kernel took ~1 MB of frames first (4434 tokens,
+172 s). A non-streaming request whose client left after 3 s stopped at 76 tokens of 3000.
+
+Still open: the engine lock is held while a send waits (another client waits up to `--send-timeout` per stalled
+request; a bounded per-request output buffer drained by the connection thread would remove that); nothing is sent
+while a request is queued or prefilling, so a client's idle timeout can still fire first (an SSE comment heartbeat
+would keep it alive and turn a departure into a failed write); a half-closed connection (`shutdown(SHUT_WR)`
+after the request) counts as gone; `Qwen35Generator` polls before its prefill and each step, not between chunks.

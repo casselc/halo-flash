@@ -11,7 +11,9 @@
 //   Responses: typed events with sequence numbers (response.created, output
 //     items added and done, output_text / reasoning_text / function-call
 //     argument deltas and dones, response.completed or response.incomplete);
-//     or one response object. Items are reasoning (reasoning_text content),
+//     or one response object. A response whose client left before it was
+//     delivered in full is marked cancelled (MarkCancelled): its object has
+//     status "cancelled" (and Chat / Completions finish_reason "cancelled"). Items are reasoning (reasoning_text content),
 //     message (output_text) and function_call.
 //   Completions: text_completion chunks or object; the text is the raw
 //     generation (no parsing).
@@ -57,6 +59,12 @@ class OutputBuilder {
   /// Ends the output: closes open items and appends the final events.
   void Finish(FinishReason reason, const Usage& usage, std::vector<json::Value>* out);
 
+  /// The client left before the output was delivered in full: Final() reports it cancelled (Responses status
+  /// "cancelled", incomplete_details null; Chat and Completions finish_reason "cancelled"), never completed.
+  /// Events already produced are not taken back (they were not delivered).
+  void MarkCancelled() { cancelled_ = true; }
+  [[nodiscard]] bool cancelled() const { return cancelled_; }
+
   /// The non-streaming object (after Finish).
   [[nodiscard]] json::Value Final() const;
 
@@ -101,6 +109,7 @@ class OutputBuilder {
   bool item_open_ = false;  // items_.back() is a reasoning or message item still open
   std::string reasoning_, content_;  // Chat and Completions accumulate
   FinishReason reason_ = FinishReason::kStop;
+  bool cancelled_ = false;
   Usage usage_;
 };
 

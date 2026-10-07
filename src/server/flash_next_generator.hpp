@@ -46,7 +46,10 @@ class FlashNextGenerator : public TextGenerator {
 
   /// The token-level generation (tests drive it without a tokenizer): `prompt` ids, the stable prefix length
   /// (see SessionCache::Prepare), sampling and limits from `params` (its prompt text unused); `on_token` gets each
-  /// generated token (not the stop) and returns false to cancel.
+  /// generated token (not the stop) and returns false to cancel. `params.cancelled` (optional) is polled while
+  /// queued behind another generation, between prefill chunks and before each decode step: a request whose
+  /// client left gives up within one chunk or step (Result::cancelled) and leaves the cache as a cold replay of
+  /// what was retained would (a partly prefilled live session is dropped; a decode stop keeps what ran).
   Result GenerateIds(std::span<const std::int32_t> prompt, std::size_t stable, const Params& params,
                      const std::function<bool(text::TokenId)>& on_token);
 
@@ -57,7 +60,7 @@ class FlashNextGenerator : public TextGenerator {
   const text::Tokenizer* tok_;  // null: token-level only
   const std::uint32_t max_context_;
   std::vector<text::TokenId> stops_;
-  std::mutex mu_;  // one generation at a time
+  std::timed_mutex mu_;  // one generation at a time (timed: a queued request polls Params::cancelled)
   SessionCache cache_;
   text::TokenId im_start_ = text::kNoToken;
 };

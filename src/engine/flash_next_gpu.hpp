@@ -276,8 +276,12 @@ class FlashNextGpu {
   /// P4: in chunks of prefill_chunk_ tokens, the dense projections as T-token
   /// GEMMs and the rest row-batched or token by token (prefill_chunk.cpp);
   /// a token at a time when batched_prefill_ is off or the model's shapes
-  /// do not fit the chunk kernels.
-  [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error);
+  /// do not fit the chunk kernels. `cancelled` (optional) is polled between
+  /// chunks (each chunk ends synchronized, so at most one chunk runs after
+  /// it turns true); then the call fails with error "cancelled" and the
+  /// bound session's state is partly advanced (drop or reset it).
+  [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error,
+                             const std::function<bool()>& cancelled = {});
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
   /// Graph replay (default) or eager launches; both run the same sequence.
   void SetUseGraphs(bool on) noexcept { use_graphs_ = on; }

@@ -1243,3 +1243,80 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "Qwen35Gpu.DeciderTorsoPrefillMatchesSteps"
 why = "each query of a chunk attends to every position up to and including its own"
+
+# ---- Serving: client departure, liveness, send deadline, memory guard ------
+# (audit streams/A/AUDIT.md F1, F3, F4, F5)
+
+[[mutant]]
+name = "http-send-no-deadline"
+file = "src/server/http.cpp"
+find = 'if (::poll(&p, 1, static_cast<int>(left)) < 0 && errno != EINTR) return false;'
+replace = 'if (::poll(&p, 1, -1) < 0 && errno != EINTR) return false;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Http.AStalledReaderIsCutOffAfterTheSendTimeout:OpenAiService.ServingModelUnderDeparturesStallsAndRetries"
+timeout = 120
+why = "a client that stays connected but stops reading holds its handler (and the engine lock) until it closes"
+
+[[mutant]]
+name = "svc-departure-as-stop"
+file = "src/server/openai_service.cpp"
+find = 'const bool cancelled = client_gone || result.cancelled || !flush() || gone();'
+replace = 'const bool cancelled = false;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.ADepartedStreamIsRecordedAndStoredAsCancelled:OpenAiService.ServingModelUnderDeparturesStallsAndRetries"
+timeout = 120
+why = "a client that left mid-stream is recorded as finish_reason stop and its truncated turn stored as completed"
+
+[[mutant]]
+name = "svc-no-liveness-check"
+file = "src/server/openai_service.cpp"
+find = 'const auto gone = [connected] { return connected && !connected(); };'
+replace = 'const auto gone = [connected] { return connected && false; };'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.ADepartedNonStreamingClientStopsGeneration:OpenAiService.ServingModelUnderDeparturesStallsAndRetries"
+timeout = 300
+why = "a request whose client left before its first byte (queued, prefilling) or a non-streaming one runs to completion"
+
+[[mutant]]
+name = "gen-queue-ignores-departure"
+file = "src/server/flash_next_generator.cpp"
+find = '    if (gone()) return r.cancelled = true, r;'
+replace = '    (void)0;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.AQueuedRequestWhoseClientLeftNeverRuns"
+why = "a request whose client left while it waited for the engine still runs once the engine is free"
+
+[[mutant]]
+name = "engine-prefill-ignores-cancel"
+file = "src/engine/flash_next_gpu.cpp"
+find = '    if (i > 0 && stop()) {'
+replace = '    if (false) {'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.ACancelStopsThePrefillAtTheNextChunk"
+why = "a client that left mid-prefill gets the rest of its prefill (minutes at long context) computed for nobody"
+
+[[mutant]]
+name = "guard-ignores-released"
+file = "src/engine/flash_next_gpu.cpp"
+find = '      dev_.ReleaseRange(r.va);'
+replace = '      (void)0;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.EvictionStopsOnceThePromptFits"
+why = "evicting a retained session frees nothing the memory guard can see (its pages stay charged while their range is reserved), so the cache empties itself and still refuses"
+
+[[mutant]]
+name = "http-stall-ignores-unsent"
+file = "src/server/http.cpp"
+find = 'return now - progress < std::chrono::milliseconds(t);'
+replace = 'return true;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Http.ASlowStalledReaderIsCutOffToo"
+timeout = 120
+why = "a client that stops reading a token-rate stream is noticed only once the kernel's buffers are full (about 1 MB: minutes of tokens)"
