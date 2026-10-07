@@ -333,29 +333,43 @@ Every boundary a request crosses now has a done / not done outcome, and the unkn
 |---|---|---|---|
 | Client receives the response | every event, the terminal one included, written | a write failed, the connection closed (`POLLRDHUP`), or the server is stopping: **cancelled** | bytes the kernel accepted after the peer left: found at the next write or poll (one frame) |
 | Client still reading | the kernel keeps sending | no progress for `--send-timeout` (default 30 s): a blocked send, or written bytes the kernel cannot send because the client's window stayed closed (`SIOCOUTQNSD`) | a client whose own buffers still take data is indistinguishable from a reader until they fill |
-| Engine work for the request | ran in full | stopped: while queued (the generator's timed lock is retried every 20 ms), before each prefill chunk after the first (chunks end synchronized: at most one more runs), before each decode step | none past one chunk or step |
+| Engine work for the request | ran in full | stopped: while queued (the generator's timed lock is retried every 20 ms; Flash-Next and Qwen3.5), before each prefill chunk after the first (chunks end synchronized: at most one more runs), before each decode step | none past one chunk or step |
 
 What a cancelled request leaves:
 - **Responses object**: status `cancelled` (an API status; `incomplete_details` stays null, its reasons being
   `max_output_tokens` and `content_filter`). A response is `completed` only when it was written in full.
-- **Store**: only the cancelled object (conversation null), so `GET /v1/responses/{id}` answers definitely and
-  `previous_response_id` on it is a 400 naming the parameter, never a continuation of a turn the client did not get.
+- **Store**: a streamed request keeps only the cancelled object (conversation null; its client may hold the id from
+  `response.created`), so `GET /v1/responses/{id}` answers definitely and `previous_response_id` on it is a 400
+  naming the parameter, never a continuation of a turn the client did not get. A non-streaming request whose
+  client left stores nothing (nobody received its id): `GET` and `previous_response_id` on it are 404.
+- **Store write that fails** (audit F7): the terminal event (`response.completed` / `incomplete`) is held back
+  until `ResponseStore::Put` returns, and a non-streaming body is built after it. Put settles its own outcome (a
+  failed SQLite COMMIT is rolled back, so false means nothing was written). Not stored: non-streaming 500, streaming
+  an `error` event in place of the terminal one, observer `finish_reason` `error`; nothing is kept and a retry is
+  safe (each attempt is a new response node). A stream whose held-back terminal event cannot be delivered replaces
+  the stored turn with the cancelled object.
 - **Observer** (halo-scope GENERATION): `finish_reason` `cancelled`, so a truncated generation never looks like a
   finished one in traces or training data.
 - **Engine state**: a request stopped mid-prefill drops its live session (partly advanced); checkpoints parked
   before the stop stay (each a cold prefill of its tokens). A stop between decode steps keeps exactly what ran,
   the state of the same request with `max_tokens` equal to the tokens emitted (fast mode retains it, exact mode
   drops it as usual). A request cancelled while queued never touches the cache.
-- **Non-streaming**: a 503 (only a client of a stopping server can still read it).
+- **Non-streaming**: a 503 (only a client of a stopping server can still read it), decided by the execution's own
+  cancelled outcome, not a second poll. A pipelined next request on a keep-alive connection is not a departure
+  (the liveness check reads `POLLRDHUP`/`POLLHUP`/`POLLERR`, never a readable socket).
 
 Tests: `OpenAiService.ServingModelUnderDeparturesStallsAndRetries` (Hegel rules complete / leave while queued,
 mid-prefill, mid-decode / stall / retry / continue over loopback HTTP, with the invariants above),
-`OpenAiService.ADeparted*`, `Http.AStalledReaderIsCutOffAfterTheSendTimeout`, `Http.ASlowStalledReaderIsCutOffToo`;
+`OpenAiService.ADeparted*`, `APipelinedNextRequestIsNotADeparture`, `AFailedStoreWriteIsAnErrorAndKeepsNothing`
+(the Hegel machine also has a store-fails rule), `KeepaliveCommentsWhileAStreamWaitsAndClientsIgnoreThem`,
+`ScopeResponses.AFailedWriteIsReportedAndLeavesNothing`, `Http.AStalledReaderIsCutOffAfterTheSendTimeout`, `Http.ASlowStalledReaderIsCutOffToo`;
 GPU (small model): `SessionCache.CancelledRequestsLeaveStateEqualToAColdReplay` (cancels at any poll; exact mode
 stays byte-identical to a cold engine, fast mode after a k-token stop equals `max_tokens` = k),
 `ACancelStopsThePrefillAtTheNextChunk`, `AQueuedRequestWhoseClientLeftNeverRuns`. Mutants (tests/mutants.toml):
 `svc-departure-as-stop`, `svc-no-liveness-check`, `gen-queue-ignores-departure`, `engine-prefill-ignores-cancel`,
-`http-send-no-deadline`, `http-stall-ignores-unsent`, `guard-ignores-released`.
+`http-send-no-deadline`, `http-stall-ignores-unsent`, `guard-ignores-released`, and (stream A2)
+`svc-departed-nonstream-stored`, `http-readable-is-departure`, `svc-store-failure-ignored`,
+`svc-terminal-before-store`, `scope-commit-failure-left-open`, `svc-keepalive-never-sent`.
 
 End to end (real model, `halo_serve --send-timeout 5`, `HALO_CACHE_TRACE=1`): a streamed Responses request cut
 after 20 deltas stopped at 35 tokens, `GET` said `cancelled`, continuing from it was a 400, and a completed
@@ -364,7 +378,11 @@ before a second client was served; with the send deadline alone the kernel took 
 172 s). A non-streaming request whose client left after 3 s stopped at 76 tokens of 3000.
 
 Still open: the engine lock is held while a send waits (another client waits up to `--send-timeout` per stalled
-request; a bounded per-request output buffer drained by the connection thread would remove that); nothing is sent
-while a request is queued or prefilling, so a client's idle timeout can still fire first (an SSE comment heartbeat
-would keep it alive and turn a departure into a failed write); a half-closed connection (`shutdown(SHUT_WR)`
-after the request) counts as gone; `Qwen35Generator` polls before its prefill and each step, not between chunks.
+request; a bounded per-request output buffer drained by the connection thread would remove that); by default
+nothing is sent while a request is queued or prefilling, so a client's idle timeout can still fire first:
+`halo_serve --sse-keepalive S` (off by default, stream A2) writes an SSE comment `: keepalive` from the liveness
+poll when a stream has written nothing for S seconds (SSE parsers ignore comments; checked with the openai 2.24
+SDK, `tests/functional/sse_keepalive_sdk_check.py`), which also turns a departure into a failed write; a
+half-closed connection (`shutdown(SHUT_WR)` after the request) counts as gone; `Qwen35Generator` polls while
+queued, before its prefill and each step, but its prefill is one engine call; the first prefill chunk after a
+checkpoint fork starts without a poll (the generation prompt only, a few tokens).
