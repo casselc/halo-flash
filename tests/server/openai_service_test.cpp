@@ -18,7 +18,9 @@
 #include <hegel/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -430,4 +432,72 @@ TEST(OpenAiService, VariantsAreSelectedPerRequestAndUnknownOnesRefused) {
                  R"({"messages": [{"role": "user", "content": "hi"}], "variant": "sentiment-ab"})")
                 .first,
             404);
+}
+
+namespace {
+
+/// Sends a request and reads the reply until `until` appears in it (or the
+/// connection ends); returns the bytes read and leaves the socket open in *fd.
+std::string SendAndReadUntil(int port, const std::string& path, const std::string& body, const std::string& until,
+                             int* fd) {
+  *fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_port = htons(static_cast<std::uint16_t>(port));
+  ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+  if (::connect(*fd, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0) throw std::runtime_error("connect");
+  const std::string req = "POST " + path + " HTTP/1.1\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+  ::send(*fd, req.data(), req.size(), MSG_NOSIGNAL);
+  std::string raw;
+  char b[4096];
+  while (!until.empty() && raw.find(until) == std::string::npos) {
+    const ssize_t n = ::recv(*fd, b, sizeof b, 0);
+    if (n <= 0) break;
+    raw.append(b, static_cast<std::size_t>(n));
+  }
+  return raw;
+}
+
+/// Waits until the observer holds `n` records; returns a copy of record `n - 1`.
+std::optional<GenerationRecord> AwaitRecord(Recording& r, std::size_t n, int ms = 10000) {
+  for (int i = 0; i < ms / 5; ++i) {
+    {
+      std::lock_guard<std::mutex> lk(r.mu);
+      if (r.records.size() >= n) return r.records[n - 1];
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
+// A client that leaves a /v1/responses stream partway: the generation is not a completed response (audit F1). The
+// observer records it as cancelled (never "stop": a truncated generation must not look like a finished one), and
+// the store does not keep the truncated turn as a completed response.
+TEST(OpenAiService, ADepartedStreamIsRecordedAndStoredAsCancelled) {
+  Rig rig;
+  rig.gen.scripts = {"r\n</think>\n\n" + std::string(3000, 'a')};
+  rig.gen.piece = 1;
+  rig.gen.delay_ms = 1;
+  int fd = -1;
+  const std::string got = SendAndReadUntil(rig.server.port(), "/v1/responses", R"({"input": "hi", "stream": true})",
+                                           "response.output_text.delta", &fd);
+  ASSERT_NE(got.find("response.created"), std::string::npos);
+  ::close(fd);
+  const auto rec = AwaitRecord(rig.observed, 1);
+  ASSERT_TRUE(rec);
+  EXPECT_EQ(rec->finish_reason, "cancelled");
+  EXPECT_LT(rec->completion_tokens, 3000u);
+  // GET answers with the cancelled object (the client holds its id from response.created); its turn is not kept,
+  // so continuing from it is refused rather than building on output the client never got in full.
+  auto [status, body] = Post(rig.server.port(), "GET", "/v1/responses/resp_1", "");
+  ASSERT_EQ(status, 200) << body;
+  EXPECT_EQ(J(body).find("status")->str(), "cancelled") << body;
+  rig.gen.scripts = {"\n</think>\n\nok"};
+  rig.gen.delay_ms = 0;
+  auto [s2, t2] = Post(rig.server.port(), "POST", "/v1/responses", R"({"previous_response_id": "resp_1", "input": "go on"})");
+  EXPECT_EQ(s2, 400) << t2;
+  EXPECT_EQ(J(t2).find("error")->find("param")->str(), "previous_response_id");
+  EXPECT_EQ(rig.gen.prompts.size(), 1u) << "a refused continuation reached the generator";
 }

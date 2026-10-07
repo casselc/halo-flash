@@ -1257,3 +1257,14 @@ binary = "server_tests"
 filter = "Http.AStalledReaderIsCutOffAfterTheSendTimeout"
 timeout = 120
 why = "a client that stays connected but stops reading holds its handler (and the engine lock) until it closes"
+
+[[mutant]]
+name = "svc-departure-as-stop"
+file = "src/server/openai_service.cpp"
+find = 'const bool cancelled = client_gone || !flush();'
+replace = 'const bool cancelled = false;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.ADepartedStreamIsRecordedAndStoredAsCancelled"
+timeout = 120
+why = "a client that left mid-stream is recorded as finish_reason stop and its truncated turn stored as completed"

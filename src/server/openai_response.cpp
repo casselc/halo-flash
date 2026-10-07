@@ -433,8 +433,12 @@ void OutputBuilder::Finish(FinishReason reason, const Usage& usage, std::vector<
 }
 
 Value OutputBuilder::Final() const {
-  if (req_.api == Api::kResponses) return ResponseJson(reason_ == FinishReason::kStop ? "completed" : "incomplete");
-  const char* finish = reason_ == FinishReason::kLength ? "length" : !calls_.empty() ? "tool_calls" : "stop";
+  if (req_.api == Api::kResponses)
+    return ResponseJson(cancelled_ ? "cancelled" : reason_ == FinishReason::kStop ? "completed" : "incomplete");
+  const char* finish = cancelled_                         ? "cancelled"
+                       : reason_ == FinishReason::kLength ? "length"
+                       : !calls_.empty()                  ? "tool_calls"
+                                                          : "stop";
   Value choice = Value::MakeObject();
   choice.set("index", Value::Int(0));
   if (req_.api == Api::kCompletions) {

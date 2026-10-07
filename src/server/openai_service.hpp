@@ -12,7 +12,10 @@
 //
 // Responses with store (the default) are kept with their input, so
 // previous_response_id continues a conversation by prefixing the stored
-// turns. The store is in memory for now (P7 moves it to the halo-scope
+// turns. A response whose client left before it was delivered in full is
+// cancelled: the observer records finish_reason "cancelled", and the store
+// keeps only the cancelled object (status "cancelled", for GET), never its
+// turn, so previous_response_id cannot continue from it (400). The store is in memory for now (P7 moves it to the halo-scope
 // SQLite store and binds it to live engine sessions).
 
 #include <cstdint>
