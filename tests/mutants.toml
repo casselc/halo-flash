@@ -17,6 +17,11 @@ env = ["HALO_TINY_HF_DIR", "HALO_TINY_QWEN35_DIR", "HALO_SMALL_QUANT_DIR", "HALO
 [suite.cpu]
 build_dir = "build/cpu-debug"
 
+# The real model and its MTP sidecar (one model instance: take the GPU lock).
+[suite.gpu-real]
+build_dir = "build/gpu"
+env = ["HALO_FLASH_NEXT_GGUF", "HALO_FLASH_NEXT_MTP", "HALO_SMALL_QUANT_DIR"]
+
 # halo-scope under ASan+UBSan: the cpu-asan preset with -DHALO_SCOPE=ON
 # (cmake --preset cpu-asan -B build/scope-asan -DHALO_SCOPE=ON); the filters
 # below need no libchdb. libchdb is not ASan-built and crashes under it: run
@@ -1446,3 +1451,95 @@ binary = "server_tests"
 filter = "OpenAiService.KeepaliveCommentsWhileAStreamWaitsAndClientsIgnoreThem"
 timeout = 120
 why = "with --sse-keepalive a stream still writes nothing while queued or prefilling, so a client's idle-read timeout fires first (D3)"
+
+# ---- SR4: session spill / restore (src/engine/session_spill.cpp, src/server/session_cache.cpp) ----------------
+
+[[mutant]]
+name = "spill-skips-recurrent"
+file = "src/engine/session_spill.cpp"
+find = '      add(s.state, 0, s.state.bytes / 4);'
+replace = '      (void)0;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Spill.RoundTripIsBitIdentical"
+why = "the DeltaNet recurrent state is not spilled: a restored session keeps whatever recurrent state its slot held"
+
+[[mutant]]
+name = "spill-wrong-position"
+file = "src/engine/session_spill.cpp"
+find = '  position_ = h.position;'
+replace = '  position_ = h.position - (h.position > 0);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Spill.LongContextRoundTripAndDropPath:Spill.RoundTripIsBitIdentical"
+why = "the restored session resumes one position early: its next token overwrites the last cached row"
+
+[[mutant]]
+name = "spill-fp16-copy-kept-valid"
+file = "src/engine/session_spill.cpp"
+find = '    attn_[l].valid16 = kv16_only_ ? position_ : 0;  // fp32 K/V: the fp16 copy is re-derived on use'
+replace = '    attn_[l].valid16 = position_;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Spill.RoundTripIsBitIdentical"
+why = "default KV: the fp16 copy the chunked prefill reads is taken as current after a restore, though the file holds only fp32 rows"
+
+[[mutant]]
+name = "spill-no-payload-checksum"
+file = "src/engine/session_spill.cpp"
+find = '        if (Crc32c(buf, k.bytes) != k.crc)'
+replace = '        if (false)'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Spill.RefusesDamagedTruncatedAndMismatchedFiles"
+why = "payload pieces are not checked: a flipped bit is restored into the session as state"
+
+[[mutant]]
+name = "spill-no-header-checksum"
+file = "src/engine/session_spill.cpp"
+find = '  if (Crc32c(&h, sizeof(h)) != want) return Fail(error, "spill file header checksum mismatch");'
+replace = '  (void)want;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Spill.RefusesDamagedTruncatedAndMismatchedFiles"
+why = "a damaged header field that nothing else validates is accepted"
+
+[[mutant]]
+name = "spill-options-unbound"
+file = "src/engine/session_spill.cpp"
+find = '  return h ^ lora;'
+replace = '  return 0 * (h ^ lora);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Spill.RefusesDamagedTruncatedAndMismatchedFiles"
+why = "a state computed under other numerics options is restored as if this engine had computed it"
+
+[[mutant]]
+name = "spill-writes-in-place"
+file = "src/engine/session_spill.cpp"
+find = '  const std::string tmp = path + ".tmp." + std::to_string(::getpid()) + "." + std::to_string(g_temp_counter++);'
+replace = '  const std::string tmp = path;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Spill.CrashMidWriteLeavesTheOldFileOrNone"
+why = "the file is written where readers look: a crash mid-write leaves a torn file at the path (and an old file cannot be replaced)"
+
+[[mutant]]
+name = "spill-mtp-rows-skipped"
+file = "src/engine/session_spill.cpp"
+find = '    add(mtp_attn_.k, 0, std::size_t{mtp_pos} * kv);'
+replace = '    add(mtp_attn_.k, 0, 0);'
+suite = "gpu-real"
+binary = "gpu_tests"
+filter = "MtpSpec.SpillRestoreKeepsDraftHistoryOnRealModel"
+why = "the draft block's K rows are not spilled: after a restore it drafts from another history (acceptance and drafts change)"
+
+[[mutant]]
+name = "cache-uses-unrestored-entry"
+file = "src/server/session_cache.cpp"
+find = '      if (!Restore(key, &why)) again = true;'
+replace = '      if (!Restore(key, &why)) again = false;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.SpilledStatesServeByteIdenticalToColdPrefill"
+why = "a spilled entry whose restore failed (damaged file) is used anyway instead of re-prefilling its tokens"

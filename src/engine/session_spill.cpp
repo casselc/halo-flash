@@ -359,11 +359,10 @@ bool FlashNextGpu::SpillSession(const std::string& path, std::span<const std::ui
   m.h.file_bytes = end;
 
   const std::string tmp = path + ".tmp." + std::to_string(::getpid()) + "." + std::to_string(g_temp_counter++);
+  // O_DIRECT (no page cache: 6+ GB files would evict the n-gram rows); buffered where refused (tmpfs).
   int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_DIRECT, 0600);
-  bool direct = fd >= 0;
   if (fd < 0 && errno == EINVAL) fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   if (fd < 0) return Fail(error, "spill: cannot create " + tmp + ": " + std::strerror(errno));
-  (void)direct;
   const auto abandon = [&](std::string why) {
     ::close(fd);
     ::unlink(tmp.c_str());

@@ -179,7 +179,7 @@ TEST(Spill, RoundTripIsBitIdentical) {
     std::vector<Op> ops;
     std::uint32_t pos = 0;
     const int nops = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 5}));
-    for (int i = 0; i < nops && pos < 400; ++i) {
+    for (int i = 0; i < nops && pos < 380; ++i) {
       Op o;
       o.prefill = tc.draw(gs::booleans());
       const auto n = o.prefill ? tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 380 - pos})) : 1u;
@@ -214,14 +214,19 @@ TEST(Spill, RoundTripIsBitIdentical) {
     E::SpillInfo ri;
     ASSERT_TRUE(target->RestoreSession(path, nullptr, &ri, &error)) << error;
     ASSERT_EQ(target->Position(), pos);
+    // Then steps and prefill chunks (a prefill reads the fp16 K/V copy, which a restore must re-derive).
     std::vector<float> got(V), want(V);
     const int tail = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 6}));
-    for (int j = 0; j < tail; ++j) {
-      const auto t = token();
-      ASSERT_TRUE(target->Step(t, got, &error) && oracle->Step(t, want, &error)) << error;
+    for (int j = 0; j < tail && pos + 41 < kMaxContext; ++j) {
+      Op o;
+      o.prefill = tc.draw(gs::booleans());
+      const auto n = o.prefill ? tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 40})) : 1u;
+      pos += n;
+      for (std::uint32_t k = 0; k < n; ++k) o.tokens.push_back(token());
+      ASSERT_TRUE(Apply(*target, o, got, &error) && Apply(*oracle, o, want, &error)) << error;
       ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0)
-          << "step " << j << " after restoring position " << pos << " (where " << where << ", kv16 "
-          << E::kv_f16_only_ << ")";
+          << (o.prefill ? "prefill " : "step ") << j << " after the restore, now at " << pos << " (where " << where
+          << ", kv16 " << E::kv_f16_only_ << ")";
     }
     std::filesystem::remove(path);
   }, {.test_cases = 40});
@@ -327,6 +332,8 @@ TEST(Spill, RefusesDamagedTruncatedAndMismatchedFiles) {
   cases.push_back({"extended", with([&](auto& c) { c.resize(c.size() + 4096, 0); }), false});
   cases.push_back({"magic", with([&](auto& c) { c[0] ^= 1; }), false});
   cases.push_back({"header bit flip (position)", with([&](auto& c) { c[40] ^= 1; }), false});
+  // A field nothing else validates (draft-block blocks, no draft block in this file): only the header checksum.
+  cases.push_back({"header bit flip (unused field)", with([&](auto& c) { c[60] ^= 1; }), false});
   cases.push_back({"meta bit flip (a task's checksum)", with([&](auto& c) { c[200] ^= 0x10; }), false});
   cases.push_back({"payload bit flip (first piece)", with([&](auto& c) { c[header_bytes + 5] ^= 0x40; }), true});
   cases.push_back({"payload bit flip (last piece)", with([&](auto& c) { c[c.size() - 4096 - 100] ^= 1; }), true});

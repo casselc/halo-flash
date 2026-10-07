@@ -92,6 +92,49 @@ class StrandsEngine : public server::DecisionEngine {
 };
 }  // namespace
 
+
+// SR4 admin routes over the session cache (docs/SESSIONS.md section 10): list retained states, spill one to the
+// spill directory, restore one. Each runs between generations (the generation lock).
+static void RegisterSpillRoutes(halo::server::HttpServer& http, halo::server::FlashNextGenerator& g) {
+  using halo::server::HttpRequest;
+  using halo::server::HttpResponse;
+  using halo::server::SessionCache;
+  http.Route("GET", "/admin/sessions", [&g](const HttpRequest&) {
+    std::string body = "{\"sessions\":[";
+    g.WithCache([&](SessionCache& c) {
+      bool first = true;
+      for (const auto& e : c.List()) {
+        char b[320];
+        std::snprintf(b, sizeof(b),
+                      "%s{\"key\":%llu,\"tokens\":%zu,\"checkpoint\":%s,\"canonical\":%s,\"spilled\":%s,"
+                      "\"device_bytes\":%zu,\"file_bytes\":%llu}",
+                      first ? "" : ",", static_cast<unsigned long long>(e.key), e.tokens, e.checkpoint ? "true" : "false",
+                      e.canonical ? "true" : "false", e.spilled ? "true" : "false", e.device_bytes,
+                      static_cast<unsigned long long>(e.file_bytes));
+        body += b;
+        first = false;
+      }
+      return true;
+    });
+    return HttpResponse::Json(200, body + "]}");
+  });
+  http.RoutePrefix("POST", "/admin/sessions/", [&g](const HttpRequest& r) {
+    const std::string rest = r.path.substr(std::string_view("/admin/sessions/").size());
+    const auto slash = rest.find('/');
+    const std::string op = slash == std::string::npos ? "" : rest.substr(slash + 1);
+    char* end = nullptr;
+    const unsigned long long key = std::strtoull(rest.c_str(), &end, 10);
+    if (slash == std::string::npos || end != rest.c_str() + slash || (op != "spill" && op != "restore"))
+      return HttpResponse::Json(404, "{\"error\":\"POST /admin/sessions/{key}/spill or /restore\"}");
+    std::string why;
+    const bool ok = g.WithCache([&](SessionCache& c) { return op == "spill" ? c.Spill(key, &why) : c.Restore(key, &why); });
+    std::string esc;
+    for (char ch : why) esc += ch == '"' || ch == '\\' ? std::string("\\") + ch : std::string(1, ch);
+    return ok ? HttpResponse::Json(200, "{\"ok\":true}")
+              : HttpResponse::Json(409, "{\"ok\":false,\"error\":\"" + esc + "\"}");
+  });
+}
+
 int main(int argc, char** argv) {
   std::string model, device = "hip", host = "127.0.0.1", api_key, model_id = "qwen3.8-flash-next", decider_dir,
                     decider_device = "hip", scope_dir, scope_project = "halo-flash", scope_capture = "digest",
@@ -119,6 +162,9 @@ int main(int argc, char** argv) {
           "                        Default KV reliably holds ~150K positions; 262144 needs fp16-only KV.\n"
           "  --prefix-cache exact|fast|off  prompt-prefix reuse (default exact: byte-identical to a cold prefill)\n"
           "  --prefix-cache-sessions N --prefix-cache-gb G --prefix-cache-align N\n"
+          "  --spill-dir DIR       session spill files (default /data/halo-work/spill; 0700 dir, 0600 files)\n"
+          "  --spill-evict 0|1     cache eviction spills to DIR instead of dropping (default 0). Admin routes:\n"
+          "                        GET /admin/sessions, POST /admin/sessions/{key}/spill | /restore\n"
           "  --ngram-cache-gb G --moe-topk N --decider-dir DIR --decider-device hip|hrx|cpu --variant MANIFEST\n"
           "  --scope-dir DIR --scope-project NAME --scope-capture off|digest|full --scope-wal PATH\n"
           "  --scope-eval-endpoint URL\n");
@@ -154,6 +200,8 @@ int main(int argc, char** argv) {
     } else if (a == "--prefix-cache-sessions") cache.max_retained = std::strtoul(v.c_str(), nullptr, 10);
     else if (a == "--prefix-cache-gb") cache.budget_bytes = static_cast<std::size_t>(std::atof(v.c_str()) * (1ull << 30));
     else if (a == "--prefix-cache-align") cache.align = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+    else if (a == "--spill-dir") cache.spill_dir = v;
+    else if (a == "--spill-evict") cache.spill_on_evict = v == "1";
     else if (a == "--model-id") model_id = v;
     else if (a == "--decider-dir") decider_dir = v;
     else if (a == "--decider-device") decider_device = v;
@@ -169,8 +217,10 @@ int main(int argc, char** argv) {
   }
   if (model.empty() == qwen35_model.empty())
     return std::fprintf(stderr, "usage: halo_serve --model <gguf> | --qwen35-model <gguf> --qwen35-tokenizer <gguf> [options]\n"), 2;
+  if (cache.spill_dir.empty()) cache.spill_dir = "/data/halo-work/spill";  // SR4 default: not /tmp (docs/SESSIONS.md 10)
   std::string error;
   std::unique_ptr<server::TextGenerator> generator;
+  server::FlashNextGenerator* flash_generator = nullptr;  // SR4 admin routes
   // Flash-Next (--model) or a Qwen3.5 dense model with variants (--qwen35-model).
   std::unique_ptr<core::GgufReader> reader, q35_reader, q35_tok_reader;
   std::optional<model::ModelWeights> weights;
@@ -207,7 +257,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "loading weights...\n");
     engine = engine::FlashNextGpu::Create(*dev, *weights, ngram.get(), nullptr, max_context, &error, sources);
     if (!engine) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
-    generator = std::make_unique<server::FlashNextGenerator>(*engine, *tok, max_context, cache);
+    auto fg = std::make_unique<server::FlashNextGenerator>(*engine, *tok, max_context, cache);
+    flash_generator = fg.get();
+    generator = std::move(fg);
   } else {
     q35_reader = core::GgufReader::OpenFile(qwen35_model, &error);
     if (!q35_reader) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
@@ -297,6 +349,7 @@ int main(int argc, char** argv) {
                            .api_key = api_key});
   service.Register(http);
   metrics.Register(http);
+  if (flash_generator) RegisterSpillRoutes(http, *flash_generator);
 #if HALO_WITH_SCOPE
   if (scope) {
     scope::RegisterAnnotationRoutes(http, scope::AnnotatorOf(scope));  // harnesses in other processes

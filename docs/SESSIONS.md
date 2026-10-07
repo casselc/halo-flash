@@ -386,3 +386,168 @@ SDK, `tests/functional/sse_keepalive_sdk_check.py`), which also turns a departur
 half-closed connection (`shutdown(SHUT_WR)` after the request) counts as gone; `Qwen35Generator` polls while
 queued, before its prefill and each step, but its prefill is one engine call; the first prefill chunk after a
 checkpoint fork starts without a poll (the generation prompt only, a few tokens).
+
+## 10. Suspend and resume: a session's state spilled to NVMe (stream SR4, 2026-10-07; working files `/data/halo-work/streams/SR4/`)
+
+HARNESS.md SR4: an idle session costs disk, not device memory; a resume restores its state instead of re-prefilling.
+`FlashNextGpu::SpillSession(path, blob)` writes the bound session's state to a file; `RestoreSession(path)` puts it
+back into the bound session (any session, any engine of the same model and options). Code:
+`src/engine/session_spill.cpp`; cache and server hooks in `server::SessionCache` and `halo_serve`.
+
+**What a file holds.** Snapshot's rows, nothing derived: the DeltaNet recurrent state (36 x 48 x 128 x 128 fp32) and
+conv state, the PLE conv history, per attention layer the K and V rows (fp32, or fp16 with `--kv-f16 1`), the live
+indexer-key rows (`kv_index_window_`: only the current QSA block's), the pooled block rows, the per-layer block counts,
+the n-gram window and the position. The fp16 K/V copy of the default kinds is not stored: Restore marks it invalid and
+the chunked prefill re-derives it from the fp32 rows on first use (the same conversion, so the same bits; mutant
+`spill-fp16-copy-kept-valid`). Captured decode graphs are not state: a restored session captures its own.
+
+**Bytes per token** (measured on the files, real model, `halo_run --spill-bench`): **default KV 50.7 KB a token, fp16-only
+KV 26.1 KB a token, plus 118.0 MB per session** (recurrent + conv + PLE) and < 1 MB of header, live indexer rows and
+4 KB section padding. That is 12 attention layers x (K + V 4096 B + pooled blocks 128 B) and x (2048 + 128) B. The
+file is smaller than the session's device footprint (default 75.3 KB / token mapped: the fp16 copy and the indexer
+keys are not stored).
+
+**Draft block (MTP).** The draft block's history is engine-wide state owned by one session. When the spilled session
+is that owner with an unbroken history (`MtpPending`), the file also holds the draft block's position, its pending
+hidden and its K / V / indexer / block rows; a restore into an engine that has the draft block loaded and tracking
+takes ownership and resumes drafting exactly where it was (`MtpSpec.SpillRestoreKeepsDraftHistoryOnRealModel`: the
+same drafts, acceptances and tokens as the uninterrupted session). Otherwise (not the owner, history broken, or an
+engine without the draft block) nothing of it is stored or restored, and the rule is the one `MtpTrack` already has
+mid-sequence: the restored session does not draft until its next reset (`mtp_pos_` past the position). The trunk's
+results never depend on the draft block (greedy verification emits AR's tokens), so this costs speed only.
+
+### File format (version 1)
+
+| Bytes | Content |
+|---|---|
+| 0-95 | header: magic `HALOSPL1`, version, header size, **model fingerprint**, **options fingerprint**, **KV kind**, indexer window, **position**, layer count, task count, draft-block flag / position / blocks, n-gram size, blob size, file size, meta size, meta CRC, piece size, **header CRC** |
+| 96 .. 4096k | meta: block counts, n-gram window, the task table (file offset, bytes, CRC32C per piece), the caller's blob |
+| payload | the sections in order, each from a 4096-byte boundary, cut into pieces of at most 16 MB (the I/O and checksum unit) |
+
+- **Model fingerprint**: FNV-1a over every uploaded tensor's name, type, shape, file offset and first 64 bytes, and the
+  LoRA count (fixed at the end of Create). Not a content hash of 79 GB (that is `model::BaseContentHashCached`, minutes
+  cold); it tells apart other models, other quantizations and other files of the same shapes.
+- **Options fingerprint**: every static option that changes a state's numbers (prefill precision options, chunk sizes,
+  router modes, decode kernel masks, `prefill_kv16_`, the KV kind and index window, LoRA scales), strictly: a state
+  computed under other options is not what this engine's own prefill would hold, so it is refused even where the
+  option is documented exact. Graphs and timing are not in it.
+- **Checks on restore, before the session is touched**: magic, version, header CRC, sizes, file size = recorded size
+  (truncated or extended files), meta CRC, model, options, KV kind, index window, layer count, position <= max_context,
+  block counts, and the whole task table against the layout this engine computes for that position. A refused file
+  leaves the session as it was. **While reading**: each piece's CRC32C; a mismatch resets the session to empty
+  (`RestoreSession` reports `reset`), never a partly restored state. The caller then re-prefills, which is exactly a
+  cold prefill.
+- The blob (the cache's token list) is covered by the meta CRC; the caller trusts the blob, not its own record, for what
+  the state holds.
+
+### I/O path
+
+Spill: `Synchronize`, then 4 threads (`spill_threads_`), each with one pinned 16 MB staging buffer (`AllocHost`):
+`Download` of a piece (serialized under one mutex: one HIP stream), CRC32C (SSE4.2), `pwrite` with `O_DIRECT` (no page
+cache: multi-GB files would evict the n-gram row cache) to a temp file; then the header, `fsync`, `rename`, `fsync` of
+the directory. Restore: header and meta read buffered, then 4 threads `pread` `O_DIRECT` pieces, check them, `Upload`.
+Disk reads of different pieces overlap each other and the uploads; overlap with other sessions' decode was not built
+(the server is one request at a time; the uploads hold the engine's stream for ~3 ms per 16 MB). `O_DIRECT` refused
+(tmpfs): buffered fallback.
+
+### Measured: restore against re-prefill (real model, `halo_run --spill-bench`, `/data` XFS on the SN5000, PCIe Gen3 x4, unpinned)
+
+Restore = a new session (the suspended one was dropped) + `RestoreSession`, median of 3, each followed by a step
+whose logits are compared bitwise with the uninterrupted session's (all 18 identical). Re-prefill = one `Prefill` of
+the same tokens after a warm-up prefill.
+
+| Context | KV | File | Spill (write + fsync) | Restore: predicted / measured | Re-prefill | Ratio |
+|---:|---|---:|---:|---:|---:|---:|
+| 2,048 | default | 221.9 MB | 67 ms | 0.10 / **0.094 s** | 1.33 s | 14x |
+| 12,288 | default | 740.9 MB | 213 ms | 0.31 / **0.289 s** | 8.56 s | 30x |
+| 131,072 | default | 6.76 GB | 1.97 s | 2.7 / **2.56 s** | 98.7 s | 39x |
+| 2,048 | fp16-only | 171.5 MB | 54 ms | 0.09 / **0.072 s** | 1.32 s | 18x |
+| 12,288 | fp16-only | 438.9 MB | 144 ms | 0.18 / **0.162 s** | 8.51 s | 53x |
+| 131,072 | fp16-only | 3.54 GB | 1.05 s | 1.35 / **1.22 s** | 97.6 s | 80x |
+
+HARNESS predicted < 0.5 s at 12K against ~8 s: 0.29 s (default) and 0.16 s (fp16) against 8.5 s. The model (file /
+3.4 GB/s + 130 us per new 2 MB page + ~20 ms) was within 10%: restores read at 2.7-3.0 GB/s (the page mapping and the
+single-stream uploads sit inside the measured time), spills write at 3.0-3.5 GB/s. At 128K the read is the whole cost:
+a Gen4 link (BIOS setting, docs/BENCHMARKS.md) would roughly halve it.
+
+**Exactness.** Bitwise: logits after spill + restore equal the uninterrupted session's (gpu_tests below; the bench's
+18 restores; `halo_run --prefill-prompt 1 --spill-roundtrip DIR --decode-logits-out` vs the same run without it, 16
+decode steps after prose_8888, `cmp`-identical for both KV kinds). The drop path (no file, or a refused one) is a
+re-prefill from empty, which equals a cold prefill (`Spill.LongContextRoundTripAndDropPath`).
+
+### Where it fits in SessionCache
+
+`SessionCacheOptions::spill_dir` (halo_serve `--spill-dir`, default `/data/halo-work/spill`) adds a disk tier:
+- `List()`, `Spill(key)`, `Restore(key)`: retained entries by a stable key; halo_serve exposes them as
+  `GET /admin/sessions`, `POST /admin/sessions/{key}/spill`, `POST /admin/sessions/{key}/restore` (under the generation
+  lock, so between requests; behind `--api-key` like every route). This is the hook yard-ctl drives; the policy (which
+  session, when) is SR5's.
+- `spill_on_evict` (halo_serve `--spill-evict 1`, default off): eviction (count, budget, `KvRoomFor`) spills the least
+  recently used resident entry instead of dropping it; a spill that is not done drops it as before.
+- `Prepare` treats a spilled entry like a resident one when it holds the longest usable prefix: it restores it (making
+  room by evicting others first), checks the blob equals the entry's tokens, deletes the file, then forks or extends it
+  as usual. A restore that fails erases the entry and the search runs again (those tokens are re-prefilled).
+- Bounds: `max_spilled` (64) and `spill_budget_bytes` (64 GB); beyond them the oldest files are deleted. Files are
+  named `s<pid>-<key>.spill`; at startup the cache deletes crash-left temp files and the files of processes that no
+  longer run (their index lived in that process); the destructor deletes its own.
+- **Memory guard (audit F3).** A spill ends in `DropSession`, which frees the session's ranges, and stream F measured
+  that this returns the pages to `AvailableBytes` at once (section 7): `KvRoomFor` sees what a spill frees, exactly as
+  with a drop. A spill briefly allocates 4 x 16 MB of pinned staging (freed before it returns).
+- Exactness: a restored entry is bit-identical to the spilled one, so exact mode's contract holds
+  (`SessionCache.SpilledStatesServeByteIdenticalToColdPrefill`).
+
+### Ambiguity (done / not done / unknown) and the caller rules
+
+Every call is synchronous: when it returns, no I/O of it is in flight (threads joined, `fsync` returned), so the
+settle bound is the return, or the process's death.
+
+| Call | Done | Not done | Unknown, and the caller rule |
+|---|---|---|---|
+| `SpillSession` | true: the complete file is at `path` and durable (fsync before rename, rename, fsync of the directory) | false before the rename: `path` is unchanged (absent or the older complete file), the temp file removed | (1) crash during the call: `path` holds the old file or none, plus a temp file no reader opens (deleted at the next start) -> **verify**: a later restore reads whatever complete file is there and its blob says which state it is. (2) crash between rename and the directory fsync, or that fsync failing (false, "may not be durable"): after a power loss `path` holds either the old or the new file, each complete -> **verify** the same way. (3) a torn or bit-rotted file at `path` (not this protocol's doing) -> the checksums refuse it -> **re-prefill**. Cache rule: an entry is marked spilled only on done; otherwise it stays resident (its device state is intact) |
+| `RestoreSession` | true: the session's state is the file's, bit for bit; the blob says what it holds | false, `reset` false: refused before any write, the session unchanged; false, `reset` true: a piece failed its checksum, the session is empty | crash mid-restore: the process's state is gone; the file is only read, so a retry is **idempotent** (and if the file is gone, re-prefill). Cache rule: any false erases the entry and its file; the tokens are re-prefilled (a cold prefill) |
+| Evict with spill (`spill_on_evict`) | spill done, then the device copy dropped | spill not done: dropped (the state is recomputed if asked for again) | as `SpillSession`; never two resident copies, never a spilled entry without a complete file |
+| Delete a file (restore done, trim, destructor) | removed | unlink failed: the file stays, unreferenced | **fence** by name: a dead pid's files are deleted at the next start; a live process never reads a file its index does not name |
+| Admin route | 200 `{"ok":true}` | 409 with the reason: nothing changed (spill) or the entry is gone (restore) | the HTTP answer lost: **verify** with `GET /admin/sessions` (spilled flag and key); both operations are safe to repeat (spill of a spilled entry and restore of a resident one are no-ops) |
+
+Fault injection: `spill_fault_` 1 (crash after half the payload, no rename) and 2 (after the fsync, before the
+rename) in `Spill.CrashMidWriteLeavesTheOldFileOrNone` and the Hegel machine; bit flips, truncation and extension of
+files in `Spill.RefusesDamagedTruncatedAndMismatchedFiles` and the machines. Counters: `SessionCache::spill_counters()`
+(spilled, spill_failed, restored, restore_failed, files_deleted); not yet exported as Prometheus metrics (open).
+
+### Permissions and storage
+
+Files are created `0600` (`O_EXCL`), the spill directory `0700`, under `--spill-dir` (default `/data/halo-work/spill`,
+not `/tmp`: tmpfs would hold multi-GB files in RAM, the memory a spill exists to free). A spill file holds the whole
+conversation's state (its tokens in the blob, and states from which text can be recovered): **encryption at rest is a
+later decision for the user** (HARNESS SR0 invariant 4 asks for encrypted datasets; `/data` is plain XFS today).
+
+### Tests and mutants
+
+- `Spill.RoundTripIsBitIdentical` (Hegel, 40): random histories of prefill chunks and steps, both KV kinds, pieces 16 KB
+  (sections cut into many pieces) or 16 MB, 1-4 threads; restored into the same session (after rewriting it), another
+  session, or a fresh engine; then steps and prefill chunks memcmp-equal to the uninterrupted engine; file mode 0600.
+- `Spill.LongContextRoundTripAndDropPath`: 3,333 positions (indexer window, many blocks), both kinds, into a fresh
+  engine; the drop path equals the cold prefill.
+- `Spill.RefusesDamagedTruncatedAndMismatchedFiles`: truncated (a piece, to the header, empty), extended, magic, header
+  bit flips (position; a field only the header CRC protects), meta bit flip, payload bit flips (first and last piece:
+  session reset), other model, options, KV kind, position, version (re-checksummed headers), an fp16-only engine, a
+  precision option flipped, a smaller max context; refused ones leave the session stepping bitwise like the oracle.
+- `Spill.CrashMidWriteLeavesTheOldFileOrNone`: both faults, with and without an older file (which still restores the
+  older state exactly); `SpillCleanTemps` removes the temp.
+- `Spill.SuspendResumeEvictCrashMachine` (Hegel, swarm, 64 KB pages): three logical sessions; step, prefill, suspend,
+  crash while suspending, resume (restore or re-prefill), evict, flip a file bit. After every resume the state is what
+  the last done spill's blob says, an undamaged file always restores, and the next step equals a fresh replay.
+- `SessionCache.SpilledStatesServeByteIdenticalToColdPrefill` (Hegel, 40): exact cache, max_retained 1-2 with
+  spill-on-evict, admin spills / restores / bit flips between turns; every request's tokens equal a cache-off engine's.
+- `MtpSpec.SpillRestoreKeepsDraftHistoryOnRealModel` (real model + MTP sidecar, 300 and 2,600 tokens).
+- Mutants (tests/mutants.toml, all killed): `spill-skips-recurrent`, `spill-wrong-position`, `spill-fp16-copy-kept-valid`,
+  `spill-no-payload-checksum`, `spill-no-header-checksum`, `spill-options-unbound`, `spill-writes-in-place`,
+  `spill-mtp-rows-skipped` (suite `gpu-real`), `cache-uses-unrestored-entry`.
+
+### Open
+
+- Uploads under one mutex on the engine's stream: a second stream (or `UploadAsync` with per-thread staging) would let
+  a restore run beside another session's decode; and would lift 2.8 GB/s toward the disk's 3.4.
+- Spill files outlive nothing: the index is in the process. Resuming after a halo_serve restart needs the index (token
+  lists) persisted next to the files (the blob already holds the tokens; the canonical / checkpoint flags would join it).
+- Prometheus counters for the spill outcomes; SR5's policy (what to spill, when) and yard-ctl's one-shot resume token.
