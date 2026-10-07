@@ -175,7 +175,7 @@ verification; the measured per-column cost, not bytes, decides it here. Acceptan
 ## 7. Full context (stream C, 2026-10-06; working files `/data/halo-work/streams/C/`)
 
 **KV kinds.** Every region carries its kind (`KvKind`: K, V, indexer keys, pooled blocks, fp16 K, fp16 V) and
-layer; forks, snapshots and paging go by the kind table. `--kv-f16 1` (`kv_f16_only_`, default off) drops the
+layer; forks, snapshots and paging go by the kind table. `--kv-f16 1` (`kv_f16_only_`, default off; `halo_serve` turns it on above 150000 positions, see below) drops the
 fp32 K/V: decode attention reads fp16 rows (`halo_attention_select_bh`, bit-identical to the fp32 kernel on the
 rounded cache), prefill appends fp16 rows directly; prefill logits are bit-identical to the default kinds.
 Raw indexer keys are read only while their QSA block is incomplete, so pages wholly below the current block
@@ -225,7 +225,14 @@ the pages the session alone holds (only fork-shared pages are unmapped, which th
 3 without the pool). Still uncounted: indexer-key pages released below the live window (~6 KB a token, reused by
 the runtime on the next prompt, so the guard under-reports by up to ~0.8 GB after a 128K prompt).
 
-**The case for `--kv-f16 1` as the long-context serving default** (not flipped: the user decides).
+**`halo_serve` default (2026-10-07, option (b) with the threshold rule).** Without `--kv-f16`, `halo_serve` uses
+fp16-only KV when `--max-context` is above `--kv-f16-above` (default 150000, about what default KV reliably holds;
+`0` disables the automatic choice) and the default kinds at or below it. An explicit `--kv-f16 1` or `--kv-f16 0`
+always wins. Startup logs one line, e.g. `kv: fp16-only (auto: --max-context 262144 > --kv-f16-above 150000)`.
+`halo_run`, `halo_score` and the library default (`kv_f16_only_ = false`) are unchanged, so their references stay
+valid. Resolution: `server::ResolveKvKind` (`src/server/kv_choice.hpp`, tests `KvChoice.*` in server_tests).
+
+**The case for `--kv-f16 1` as the long-context serving default** (decided above: option (b)).
 
 - Capacity: 26.2 KB a token against 75.3 (window on), 65% less. One default-KV session tops out near
   150K; fp16-only serves the model's full 262,144 positions. At 32K, 11 sessions fit against 4-5.
