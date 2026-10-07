@@ -118,7 +118,10 @@ bool FlashNextGpu::Launch(const char* name, rt::Dim3 grid, rt::Dim3 block, std::
     return id >= 0 && dev_.Launch(id, {1}, {1}, a, error);
   };
   if (traced && !span_set(1)) return false;
-  if (!dev_.Launch(it->second, grid, block, std::span<const rt::Arg>(args.begin(), args.size()), error)) return false;
+  if (!dev_.Launch(it->second, grid, block, std::span<const rt::Arg>(args.begin(), args.size()), error)) {
+    if (error) *error += std::string(" (launching ") + name + ")";  // a fault surfaces here under AMD_SERIALIZE_KERNEL
+    return false;
+  }
   if (traced && !span_set(0)) return false;
   if (timing_)
     Stamp(std::string(name) + " [" + std::to_string(grid.x) + "x" + std::to_string(grid.y) + "x" +
