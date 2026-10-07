@@ -2,8 +2,8 @@
 // Flash-Next, on every built backend:
 //   - greedy text equals a manual loop of engine steps and argmax, stopping
 //     at the same tokens;
-//   - a follow-up prompt that extends everything run reuses the engine state
-//     and generates exactly what a freshly reset engine generates;
+//   - fast mode: a follow-up prompt that extends everything run reuses the
+//     finished session and generates what a freshly reset engine generates;
 //   - max_tokens and cancellation end generation where they should.
 //   HALO_TINY_HF_DIR  tiny random Flash-Next (tools/make_tiny_hf_reference.py)
 
@@ -112,7 +112,9 @@ TEST(FlashNextGenerator, GreedyMatchesEngineStepsAndReuseIsExact) {
 
     // Reuse: a fresh generator (engine reset by the manual run above), then
     // a prompt extending everything it ran; compare with a fresh engine.
-    server::FlashNextGenerator a(*engine, *t->tok, kCtx);
+    // Fast mode: the finished session itself is extended (exact mode re-prefills from an aligned checkpoint;
+    // tests/gpu/session_cache_gpu_test.cpp).
+    server::FlashNextGenerator a(*engine, *t->tok, kCtx, {.mode = server::SessionCacheOptions::Mode::kFast});
     ASSERT_TRUE(engine->Reset(&e));
     (void)Collect(a, kPrompt, 8);
     const std::size_t ran = a.cached_tokens();

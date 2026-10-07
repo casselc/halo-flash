@@ -7,19 +7,23 @@
 // UTF-8 characters. Generation ends at <|im_end|>, <|endoftext|> or the
 // tokenizer's EOS (none of which is emitted), or at max_tokens.
 //
-// One sequence, one request at a time (P6 adds sessions and batching). The
-// engine's state is reused across requests when the new prompt extends
-// everything already run (a multi-turn conversation whose history renders
-// as it was generated); otherwise it is reset. Reuse is exact: the engine
-// state after running a token sequence does not depend on how it got there.
+// One request at a time. Prompt prefixes are reused across requests through
+// a SessionCache (server/session_cache.hpp): retained sessions, checkpoints
+// parked where each prompt's generation prompt starts, LRU eviction. In exact
+// mode (the default) a request's results are byte-identical to a cold
+// prefill of its prompt; fast mode also extends finished sessions (fewer
+// tokens prefilled, equal only up to the prefill-vs-decode rounding).
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "engine/flash_next_gpu.hpp"
 #include "server/openai_service.hpp"
+#include "server/session_cache.hpp"
 #include "text/tokenizer.hpp"
 
 namespace halo::server {
@@ -27,22 +31,35 @@ namespace halo::server {
 class FlashNextGenerator : public TextGenerator {
  public:
   /// `engine` and `tokenizer` must outlive the generator.
-  FlashNextGenerator(engine::FlashNextGpu& engine, const text::Tokenizer& tokenizer, std::uint32_t max_context);
+  FlashNextGenerator(engine::FlashNextGpu& engine, const text::Tokenizer& tokenizer, std::uint32_t max_context,
+                     SessionCacheOptions cache = {});
 
   Result Generate(const Params& params, const std::function<bool(std::string_view)>& on_text) override;
 
-  /// Tokens currently in the engine (prompt and generated, as run).
-  [[nodiscard]] std::size_t cached_tokens() const { return history_.size(); }
+  /// Token-level only (GenerateIds; Generate fails): no tokenizer, generation stops at `stops`.
+  FlashNextGenerator(engine::FlashNextGpu& engine, std::vector<text::TokenId> stops, std::uint32_t max_context,
+                     SessionCacheOptions cache = {});
+
+  /// Tokens the last generation's session ran (prompt and generated).
+  [[nodiscard]] std::size_t cached_tokens() const { return cache_.live_tokens(); }
+  [[nodiscard]] const SessionCache& cache() const { return cache_; }
+
+  /// The token-level generation (tests drive it without a tokenizer): `prompt` ids, the stable prefix length
+  /// (see SessionCache::Prepare), sampling and limits from `params` (its prompt text unused); `on_token` gets each
+  /// generated token (not the stop) and returns false to cancel.
+  Result GenerateIds(std::span<const std::int32_t> prompt, std::size_t stable, const Params& params,
+                     const std::function<bool(text::TokenId)>& on_token);
 
  private:
   bool IsStop(text::TokenId t) const;
 
   engine::FlashNextGpu& engine_;
-  const text::Tokenizer& tok_;
+  const text::Tokenizer* tok_;  // null: token-level only
   const std::uint32_t max_context_;
   std::vector<text::TokenId> stops_;
-  std::mutex mu_;                       // one generation at a time
-  std::vector<std::int32_t> history_;  // tokens the engine has run, in order
+  std::mutex mu_;  // one generation at a time
+  SessionCache cache_;
+  text::TokenId im_start_ = text::kNoToken;
 };
 
 /// The longest prefix of `bytes` made of whole UTF-8 sequences (a trailing
