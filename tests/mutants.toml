@@ -17,6 +17,14 @@ env = ["HALO_TINY_HF_DIR", "HALO_TINY_QWEN35_DIR", "HALO_SMALL_QUANT_DIR", "HALO
 [suite.cpu]
 build_dir = "build/cpu-debug"
 
+# halo-scope under ASan+UBSan: the cpu-asan preset with -DHALO_SCOPE=ON
+# (cmake --preset cpu-asan -B build/scope-asan -DHALO_SCOPE=ON); the filters
+# below need no libchdb. libchdb is not ASan-built and crashes under it: run
+# with HALO_SCOPE_LIBCHDB=/nonexistent and the nix env (.nix-env.sh) sourced.
+[suite.scope-asan]
+build_dir = "build/scope-asan"
+env = []
+
 # Filters. Directed tests first: --gtest_fail_fast stops before Hegel shrinks.
 #   forward: tiny Flash-Next vs reference + transformers, random sequences, tiny Qwen3.5
 #   state:   snapshots, reset, prefill
@@ -1320,3 +1328,121 @@ binary = "server_tests"
 filter = "Http.ASlowStalledReaderIsCutOffToo"
 timeout = 120
 why = "a client that stops reading a token-rate stream is noticed only once the kernel's buffers are full (about 1 MB: minutes of tokens)"
+
+# ---- Audit F5-F8 (stream A2): departures, store failures, recorder producers, client connect ---------------------
+
+[[mutant]]
+name = "svc-departed-nonstream-stored"
+file = "src/server/openai_service.cpp"
+find = 'if (storing && cancelled && run->req.stream) {'
+replace = 'if (storing && cancelled) {'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.ADepartedNonStreamingResponseStopsAndIsNotStored:OpenAiService.ServingModelUnderDeparturesStallsAndRetries"
+timeout = 300
+why = "a non-streaming response whose client left (and so never got its id) is kept in the store"
+
+[[mutant]]
+name = "http-readable-is-departure"
+file = "src/server/http.cpp"
+find = '''  pollfd p{fd, POLLRDHUP, 0};
+  const int r = ::poll(&p, 1, 0);
+  if (r < 0) return errno == EINTR;
+  return (p.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) == 0;'''
+replace = '''  pollfd p{fd, POLLRDHUP | POLLIN, 0};
+  const int r = ::poll(&p, 1, 0);
+  if (r < 0) return errno == EINTR;
+  return (p.revents & (POLLIN | POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) == 0;'''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.APipelinedNextRequestIsNotADeparture"
+timeout = 120
+why = "a liveness check that takes a readable socket for a departure cancels a request whose client pipelined the next one (keep-alive)"
+
+[[mutant]]
+name = "svc-store-failure-ignored"
+file = "src/server/openai_service.cpp"
+find = 'if (!store_->Put(id, {std::move(conv), final}, &err)) return err.empty() ? std::string("the store refused it") : err;'
+replace = '(void)store_->Put(id, {std::move(conv), final}, &err);'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.AFailedStoreWriteIsAnErrorAndKeepsNothing:OpenAiService.ServingModelUnderDeparturesStallsAndRetries"
+timeout = 300
+why = "a failed store write is answered 200 / response.completed with an id that then 404s on previous_response_id (F7)"
+
+[[mutant]]
+name = "svc-terminal-before-store"
+file = "src/server/openai_service.cpp"
+find = 'if (storing && events && !events->empty()) {'
+replace = 'if (false) {'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.AFailedStoreWriteIsAnErrorAndKeepsNothing:OpenAiService.ServingModelUnderDeparturesStallsAndRetries"
+timeout = 300
+why = "the stream's response.completed goes out before the store write, so a client is told finished for a response that was not stored"
+
+[[mutant]]
+name = "scope-commit-failure-left-open"
+file = "src/scope/metadata.cpp"
+find = '  if (Exec("COMMIT", err)) return true;'
+replace = '  return Exec("COMMIT", err);'
+suite = "scope-asan"
+binary = "scope_tests"
+filter = "ScopeResponses.AFailedWriteIsReportedAndLeavesNothing"
+timeout = 120
+why = "a COMMIT that fails leaves the transaction open: the unwritten response is visible and every later store write fails to begin"
+
+[[mutant]]
+name = "scope-producer-never-freed"
+file = "src/scope/recorder.cpp"
+find = '    if (retired) freed_.push_back(p);'
+replace = '    (void)retired;'
+suite = "scope-asan"
+binary = "scope_tests"
+filter = "ScopeWritePath.RetiredProducersAreDrainedThenFreed:ScopeAnnotate.ShortLivedThreadsLeaveNoRingsBehindAndLoseNothing"
+timeout = 120
+why = "every thread that recorded (one per HTTP connection) leaves its 1 MiB pre-faulted ring behind (F6)"
+
+[[mutant]]
+name = "scope-retired-ring-not-drained"
+file = "src/scope/recorder.cpp"
+find = '    while (ring.Pop(&table, &body, scratch_)) {'
+replace = '    while (!retired && ring.Pop(&table, &body, scratch_)) {'
+suite = "scope-asan"
+binary = "scope_tests"
+filter = "ScopeWritePath.RetiredProducersAreDrainedThenFreed"
+timeout = 120
+why = "a retired producer is freed with records still in its ring: the last records of an exiting thread are lost"
+
+[[mutant]]
+name = "scope-lease-never-retires"
+file = "src/scope/recorder.cpp"
+find = '      p_->retired_.store(true, std::memory_order_release);'
+replace = '      (void)0;'
+suite = "scope-asan"
+binary = "scope_tests"
+filter = "ScopeAnnotate.ShortLivedThreadsLeaveNoRingsBehindAndLoseNothing"
+timeout = 120
+why = "a thread's exit never retires its producer, so the Annotator path leaks a ring per connection thread"
+
+[[mutant]]
+name = "scope-connect-unbounded"
+file = "src/scope/http_client.cpp"
+find = 'if (Connect(s.fd, a->ai_addr, a->ai_addrlen, timeout_ms)) break;'
+replace = 'if (::connect(s.fd, a->ai_addr, a->ai_addrlen) == 0) break;'
+suite = "scope-asan"
+binary = "scope_tests"
+filter = "ScopeHttpClient.ConnectIsBoundedByTheTimeout"
+timeout = 30
+why = "an unreachable eval target or judge holds the runner for the kernel's SYN retries (about 2 min), not the client timeout"
+
+[[mutant]]
+name = "svc-keepalive-never-sent"
+file = "src/server/openai_service.cpp"
+find = 'alive = write(": keepalive\n\n");'
+replace = '(void)0;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.KeepaliveCommentsWhileAStreamWaitsAndClientsIgnoreThem"
+timeout = 120
+why = "with --sse-keepalive a stream still writes nothing while queued or prefilling, so a client's idle-read timeout fires first (D3)"
