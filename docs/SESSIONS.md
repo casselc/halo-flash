@@ -40,8 +40,10 @@ changed and every result is byte-identical by construction (decode and prefill l
   written; complete QSA blocks; fp16 rows already converted) into its own range, refcounted; the page holding
   the bound and anything mapped above it are copied. Sessions only append, so neither side ever writes a shared
   page: no fault handling is needed. Reset and Restore rewrite positions from 0, so they first unmap the bound
-  session's pages (stream C: before that fix a reset parent wrote into pages its forks shared; regression test
-  `Sessions.ForkSurvivesParentResetAndRestore`).
+  session's pages that a fork also holds (stream C: before that fix a reset parent wrote into pages its forks
+  shared; regression test `Sessions.ForkSurvivesParentResetAndRestore`). Pages the session alone holds stay mapped
+  and are rewritten in place (`Sessions.ResetKeepsExclusivePagesExactly`): released pages stay charged to GTT by
+  the HIP runtime, so releasing them made the server refuse prompts it could hold (section 7).
 - **Pluggable layout.** A region is `(row_bytes, row_tokens, pages)`; today's kinds are K / V (2048 B a token),
   indexer keys (512 B), pooled blocks (512 B per 4 tokens), fp16 K / V (1024 B). An fp16-only KV layout (stream
   for full context) is a different kind table with the same paging.
@@ -145,7 +147,9 @@ n-gram host 2.7) ~0.9 -> ~20.
   memory accounting shows shared pages (64 KB pages: 14.0 MB mapped, 10.4 MB exclusive).
 - `Sessions.BatchedStepsEqualSingleSteps`: B = 2..8, logits and device sampling (temperature 0.8, top-p 0.9),
   12 steps, each entry against the same session on a second engine.
-- gpu_tests 62 pass with `HALO_SMALL_QUANT_DIR`; decode logits (66 steps, short and 7K context) and prefill logits
+- `Sessions.ForkSurvivesParentResetAndRestore`, `Sessions.ResetKeepsExclusivePagesExactly` (stream C, 4 KB pages):
+  a parent reset or restored under a fork, and a reset over kept dirty pages, each against a fresh engine bitwise.
+- gpu_tests 62 pass with `HALO_SMALL_QUANT_DIR` (68 at stream C's end, at both 2 MB and 4 KB pages); decode logits (66 steps, short and 7K context) and prefill logits
   (2K vs `logits_main_5e5466e.bin`, 8K vs `l8k_ref.bin`) byte-identical to main after every change.
 
 ## 5. Open items
@@ -193,6 +197,51 @@ attention scores are sized by the visible stride. `halo_serve` refuses a prompt 
 (`KvRoomFor`) before prefilling it.
 
 Quality of `--kv-f16 1` (docs/BENCHMARKS.md gate): passes vs main defaults and vs the original baseline; on a
-128K-token document its NLL equals the default kinds' (paired -0.0007 +- 0.0030). Long-range checks, speed and
-the open items: `/data/halo-work/streams/C/STATE.md`.
+128K-token document its NLL equals the default kinds' (paired -0.0007 +- 0.0030). Needles, NLL by window and the
+split / fork checks: docs/BENCHMARKS.md "Long context". Raw results: `/data/halo-work/streams/C/`.
+
+**Serving end to end** (`halo_serve --max-context 262144`, one request at a time, greedy, thinking off;
+`streams/C/serve/`):
+
+| KV | Request sequence | Result |
+|---|---|---|
+| fp16-only | 261,499-token needle prompt, then a follow-up turn | correct; turn 1 200.1 s end to end; turn 2 reused 261,506 cached tokens, 0.79 s; GTT max 98.2 GB, MemAvailable min 25.3 GB |
+| default | fresh server: 192K, 208K, 224K, 256K | each refused before prefill in < 0.2 s (192K: 14.8 GB KV + 5.9 GB chunk buffers + 2 GB reserve > 21.6 GB free); server healthy after each |
+| default | 128K, then 160K, 176K (before the fix below) | 128K correct (94.5 s); 160K and 176K refused ("4.4 GB available") |
+| default | 128K, 160K, 176K, 128K (after the fix) | 128K correct (93.8 s); 160K refused by 0.1 GB (needs 2.5 GB more, was 12.4; + 2 GB reserve vs 4.4 free); 176K refused; 128K again correct over the kept pages (95.4 s) |
+
+**Largest reliable context per KV kind** (one session, the 8,192-token prefill chunk): default KV **~150K
+positions** (prompt + max_tokens + 512 slack) whatever was served before: 104.86 GB GTT - 83.27 model - 7.2 chunk
+buffers and scratch (measured) - ~0.8 released indexer pages - 2 reserve = 11.6 GB / 75.3 KB. A fresh server
+admits up to ~170K (the guard estimates the chunk buffers at 5.9 GB, 1.3 GB under the measured growth: open item).
+fp16-only KV: the full 262,144, with ~6 GB of GTT to spare.
+
+**Released pages stay charged.** The HIP runtime keeps a released VMM page charged to GTT for the life of the
+process (GTT used stays flat across resets; a later hipMemCreate reuses it), so rt::Device::AvailableBytes cannot
+see it. With Reset releasing every page, a server that had served 128K refused 160K. Reset and Restore now keep
+the pages the session alone holds (only fork-shared pages are unmapped, which the COW fix needs), so the guard's
+"pages already held" covers them. Not kept: an engine-owned pool remapping released handles at another address
+(`streams/C/pool_c14.patch`): the swarm faulted with a GPU aperture violation at 2 MB pages in 2 of 3 runs (0 of
+3 without the pool). Still uncounted: indexer-key pages released below the live window (~6 KB a token, reused by
+the runtime on the next prompt, so the guard under-reports by up to ~0.8 GB after a 128K prompt).
+
+**The case for `--kv-f16 1` as the long-context serving default** (not flipped: the user decides).
+
+- Capacity: 26.2 KB a token against 75.3 (window on), 65% less. One default-KV session tops out near
+  150K; fp16-only serves the model's full 262,144 positions. At 32K, 11 sessions fit against 4-5.
+- Quality: the precision gate passes against main defaults (short -0.00045 +- 0.00040, long -0.00019 +- 0.00053)
+  and against the original baseline; 128K-document NLL equals the default kinds' (-0.0007 +- 0.0030); needles
+  are correct at every depth tried, in both kinds at 32K and 128K (11/11 each) and in fp16 at 256K (7/7).
+- Speed: prefill is unchanged (prefill reads only fp16 rows in both kinds; prefill logits are bit-identical).
+  Decode is the same or slightly faster: 128K needle steps 42.1-42.4 ms (fp16) vs 42.6-42.8 (default), 32K
+  39.1-39.6 vs 39.6-41.1 (unpinned, different sessions; not an A/B).
+- Costs: decode logits are no longer byte-identical to main's references (a precision change, quality-gated),
+  so decode exactness checks would need fp16-KV references, and the gain does not show at short context, so the
+  rule "default only if significant end to end" is not met by speed or quality; the case is capacity.
+- Options: (a) default on everywhere; (b) default on in `halo_serve` only, or only when `--max-context` exceeds
+  what default KV can hold (~150K), keeping `halo_run` / `halo_score` references unchanged; (c) keep off and
+  document `--kv-f16 1` for long contexts. Recommendation: (b), with the threshold rule, since it changes nothing
+  below 150K and makes the advertised context actually servable.
+- gufo on the same needle prompts (its own server, `-c` at the length): 32K 11/11, 128K 11/11, 256K
+  7/7; cold prefill 25.1-25.5 s / 104.0-106.0 s / 218-220 s against ours 22.2-24.6 / 92.9-96.1 / 198.7-202.0 s.
 

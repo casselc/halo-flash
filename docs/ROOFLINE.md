@@ -1403,6 +1403,7 @@ attention 1.7 ms.
 | Decode QSA select on `halo_qsa_select256` (`kDecodeSelect256`, same lists) | 7K -0.2; 128K -1.5..-3; 256K -3..-6 | -0.21 / -0.20 / -0.27 (128K) / -0.27 (256K): the 1024-thread select costs only 136-274 us a call | yes (default) |
 | Decode qsa_scores_b on a full grid (one row a thread, `kDecodeScoresWide`) | 256K -1.8..-2.2 | +1.7 ms at 256K (327 -> 439 us a call) | no |
 | `halo_qsa_scores_wmma_b`: block-key tile split once per block in LDS, q pre-split (bit-identical) | 256K -7..-11 s, 128K -1.5..-2.5 s | 128K prefill (pinned, 2 rounds): 91.65 / 92.33 -> 88.71 / 89.03 s (-2.9 / -3.3 s); logits bit-identical (128K `cmp`, 2K / 8K references, property test bitwise) | yes (default) |
+| Engine KV page pool (released pages kept and remapped at another address; for the server's memory guard, not speed) | logits unchanged; server admits 160K after 128K | GPU aperture violation in the swarm at 2 MB pages, 2 of 3 runs (0 of 3 without): remapping a released handle is unsafe here. Replaced by Reset/Restore keeping exclusive pages in place (59752a2; exact, 68 tests at 2 MB and 4 KB) | no |
 
 ## 14. 2026-10-06 (stream L2, branch `stream/pageloc`): page locality at fixed bytes in flight (probe only)
 

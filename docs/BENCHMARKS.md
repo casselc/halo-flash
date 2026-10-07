@@ -167,6 +167,11 @@ end, greedy, thinking off; correct = the number in the answer):
 | 261,500 | fp16-only | 0, 10, 25, 50, 75, 90, 100 | 7/7 | 198.7-217.6 s | 45.1 |
 | 261,500 | default | — | does not fit | | |
 
+gufo on the same prompt files (`gufo serve -c <length> --think off -t 0`, alone): 32K 11/11, 128K 11/11, 256K
+7/7. Cold time to the answer 25.1-25.5 s / 104.0-106.0 s / 218.2-220.5 s against our prefill 22.2-24.6 /
+92.9-96.1 / 198.7-202.0 s (post-reboot); gufo's prefix cache served later depths faster, so only cold requests
+compare. gufo exposes no log-probabilities: no NLL comparison.
+
 **Long-document NLL** (1,024 target tokens at the end of `code.txt`, the same targets scored with the context
 truncated to a window; paired difference ± SE vs the full window):
 
