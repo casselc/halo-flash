@@ -16,6 +16,12 @@
 // frames left by a crash are replayed at startup (exactly once in chDB).
 // With a payload cache, a payload whose (project, hash) is already durably
 // written, or already in the batch being built, is not sent again.
+//
+// A producer leased to a thread (Recorder::Lease) is retired when the lease
+// dies, at the latest when its thread exits: the writer drains what its ring
+// still holds and then frees it, so threads that come and go (one per HTTP
+// connection) do not each leave a ring behind. Its counts carry over into
+// stats(), so the accounting above still holds.
 
 #include <array>
 #include <atomic>
@@ -70,6 +76,14 @@ class ChdbSink : public Sink {
 
 class Recorder;
 
+namespace detail {
+/// Whether the Recorder is still there, for leases that may outlive it.
+struct RecorderLife {
+  std::mutex mu;
+  Recorder* rec = nullptr;  // null once the Recorder is being destroyed
+};
+}  // namespace detail
+
 /// One producer thread's handle. Not thread-safe: one thread records
 /// through it. Owned by the Recorder; valid until the Recorder dies.
 class Producer {
@@ -103,10 +117,45 @@ class Producer {
 
  private:
   friend class Recorder;
+  friend class ProducerLease;
   Producer(Recorder* rec, std::size_t ring_bytes) : rec_(rec), ring_(ring_bytes) { scratch_.reserve(4096); }
   Recorder* rec_;
   Ring ring_;
   std::string scratch_;
+  /// Set (release) by its lease once its thread records no more; the writer frees the producer after the drain
+  /// that follows its acquire load, so every record pushed before the retirement is written first.
+  std::atomic<bool> retired_{false};
+};
+
+/// A thread's ownership of a producer: destroying the lease (for a
+/// thread_local one, when the thread exits) retires the producer; the
+/// writer drains its ring, then frees it. A lease destroyed after its
+/// Recorder does nothing (the Recorder freed the producer). Movable.
+class ProducerLease {
+ public:
+  ProducerLease() = default;
+  ProducerLease(ProducerLease&& o) noexcept : life_(std::move(o.life_)), p_(o.p_) { o.p_ = nullptr; }
+  ProducerLease& operator=(ProducerLease&& o) noexcept {
+    if (this != &o) {
+      Release();
+      life_ = std::move(o.life_);
+      p_ = o.p_;
+      o.p_ = nullptr;
+    }
+    return *this;
+  }
+  ProducerLease(const ProducerLease&) = delete;
+  ProducerLease& operator=(const ProducerLease&) = delete;
+  ~ProducerLease() { Release(); }
+  [[nodiscard]] Producer* get() const { return p_; }
+  /// Retires the producer now (the thread must not use it afterwards).
+  void Release();
+
+ private:
+  friend class Recorder;
+  ProducerLease(std::shared_ptr<detail::RecorderLife> life, Producer* p) : life_(std::move(life)), p_(p) {}
+  std::shared_ptr<detail::RecorderLife> life_;
+  Producer* p_ = nullptr;
 };
 
 struct RecorderOptions {
@@ -140,6 +189,8 @@ struct RecorderStats {
   bool crashed = false;                // the sink threw; the writer stopped
   std::uint64_t sink_ns = 0;          // writer wall time inside Sink::Write
   std::uint64_t sink_thread_cpu_ns = 0;  // writer thread CPU inside Sink::Write
+  std::uint64_t producers = 0;           // live producers (each holds a ring of ring_bytes)
+  std::uint64_t producers_freed = 0;     // retired producers drained and freed
   std::string last_error;
 };
 
@@ -154,7 +205,11 @@ class Recorder {
   Recorder& operator=(const Recorder&) = delete;
 
   /// A new producer with its own ring. Takes a lock; call once per thread.
+  /// It lives as long as the Recorder (see Lease for one that is freed).
   Producer* NewProducer();
+  /// A new producer owned by the returned lease: when the lease dies the
+  /// producer is retired, drained and freed by the writer.
+  ProducerLease Lease();
   /// Returns when every record accepted before the call (in happens-before
   /// order) has been handed to the sink, written or failed.
   void Flush();
@@ -168,7 +223,10 @@ class Recorder {
 
  private:
   friend class Producer;
+  friend class ProducerLease;
   void Wake();
+  /// Frees the retired producers in `freed` (writer side, after their final drain).
+  void Free(const std::vector<Producer*>& freed);
   void WriterLoop();
   bool Iterate(bool send_all);
   bool DrainAll();
@@ -211,8 +269,10 @@ class Recorder {
   std::unordered_set<std::string> in_batch_;
   std::vector<std::string> in_batch_order_;
 
-  // published stats (guarded by mu_)
+  // published stats (guarded by mu_); the counts of freed producers live on in stats_.accepted / dropped
   RecorderStats stats_;
+  std::vector<Producer*> freed_;  // writer-thread scratch
+  std::shared_ptr<detail::RecorderLife> life_ = std::make_shared<detail::RecorderLife>();
 };
 
 }  // namespace halo::scope

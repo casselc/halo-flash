@@ -42,13 +42,14 @@ Annotator::Annotator(Recorder& rec, std::string project, Capture capture, Clock 
 
 Producer* Annotator::ThisThread() {
   // Serial-keyed, so an annotator allocated where a dead one was never
-  // inherits its producers.
-  thread_local std::vector<std::pair<std::uint64_t, Producer*>> mine;
-  for (const auto& [serial, p] : mine)
-    if (serial == serial_) return p;
-  Producer* p = rec_.NewProducer();
-  mine.emplace_back(serial_, p);
-  return p;
+  // inherits its producers. Leased: when the thread exits (an HTTP
+  // connection's thread, one per connection) its producers are retired,
+  // and the recorder's writer drains and frees their rings.
+  thread_local std::vector<std::pair<std::uint64_t, ProducerLease>> mine;
+  for (const auto& [serial, lease] : mine)
+    if (serial == serial_) return lease.get();
+  mine.emplace_back(serial_, rec_.Lease());
+  return mine.back().second.get();
 }
 
 std::string Annotator::NewId() {

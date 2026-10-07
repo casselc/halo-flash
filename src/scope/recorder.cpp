@@ -78,6 +78,7 @@ std::string PayloadKey(std::string_view row) {
 }  // namespace
 
 Recorder::Recorder(Sink& sink, RecorderOptions opt) : sink_(sink), opt_(opt) {
+  life_->rec = this;
   epoch_ = std::random_device{}() ^ (static_cast<std::uint64_t>(std::random_device{}()) << 32);
   for (auto& b : batches_) b.buf.reserve(1 << 20);
   if (!opt_.wal_path.empty()) {
@@ -104,13 +105,48 @@ Recorder::Recorder(Sink& sink, RecorderOptions opt) : sink_(sink), opt_(opt) {
   if (opt_.writer_thread) writer_ = std::thread([this] { WriterLoop(); });
 }
 
-Recorder::~Recorder() { Stop(); }
+Recorder::~Recorder() {
+  {
+    // Leases that die from now on leave their producers to this destructor.
+    std::lock_guard<std::mutex> lk(life_->mu);
+    life_->rec = nullptr;
+  }
+  Stop();
+}
 
 Producer* Recorder::NewProducer() {
   std::lock_guard<std::mutex> lk(mu_);
   producers_.emplace_back(new Producer(this, opt_.ring_bytes));
   producers_gen_.fetch_add(1, std::memory_order_release);
   return producers_.back().get();
+}
+
+ProducerLease Recorder::Lease() { return ProducerLease(life_, NewProducer()); }
+
+void ProducerLease::Release() {
+  if (!p_) return;
+  {
+    std::lock_guard<std::mutex> lk(life_->mu);
+    if (Recorder* rec = life_->rec) {
+      // Release: every record this thread pushed is visible to the writer that acquires the flag.
+      p_->retired_.store(true, std::memory_order_release);
+      rec->Wake();
+    }
+  }
+  p_ = nullptr;
+  life_.reset();
+}
+
+void Recorder::Free(const std::vector<Producer*>& freed) {
+  std::lock_guard<std::mutex> lk(mu_);
+  for (Producer* p : freed) {
+    stats_.accepted += p->accepted();
+    stats_.dropped += p->dropped();
+    ++stats_.producers_freed;
+    std::erase_if(producers_, [p](const std::unique_ptr<Producer>& q) { return q.get() == p; });
+    std::erase(snapshot_, p);
+  }
+  producers_gen_.fetch_add(1, std::memory_order_release);
 }
 
 void Recorder::Wake() {
@@ -157,6 +193,7 @@ RecorderStats Recorder::stats() const {
     s.accepted += p->accepted();
     s.dropped += p->dropped();
   }
+  s.producers = producers_.size();
   return s;
 }
 
@@ -239,8 +276,12 @@ bool Recorder::DrainAll() {
     snapshot_gen_ = producers_gen_.load(std::memory_order_relaxed);
   }
   bool any = false;
+  freed_.clear();
   for (Producer* p : snapshot_) {
     Ring& ring = p->ring_;
+    // Read before the drain: a retired producer's records were all pushed before the flag (release / acquire),
+    // so this drain empties it for good.
+    const bool retired = p->retired_.load(std::memory_order_acquire);
     std::uint8_t table;
     std::string_view body;
     while (ring.Pop(&table, &body, scratch_)) {
@@ -280,7 +321,9 @@ bool Recorder::DrainAll() {
       }
     }
     ring.wake_sent.store(false, std::memory_order_relaxed);
+    if (retired) freed_.push_back(p);
   }
+  if (!freed_.empty()) Free(freed_);
   return any;
 }
 
