@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -25,6 +27,7 @@ bool Ok(hipError_t e, const char* what, std::string* error) {
 class HipDevice final : public Device {
  public:
   ~HipDevice() override {
+    for (const auto& [bytes, p] : range_pool_) (void)hipMemAddressFree(p, bytes);
     if (module_) (void)hipModuleUnload(module_);
     if (stream_) (void)hipStreamDestroy(stream_);
   }
@@ -101,15 +104,32 @@ class HipDevice final : public Device {
       if (error) *error = "page mapping: not supported by this device";
       return b;
     }
-    const std::size_t n = (bytes + page_bytes_ - 1) / page_bytes_ * page_bytes_;
+    const std::size_t n = std::max((bytes + page_bytes_ - 1) / page_bytes_ * page_bytes_, page_bytes_);
+    {
+      std::lock_guard<std::mutex> lk(range_mu_);
+      if (auto it = range_pool_.find(n); it != range_pool_.end()) {  // a released range of this size, still reserved
+        b.device = it->second;
+        b.bytes = n;
+        range_pool_.erase(it);
+        return b;
+      }
+    }
     void* p = nullptr;
-    if (!Ok(hipMemAddressReserve(&p, n ? n : page_bytes_, 0, nullptr, 0), "hipMemAddressReserve", error)) return b;
+    if (!Ok(hipMemAddressReserve(&p, n, 0, nullptr, 0), "hipMemAddressReserve", error)) return b;
     b.device = p;
-    b.bytes = n ? n : page_bytes_;
+    b.bytes = n;
     return b;
   }
+  // Released ranges (their pages already unmapped) stay reserved and are handed out again by ReserveRange:
+  // freeing a range and reserving one at the same address again (the runtime's allocator reuses addresses)
+  // made a kernel writing a page freshly mapped there take a GPU permission fault, intermittently (MTP serving,
+  // 7 of 11 runs; 0 of 4 with no address reuse, 0 of 4 with this pool; docs/SESSIONS.md section 10). Remapping
+  // pages inside a kept reservation is what EnsureKv / Reset already do. The pool holds at most the peak in use.
   void ReleaseRange(Buffer& b) noexcept override {
-    if (b.device) (void)hipMemAddressFree(b.device, b.bytes);
+    if (b.device) {
+      std::lock_guard<std::mutex> lk(range_mu_);
+      range_pool_.emplace(b.bytes, b.device);
+    }
     b = {};
   }
   void* CreatePage(std::string* error) override {
@@ -243,6 +263,8 @@ class HipDevice final : public Device {
     return false;
   }
   bool capturing_ = false;
+  std::mutex range_mu_;
+  std::multimap<std::size_t, void*> range_pool_;  // released ranges by size, still reserved (guarded by range_mu_)
   hipStream_t stream_ = nullptr;
   static constexpr std::size_t kPageTarget = std::size_t{2} << 20;
   hipMemAllocationProp prop_{};

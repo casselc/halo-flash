@@ -569,6 +569,63 @@ struct CancelAt {
 
 }  // namespace
 
+// rt::HipDevice keeps released ranges reserved and hands them out again (the runtime reusing a freed address made
+// a write to a freshly mapped page fault: docs/SESSIONS.md section 10). 32 ranges of 3 pages are used and released;
+// 96 ranges of 1 or 2 pages reserved meanwhile overlap none of them (they stay reserved; returned to the runtime,
+// their addresses are handed out again for other sizes); 32 new 3-page ranges are exactly the released ones. Every
+// range's fresh pages hold what was written through them.
+TEST(SessionCache, ReleasedRangesComeBackAndRemapCleanly) {
+  std::string e;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &e);
+  if (!dev) GTEST_SKIP() << "no GPU backend";
+  const std::size_t pb = dev->PageBytes();
+  if (pb == 0) GTEST_SKIP() << "no page mapping";
+  // Maps a fresh page at each page of `r`, fills it with `v`, reads it back, unmaps and releases the pages.
+  const auto use = [&](const rt::Buffer& r, std::uint8_t v) {
+    std::vector<void*> h(r.bytes / pb);
+    for (std::size_t j = 0; j < h.size(); ++j) {
+      h[j] = dev->CreatePage(&e);
+      ASSERT_TRUE(h[j] && dev->MapPage(r, j * pb, h[j], &e)) << e;
+    }
+    ASSERT_TRUE(dev->Fill(r, v, &e) && dev->Synchronize(&e)) << e;
+    std::vector<std::uint8_t> back(r.bytes);
+    ASSERT_TRUE(dev->Download(r, 0, back.data(), back.size(), &e)) << e;
+    ASSERT_TRUE(std::all_of(back.begin(), back.end(), [&](std::uint8_t b) { return b == v; })) << int(v);
+    for (std::size_t j = 0; j < h.size(); ++j) {
+      ASSERT_TRUE(dev->UnmapPage(r, j * pb, &e)) << e;
+      dev->ReleasePage(h[j]);
+    }
+  };
+  std::vector<rt::Buffer> big(32), small(96);
+  std::set<void*> released;
+  for (auto& r : big) {
+    r = dev->ReserveRange(3 * pb, &e);
+    ASSERT_TRUE(r.device) << e;
+  }
+  for (auto& r : big) {
+    ASSERT_NO_FATAL_FAILURE(use(r, 1));
+    released.insert(r.device);
+    dev->ReleaseRange(r);
+  }
+  for (std::size_t i = 0; i < small.size(); ++i) {
+    small[i] = dev->ReserveRange((1 + i % 2) * pb, &e);
+    ASSERT_TRUE(small[i].device) << e;
+    const auto* p = static_cast<const char*>(small[i].device);
+    for (void* q : released)
+      ASSERT_TRUE(p + small[i].bytes <= static_cast<const char*>(q) || static_cast<const char*>(q) + 3 * pb <= p)
+          << "range " << i << " overlaps a released range that should still be reserved";
+    ASSERT_NO_FATAL_FAILURE(use(small[i], static_cast<std::uint8_t>(2 + i)));
+  }
+  for (auto& r : big) {
+    r = dev->ReserveRange(3 * pb, &e);
+    ASSERT_TRUE(r.device) << e;
+    ASSERT_EQ(released.erase(r.device), 1u) << "a 3-page range did not come from the released ones";
+    ASSERT_NO_FATAL_FAILURE(use(r, 200));
+  }
+  for (auto& r : big) dev->ReleaseRange(r);
+  for (auto& r : small) dev->ReleaseRange(r);
+}
+
 // Requests cancelled at any point (before the prefill, between its chunks, between decode steps) leave the cache as
 // cold replays would. Exact mode: every later request's tokens equal a cold engine's, and a cancelled request's
 // tokens are a prefix of its full run. Fast mode: a request stopped after k decode steps leaves the same state as

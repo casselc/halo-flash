@@ -1372,3 +1372,13 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "SessionCache.SpeculativeDecodeIsGreedyIdenticalAndReuseStaysExact"
 why = "a sampled request verified greedily returns the argmax text instead of a sample"
+
+[[mutant]]
+name = "rt-range-freed-on-release"
+file = "src/rt/hip_device.cpp"
+find = 'range_pool_.emplace(b.bytes, b.device);'
+replace = '(void)hipMemAddressFree(b.device, b.bytes);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.ReleasedRangesComeBackAndRemapCleanly"
+why = "a released range goes back to the runtime, whose reuse of the address made writes to a freshly mapped page fault"
