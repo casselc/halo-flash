@@ -981,7 +981,8 @@ int main(int argc, char** argv) {
           windows.push_back(std::atol(spec_windows.substr(p, q == std::string::npos ? std::string::npos : q - p).c_str()));
           p = q == std::string::npos ? spec_windows.size() : q + 1;
         }
-        for (const long window : windows) {
+        for (std::size_t wi = 0; wi < windows.size(); ++wi) {
+        const long window = windows[wi];
         sp.clear();
         double sp_ms = 0;  // per window (one timer across windows divided window k's tokens by k windows' time)
         // Speculative: the draft block follows the last `window` prompt positions (all: -1).
@@ -1036,7 +1037,7 @@ int main(int argc, char** argv) {
         std::printf("spec window %s %ld: prefill %.1f ms (draft from %u), TTFT %.1f ms, tokens/cycle %.3f, MTP %.2f tok/s\n",
                     name.c_str(), window, prefill_ms, start, prefill_ms + first_ms, double(n) / cycles, sp_tok);
         std::fflush(stdout);
-        if (&window == &windows.front()) ar_ms_all += ar_ms, ar_n_all += n - 4;
+        if (wi == 0) ar_ms_all += ar_ms, ar_n_all += n - 4;
         sp_ms_all += sp_ms, sp_n_all += timed;
         }
       }
