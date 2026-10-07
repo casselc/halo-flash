@@ -1469,16 +1469,20 @@ namespace halo::engine {
 bool FlashNextGpu::MtpAfterPrefillRows(std::span<const std::int32_t> tokens, std::string* error) {
   const auto& c = w_.config;
   const std::uint32_t D = c.HcDim(), T = static_cast<std::uint32_t>(tokens.size());
-  if (position_ > 0 && mtp_pos_ + 1 != position_) return true;  // history already broken: no drafting
-  if (position_ > 0 && !MtpRun(tokens[0], &mtp_hpend_, {}, error)) return false;
+  // Row t is trunk position P = position_ + t. Pending (the hidden of P - 1 kept): the base step for its token;
+  // following (P is the next position to keep): keep its hidden. Rows before mtp_base_ (the history window) and
+  // a broken history (kMtpNever) do neither.
   for (std::uint32_t t = 0; t < T; ++t) {
+    const std::uint32_t P = position_ + t;
+    if (P > 0 && mtp_base_ + mtp_pos_ + 1 == P && !MtpRun(tokens[t], &mtp_hpend_, {}, error)) return false;
+    if (mtp_base_ + mtp_pos_ != P) continue;
     const bool ok = Res16() ? Launch(Rk("halo_res_to_f32", Res16()).c_str(), {Blocks(D)}, {kBlock},
                                      {rt::Arg::Buf(mtp_hpend_), rt::Arg::Buf(ck_.res, std::size_t{t} * D * 2), rt::Arg::Val(D)},
                                      error)
                             : Launch("halo_copy", {Blocks(D)}, {kBlock},
                                      {rt::Arg::Buf(mtp_hpend_), rt::Arg::Buf(ck_.res, std::size_t{t} * D * 4), rt::Arg::Val(D)},
                                      error);
-    if (!ok || (t + 1 < T && !MtpRun(tokens[t + 1], &mtp_hpend_, {}, error))) return false;
+    if (!ok) return false;
   }
   return true;
 }

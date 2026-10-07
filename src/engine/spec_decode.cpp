@@ -35,9 +35,16 @@ bool FlashNextGpu::MtpTrack(bool on, std::string* error) {
   }
   mtp_track_ = on;
   mtp_owner_ = bound_;
-  // From position 0 the draft block follows every step; mid-sequence it has no history, so no drafting
-  // (mtp_pos_ never catches up) until the next Reset.
-  mtp_pos_ = position_ == 0 ? 0 : position_ + 1;
+  // From position 0 the draft block follows every step; mid-sequence it has no history, so no drafting until the
+  // next Reset (MtpTrackFrom starts a history mid-sequence).
+  mtp_pos_ = 0;
+  mtp_base_ = position_ == 0 ? 0 : kMtpNever;
+  return true;
+}
+
+bool FlashNextGpu::MtpTrackFrom(std::uint32_t start, std::string* error) {
+  if (!MtpTrack(true, error)) return false;
+  mtp_base_ = std::max(start, position_);
   return true;
 }
 
@@ -47,6 +54,7 @@ bool FlashNextGpu::MtpSave(MtpCheckpoint* cp, std::string* error) {
     return false;
   }
   cp->pos = mtp_pos_;
+  cp->base = mtp_base_;
   cp->hpend.resize(w_.config.HcDim());
   return dev_.Download(mtp_hpend_, 0, cp->hpend.data(), cp->hpend.size() * 4, error);
 }
@@ -57,6 +65,7 @@ bool FlashNextGpu::MtpRestore(const MtpCheckpoint& cp, std::string* error) {
     return false;
   }
   mtp_pos_ = cp.pos;  // the draft block's cache rows past it are overwritten by later steps
+  mtp_base_ = cp.base;
   return dev_.Upload(mtp_hpend_, 0, cp.hpend.data(), cp.hpend.size() * 4, error);
 }
 
@@ -292,7 +301,7 @@ bool FlashNextGpu::SpecVerify(std::span<const std::int32_t> rows_tok, std::span<
   // 5. The draft block catches up on the committed rows (their true hiddens), the last one stays pending.
   if (!(mtp_track_ && bound_ == mtp_owner_)) return dev_.Synchronize(error);  // SpecStepDrafts: no draft block
   const std::size_t D = c.HcDim();
-  mtp_pos_ = p;
+  mtp_pos_ = p - mtp_base_;  // drafting needed MtpPending: mtp_base_ + mtp_pos_ + 1 == p before the drafts
   for (std::uint32_t e = 0; e < a; ++e) {
     const rt::Buffer h = View(bb_.res, std::size_t{e} * D * 4, D * 4);
     if (!MtpRun(rows_tok[e + 1], &h, {}, error)) return false;
