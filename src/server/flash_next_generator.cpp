@@ -1,6 +1,9 @@
 #include "server/flash_next_generator.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 #include "core/sampling.hpp"
 
@@ -82,10 +85,15 @@ TextGenerator::Result FlashNextGenerator::GenerateIds(std::span<const std::int32
       std::min<std::uint32_t>(params.max_tokens, max_context_ - static_cast<std::uint32_t>(ids.size()));
   std::string error;
   // A prompt the memory left cannot hold is refused before its prefill (minutes at long context), not midway.
+  using Clock = std::chrono::steady_clock;
+  static const bool trace = std::getenv("HALO_CACHE_TRACE") != nullptr;  // per-request timing on stderr
+  const auto t0 = Clock::now();
   SessionCache::Prepared prep;
   if (!cache_.Prepare(ids, stable, static_cast<std::uint32_t>(ids.size()) + budget, &prep, &error))
     return r.error = error, r;
   r.cached_tokens = prep.reused;
+  const auto t1 = Clock::now();
+  auto t2 = t1;
 
   std::vector<text::TokenId> as_tok(ids.begin(), ids.end());
   sampling::SamplerState state(params.sampling, as_tok);
@@ -99,6 +107,7 @@ TextGenerator::Result FlashNextGenerator::GenerateIds(std::span<const std::int32
       return r.error = error, r;
     }
     cache_.Ran(token);
+    if (r.completion_tokens == 0) t2 = Clock::now();
     state.SetRngState(res.rng);
     const auto next = static_cast<text::TokenId>(res.token);
     if (IsStop(next)) break;
@@ -112,7 +121,15 @@ TextGenerator::Result FlashNextGenerator::GenerateIds(std::span<const std::int32
   }
   r.length_limited = !cancelled && r.completion_tokens == budget && budget > 0;
   // A sampled token that was neither a stop nor run is not in the session; its state is exactly what it ran.
+  const auto t3 = Clock::now();
   cache_.Finish();
+  if (trace) {
+    const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    std::fprintf(stderr, "cache: prompt %zu reused %zu prefilled %zu ckpt %d | prepare %.1f ms, first step %.1f ms, "
+                 "decode %.1f ms, finish %.1f ms | %llu tokens, retained %zu\n", ids.size(), prep.reused, prep.prefilled,
+                 prep.checkpointed ? 1 : 0, ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, Clock::now()),
+                 static_cast<unsigned long long>(r.completion_tokens), cache_.retained());
+  }
   return r;
 }
 

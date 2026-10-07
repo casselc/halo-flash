@@ -196,3 +196,48 @@ Quality of `--kv-f16 1` (docs/BENCHMARKS.md gate): passes vs main defaults and v
 128K-token document its NLL equals the default kinds' (paired -0.0007 +- 0.0030). Long-range checks, speed and
 the open items: `/data/halo-work/streams/C/STATE.md`.
 
+
+## 8. Serving: prompt-prefix reuse across retained sessions (stream H, 2026-10-06; working files `/data/halo-work/streams/H/`)
+
+`halo_serve` used one engine state, extended when a prompt extended everything run and reset otherwise. Two
+agent harnesses defeated it (yard Phase 0): opencode's concurrent title request (another prompt) reset the
+conversation, which then re-prefilled 7.3K tokens; Hermes drops `reasoning_content` from its history, so its
+next prompt is never an extension of what the engine generated and it re-prefilled ~12.5K tokens every turn.
+
+`server::SessionCache` (`src/server/session_cache.hpp`) keeps several sessions and starts each request from the
+retained state with the longest prefix of its prompt:
+- **Checkpoints.** During each prefill a fork is parked where the prompt's generation prompt starts (the last
+  `<|im_start|>`): the next turn renders everything before it again, however it renders this turn's output.
+  So reasoning dropped from history costs nothing: it sits after the checkpoint, never mid-history (the engine's
+  copy need not be re-rendered without reasoning).
+- **LRU** under `--prefix-cache-sessions` (8) and `--prefix-cache-gb` (8 GB of recurrent + exclusive KV pages),
+  and whenever `KvRoomFor` says a prompt does not fit. An unrelated request gets its own session.
+- **One request at a time** still (the mutex): the title request no longer evicts the conversation, but the
+  conversation's request still waits for it. Overlap needs the scheduler (G3) and batched decode.
+
+**Exactness.** Where a prefill is split changes the arithmetic. Real model (`SessionCache.RealModelSplitProbe`,
+prose, 5000 and 10000 tokens): a split at any multiple of 16 positions leaves the logits of the prefill and of
+4 steps after it bit-identical to one unsplit prefill (24 points from 16 to 9008, across the 8192-token long-chunk
+boundary); every split at a multiple of 8 or 4 only moves them by 1.2e-2 to 6.4e-2 relative (L2). 16 is the
+DeltaNet scan's piece. A decoded token's state also differs from a prefilled one's.
+
+| `--prefix-cache` | Reuses | Results vs one cold prefill of the prompt |
+|---|---|---|
+| `exact` (default) | checkpoints at multiples of 64 (`--prefix-cache-align`) taken in aligned prefills | byte-identical (test below) |
+| `fast` | also finished sessions (the client echoed what was generated) and unaligned checkpoints | equal up to the prefill-vs-decode rounding: 1 of 123 small-model requests differed |
+| `off` | nothing | the reference |
+
+`SessionCache.ReuseIsByteIdenticalToColdPrefill` (Hegel, small model, 40 conversations, 123 requests): random
+agent conversations whose next prompt keeps the previous prompt to its generation prompt and then echoes or
+re-renders the turn, with unrelated requests interleaved; every request's greedy or seeded-sampled tokens from
+the exact cache equal a cache-off engine's; 28% of prompt tokens were reused. Positive control:
+`HALO_TEST_CACHE_ALIGN=1` (checkpoints anywhere) fails it on the first request.
+
+**Cost per request** (real model, `HALO_CACHE_TRACE=1`, 1.4-1.6K-token conversation, stream H c1/c2): a
+`Prefill` call has ~140 ms fixed cost (113 tokens 279 ms; marginal ~0.65 ms/token), and a checkpoint splits the
+prefill into two calls plus a fork (~10-20 ms). A later turn's prepare: exact 400-427 ms (64 + ~12 tokens),
+fast 290-300 ms, off 1.06-1.17 s; the first decode step is 38-43 ms in every mode (no graph-capture cost). So
+exact mode costs clients that echo their history (pi, opencode) ~0.2 s TTFC a turn against the old single-session
+extension, and saves Hermes ~8 s a turn. Fast mode skips the checkpoint when it extends a finished session.
+Removing the split cost belongs to the engine: a lower per-call fixed cost, or capturing the recurrent state at an
+aligned position inside a chunk.

@@ -63,6 +63,7 @@ bool SessionCache::Prepare(std::span<const std::int32_t> prompt, std::size_t sta
 
   // The live session: a fork of a checkpoint, a finished live session taken over, or a fresh one.
   live_ = {};
+  const bool extends_live = best && !best->checkpoint;
   if (best && best->checkpoint) {
     if (!e_.ForkSession(best->id, &live_.id, error)) return false;
     best->used = ++clock_;
@@ -93,7 +94,11 @@ bool SessionCache::Prepare(std::span<const std::int32_t> prompt, std::size_t sta
   // Checkpoint position: where the generation prompt starts (exact: rounded down to the alignment).
   std::size_t ck = std::min(stable, n);
   if (exact) ck = ck / opt_.align * opt_.align;
-  const bool want_ck = opt_.mode != SessionCacheOptions::Mode::kOff && ck > out->reused &&
+  // A checkpoint costs a second prefill call (~140 ms fixed per call on the real model, stream H c1) and a fork.
+  // Fast mode skips it when this request extends a finished session: that client echoes its history, so the
+  // next request will most likely extend this one again (opencode, pi); a client that re-renders (Hermes) never
+  // extends, so it always gets one.
+  const bool want_ck = opt_.mode != SessionCacheOptions::Mode::kOff && ck > out->reused && !extends_live &&
                        !(exact && !live_.canonical) &&
                        std::none_of(entries_.begin(), entries_.end(), [&](const Entry& en) {
                          return en.tokens.size() == ck && std::equal(en.tokens.begin(), en.tokens.end(), prompt.begin());
