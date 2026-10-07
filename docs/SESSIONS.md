@@ -241,3 +241,20 @@ exact mode costs clients that echo their history (pi, opencode) ~0.2 s TTFC a tu
 extension, and saves Hermes ~8 s a turn. Fast mode skips the checkpoint when it extends a finished session.
 Removing the split cost belongs to the engine: a lower per-call fixed cost, or capturing the recurrent state at an
 aligned position inside a chunk.
+
+**Agent harnesses** (yard Phase 0 battery, 5 tasks each, real model; `platform/bin/analyze.py`; "later" = every
+request of a task after its first; re-prefill = prompt tokens not served from reused state):
+
+| Harness | Later-turn TTFC median: main / exact / fast | Re-prefill median, exact | Task wall, t1+t4+t5: main / exact / fast | Pass: main / exact |
+|---|---|---|---|---|
+| Hermes 0.21.5 | 9.5 / 0.76 / 0.63 s | 329 tokens (main: the whole ~12.5K prompt) | 136 / 75 / 70 s | 5/5 / 5/5 |
+| opencode 1.18.35 | 0.42 / 0.81 / 0.44 s | 436 | 88 / 78 / 125 s | 5/5 / 5/5 |
+| pi 1.0.4 (chat) | 0.35 / 0.65 / 0.24 s | 270 | 49 / 43 / 43 s | 5/5 / 5/5 |
+| pi 1.0.4 (responses) | 0.33 / 0.66 / 0.28 s | 243 | 53 / 36 / 38 s | 5/5 / 5/5 |
+| Codex 0.160.1 | rejected (400) / 0.96 / 0.50 s | 636 | - / 109 / 93 s | 0/1 / 4/5 |
+
+Main's opencode p90 (15.8 s: the title request's ~11 s plus a 7.3K re-prefill) became 10.5 s: the wait for the
+title request remains (one request at a time), the re-prefill is gone. Codex's multi-agent tools work end to
+end (namespace tools, server/openai_request.hpp): asked to delegate, it spawned, waited for and closed a sub-agent
+through `multi_agent_v1.*` calls returned with `"namespace"`, and answered correctly. Single runs per task: task walls move with
+the model's output length (opencode t5 24.7 s exact, 43.5 s fast).
