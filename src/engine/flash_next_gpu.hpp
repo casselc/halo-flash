@@ -351,6 +351,43 @@ class FlashNextGpu {
   /// Device bytes one more position costs the bound session (its KV kind table; indexer keys windowed).
   [[nodiscard]] double KvBytesPerToken() const;
 
+  // ---- SR4: session state spilled to disk (session_spill.cpp; docs/SESSIONS.md section 10) ----
+  /// What a spill file holds: the bound session's live state (Snapshot's rows: DeltaNet recurrent and conv state,
+  /// K/V or fp16 K/V rows, live indexer keys, pooled blocks, PLE history, n-gram window, position) and, when the
+  /// session is the draft block's owner with an unbroken history, the draft block's (position, pending hidden,
+  /// its K/V / indexer / block rows). Bound to the model (fingerprint), the numerics options, the KV kind and the
+  /// position; every part is CRC32C-checked on read.
+  struct SpillInfo {
+    std::uint64_t file_bytes = 0;
+    std::uint32_t position = 0;
+    bool mtp = false;     ///< the draft block's history is in the file (restored when this engine tracks)
+    double ms = 0;        ///< wall time of the whole call
+  };
+  /// Writes the bound session's state to `path`: a temp file next to it (mode 0600), fsync, rename, fsync of the
+  /// directory. True: the file at `path` is complete and durable. False: `path` is what it was before (absent or
+  /// an older complete file); a temp file may be left only by a crash (SpillCleanTemps removes those).
+  /// `blob`: caller bytes stored with the state (the session cache's token list), covered by the checksum.
+  [[nodiscard]] bool SpillSession(const std::string& path, std::span<const std::uint8_t> blob, SpillInfo* info,
+                                  std::string* error);
+  /// Replaces the bound session's state with the one in `path`. Refuses (false, nothing read into the session)
+  /// a file of another model, numerics options, KV kind or format, a position past max_context, a damaged
+  /// header; a payload whose checksum fails is found while restoring: then the bound session is reset to empty.
+  /// So on false the session is either unchanged (refused before any write) or empty (`*reset` true), and the
+  /// caller re-prefills; never a partly restored state.
+  [[nodiscard]] bool RestoreSession(const std::string& path, std::vector<std::uint8_t>* blob, SpillInfo* info,
+                                    std::string* error, bool* reset = nullptr);
+  /// Reads and checks a spill file's header only (identity, options, kind, layout, header checksum).
+  [[nodiscard]] bool SpillPeek(const std::string& path, std::vector<std::uint8_t>* blob, SpillInfo* info,
+                               std::string* error) const;
+  /// Removes `<dir>/*.tmp.*` spill temp files a crash left.
+  static void SpillCleanTemps(const std::string& dir);
+  [[nodiscard]] std::uint64_t ModelFingerprint() const noexcept { return model_fp_; }
+  /// Test hooks (crash simulation): 1 = stop after half the payload (temp file left, no rename); 2 = stop after
+  /// the fsync, before the rename.
+  static inline int spill_fault_ = 0;
+  static inline unsigned spill_threads_ = 4;  ///< I/O threads (each: one pinned staging buffer of a piece)
+  static inline std::size_t spill_piece_bytes_ = 16u << 20;  ///< I/O and checksum unit, a multiple of 4096
+
   // ---- P5 MTP draft layer (mtp.cpp), measurement stage: no verify path, the trunk's numerics untouched ----
   /// Uploads the draft block (the `shared-*` sidecar). Its attention cache holds max_context positions.
   [[nodiscard]] bool LoadMtp(const model::MtpWeights& mtp, std::string* error);
@@ -693,6 +730,16 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   rt::Buffer probe_x_, probe_part_, probe_y_, probe_h_, probe_ep_, probe_tab_;
   std::uint32_t probe_B_ = 0;
   std::size_t probe_tab_stride_ = 0;
+  // SR4: identity of the uploaded weights (each tensor's name, type, shape, offset and first bytes), fixed at the
+  // end of Init; and the spill file's sections for a given position (session_spill.cpp).
+  std::uint64_t upload_fp_ = 0, model_fp_ = 0;
+  struct SpillSection {
+    rt::Buffer view;  // device bytes (null device pointer when only sizes are wanted)
+    std::size_t bytes = 0;
+  };
+  std::vector<SpillSection> SpillLayout(std::uint32_t position, std::span<const std::uint32_t> blocks, bool mtp,
+                                        std::uint32_t mtp_pos, std::uint32_t mtp_blocks) const;
+  std::uint64_t OptionsFingerprint() const;
   const model::MtpWeights* mtp_ = nullptr;
   AttnState mtp_attn_;
   rt::Buffer mtp_res_, mtp_in_, mtp_hn_, mtp_cat_;

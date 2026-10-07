@@ -155,6 +155,7 @@ if(HALO_GPU)
     src/engine/mtp.cpp
     src/engine/probe.cpp
     src/engine/spec_decode.cpp
+    src/engine/session_spill.cpp
     ${HALO_GEN}/kernels/core_hsaco.cpp)
   target_include_directories(halo_gpu PUBLIC ${HALO_GEN})
   target_compile_definitions(halo_gpu PUBLIC __HIP_PLATFORM_AMD__ HALO_WITH_HIP=1)
@@ -234,7 +235,8 @@ if(HALO_BUILD_TESTS)
     HALO_DECIDE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/decide/data")
   if(HALO_GPU)
     halo_test(gpu_tests tests/gpu/qwen35_gpu_test.cpp tests/gpu/quant_gpu_test.cpp tests/gpu/flash_next_gpu_test.cpp tests/gpu/select_gpu_test.cpp tests/gpu/decode2_gpu_test.cpp tests/gpu/sample_gpu_test.cpp
-      tests/gpu/flash_next_generator_test.cpp tests/gpu/sessions_gpu_test.cpp tests/gpu/session_cache_gpu_test.cpp)
+      tests/gpu/flash_next_generator_test.cpp tests/gpu/sessions_gpu_test.cpp tests/gpu/session_cache_gpu_test.cpp
+      tests/gpu/spill_gpu_test.cpp)
     target_link_libraries(gpu_tests PRIVATE halo_gpu)
     target_link_libraries(decide_tests PRIVATE halo_gpu)
     add_executable(halo_step_stats tools/step_stats.cpp)

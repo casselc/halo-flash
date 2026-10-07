@@ -71,6 +71,16 @@ rt::Buffer FlashNextGpu::Scratch(std::size_t floats, std::string* error) {
 
 bool FlashNextGpu::Upload(const model::TensorRef& t, std::string* error) {
   if (t.empty() || tensors_.contains(t.data)) return true;
+  {  // SR4 model fingerprint (FNV-1a over the tensor's identity and its first bytes)
+    const auto mix = [&](const void* p, std::size_t n) {
+      for (std::size_t i = 0; i < n; ++i) upload_fp_ = (upload_fp_ ^ static_cast<const std::uint8_t*>(p)[i]) * 0x100000001b3ull;
+    };
+    if (upload_fp_ == 0) upload_fp_ = 0xcbf29ce484222325ull;
+    mix(t.name.data(), t.name.size());
+    const std::uint64_t dims[6] = {static_cast<std::uint64_t>(t.type), t.cols, t.rows, t.experts, t.file_offset, t.shard};
+    mix(dims, sizeof(dims));
+    mix(t.data, std::min<std::size_t>(64, t.SizeBytes()));
+  }
   DevTensor d;
   const std::size_t bytes = t.SizeBytes();
   d.buf = dev_.Alloc(bytes, error);
@@ -376,6 +386,7 @@ bool FlashNextGpu::Init(const model::LoraAdapter* lora, std::uint32_t max_contex
   if (!AllocSeq(*sessions_[0], error)) return false;
   SwapBound(*sessions_[0]);
   bound_ = 0;
+  model_fp_ = upload_fp_ ^ (lora_.size() * 0x9e3779b97f4a7c15ull);
   return dev_.Synchronize(error);
 }
 
