@@ -229,34 +229,87 @@ Greedy E[tokens/cycle | depth 4]: trimmed 32K head mean 3.98 (3.49-4.27) vs full
 0.901 vs 0.913. Largest loss he2 (3.73 -> 3.49). T 0.8 (sum min(p, q)): mean 3.93. The trimmed head stays (the
 draft step is 1.77 ms vs 4.2).
 
-### Server integration: proposal only (not built)
-Today `FlashNextGenerator` (src/server/flash_next_generator.cpp) runs one sequence: prefill, then StepSample per
-token with device sampling (penalties and RNG in a `SamplerState`), prefix reuse when the new prompt extends
-`history_`. Proposed, behind `halo_serve --mtp-model F [--mtp-vocab V]`, **off by default**:
-1. **Load and track.** Load the sidecar (2.8 GB) and the trimmed head at startup; `MtpTrack(true)` after every
-   `Reset`, so the draft block follows from position 0 and prefix reuse keeps it in step (`MtpPending` holds while
-   the engine is only ever advanced by Prefill / Step / SpecStep).
-2. **Prompt cost first.** The draft block's prompt history runs as eager single steps, 1.3 ms a prompt token: +2.7 s
-   TTFT at 2K, +10 s at 8K, against 1.25 s / 5 s of trunk prefill. Before serving, either (a) a batched draft
-   prefill (the block's projections as GEMMs over the chunk, like the trunk's), or (b) a history window: catch the
-   block up on only the last W prompt tokens (e.g. 512). (b) changes acceptance only, never the output (every token
-   is verified), so it is safe to ship first; measure acceptance against W.
-3. **Decode loop.** Replace StepSample by `SpecStep(token, chooser.Depth(), ...)` while the request qualifies:
-   greedy (temperature 0) at any setting; sampled only without penalties (repeat / frequency / presence), else
-   StepSample as today. A `MtpDepthChooser` per generator, reset per request (its prior is the persistent part).
-   Cap drafts at `budget - completion_tokens - 1` so a cycle never emits past max_tokens.
-4. **Stops and history.** A cycle can emit several tokens; on a stop at emitted index j, emit nothing after it.
-   The engine has run the cycle's committed rows (token, d1 .. da) past the stop, so `history_` must record exactly
-   what the engine ran (token plus the accepted drafts), not what was emitted; the next request's prefix check
-   then decides reuse as today (a mismatch resets: correct, only the reuse is lost).
-5. **KV room.** `KvRoomFor` must reserve `kMaxDrafts` rows beyond prompt + budget (the verify writes k rows ahead).
-6. **Sampling reproducibility.** Sampled spec mode draws on the host from the request's RNG stream in a different
-   order than device StepSample, so a seeded request gives a different (equally distributed, per the audit) text with
-   MTP on. Document it; keep `--mtp-model` off when seed reproducibility against AR matters.
-7. **Metrics.** Per request drafted / accepted / cycles and the chooser's depth histogram in `/metrics` and the
-   observer.
-8. **Tests.** A server-level test on the small fixture is impossible (no sidecar); gate a real-model test like
-   `MtpSpec.GreedyEqualsArOnRealModel`: the same request with and without `--mtp-model`, greedy, identical text,
-   including a stop inside an accepted run and a max_tokens cut mid-cycle.
-Batched sessions (StepBatch) stay AR: the draft block follows one session (`mtp_owner_`), and B-session x (k + 1)-row
-verify batches are a P6/P5 follow-up.
+### Server integration (stream MS, 2026-10-07; working files `/data/halo-work/streams/MS/`)
+Built behind `halo_serve --mtp-model F [--mtp-vocab V] [--mtp-window W (128)] [--mtp-depth N (4)]`, **off by default**.
+Startup loads the sidecar in 0.4 s (2.74 GB device: weights plus a max-context draft cache) and the 32K head in 0.2 s
+(0.084 GB). Items as proposed:
+1. **Load and track.** Each request re-anchors the draft block before its prefill (`MtpTrackFrom`, set through a
+   `SessionCache::Prepare` hook once the live session is bound): it follows from max(reused, prompt - W).
+2. **Prompt cost: a history window** (`FlashNextGpu::MtpTrackFrom`, `halo_run --mtp-window W[,W..]`). Measured below;
+   default W = 128. A batched draft prefill is not built.
+3. **Decode loop** (`RunDecode`, src/server/decode_loop.cpp, shared by both modes): greedy at any sampler setting,
+   sampled only without repeat / frequency / presence penalties (else StepSample as before); one `MtpDepthChooser`
+   per generator, reset per request; drafts capped at (tokens left - 1), so no cycle emits past max_tokens.
+4. **Stops and history.** A cycle's tokens are emitted in order until a stop token, a stop string, the budget or
+   a departure; the session records exactly what the engine ran (the token and the accepted drafts, also past
+   the end), see docs/SESSIONS.md section 10.
+5. **KV room**: `KvRoomFor(prompt + budget + kMaxDrafts)`.
+6. **Sampling reproducibility**: a seeded sampled request gives a different (equally distributed) text with MTP on.
+7. **Metrics**: vLLM's `vllm:spec_decode_num_drafts_total`, `..._num_draft_tokens_total`,
+   `..._num_accepted_tokens_total`, `..._num_accepted_tokens_per_pos_total{position}`, plus
+   `halo:mtp_decode_steps_total{depth}` and `halo:mtp_catchup_tokens_total`; the halo-scope observer adds
+   `mtp_cycles / mtp_drafted / mtp_accepted / mtp_catchup` usage details (only when MTP ran). `HALO_CACHE_TRACE`
+   prints them per request.
+8. **Tests.** `MtpServe.GreedyRepliesIdenticalThroughTheServiceOnRealModel` (gpu_tests, gated like MtpSpec, ~100 s):
+   one engine, 16 requests through `OpenAiService` without MTP, then with it at W 0 and 4096 — chat with and
+   without thinking, /v1/completions, a Responses chain via previous_response_id, a stop string, max_tokens 1..13;
+   greedy bodies byte-identical (cached-token counts aside), penalties never draft, sampled requests draft;
+   positive controls: accepted drafts, a reply ending inside an accepted run, a capped cycle. Through halo_serve
+   (`tools/serve_ab.py compare`, `streams/MS/check.jsonl`, W 128): 22 of 22 greedy / penalty requests identical
+   (text and finish reason), the 2 sampled ones 200 with a different text. Host: `DecodeLoop.*` (Hegel: speculative
+   cycles emit what steps emit, record what ran, never exceed the cap; directed stop-inside-a-run and budget
+   cases), `Metrics.SpecDecodeCountersSumOverRequests`, the scope usage check, and the Hegel serving machine
+   `ServingModelUnderDeparturesStallsAndRetries` with speculative cycles (departures between a cycle's tokens).
+   Small fixture: `SessionCache.SpeculativeDecodeIsGreedyIdenticalAndReuseStaysExact` (oracle / random drafts via
+   a cycle hook, exact prefix reuse afterwards). Mutants (tests/mutants.toml), all killed: `spec-draft-past-budget`,
+   `spec-history-drops-accepted-drafts`, `spec-no-departure-inside-cycle` (cpu-asan), `spec-ignores-penalties`,
+   `spec-sampled-verified-greedy` (gpu).
+
+**History window** (`halo_run --spec 1 --spec-depth -2 --mtp-window`, 256 greedy tokens, pinned; prompts: unrelated
+context + a question (ctx), docs to summarize (doc), code to rewrite (code); MTP / AR decode):
+
+| prompt | W 0 | 128 | 512 | 2048 | full | tokens/cycle W 0 -> full | TTFT W 0 / 128 / 512 / full s |
+|---|---:|---:|---:|---:|---:|---|---|
+| ctx 2K | 1.46x | 1.48 | 1.49 | 1.47 | 1.47 | flat | |
+| doc 2K | 1.25x | 1.27 | 1.29 | 1.41 | 1.44 | | |
+| code 2K | 1.23x | 1.25 | 1.27 | 1.38 | 1.38 | | |
+| ctx 8K | 1.46x | 1.48 | 1.48 | 1.47 | 1.46 | 3.33 -> 3.41 | 4.79 / 4.98 / 5.50 / 15.34 |
+| doc 8K | 1.20x | 1.23 | 1.23 | 1.30 | 1.45 | 2.19 -> 3.61 | 5.42 / 5.54 / 6.09 / 16.72 |
+| code 8K | 1.20x | 1.22 | 1.23 | 1.25 | 1.37 | 2.19 -> 3.12 | 5.27 / 5.15 / 5.65 / 15.72 |
+
+The catch-up is one eager draft step per window position, 1.33-1.42 ms (+10.5 s TTFT for full history at 8K). On
+copy tasks the block uses history from far back (doc 8K at W 2048 is still 2.70 vs 3.61 tokens/cycle), so a large
+window pays only with a batched draft prefill (~0.1 s at 8K by the trunk's ratio: doc 8K 1.20x -> 1.45x, code
+1.20x -> 1.37x). With eager catch-up W 0 and 128 tie end to end at 256 output tokens; serving picked 128 (below).
+An earlier "MTP slower than AR at W > 0" was a halo_run timer bug (window k divided its tokens by the time of
+windows 1..k; fixed in d282983); stream M's chooser numbers reproduce per prompt (`streams/MS/r1.txt`).
+
+**Serving numbers** (`tools/serve_ab.py`, `streams/MS/bench.jsonl`, pinned; client side: TTFT = first output
+piece, decode = (completion tokens - 1) / first-to-last piece; chat template with thinking, 256 max tokens; agent =
+a 12,969-token tool-call history over this repository's server sources, then the same at T 0.8 and a second turn
+reusing the 12,928-token prefix; MTP off once, W 0 four runs, W 128 five runs, medians):
+
+| | predicted | W 0 | W 128 (default) |
+|---|---|---:|---:|
+| paper-style greedy (7 prompts) | 1.35x (1.15-1.55) | 1.21x (1.10-1.36) | **1.26x (1.16-1.39)** |
+| same, T 0.8 / top-p 0.95, no penalties | 1.20x (1.0-1.4) | 1.22x (1.08-1.37) | **1.23x (1.07-1.40)** |
+| agent greedy, cold 13K / turn 2 | 1.20x (1.05-1.35) | 1.27x / 1.37x | **1.24x / 1.35x** |
+| TTFT, short prompts | = AR at W 0, +1.35 ms per window position | = AR (+-3%) | +0.13-0.18 s cold, +0.04-0.09 s reused |
+| TTFT, agent cold / turn 2 (AR 9.73 / 0.87 s) | 8.5 s / 0.6 s both | 9.4-10.1 / 0.87 s | 9.6 / 1.04 s |
+
+AR decode 26.4-26.9 tok/s short, 25.3-25.6 at 13K. Greedy end to end over the bench: AR 78.1 s, W 0 68.1 s, W 128
+66.5-66.8 s, hence W = 128 (the pre-registered rule: W 128 unless > 1% worse than W 0). Missed: paper-style greedy
+(1.26x vs 1.35x predicted): through the chat template with thinking the served texts are not halo_run's raw prompts,
+the HumanEval and open chat prompts accept less (1.16-1.20x), and the window is short (stream M's 1.29-1.51x on
+these prompts used full history). Held: T 0.8 at about greedy's rate (host verification costs little), the agent
+inside its range, W 0 TTFT equal to AR. Agent cold TTFT: predicted 8.5 s, AR itself took 9.7 s (13K prefill).
+A sampled request's text depends on the window (different drafts consume the RNG differently): agent_t08 ran to 256
+tokens at W 128 (1.07x) and stopped at 65 at W 0.
+
+**Fault found and fixed** (docs/SESSIONS.md section 10): intermittent GPU write faults in MTP serving traced to the
+HIP runtime reusing freed virtual ranges; `HipDevice` now pools released ranges. 0 of 8 runs since (4 with no reuse
+at all, 4 with the pool), against 7 of 11 before.
+
+Still open: batched sessions (StepBatch) stay AR (the draft block follows one session, `mtp_owner_`); a batched draft
+prefill would make full history affordable (+0.17-0.25x on doc / code at 8K); the paper-style gate (1.5x) is not
+met (verify cost, as in round 3).
