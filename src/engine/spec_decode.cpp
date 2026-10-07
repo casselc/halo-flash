@@ -85,7 +85,7 @@ bool FlashNextGpu::SpecStep(std::int32_t token, std::uint32_t drafts, sampling::
     result->tokens.push_back(r.token);
     return true;
   }
-  if (!AllocBatch(error) || !AllocVerifySnaps(k, error) || !EnsureKv(p + k + 1, error)) return false;
+  if (!AllocBatch(error) || !AllocVerifySnaps(k, error) || !EnsureKv(p + k + 1, p, error)) return false;
   // 1. Drafts: the pending base step (hidden of p - 1, token) proposes d1, then the chain.
   const std::size_t QV = draft_rows_ ? draft_rows_ : c.vocab_size;
   std::vector<float> q(QV);
