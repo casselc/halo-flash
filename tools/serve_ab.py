@@ -83,6 +83,9 @@ def send(port: int, req: dict, ids: dict) -> dict:
     tool_args: dict = {}
     for now, e in sse_events(resp):
         piece = ""
+        if "error" in e and "choices" not in e:  # a generation that failed after the stream started
+            out["error"] = json.dumps(e["error"])[:500]
+            continue
         if "choices" in e:  # chat.completion.chunk, text_completion
             out["id"] = e.get("id", out["id"])
             for ch in e["choices"]:
@@ -137,7 +140,8 @@ def cmd_run(a) -> int:
                 f.flush()
                 u = res.get("usage") or {}
                 print(f"{res['name']}: {res['status']} {res['finish_reason']} {u.get('completion_tokens')} tokens, "
-                      f"ttft {res['ttft_s']}, decode {res['decode_s']}", flush=True)
+                      f"ttft {res['ttft_s']}, decode {res['decode_s']}" + (f", ERROR {res['error']}" if res.get("error") else ""),
+                      flush=True)
         c = http.client.HTTPConnection("127.0.0.1", a.port, timeout=30)  # the counters after the set
         c.request("GET", "/metrics")
         with open(a.out + ".metrics", "w") as f:
@@ -165,7 +169,8 @@ def cmd_compare(a) -> int:
             continue
         rb = B.get(name)
         n += 1
-        same = rb is not None and ra["text"] == rb["text"] and ra["finish_reason"] == rb["finish_reason"]
+        same = (rb is not None and ra["text"] == rb["text"] and ra["finish_reason"] == rb["finish_reason"]
+                and not ra.get("error") and not rb.get("error"))
         if not same:
             bad += 1
             pos = next((i for i, (x, y) in enumerate(zip(ra["text"], (rb or {}).get("text", ""))) if x != y), None)
