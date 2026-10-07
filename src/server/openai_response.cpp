@@ -420,6 +420,13 @@ void OutputBuilder::Finish(FinishReason reason, const Usage& usage, std::vector<
     u.set("prompt_tokens", U(usage.prompt_tokens));
     u.set("completion_tokens", U(usage.completion_tokens));
     u.set("total_tokens", U(usage.prompt_tokens + usage.completion_tokens));
+    // As in the whole object: clients and logs read the prompt tokens served from reused state.
+    Value pd = Value::MakeObject();
+    pd.set("cached_tokens", U(usage.cached_tokens));
+    u.set("prompt_tokens_details", std::move(pd));
+    Value cd = Value::MakeObject();
+    cd.set("reasoning_tokens", U(usage.reasoning_tokens));
+    u.set("completion_tokens_details", std::move(cd));
     c.set("usage", std::move(u));
     out->push_back(std::move(c));
   }
