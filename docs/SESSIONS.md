@@ -245,3 +245,65 @@ the runtime on the next prompt, so the guard under-reports by up to ~0.8 GB afte
 - gufo on the same needle prompts (its own server, `-c` at the length): 32K 11/11, 128K 11/11, 256K
   7/7; cold prefill 25.1-25.5 s / 104.0-106.0 s / 218-220 s against ours 22.2-24.6 / 92.9-96.1 / 198.7-202.0 s.
 
+
+## 8. Serving: prompt-prefix reuse across retained sessions (stream H, 2026-10-06; working files `/data/halo-work/streams/H/`)
+
+`halo_serve` used one engine state, extended when a prompt extended everything run and reset otherwise. Two
+agent harnesses defeated it (yard Phase 0): opencode's concurrent title request (another prompt) reset the
+conversation, which then re-prefilled 7.3K tokens; Hermes drops `reasoning_content` from its history, so its
+next prompt is never an extension of what the engine generated and it re-prefilled ~12.5K tokens every turn.
+
+`server::SessionCache` (`src/server/session_cache.hpp`) keeps several sessions and starts each request from the
+retained state with the longest prefix of its prompt:
+- **Checkpoints.** During each prefill a fork is parked where the prompt's generation prompt starts (the last
+  `<|im_start|>`): the next turn renders everything before it again, however it renders this turn's output.
+  So reasoning dropped from history costs nothing: it sits after the checkpoint, never mid-history (the engine's
+  copy need not be re-rendered without reasoning).
+- **LRU** under `--prefix-cache-sessions` (8) and `--prefix-cache-gb` (8 GB of recurrent + exclusive KV pages),
+  and whenever `KvRoomFor` says a prompt does not fit. An unrelated request gets its own session.
+- **One request at a time** still (the mutex): the title request no longer evicts the conversation, but the
+  conversation's request still waits for it. Overlap needs the scheduler (G3) and batched decode.
+
+**Exactness.** Where a prefill is split changes the arithmetic. Real model (`SessionCache.RealModelSplitProbe`,
+prose, 5000 and 10000 tokens): a split at any multiple of 16 positions leaves the logits of the prefill and of
+4 steps after it bit-identical to one unsplit prefill (24 points from 16 to 9008, across the 8192-token long-chunk
+boundary); every split at a multiple of 8 or 4 only moves them by 1.2e-2 to 6.4e-2 relative (L2). 16 is the
+DeltaNet scan's piece. A decoded token's state also differs from a prefilled one's.
+
+| `--prefix-cache` | Reuses | Results vs one cold prefill of the prompt |
+|---|---|---|
+| `exact` (default) | checkpoints at multiples of 64 (`--prefix-cache-align`) taken in aligned prefills | byte-identical (test below) |
+| `fast` | also finished sessions (the client echoed what was generated) and unaligned checkpoints | equal up to the prefill-vs-decode rounding: 1 of 123 small-model requests differed |
+| `off` | nothing | the reference |
+
+`SessionCache.ReuseIsByteIdenticalToColdPrefill` (Hegel, small model, 40 conversations, 123 requests): random
+agent conversations whose next prompt keeps the previous prompt to its generation prompt and then echoes or
+re-renders the turn, with unrelated requests interleaved; every request's greedy or seeded-sampled tokens from
+the exact cache equal a cache-off engine's; 28% of prompt tokens were reused. Positive control:
+`HALO_TEST_CACHE_ALIGN=1` (checkpoints anywhere) fails it on the first request.
+
+**Cost per request** (real model, `HALO_CACHE_TRACE=1`, 1.4-1.6K-token conversation, stream H c1/c2): a
+`Prefill` call has ~140 ms fixed cost (113 tokens 279 ms; marginal ~0.65 ms/token), and a checkpoint splits the
+prefill into two calls plus a fork (~10-20 ms). A later turn's prepare: exact 400-427 ms (64 + ~12 tokens),
+fast 290-300 ms, off 1.06-1.17 s; the first decode step is 38-43 ms in every mode (no graph-capture cost). So
+exact mode costs clients that echo their history (pi, opencode) ~0.2 s TTFC a turn against the old single-session
+extension, and saves Hermes ~8 s a turn. Fast mode skips the checkpoint when it extends a finished session.
+Removing the split cost belongs to the engine: a lower per-call fixed cost, or capturing the recurrent state at an
+aligned position inside a chunk.
+
+**Agent harnesses** (yard Phase 0 battery, 5 tasks each, real model; `platform/bin/analyze.py`; "later" = every
+request of a task after its first; re-prefill = prompt tokens not served from reused state):
+
+| Harness | Later-turn TTFC median: main / exact / fast | Re-prefill median, exact | Task wall, t1+t4+t5: main / exact / fast | Pass: main / exact |
+|---|---|---|---|---|
+| Hermes 0.21.5 | 9.5 / 0.76 / 0.63 s | 329 tokens (main: the whole ~12.5K prompt) | 136 / 75 / 70 s | 5/5 / 5/5 |
+| opencode 1.18.35 | 0.42 / 0.81 / 0.44 s | 436 | 88 / 78 / 125 s | 5/5 / 5/5 |
+| pi 1.0.4 (chat) | 0.35 / 0.65 / 0.24 s | 270 | 49 / 43 / 43 s | 5/5 / 5/5 |
+| pi 1.0.4 (responses) | 0.33 / 0.66 / 0.28 s | 243 | 53 / 36 / 38 s | 5/5 / 5/5 |
+| Codex 0.160.1 | rejected (400) / 0.96 / 0.50 s | 636 | - / 109 / 93 s | 0/1 / 4/5 |
+
+Main's opencode p90 (15.8 s: the title request's ~11 s plus a 7.3K re-prefill) became 10.5 s: the wait for the
+title request remains (one request at a time), the re-prefill is gone. Codex's multi-agent tools work end to
+end (namespace tools, server/openai_request.hpp): asked to delegate, it spawned, waited for and closed a sub-agent
+through `multi_agent_v1.*` calls returned with `"namespace"`, and answered correctly. Single runs per task: task walls move with
+the model's output length (opencode t5 24.7 s exact, 43.5 s fast).

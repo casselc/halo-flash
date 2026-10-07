@@ -91,6 +91,7 @@ int main(int argc, char** argv) {
   std::uint32_t moe_topk = 0;  // --moe-topk N: experts per token (0: the file's count; CODESIGN arm B)
   double ngram_cache_gb = 4.0;  // cache of n-gram rows read from disk, GiB (0: off)
   std::uint32_t max_context = 32768;
+  server::SessionCacheOptions cache;  // prompt-prefix reuse across requests (server/session_cache.hpp)
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i], v = argv[i + 1];
     if (a == "--model") model = v;
@@ -102,6 +103,14 @@ int main(int argc, char** argv) {
     else if (a == "--kv-f16") engine::FlashNextGpu::kv_f16_only_ = v == "1";  // fp16-only KV (docs/SESSIONS.md)
     else if (a == "--moe-topk") moe_topk = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--api-key") api_key = v;
+    else if (a == "--prefix-cache") {  // exact (default) | fast | off
+      if (v == "exact") cache.mode = server::SessionCacheOptions::Mode::kExact;
+      else if (v == "fast") cache.mode = server::SessionCacheOptions::Mode::kFast;
+      else if (v == "off") cache.mode = server::SessionCacheOptions::Mode::kOff;
+      else return std::fprintf(stderr, "--prefix-cache must be exact, fast or off\n"), 2;
+    } else if (a == "--prefix-cache-sessions") cache.max_retained = std::strtoul(v.c_str(), nullptr, 10);
+    else if (a == "--prefix-cache-gb") cache.budget_bytes = static_cast<std::size_t>(std::atof(v.c_str()) * (1ull << 30));
+    else if (a == "--prefix-cache-align") cache.align = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--model-id") model_id = v;
     else if (a == "--decider-dir") decider_dir = v;
     else if (a == "--decider-device") decider_device = v;
@@ -151,7 +160,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "loading weights...\n");
     engine = engine::FlashNextGpu::Create(*dev, *weights, ngram.get(), nullptr, max_context, &error, sources);
     if (!engine) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
-    generator = std::make_unique<server::FlashNextGenerator>(*engine, *tok, max_context);
+    generator = std::make_unique<server::FlashNextGenerator>(*engine, *tok, max_context, cache);
   } else {
     q35_reader = core::GgufReader::OpenFile(qwen35_model, &error);
     if (!q35_reader) return std::fprintf(stderr, "%s\n", error.c_str()), 1;

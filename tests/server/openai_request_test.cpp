@@ -346,3 +346,79 @@ TEST(OpenAiRequest, ArbitraryBodiesNeverCrash) {
     }
   }, {.test_cases = 2000});
 }
+
+// G6: Codex 0.160.1's first request (logs/mock-capture/00004-req.json in the yard Phase 0 notes, trimmed): a
+// namespace tool among function tools, store false, include of encrypted reasoning, reasoning.summary,
+// prompt_cache_key, client_metadata and parallel_tool_calls. It parses; the namespace's functions become flat
+// "<namespace>.<name>" tools (described with the namespace's purpose); history items that carry a namespace render
+// under the flat name; Codex's echo of a reasoning item ("encrypted_content": null) is accepted.
+TEST(OpenAiRequest, CodexNamespaceToolsAndFieldsAreAccepted) {
+  RequestError e;
+  const auto r = ParseResponsesRequest(J(R"({
+    "model": "qwen3.8-flash-next", "instructions": "You are Codex.",
+    "input": [
+      {"type": "message", "id": "msg_1", "role": "developer", "content": [{"type": "input_text", "text": "rules"}]},
+      {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "spawn one"}]},
+      {"type": "reasoning", "summary": [], "content": [{"type": "reasoning_text", "text": "I will spawn."}], "encrypted_content": null},
+      {"type": "function_call", "name": "spawn_agent", "namespace": "multi_agent_v1", "arguments": "{\"message\":\"x\"}", "call_id": "call_1"},
+      {"type": "function_call_output", "call_id": "call_1", "output": "agent a1"},
+      {"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\":\"ls\"}", "call_id": "call_2"},
+      {"type": "function_call_output", "call_id": "call_2", "output": "README"}
+    ],
+    "tools": [
+      {"type": "function", "name": "exec_command", "description": "Runs a command.", "strict": false,
+       "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"], "additionalProperties": false}},
+      {"type": "namespace", "name": "multi_agent_v1", "description": "Tools for spawning and managing sub-agents.", "tools": [
+        {"type": "function", "name": "spawn_agent", "description": "Spawn an agent.", "strict": false,
+         "parameters": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}},
+        {"type": "function", "name": "close_agent", "strict": false,
+         "parameters": {"type": "object", "properties": {"target": {"type": "string"}}}}]},
+      {"type": "function", "name": "get_goal", "strict": false, "parameters": {"type": "object", "properties": {}}}
+    ],
+    "tool_choice": "auto", "parallel_tool_calls": true, "reasoning": {"summary": "auto"}, "store": false, "stream": true,
+    "include": ["reasoning.encrypted_content"], "prompt_cache_key": "01a1134f",
+    "client_metadata": {"thread_id": "01a1134f", "session_id": "01a1134f", "x-codex-window-id": "01a1134f:0"}
+  })"), RequestDefaults{}, &e);
+  ASSERT_TRUE(r) << e.param << ": " << e.message;
+  std::vector<std::string> names;
+  for (const auto& t : r->tools.items()) names.push_back(t.find("function")->find("name")->str());
+  EXPECT_EQ(names, (std::vector<std::string>{"exec_command", "multi_agent_v1.spawn_agent", "multi_agent_v1.close_agent", "get_goal"}));
+  EXPECT_EQ(r->tools.items()[1].find("function")->find("description")->str(),
+            "[multi_agent_v1: Tools for spawning and managing sub-agents.] Spawn an agent.");
+  ASSERT_EQ(r->namespaced_tools.size(), 2u);
+  EXPECT_EQ(r->FindNamespaced("multi_agent_v1.close_agent")->name, "close_agent");
+  EXPECT_EQ(r->FindNamespaced("spawn_agent")->ns, "multi_agent_v1");  // a bare member name, unambiguous
+  EXPECT_EQ(r->FindNamespaced("exec_command"), nullptr);
+  EXPECT_EQ(r->FindNamespaced("nope"), nullptr);
+  EXPECT_FALSE(r->store);
+  EXPECT_TRUE(r->stream);
+  EXPECT_TRUE(r->parallel_tool_calls);
+  const std::string prompt = Render(*r);
+  EXPECT_NE(prompt.find("<function=multi_agent_v1.spawn_agent>"), std::string::npos);  // the history call
+  EXPECT_NE(prompt.find("I will spawn."), std::string::npos);
+  EXPECT_NE(prompt.find("\"name\": \"multi_agent_v1.spawn_agent\""), std::string::npos);  // the tool list
+
+  // Ambiguity and collisions: a bare name two namespaces share maps to neither; a flat name that collides with a
+  // plain function is refused (a call could not round-trip); members must be functions.
+  const auto two = ParseResponsesRequest(J(R"({"input": "x", "tools": [
+      {"type": "namespace", "name": "a", "tools": [{"type": "function", "name": "f"}]},
+      {"type": "namespace", "name": "b", "tools": [{"type": "function", "name": "f"}]}]})"), RequestDefaults{}, &e);
+  ASSERT_TRUE(two) << e.message;
+  EXPECT_EQ(two->FindNamespaced("f"), nullptr);
+  EXPECT_EQ(two->FindNamespaced("b.f")->ns, "b");
+  for (const auto& [body, param] : std::vector<std::pair<const char*, const char*>>{
+           {R"({"input": "x", "tools": [{"type": "function", "name": "a.f"}, {"type": "namespace", "name": "a", "tools": [{"type": "function", "name": "f"}]}]})", "tools"},
+           {R"({"input": "x", "tools": [{"type": "namespace", "name": "a", "tools": [{"type": "custom", "name": "f"}]}]})", "tools[0].tools[0].type"},
+           {R"({"input": "x", "tools": [{"type": "namespace", "name": "a", "tools": []}]})", "tools[0].tools"},
+           {R"({"input": "x", "tools": [{"type": "namespace", "tools": [{"type": "function", "name": "f"}]}]})", "tools[0].name"},
+           {R"({"input": [{"type": "function_call", "name": "f", "namespace": 3, "arguments": "{}", "call_id": "c"}]})", "input[0].namespace"},
+           {R"({"input": [{"type": "reasoning", "summary": [], "encrypted_content": "opaque"}]})", "input[0]"},
+       }) {
+    EXPECT_FALSE(ParseResponsesRequest(J(body), RequestDefaults{}, &e)) << body;
+    EXPECT_EQ(e.param, param) << body << " -> " << e.message;
+  }
+  // Chat requests have no namespace tools.
+  EXPECT_FALSE(ParseChatRequest(J(R"({"messages": [{"role": "user", "content": "x"}], "tools": [{"type": "namespace", "name": "a", "tools": []}]})"),
+                                RequestDefaults{}, &e));
+  EXPECT_EQ(e.param, "tools[0].type");
+}

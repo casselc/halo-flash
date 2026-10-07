@@ -72,6 +72,7 @@ class OutputBuilder {
   enum class Open : std::uint8_t { kNone, kReasoning, kMessage };
   struct Call {
     std::string item_id, call_id, name, arguments;
+    std::string ns;  // Responses: the namespace of a flattened namespace tool (name is then its member name)
   };
   struct Item {
     enum class Kind : std::uint8_t { kReasoning, kMessage, kFunctionCall } kind;

@@ -147,6 +147,7 @@ Value OutputBuilder::ItemJson(const Item& item, bool done) const {
       v.set("id", Str(c.item_id));
       v.set("call_id", Str(c.call_id));
       v.set("name", Str(c.name));
+      if (!c.ns.empty()) v.set("namespace", Str(c.ns));
       v.set("arguments", Str(done ? c.arguments : ""));
       v.set("status", Str(done ? "completed" : "in_progress"));
       break;
@@ -324,6 +325,11 @@ void OutputBuilder::CloseItem(std::vector<Value>* out) {
 void OutputBuilder::ToolCall(const text::ParsedToolCall& parsed, std::vector<Value>* out) {
   StartStream(out);
   Call c{"fc_" + ids_(), "call_" + ids_(), parsed.name, CompactJson(parsed.arguments)};
+  if (req_.api == Api::kResponses)
+    if (const auto* t = req_.FindNamespaced(parsed.name)) {
+      c.name = t->name;
+      c.ns = t->ns;
+    }
   calls_.push_back(c);
   if (req_.api == Api::kCompletions) {
     // No parsing for completions; never reached (AddText), kept total.
@@ -414,6 +420,13 @@ void OutputBuilder::Finish(FinishReason reason, const Usage& usage, std::vector<
     u.set("prompt_tokens", U(usage.prompt_tokens));
     u.set("completion_tokens", U(usage.completion_tokens));
     u.set("total_tokens", U(usage.prompt_tokens + usage.completion_tokens));
+    // As in the whole object: clients and logs read the prompt tokens served from reused state.
+    Value pd = Value::MakeObject();
+    pd.set("cached_tokens", U(usage.cached_tokens));
+    u.set("prompt_tokens_details", std::move(pd));
+    Value cd = Value::MakeObject();
+    cd.set("reasoning_tokens", U(usage.reasoning_tokens));
+    u.set("completion_tokens_details", std::move(cd));
     c.set("usage", std::move(u));
     out->push_back(std::move(c));
   }
