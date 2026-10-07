@@ -270,7 +270,9 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
   auto run = std::make_shared<Run>(Run{std::move(req), std::move(prompt), std::move(popt), std::move(conversation)});
   // The client closed its end (or the server is stopping): nobody will receive the rest.
   const auto gone = [connected] { return connected && !connected(); };
-  const auto execute = [this, api, id, run, gone](std::vector<Value>* events, const std::function<bool()>& flush) {
+  // `poll`: Params::cancelled (gone, plus the stream's keepalive).
+  const auto execute = [this, api, id, run, gone](std::vector<Value>* events, const std::function<bool()>& flush,
+                                                  const std::function<bool()>& poll) {
     OutputBuilder builder(run->req, id, opt_.now_s(), opt_.new_id);
     text::ToolCallStreamParser parser(run->popt);
     StopMatcher stops(run->req.stop);
@@ -285,7 +287,7 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
         builder.Add(parsed, events);
       }
     };
-    TextGenerator::Params params{run->prompt, run->req.variant, run->req.sampling, run->req.max_tokens, gone};
+    TextGenerator::Params params{run->prompt, run->req.variant, run->req.sampling, run->req.max_tokens, poll};
     if (opt_.on_activity) opt_.on_activity(true);
     struct Done {
       const std::function<void(bool)>& f;
@@ -390,22 +392,36 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
   };
 
   if (!run->req.stream) {
-    auto [error, final, cancelled] = execute(nullptr, [] { return true; });
+    auto [error, final, cancelled] = execute(nullptr, [] { return true; }, gone);
     if (!error.empty()) return HttpResponse::Json(500, CompactJson(ErrorBody({error, ""})));
     if (cancelled)  // nobody is there to read it, unless the server is stopping
       return HttpResponse::Json(503, CompactJson(ErrorBody({"generation cancelled: the client left or the server is stopping", ""})));
     return HttpResponse::Json(200, CompactJson(final));
   }
-  return HttpResponse::EventStream([api, run, execute](const BodyWriter& write) {
+  return HttpResponse::EventStream([api, run, execute, gone, keepalive = opt_.sse_keepalive_ms](const BodyWriter& write) {
+    using Clock = std::chrono::steady_clock;
     std::vector<Value> events;
     bool alive = true;
+    auto last = Clock::now();  // the last write
     const auto flush = [&] {
       for (const auto& e : events)
         if (alive) alive = write(Frame(api, e));
+      if (!events.empty()) last = Clock::now();
       events.clear();
       return alive;
     };
-    auto [error, final, cancelled] = execute(&events, flush);
+    // Nothing else is written while the request is queued or prefilling (minutes at long context): with
+    // sse_keepalive_ms, an SSE comment after that long without a write keeps a client's idle-read timer from
+    // firing, and a client that left fails the write instead of waiting for its first token (audit D3).
+    const auto poll = [&] {
+      if (gone()) return true;
+      if (keepalive > 0 && alive && Clock::now() - last >= std::chrono::milliseconds(keepalive)) {
+        alive = write(": keepalive\n\n");
+        last = Clock::now();
+      }
+      return !alive;
+    };
+    auto [error, final, cancelled] = execute(&events, flush, poll);
     flush();
     if (!error.empty() && alive) {
       Value e = ErrorBody({error, ""});

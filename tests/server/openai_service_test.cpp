@@ -638,8 +638,9 @@ struct FailableStore : InMemoryResponseStore {
 };
 
 struct ServingRig {
-  ServingRig() : server({.send_timeout_ms = 200}) {
+  explicit ServingRig(int sse_keepalive_ms = 0) : server({.send_timeout_ms = 200}) {
     ServiceOptions o;
+    o.sse_keepalive_ms = sse_keepalive_ms;
     o.observer = &observed;
     o.store = &store;
     o.now_s = [] { return std::int64_t{1700000000}; };
@@ -1075,3 +1076,33 @@ TEST(OpenAiService, APipelinedNextRequestIsNotADeparture) {
   EXPECT_EQ(raw.find("\"cancelled\""), std::string::npos);
 }
 
+// Audit D3: with sse_keepalive_ms, a streamed request that waits (here held mid-prefill) writes SSE comments, which
+// SSE parsers ignore, so the stream still parses to the same events and completes; without it nothing is written
+// before the first event. HALO_SSE_DUMP=<path> saves the stream body for the OpenAI SDK replay check
+// (tests/functional/sse_keepalive_sdk_check.py).
+TEST(OpenAiService, KeepaliveCommentsWhileAStreamWaitsAndClientsIgnoreThem) {
+  for (const int keepalive : {0, 20}) {
+    ServingRig rig(keepalive);
+    const auto run = rig.gen.Plan("m0x", 1, 3);
+    Conn c(rig.server.port(), RequestBody("m0x", true, 8));
+    ASSERT_TRUE(Await([&] { return run->held.load(); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    run->release = true;
+    c.ReadToEnd();
+    const std::string body = c.Body();
+    std::size_t comments = 0;
+    for (std::size_t i = 0; (i = body.find(": keepalive\n\n", i)) != std::string::npos; ++i) ++comments;
+    if (keepalive) EXPECT_GE(comments, 3u) << "about one every 20 ms over 150 ms";
+    else EXPECT_EQ(comments, 0u) << "keepalives are opt-in";
+    const auto got = Delivered(c, true);
+    EXPECT_TRUE(got.full);
+    EXPECT_EQ(got.status, "completed");
+    EXPECT_FALSE(run->cancelled.load());
+    if (const char* dump = std::getenv("HALO_SSE_DUMP"); dump && keepalive) {
+      FILE* f = std::fopen(dump, "wb");
+      ASSERT_TRUE(f);
+      std::fwrite(body.data(), 1, body.size(), f);
+      std::fclose(f);
+    }
+  }
+}

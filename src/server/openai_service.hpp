@@ -105,6 +105,12 @@ struct ServiceOptions {
   /// "variant" field or a "base:variant" model alias) is answered 404.
   /// Unset: every variant is refused.
   std::function<std::vector<std::string>()> variants;
+  /// Streamed requests: an SSE comment (": keepalive", which SSE clients
+  /// ignore) after this many ms without a write, while the request is
+  /// queued, prefilling or between tokens, so a client's idle-read timeout
+  /// does not fire before the first token and a departed client fails the
+  /// write. 0 (the default): none.
+  int sse_keepalive_ms = 0;
   /// Ids and timestamps; tests pass deterministic ones.
   std::function<std::string()> new_id;
   std::function<std::int64_t()> now_s;
