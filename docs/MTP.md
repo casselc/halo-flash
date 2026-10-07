@@ -194,6 +194,41 @@ the limit: k + 1 rows cost 1.45-2.7x a single step (C[k] / C[0]) with today's ex
 SESSIONS.md); a cheaper multi-row verify (round 2's batch-shaped probe lost at X 60-66 ms) is the only lever left
 at this acceptance.
 
+### Tests and positive controls
+- `Sessions.SpecStepDraftsEqualsGreedyStepping` (gpu_tests, small model, 40 hegel cases): `SpecStepDrafts` takes the
+  caller's drafts (the small fixture has no MTP sidecar), drawn from the oracle's greedy continuation or at random at
+  random depths 1..7, so every acceptance count and rollback row is exercised; 4 KB pages, fp16-only KV, indexer
+  window and graphs drawn. Oracle: emitted tokens equal greedy StepSample and the next three steps' logits are
+  bitwise equal to stepping. Full gpu_tests: 68 pass, 12 skipped (real-model / tiny fixtures).
+- Positive controls (env-gated mutants of SpecVerify, `streams/M/mutants.patch`, never committed): no recurrent
+  rollback, rollback from the wrong row's snapshot (a + 1), n-gram history of all k + 1 rows kept: **all three
+  fail** (the cycle after a rejection accepts a different count). Benign mutant (zero every verify snapshot after
+  the commit: they are rewritten by each verify): passes.
+- `MtpSpec.GreedyEqualsArOnRealModel` (gated by `HALO_FLASH_NEXT_GGUF` / `HALO_FLASH_NEXT_MTP`): SpecStep with the
+  real draft block equals AR; passes.
+- 7K prompt with 4 KB pages (indexer-key window releases pages below the live row): 384 tokens identical to AR. 4 KB
+  pages slow AR to 50.8 ms a token (2 MB pages: 38.8) unpinned; speed numbers here are all on 2 MB pages.
+
+### Sampling audit (sampled SpecStep on the real model, `halo_run --spec-audit N`)
+Per prompt: the context is the prompt plus its greedy continuation up to the most entropic first-token distribution of
+a 48-step scan; 2,000 trials from one Save / `MtpSave` checkpoint (T 0.8, depth 3, trial i seeded i + 1), each
+recording the first two emitted tokens (a second cycle when the first emitted only one). References are exact, from
+single Steps' logits. Chi-square (expected >= 5 cells, the rest pooled), TV against its multinomial null 95th
+percentile, gufo's 6-sigma cell bound.
+
+| Context | first draft accepted | first token vs p(y1) | second token given y1 (top 3-4 y1) | control: raw d1 vs p(y1) |
+|---|---:|---|---|---|
+| GSM8K-1 (98 tokens) | 0.77 | chi2 4.78 df 3, p 0.19; TV 0.012 (null 0.024) | p 0.97-1.0, all near-deterministic | chi2 479, TV 0.23: detected |
+| open chat (89 tokens) | 0.31 | chi2 1.88 df 5, p 0.87; TV 0.010 (null 0.026) | p 0.42-0.98; one informative (df 4, p 0.42, TV 0.011 vs 0.026) | chi2 28,703, TV 0.69: detected |
+
+No test below p 0.001 and no cell beyond 6 sigma; the detector flags the raw draft proposals at once. Limit: the
+second-token checks are mostly near-deterministic conditionals; only one exercises a spread distribution.
+
+### Trimmed draft head on the paper-style prompts (acceptance mode, 200 tokens, `streams/M/r7_*`)
+Greedy E[tokens/cycle | depth 4]: trimmed 32K head mean 3.98 (3.49-4.27) vs full head 4.06 (3.73-4.38); depth-1
+0.901 vs 0.913. Largest loss he2 (3.73 -> 3.49). T 0.8 (sum min(p, q)): mean 3.93. The trimmed head stays (the
+draft step is 1.77 ms vs 4.2).
+
 ### Server integration: proposal only (not built)
 Today `FlashNextGenerator` (src/server/flash_next_generator.cpp) runs one sequence: prefill, then StepSample per
 token with device sampling (penalties and RNG in a `SamplerState`), prefix reuse when the new prompt extends
