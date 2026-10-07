@@ -17,6 +17,7 @@ DecodeOutcome RunDecode(std::int32_t first, std::uint32_t budget, engine::MtpDep
     }
     const std::uint32_t left = budget - o.completion;
     const std::uint32_t k = chooser ? DraftCap(*chooser, left) : 0;
+    const bool capped = chooser && k < chooser->Choose(SpecDecodeStats::kDepths);
     DecodeCycle c;
     if (!io.step(token, k, &c, &o.error)) {
       if (o.error.empty()) o.error = "decode step failed";
@@ -36,11 +37,13 @@ DecodeOutcome RunDecode(std::int32_t first, std::uint32_t budget, engine::MtpDep
         stats->accepted += c.accepted;
         for (std::uint32_t i = 0; i < c.accepted && i < stats->accepted_at.size(); ++i) ++stats->accepted_at[i];
       }
+      stats->capped += capped;
     }
     // What the engine ran: the step's token and the accepted drafts (the last emitted token is not run yet).
     io.ran(token);
     for (std::uint32_t i = 0; i < c.accepted; ++i) io.ran(c.tokens[i]);
-    for (std::size_t i = 0; i < c.tokens.size(); ++i) {
+    std::size_t unemitted = 0;  // the cycle's first token not emitted
+    for (std::size_t i = 0; i < c.tokens.size(); ++i, unemitted = i) {
       if (i > 0 && gone()) {
         o.cancelled = done = true;
         break;
@@ -54,9 +57,12 @@ DecodeOutcome RunDecode(std::int32_t first, std::uint32_t budget, engine::MtpDep
       token = c.tokens[i];
       if (!io.emit(next)) {
         o.refused = done = true;
+        unemitted = i + 1;
         break;
       }
     }
+    // Ended inside the accepted run: the engine ran drafts that were not emitted (tokens[unemitted .. accepted)).
+    if (done && stats && unemitted < c.accepted) stats->ran_past_end = 1;
   }
   o.length_limited = !o.cancelled && !o.refused && !o.stopped && o.completion == budget && budget > 0;
   return o;

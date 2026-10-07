@@ -151,7 +151,8 @@ TextGenerator::Result FlashNextGenerator::GenerateIds(std::span<const std::int32
     return on_token(t);
   };
   if (spec) chooser_.Reset();
-  const DecodeOutcome out = RunDecode(ids.back(), budget, spec ? &chooser_ : nullptr, io, &r.spec);
+  // Stats only for speculative requests (an ordinary request reports none; GenerationRecord::spec.active()).
+  const DecodeOutcome out = RunDecode(ids.back(), budget, spec ? &chooser_ : nullptr, io, spec ? &r.spec : nullptr);
   if (!out.error.empty()) {
     cache_.Abandon();
     return r.error = out.error, r;

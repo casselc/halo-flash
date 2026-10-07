@@ -144,6 +144,9 @@ TEST(DecodeLoop, SpeculativeCyclesEmitWhatStepsEmitAndRecordWhatRan) {
     if (!sp.ran.empty()) ASSERT_EQ(sp.ran.front(), 9);
     for (std::size_t i = 0; i < sp.emitted.size() && i + 1 < sp.ran.size(); ++i) ASSERT_EQ(sp.ran[i + 1], sp.emitted[i]);
     if (!sp.out.stopped && !sp.out.cancelled && !sp.out.refused) ASSERT_EQ(sp.ran.size(), sp.emitted.size());
+    // ran_past_end counts exactly the endings inside an accepted run (drafts that ran but were not emitted).
+    ASSERT_EQ(sp.stats.ran_past_end, sp.ran.size() > sp.emitted.size() + 1 ? 1u : 0u);
+    ASSERT_LE(sp.stats.capped, sp.stats.depth[0] + sp.stats.cycles);
     // Counters add up.
     std::uint64_t steps = 0, at = 0;
     for (const auto d : sp.stats.depth) steps += d;
@@ -158,12 +161,15 @@ TEST(DecodeLoop, SpeculativeCyclesEmitWhatStepsEmitAndRecordWhatRan) {
 // Directed cases the property may reach rarely: a stop inside an accepted run (the drafts past it ran and are
 // recorded), and a budget that ends inside what a deeper cycle would have emitted.
 TEST(DecodeLoop, StopInsideAnAcceptedRunAndBudgetCut) {
+  std::uint64_t past = 0, capped = 0;
   for (std::uint64_t salt = 0; salt < 400; ++salt) {
     const Outcome ar = Decode(false, 24, salt, 1.0, 4, std::nullopt, std::nullopt, salt);
     const Outcome sp = Decode(true, 24, salt, 1.0, 4, std::nullopt, std::nullopt, salt);
     ASSERT_EQ(sp.emitted, ar.emitted) << salt;
     ASSERT_EQ(sp.ran, sp.engine_ran) << salt;
     ASSERT_FALSE(sp.cap_violated) << salt;
+    past += sp.stats.ran_past_end;
+    capped += sp.stats.capped;
     if (sp.out.stopped) {
       // The stop's cycle may have run past it: everything recorded beyond emitted + 1 is accepted drafts.
       ASSERT_GE(sp.ran.size(), sp.emitted.size() + 1) << salt;
@@ -171,6 +177,9 @@ TEST(DecodeLoop, StopInsideAnAcceptedRunAndBudgetCut) {
                 sp.emitted) << salt;
     }
   }
+  // Positive controls: the directed runs reach both cases.
+  EXPECT_GT(past, 0u) << "no stop landed inside an accepted run";
+  EXPECT_GT(capped, 0u) << "the max_tokens cap never lowered a cycle's drafts";
   // Budget 1..6 with every draft right: cycles must shrink to fit.
   for (std::uint32_t b = 1; b <= 6; ++b) {
     const Outcome sp = Decode(true, b, 7, 1.0, 7, std::nullopt, std::nullopt, 1);
