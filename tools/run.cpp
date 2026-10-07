@@ -45,6 +45,20 @@ using namespace halo;
 
 namespace {
 
+// MemAvailable and the GPU's GTT use (unified memory: both come out of the same DRAM).
+void PrintMem(const char* when) {
+  double avail = -1, gtt = -1, v = 0;
+  std::ifstream m("/proc/meminfo");
+  std::string k, unit;
+  while (m >> k >> v >> unit)
+    if (k == "MemAvailable:") avail = v * 1024 / 1e9;
+  for (int card = 0; card < 4 && gtt < 0; ++card) {
+    std::ifstream g("/sys/class/drm/card" + std::to_string(card) + "/device/mem_info_gtt_used");
+    if (g >> v) gtt = v / 1e9;
+  }
+  std::printf("memory %s: MemAvailable %.2f GB, GTT used %.2f GB\n", when, avail, gtt);
+}
+
 struct Top2 {
   std::uint32_t best;
   float margin;
@@ -170,6 +184,10 @@ int main(int argc, char** argv) {
   bool wmma_consec = false;
   std::uint32_t mtp_depth = 4, mtp_check = 0;
   double mtp_temp = 0;  // --route-trace FILE: routed expert ids of every step ([layers][k] uint32)
+  std::string decode_ab;            // --decode-ab M1,M2,..: decode masks compared in forks after --prefill-prompt
+  int decode_ab_rounds = 3;         // --decode-ab-rounds R
+  bool sb_snapshot = true;          // --sb-snapshot 0: the session bench skips the whole-state snapshot
+  std::uint32_t prompt_tokens = 0;  // --prompt-tokens N: the prompt's tokens repeated / cut to N (long-context runs)
   std::uint32_t span_sample = 1;
   bool eager = false, profile = false, device_sample = false;
   bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
@@ -278,6 +296,12 @@ int main(int argc, char** argv) {
     else if (a == "--gdn-scan-h") engine::FlashNextGpu::prefill_gdn_scan_h_ = std::string(argv[i + 1]) == "1";
     else if (a == "--router-f16") engine::FlashNextGpu::prefill_router_f16_ = std::atoi(argv[i + 1]);
     else if (a == "--prefill-int8") engine::FlashNextGpu::prefill_int8_gemm_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--kv-f16") engine::FlashNextGpu::kv_f16_only_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--scores-b") engine::FlashNextGpu::prefill_scores_b_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--decode-ab") decode_ab = argv[i + 1];
+    else if (a == "--decode-ab-rounds") decode_ab_rounds = std::max(1, std::atoi(argv[i + 1]));
+    else if (a == "--sb-snapshot") sb_snapshot = std::string(argv[i + 1]) == "1";
+    else if (a == "--prompt-tokens") prompt_tokens = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else {
       std::fprintf(stderr, "unknown option %s\n", a.c_str());
       return 2;
@@ -332,6 +356,7 @@ int main(int argc, char** argv) {
     if (!gpu) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
     std::printf("gpu (%s) ready in %.1f s\n", rt::BackendName(backend),
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - tu).count());
+    PrintMem("after load");
     gpu->SetUseGraphs(!eager);
     if (!span_hsaco.empty()) {  // recording off until the traced launch; buffer cleared
       const std::uint32_t off = 0, zero_offset = 0;
@@ -463,6 +488,7 @@ int main(int argc, char** argv) {
     if (!gpu->Prefill(toks, {}, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
     if (!dev->Synchronize(&error)) return 1;
     std::printf("session bench: %u tokens prefilled in %.0f ms (page %zu B)\n", session_bench, ms(t), dev->PageBytes());
+    PrintMem("after prefill");
     const auto show = [&](const char* what, engine::FlashNextGpu::SessionId id) {
       const auto m = gpu->SessionMemory(id);
       std::printf("  %-26s recurrent %8.1f MB, KV mapped %8.1f MB, KV exclusive %8.1f MB\n", what, m.recurrent / 1e6,
@@ -491,14 +517,20 @@ int main(int argc, char** argv) {
       std::printf("  step of the fork: %.1f ms\n", ms(t));
     }
     show("fork after 4 steps", f1);
-    auto snap = gpu->NewSnapshot(&error);
-    if (!snap) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
-    t = clk::now();
-    if (!gpu->Save(*snap, &error)) return 1;
-    std::printf("  Save (whole-state snapshot copy): %.2f ms\n", ms(t));
-    t = clk::now();
-    if (!gpu->Restore(*snap, &error)) return 1;
-    std::printf("  Restore: %.2f ms\n", ms(t));
+    if (sb_snapshot) {  // a whole copy of the state (as large as the session's KV)
+      auto snap = gpu->NewSnapshot(&error);
+      if (!snap) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      t = clk::now();
+      if (!gpu->Save(*snap, &error)) return std::fprintf(stderr, "save: %s\n", error.c_str()), 1;
+      std::printf("  Save (whole-state snapshot copy): %.2f ms\n", ms(t));
+      PrintMem("with a snapshot");
+      t = clk::now();
+      if (!gpu->Restore(*snap, &error)) return 1;
+      std::printf("  Restore: %.2f ms\n", ms(t));
+      t = clk::now();
+      if (!gpu->Save(*snap, &error)) return 1;
+      std::printf("  Save again (buffers reused): %.2f ms\n", ms(t));
+    }
     if (!gpu->BindSession(0, &error)) return 1;
     t = clk::now();
     if (!gpu->DropSession(f1, &error) || !gpu->DropSession(f2, &error)) return 1;
@@ -952,6 +984,11 @@ int main(int argc, char** argv) {
     prompt.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
   }
   std::vector<text::TokenId> ids = tok->Encode(prompt);
+  if (prompt_tokens > 0 && !ids.empty()) {
+    const auto base = ids;
+    while (ids.size() < prompt_tokens) ids.insert(ids.end(), base.begin(), base.end());
+    ids.resize(prompt_tokens);
+  }
   std::printf("prompt: %zu tokens\n", ids.size());
   std::vector<float> lc(c.vocab_size), lg(c.vocab_size);
   std::vector<text::TokenId> generated;
@@ -966,9 +1003,89 @@ int main(int argc, char** argv) {
     const std::vector<std::int32_t> head(ids.begin(), ids.end() - 1);
     const auto tp = std::chrono::steady_clock::now();
     if (!gpu->Prefill(head, {}, &error)) return std::fprintf(stderr, "prefill: %s\n", error.c_str()), 1;
-    std::printf("prefill %zu prompt tokens: %.3f s\n", head.size(),
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count());
+    if (!dev->Synchronize(&error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    const double ps = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count();
+    std::printf("prefill %zu prompt tokens: %.3f s (%.1f tok/s)\n", head.size(), ps, head.size() / ps);
+    PrintMem("after prefill");
+    const auto m = gpu->SessionMemory(0);
+    std::printf("session memory: recurrent %.1f MB, KV mapped %.1f MB\n", m.recurrent / 1e6, m.kv_mapped / 1e6);
     first_step = ids.size() - 1;
+    if (!decode_ab.empty()) {
+      // Decode A/B at this depth from one prefill: each round, each mask decodes in its own fork of the prefilled
+      // session (pages shared, graphs captured under that mask). The first 8 steps return logits (compared
+      // bitwise across masks), the rest sample greedily on the device and are timed (median after 4 warm-up).
+      std::vector<unsigned> masks;
+      for (std::size_t p = 0; p < decode_ab.size();) {
+        const auto q = decode_ab.find(',', p);
+        masks.push_back(static_cast<unsigned>(std::strtoul(decode_ab.substr(p, q - p).c_str(), nullptr, 0)));
+        p = q == std::string::npos ? decode_ab.size() : q + 1;
+      }
+      static sampling::SamplingConfig greedy;
+      std::vector<std::vector<float>> first_logits(masks.size());
+      std::vector<std::vector<double>> medians(masks.size());
+      std::vector<std::vector<std::int32_t>> texts(masks.size());
+      constexpr int kLogitSteps = 8;
+      for (int round = 0; round < decode_ab_rounds; ++round)
+        for (std::size_t mi = 0; mi < masks.size(); ++mi) {
+          engine::FlashNextGpu::SessionId f;
+          if (!gpu->ForkSession(0, &f, &error) || !gpu->BindSession(f, &error))
+            return std::fprintf(stderr, "fork: %s\n", error.c_str()), 1;
+          engine::FlashNextGpu::decode_opt_ = masks[mi];
+          std::vector<float> all, lg2(c.vocab_size);
+          std::vector<double> ms;
+          std::vector<std::int32_t> toks_out;
+          std::int32_t tk = static_cast<std::int32_t>(ids.back());
+          for (int st = 0; st < n; ++st) {
+            if (decode_timing && round == 0 && st == kLogitSteps + 4 && !gpu->StartKernelTiming(1 << 20, &error))
+              return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+            const auto t1 = std::chrono::steady_clock::now();
+            if (st < kLogitSteps) {
+              if (!gpu->Step(tk, lg2, &error)) return std::fprintf(stderr, "step: %s\n", error.c_str()), 1;
+              all.insert(all.end(), lg2.begin(), lg2.end());
+              tk = static_cast<std::int32_t>(Argmax(lg2).best);
+            } else {
+              engine::FlashNextGpu::SampleResult r;
+              if (!gpu->StepSample(tk, {&greedy, {}, 0}, &r, &error))
+                return std::fprintf(stderr, "step: %s\n", error.c_str()), 1;
+              tk = r.token;
+              if (st >= kLogitSteps + 4)
+                ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count());
+            }
+            toks_out.push_back(tk);
+          }
+          if (decode_timing && round == 0) {
+            double span = 0, rate = 0, total = 0;
+            const auto times = gpu->StopKernelTiming(&span, &rate, &error);
+            const double steps = static_cast<double>(ms.size());
+            for (const auto& k : times) total += k.ms;
+            std::printf("decode A/B mask %u kernel timing (eager, %.0f steps): kernels %.2f ms/step\n", masks[mi], steps,
+                        total / steps);
+            for (const auto& k : times)
+              std::printf("  %-58s %8.3f ms/step %5.1f%% %6.1f calls/step %8.1f us/call\n", k.key.c_str(), k.ms / steps,
+                          100 * k.ms / total, k.calls / steps, 1e3 * k.ms / k.calls);
+          }
+          std::sort(ms.begin(), ms.end());
+          if (!ms.empty() && !(decode_timing && round == 0)) medians[mi].push_back(ms[ms.size() / 2]);  // eager rounds excluded
+          if (round == 0) {
+            first_logits[mi] = std::move(all);
+            texts[mi] = toks_out;
+          }
+          if (!gpu->BindSession(0, &error) || !gpu->DropSession(f, &error)) return 1;
+        }
+      for (std::size_t mi = 0; mi < masks.size(); ++mi) {
+        std::string med;
+        for (double m : medians[mi]) med += " " + std::to_string(m);
+        const bool same = first_logits[mi].size() == first_logits[0].size() &&
+                          std::memcmp(first_logits[mi].data(), first_logits[0].data(), first_logits[0].size() * 4) == 0;
+        std::printf("decode A/B at %zu tokens: mask %u median ms/step per round:%s | first %d steps' logits %s mask %u, "
+                    "tokens %s\n",
+                    ids.size() - 1, masks[mi], med.c_str(), kLogitSteps, same ? "EQUAL to" : "DIFFER from", masks[0],
+                    texts[mi] == texts[0] ? "same" : "differ");
+      }
+      std::printf("decode A/B text: %s\n",
+                  tok->Decode(std::vector<text::TokenId>(texts[0].begin(), texts[0].end())).c_str());
+      return 0;
+    }
   }
   bool timing_on = false;
   const auto ts = std::chrono::steady_clock::now();

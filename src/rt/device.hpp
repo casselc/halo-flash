@@ -110,6 +110,10 @@ class Device {
   /// Maps `page` at byte `offset` (a multiple of PageBytes) of `range`, readable and writable by kernels.
   [[nodiscard]] virtual bool MapPage(const Buffer& range, std::size_t offset, void* page, std::string* error);
   [[nodiscard]] virtual bool UnmapPage(const Buffer& range, std::size_t offset, std::string* error);
+  /// Bytes the device can still allocate, as far as the backend can tell (SIZE_MAX: unknown). On an APU the
+  /// device's memory and host RAM are one DRAM: the HIP backend reports the smaller of the GPU's GTT headroom
+  /// and the host's MemAvailable.
+  [[nodiscard]] virtual std::size_t AvailableBytes() const;
 
   /// Loads one HSACO code object; kernels are then looked up by name.
   [[nodiscard]] virtual bool LoadModule(std::span<const std::uint8_t> hsaco, std::string* error) = 0;

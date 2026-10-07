@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -72,6 +73,28 @@ class HipDevice final : public Device {
   }
   // ---- P6 page mapping (HIP virtual memory management) ----
   std::size_t PageBytes() const noexcept override { return page_bytes_; }
+  std::size_t AvailableBytes() const override {
+    // GTT headroom (amdgpu sysfs) and host MemAvailable: the same DRAM backs both on Strix Halo.
+    std::size_t best = SIZE_MAX;
+    for (int card = 0; card < 8; ++card) {
+      const std::string d = "/sys/class/drm/card" + std::to_string(card) + "/device/mem_info_gtt_";
+      std::ifstream t(d + "total"), u(d + "used");
+      std::size_t total = 0, used = 0;
+      if (t >> total && u >> used) {
+        best = total > used ? total - used : 0;
+        break;
+      }
+    }
+    std::ifstream m("/proc/meminfo");
+    std::string key, unit;
+    std::size_t kb = 0;
+    while (m >> key >> kb >> unit)
+      if (key == "MemAvailable:") {
+        best = std::min(best, kb * 1024);
+        break;
+      }
+    return best;
+  }
   Buffer ReserveRange(std::size_t bytes, std::string* error) override {
     Buffer b;
     if (!page_bytes_) {

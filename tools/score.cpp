@@ -104,6 +104,7 @@ int main(int argc, char** argv) {
     else if (a == "--router-f16") engine::FlashNextGpu::prefill_router_f16_ = std::atoi(argv[i + 1]);
     else if (a == "--ngram-cache-gb") ngram_cache_gb = std::atof(argv[i + 1]);
     else if (a == "--prefill-int8") engine::FlashNextGpu::prefill_int8_gemm_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--kv-f16") engine::FlashNextGpu::kv_f16_only_ = std::string(argv[i + 1]) == "1";
     else return std::fprintf(stderr, "unknown option %s\n", a.c_str()), 2;
   }
   if (model.empty() || fixtures.empty())
