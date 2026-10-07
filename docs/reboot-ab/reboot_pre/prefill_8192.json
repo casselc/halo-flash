@@ -1,0 +1,51 @@
+{
+ "arms": {
+  "main50d5a35": {
+   "command": "/data/halo-work/halo_run_50d5a35",
+   "runs": [
+    {
+     "round": 0,
+     "device_ms": 4967.4,
+     "reps": [
+      5003.1,
+      4965.5,
+      4967.4
+     ],
+     "kernels_ms": {}
+    },
+    {
+     "round": 1,
+     "device_ms": 4939.5,
+     "reps": [
+      4989.7,
+      4939.5,
+      4936.5
+     ],
+     "kernels_ms": {}
+    },
+    {
+     "round": 2,
+     "device_ms": 4949.7,
+     "reps": [
+      5001.7,
+      4949.7,
+      4946.8
+     ],
+     "kernels_ms": {}
+    }
+   ]
+  }
+ },
+ "clock": "od2900",
+ "tokens": 8192,
+ "reps": 3,
+ "resident": false,
+ "started": 1791331570.9642143,
+ "summary": {
+  "main50d5a35": {
+   "median": 4949.7,
+   "min": 4939.5,
+   "max": 4967.4
+  }
+ }
+}

@@ -1,0 +1,62 @@
+reboot A/B baseline 'pre' (2026-10-06T16:14:29-07:00)
+cmdline: BOOT_IMAGE=/BOOT/ubuntu_jk2x0w@/vmlinuz-7.0.0-34-generic root=ZFS=rpool/ROOT/ubuntu_jk2x0w ro quiet splash
+iommu: {'DMA': 1, 'DMA-FQ': 33, 'identity': 2} (gpu group: identity); gpu link 16.0 GT/s PCIe x16
+  nvme nvme0: CT2000P310SSD8 speed 8.0 GT/s PCIe width 4 (max 16.0 GT/s PCIe x4) group_type DMA-FQ
+  nvme nvme1: WD Blue SN5000 4TB speed 8.0 GT/s PCIe width 4 (max 16.0 GT/s PCIe x4) group_type DMA-FQ
+prefill 2048: median 1255.6 ms (1631 tok/s), rounds [1255.6, 1280.4, 1253.4], clock od2900
+prefill 8192: median 4949.7 ms (1655 tok/s), rounds [4967.4, 4939.5, 4949.7], clock od2900
+decode short: median 36.89 ms/step, rounds [36.89, 36.89, 36.89]; eager kernel sum 39.81, eager steady 39.82
+decode 7k: median 38.93 ms/step, rounds [38.93, 38.93, 38.95]; eager kernel sum 41.47, eager steady 41.26
+model ready (s): [26.5, 26.6, 26.6, 26.6, 26.6, 26.6]
+ngram_novel_nocache: read+deferred ms per chunk [124.7, 142.0, 142.5]
+ngram_novel_cache: read+deferred ms per chunk [125.3, 33.2, 33.5]
+nvme dd 2 GiB O_DIRECT: 3.4 GB/s
+pageloc key rows:
+  gtt   K  1 Wb   24K rp   24K NB   40 lds 49152   154.6 GB/s  70 MHz
+  gtt   K  2 Wb   24K rp   24K NB   40 lds 49152   119.7 GB/s  54 MHz
+  gtt   K  4 Wb   24K rp   24K NB   40 lds 49152   168.4 GB/s  92 MHz
+  gtt   K  8 Wb   24K rp   24K NB   40 lds 49152   153.1 GB/s  84 MHz
+  gtt   K 16 Wb   24K rp   24K NB   40 lds 49152   155.8 GB/s  86 MHz
+  gtt   K  1 Wb   24K rp   24K NB   80 lds 49152   174.9 GB/s  73 MHz
+  gtt   K  2 Wb   24K rp   24K NB   80 lds 49152   136.5 GB/s  56 MHz
+  gtt   K  4 Wb   24K rp   24K NB   80 lds 49152   194.1 GB/s  91 MHz
+  gtt   K  8 Wb   24K rp   24K NB   80 lds 49152   194.8 GB/s  89 MHz
+  gtt   K 16 Wb   24K rp   24K NB   80 lds 49152   180.3 GB/s  80 MHz
+  gtt   K  1 Wb   24K rp   24K NB  400 lds 49152   197.7 GB/s  72 MHz
+  gtt   K  2 Wb   24K rp   24K NB  400 lds 49152   183.3 GB/s  55 MHz
+  gtt   K  4 Wb   24K rp   24K NB  400 lds 49152   230.7 GB/s  91 MHz
+  gtt   K  8 Wb   24K rp   24K NB  400 lds 49152   232.7 GB/s  95 MHz
+  gtt   K 16 Wb   24K rp   24K NB  400 lds 49152   222.3 GB/s  86 MHz
+  gtt   K  1 Wb   24K rp   24K NB   80 lds     0   179.8 GB/s  41 MHz
+  gtt   K  2 Wb   24K rp   24K NB   80 lds     0   124.5 GB/s  30 MHz
+  gtt   K  4 Wb   24K rp   24K NB   80 lds     0   152.2 GB/s  42 MHz
+  gtt   K  8 Wb   24K rp   24K NB   80 lds     0   133.0 GB/s  43 MHz
+  gtt   K 16 Wb   24K rp   24K NB   80 lds     0   162.3 GB/s  50 MHz
+  gtt   K  4 Wb    4K rp    4K NB   80 lds 49152   227.9 GB/s  114 MHz
+  gtt   K  4 Wb   24K rp   24K NB   80 lds 49152   195.0 GB/s  86 MHz
+  gtt   K  4 Wb   64K rp   64K NB   80 lds 49152   176.9 GB/s  81 MHz
+  gtt   K  4 Wb    2M rp    2M NB   80 lds 49152   171.9 GB/s  78 MHz
+  gtt   K  4 Wb   32M rp   32M NB   80 lds 49152   177.3 GB/s  79 MHz
+  gtt   K 16 Wb    4K rp    4K NB   80 lds 49152   224.9 GB/s  97 MHz
+  gtt   K 16 Wb   24K rp   24K NB   80 lds 49152   180.5 GB/s  81 MHz
+  gtt   K 16 Wb   64K rp   64K NB   80 lds 49152   156.1 GB/s  66 MHz
+  gtt   K 16 Wb    2M rp    2M NB   80 lds 49152   155.2 GB/s  69 MHz
+  gtt   K 16 Wb   32M rp   32M NB   80 lds 49152   150.6 GB/s  66 MHz
+  gtt   K  1 Wb   24K rp   24K NB   80 lds 49152   177.8 GB/s  74 MHz
+  gtt   K  1 Wb   24K rp   64K NB   80 lds 49152   175.5 GB/s  73 MHz
+  gtt   K  1 Wb   24K rp    2M NB   80 lds 49152   166.0 GB/s  71 MHz
+  gtt   K  4 Wb   24K rp   24K NB   80 lds 49152   194.9 GB/s  88 MHz
+  gtt   K  4 Wb   24K rp   64K NB   80 lds 49152   193.9 GB/s  91 MHz
+  gtt   K  4 Wb   24K rp    2M NB   80 lds 49152   192.8 GB/s  88 MHz
+  gtt   K  4 Wb   10K rp   10K NB  544 lds 49152   236.5 GB/s  105 MHz
+  gtt   K  4 Wb   24K rp   24K NB   80 lds 49152   191.8 GB/s  87 MHz
+  gtt   K  4 Wb   12K rp   12K NB  160 lds 49152   226.5 GB/s  109 MHz
+  gtt   K 16 Wb   24K rp   24K NB   80 lds 49152   181.0 GB/s  80 MHz
+  vram  K  1 Wb   24K rp   24K NB   80 lds 49152   174.0 GB/s  73 MHz
+  gtt   K  1 Wb   24K rp   24K NB   80 lds 49152   176.9 GB/s  74 MHz
+  vram  K  4 Wb   24K rp   24K NB   80 lds 49152   192.6 GB/s  86 MHz
+  gtt   K  4 Wb   24K rp   24K NB   80 lds 49152   195.5 GB/s  91 MHz
+  vram  K 16 Wb   24K rp   24K NB   80 lds 49152   180.3 GB/s  81 MHz
+  gtt   K 16 Wb   24K rp   24K NB   80 lds 49152   181.8 GB/s  83 MHz
+  vram  K  4 Wb    2M rp    2M NB   80 lds 49152   173.0 GB/s  75 MHz
+  gtt   K  4 Wb    2M rp    2M NB   80 lds 49152   172.9 GB/s  77 MHz

@@ -1,0 +1,16 @@
+date: 2026-10-06T16:14:29-07:00
+uname: Linux marvin 7.0.0-34-generic #34-Ubuntu SMP PREEMPT_DYNAMIC Wed Sep  2 14:29:37 UTC 2026 x86_64 GNU/Linux
+cmdline: BOOT_IMAGE=/BOOT/ubuntu_jk2x0w@/vmlinuz-7.0.0-34-generic root=ZFS=rpool/ROOT/ubuntu_jk2x0w ro quiet splash
+iommu_groups: 36
+iommu_types:
+      1 DMA
+     33 DMA-FQ
+      2 identity
+gpu_iommu_group_type: identity
+nvme nvme0: CT2000P310SSD8 speed 8.0 GT/s PCIe width 4 (max 16.0 GT/s PCIe x4) group_type DMA-FQ
+nvme nvme1: WD Blue SN5000 4TB speed 8.0 GT/s PCIe width 4 (max 16.0 GT/s PCIe x4) group_type DMA-FQ
+gpu_link: 16.0 GT/s PCIe x16
+vram_total: 536870912 gtt_total: 104857600000
+MemTotal:       131010276 kB
+MemAvailable:   21435644 kB
+model_df: /dev/nvme1n1p1 xfs  3905108928 254856108 3650252820   7% /data

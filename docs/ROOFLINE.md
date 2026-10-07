@@ -1404,3 +1404,57 @@ attention 1.7 ms.
 | Decode qsa_scores_b on a full grid (one row a thread, `kDecodeScoresWide`) | 256K -1.8..-2.2 | +1.7 ms at 256K (327 -> 439 us a call) | no |
 | `halo_qsa_scores_wmma_b`: block-key tile split once per block in LDS, q pre-split (bit-identical) | 256K -7..-11 s, 128K -1.5..-2.5 s | 128K prefill (pinned, 2 rounds): 91.65 / 92.33 -> 88.71 / 89.03 s (-2.9 / -3.3 s); logits bit-identical (128K `cmp`, 2K / 8K references, property test bitwise) | yes (default) |
 
+## 14. 2026-10-06 (stream L2, branch `stream/pageloc`): page locality at fixed bytes in flight (probe only)
+
+`halo_hwprobe pageloc` (raw: `/data/halo-work/streams/L2/probe1.txt`; predictions written first in
+`streams/L2/PREDICTIONS.md`). Every wave: 12 iterations of 2 KB in flight (4 x b128 a lane, ISA checked, no
+prefetch), 24 KB a wave; K streams a wave-iteration (each a contiguous 2048/K-byte piece) spread over a Wb window;
+48 KB LDS (40 resident blocks, as `gemv_q8r_r4`) unless noted; fresh lines every launch (rotation past the MALL);
+hipMalloc buffer (lands in GTT, see D); clock pinned (2859-2900 MHz by the in-kernel clock probe before and after;
+the table's own per-row `clk` column is invalid: the clock read is scheduled before the load wait). GB/s:
+
+| K streams a wave (Wb = 24 KB, packed rows) | NB 16 | 40 | 80 | 168 | 400 | NB 80, all blocks resident (no LDS) |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 (contiguous 2 KB) | 113 | 162 | 175 | 183 | 195 | 181 |
+| 2 (rows 12 KB apart) | 134 | 120 | **137** | 155 | 182 | 125 |
+| 4 (= `gemv_q8r_r4` pattern) | 158 | 167 | **195** | 215 | 231 | 152 |
+| 8 | 162 | 153 | 189 | 220 | 233 | 134 |
+| 16 (WMMA-like) | 161 | 152 | 181 | 207 | 223 | 159 |
+
+| Window Wb (NB 80 / NB 400) | 4 KB | 24 KB | 64 KB | 2 MB | 32 MB |
+|---|---:|---:|---:|---:|---:|
+| K 2 | 223 / 239 | 137 / 184 | 137 / 183 | 136 / 183 | 137 / 179 |
+| K 4 | **228** / 239 | 196 / 231 | 177 / 213 | 173 / 209 | 177 / 211 |
+| K 16 | 225 / 235 | 179 / 222 | 158 / 191 | 154 / 189 | 152 / 184 |
+
+- Regions padded apart, same bytes (NB 80, 24 KB a wave at 24 KB / 64 KB / 2 MB pitch: 640 waves in 640 distinct
+  2 MB fragments at the last): K 1 176 / 172 / 168, K 4 196 / 194 / 192 (-2..-4%). (The NB 40 rows at 2 MB pitch,
+  ~550-600 GB/s, reused lines from the MALL: invalid.)
+- Memory type: a 192 MB hipMalloc taken first also landed in GTT (vram_used +0, gtt_used +334 MB): hipMalloc never
+  returns the carve-out here. Same patterns: identical within 1% (the "vram" rows are GTT too, so this compares two
+  GTT buffers, not VRAM; a carve-out allocation needs another allocator: not done).
+- Engine-like shapes: dual qkv + z (rows 2560 B, K 4, 544 blocks) **240**; r4 2560 x 6144 (K 4, NB 80) **195**; the same
+  r4 bytes as 160 blocks of 3072-byte rows (split-K 2 shape) **228**; 16 rows a wave at NB 80 182.
+- Counters: rocprofv3 on gfx1151 exposes no UTCL1 / UTCL2 / TLB counters and no EA read latency (only
+  GL2C_EA_RDREQ_* sizes, GL2C_MC_*, TA_BUSY); none collected.
+
+**Conclusion.** The hypothesis as stated does not hold. (1) Translation / TLB reach is not the limiter: padding the
+same bytes over 640 distinct 2 MB fragments costs 2-4%, the 2 MB and 32 MB windows equal the 64 KB one (no step at
+2 MB or 32 MB), and the two buffers match. (2) GB/s does not fall monotonically with streams at fixed bytes: at the
+GEMV's packing K 4 is the *fastest* (195 vs 175 for one contiguous stream, 137 for K 2), and K 16 is only 7% below K 4.
+(3) What matters is how a wave's in-flight 2 KB is spread over DRAM: pieces inside one 4 KB window read 223-239 GB/s
+(~peak) for every K and block count, while the same pieces spread over >= 64 KB lose 10-15% (K 4) to 15-20% (K 16),
+and some strides alias badly (K 2 at any spacing >= 12 KB: -30%). Block count still matters (NB 80 -> 400: +18% at
+K 4), and with every block resident (no LDS limit) NB 80 gets slower (152 vs 195), the residency direction D2 saw.
+This matches HARDWARE.md (row locality, not translation) refined: locality within ~4 KB of the bytes a wave has in
+flight at the same moment, not the number of rows.
+
+**Implied GEMV change (to be A/B'd in-engine, not yet built):** for the 80-block 2560 x 6144 projections (5.05
+ms/token, 162 GB/s in engine), keep 4 rows a wave and 40 resident blocks but (a) give each block half the columns
+(split-K 2, 160 blocks, 3 KB per row a wave; probe 195 -> 228 GB/s, ~-0.7 ms/token if the engine follows the probe
+ratio; not bit-exact unless the two partial sums are combined in the original order, which the lane-strided
+order prevents -> a precision-class change), or, exact, (b) store each 4-row group's Q8 rows interleaved so that a
+wave's two consecutive 2 KB load rounds fall in one 4 KB page (row r's 512-byte piece of round i at r x 1 KB +
+(i mod 2) x 512 inside the page; same lane arithmetic, same order; probe 195 -> 228 GB/s): a weight relayout that the
+prefill GEMMs must also read or a second copy (2560 x 6144 x 49 layers ~0.77 GB). Do not order a block's rows
+further apart (the 64 KB+ windows lose) and do not raise rows a wave to 16 (no gain).

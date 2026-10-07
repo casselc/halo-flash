@@ -56,6 +56,11 @@ LPDDR5X-8000 256-bit unified memory, 32 MB MALL. ROCm 7.2.3.
   segments scattered across concurrent blocks collapse DRAM bandwidth up to 20x. Random 4 KB
   pages read 512 bytes at a time: ~34 GB/s flat, whatever the loads in flight (1-8 per lane) or
   waves (1-16 per SIMD): parallelism does not fix locality.
+- **Bytes in flight per wave: locality within ~4 KB, not translation** (`halo_hwprobe pageloc`, ROOFLINE 13). At a
+  fixed 2 KB in flight a wave, pieces inside one 4 KB window read 223-239 GB/s for 2-16 streams; spread over
+  >= 64 KB windows 10-20% less, with no further step at 2 MB or 32 MB; padding 640 waves into 640 distinct 2 MB
+  fragments costs 2-4%. Some strides alias (2 streams >= 12 KB apart: -30%). hipMalloc always lands in GTT here
+  (even 192 MB with the carve-out free). No UTCL / TLB counters are exposed on gfx1151.
 - Inside the MALL the order does not matter: the same sweep over a 15 MB footprint reads ~800 GB/s
   for both orders (64 B segments and up; ~400-470 at 32 B). The collapse above is DRAM row (page)
   locality, not cache or translation. MALL-resident working sets (<= ~32 MB) stream at ~800 GB/s.
