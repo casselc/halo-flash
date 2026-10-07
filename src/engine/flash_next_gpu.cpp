@@ -1447,17 +1447,24 @@ bool FlashNextGpu::ReleaseKvPages(std::string* error) {
   const std::size_t pb = dev_.PageBytes();
   for (auto& r : kv_) {
     if (!r.paged) continue;
+    // Only pages a fork (or a fork's fork) also holds go; pages this session alone holds stay mapped where they
+    // are and are rewritten in place. Releasing those too returned them to the HIP runtime, which keeps them
+    // charged to GTT (so KvRoomFor refused a prompt the process could hold), and pooling them for a remap at
+    // another address faulted (GPU aperture violation in the swarm at 2 MB pages, stream C t13/t14).
     for (std::size_t j = 0; j < r.pages.size(); ++j)
-      if (r.pages[j] && !dev_.UnmapPage(r.va, j * pb, error)) return false;
-    r.pages.clear();  // the last holder of each (forks share pages) releases it
+      if (r.pages[j] && r.pages[j].use_count() > 1) {
+        if (!dev_.UnmapPage(r.va, j * pb, error)) return false;
+        r.pages[j].reset();  // the fork keeps it
+      }
   }
   return true;
 }
 
 bool FlashNextGpu::Reset(std::string* error) {
   const auto& c = w_.config;
-  // The bound session's KV pages go: a fork may share them, and the rewritten positions must not reach it
-  // (sessions only append, so shared pages are otherwise never written). EnsureKv maps fresh ones as needed.
+  // The bound session's shared KV pages go: a fork holds them, and the rewritten positions must not reach it
+  // (sessions only append, so shared pages are otherwise never written). EnsureKv maps fresh ones as needed;
+  // pages only this session holds are kept and rewritten in place.
   if (!ReleaseKvPages(error)) return false;
   for (std::uint32_t l = 0; l < c.num_layers; ++l)
     if (c.IsLinearLayer(l) && (!dev_.Fill(linear_[l].conv, 0, error) || !dev_.Fill(linear_[l].state, 0, error)))
