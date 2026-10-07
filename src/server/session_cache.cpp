@@ -26,6 +26,12 @@ std::size_t SessionCache::Bytes(const Entry& en) const {
   return b.recurrent + b.kv_exclusive;
 }
 
+std::size_t SessionCache::retained_bytes() const {
+  std::size_t total = 0;
+  for (const auto& en : entries_) total += Bytes(en);
+  return total;
+}
+
 bool SessionCache::EvictOne() {
   if (entries_.empty()) return false;
   auto lru = std::min_element(entries_.begin(), entries_.end(), [](const Entry& a, const Entry& b) { return a.used < b.used; });

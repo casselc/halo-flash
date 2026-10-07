@@ -81,6 +81,8 @@ class SessionCache {
   void Abandon();
 
   [[nodiscard]] std::size_t retained() const { return entries_.size(); }
+  /// Device bytes the retained states hold (recurrent buffers and KV pages no other session shares).
+  [[nodiscard]] std::size_t retained_bytes() const;
   /// Tokens the live session has run (or the last finished one's, until the next Prepare).
   [[nodiscard]] std::size_t live_tokens() const { return last_live_tokens_; }
   [[nodiscard]] const SessionCacheOptions& options() const { return opt_; }

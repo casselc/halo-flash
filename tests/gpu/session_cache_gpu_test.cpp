@@ -628,3 +628,206 @@ TEST(SessionCache, AQueuedRequestWhoseClientLeftNeverRuns) {
   ASSERT_TRUE(ref.GenerateIds(pb, pb.size() - 1, p, [&](text::TokenId t) { return want_b.push_back(t), true; }).error.empty());
   EXPECT_EQ(got_b, want_b);
 }
+
+namespace {
+
+/// The HIP device with a memory ledger in place of the real headroom, modelling what ReleasedPageChargeProbe
+/// measured: a released page stays charged while any range it was mapped into is still reserved, a new page
+/// reuses a charged one first, and creating a page past the budget fails. Buffers count while allocated.
+class LedgerDevice final : public rt::Device {
+ public:
+  explicit LedgerDevice(rt::Device& d) : d_(d) {}
+  std::size_t budget = SIZE_MAX;
+  [[nodiscard]] std::size_t Used() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return UsedLocked();
+  }
+  rt::Backend backend() const noexcept override { return d_.backend(); }
+  rt::Buffer Alloc(std::size_t bytes, std::string* error) override {
+    rt::Buffer b = d_.Alloc(bytes, error);
+    std::lock_guard<std::mutex> lk(mu_);
+    if (b.device) alloc_ += (sizes_[b.device] = b.bytes);
+    return b;
+  }
+  void Free(rt::Buffer& b) noexcept override {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (auto it = sizes_.find(b.device); it != sizes_.end()) {
+        alloc_ -= it->second;
+        sizes_.erase(it);
+      }
+    }
+    d_.Free(b);
+  }
+  bool Upload(const rt::Buffer& dst, std::size_t off, const void* src, std::size_t n, std::string* e) override {
+    return d_.Upload(dst, off, src, n, e);
+  }
+  bool Download(const rt::Buffer& src, std::size_t off, void* dst, std::size_t n, std::string* e) override {
+    return d_.Download(src, off, dst, n, e);
+  }
+  bool UploadAsync(const rt::Buffer& dst, std::size_t off, const void* src, std::size_t n, std::string* e) override {
+    return d_.UploadAsync(dst, off, src, n, e);
+  }
+  bool Fill(const rt::Buffer& dst, std::uint8_t v, std::string* e) override { return d_.Fill(dst, v, e); }
+  void* AllocHost(std::size_t n, std::string* e) override { return d_.AllocHost(n, e); }
+  void FreeHost(void* p) noexcept override { d_.FreeHost(p); }
+  std::size_t PageBytes() const noexcept override { return d_.PageBytes(); }
+  rt::Buffer ReserveRange(std::size_t n, std::string* e) override {
+    rt::Buffer b = d_.ReserveRange(n, e);
+    std::lock_guard<std::mutex> lk(mu_);
+    if (b.device) reserved_.insert(b.device);
+    return b;
+  }
+  void ReleaseRange(rt::Buffer& r) noexcept override {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      reserved_.erase(r.device);
+      for (auto it = charged_.begin(); it != charged_.end();) {
+        it->erase(r.device);
+        it = it->empty() ? charged_.erase(it) : std::next(it);
+      }
+    }
+    d_.ReleaseRange(r);
+  }
+  void* CreatePage(std::string* error) override {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!charged_.empty()) {
+        charged_.pop_front();  // the runtime hands back a released page: no new charge
+      } else if (UsedLocked() + d_.PageBytes() > budget) {
+        if (error) *error = "ledger: out of device memory";
+        return nullptr;
+      }
+      ++live_;
+    }
+    return d_.CreatePage(error);
+  }
+  void ReleasePage(void* page) noexcept override {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      --live_;
+      std::set<void*> still;
+      for (void* r : mapped_[page])
+        if (reserved_.count(r)) still.insert(r);
+      mapped_.erase(page);
+      if (!still.empty()) charged_.push_back(std::move(still));
+    }
+    d_.ReleasePage(page);
+  }
+  bool MapPage(const rt::Buffer& range, std::size_t off, void* page, std::string* e) override {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      mapped_[page].insert(range.device);
+    }
+    return d_.MapPage(range, off, page, e);
+  }
+  bool UnmapPage(const rt::Buffer& range, std::size_t off, std::string* e) override { return d_.UnmapPage(range, off, e); }
+  std::size_t AvailableBytes() const override {
+    const std::size_t u = Used();
+    return budget > u ? budget - u : 0;
+  }
+  bool LoadModule(std::span<const std::uint8_t> h, std::string* e) override { return d_.LoadModule(h, e); }
+  rt::KernelId Kernel(std::string_view n, std::string* e) override { return d_.Kernel(n, e); }
+  bool ReadGlobal(std::string_view n, void* dst, std::size_t b, std::string* e) override { return d_.ReadGlobal(n, dst, b, e); }
+  bool WriteGlobal(std::string_view n, const void* src, std::size_t b, std::string* e) override {
+    return d_.WriteGlobal(n, src, b, e);
+  }
+  bool Launch(rt::KernelId k, rt::Dim3 g, rt::Dim3 b, std::span<const rt::Arg> a, std::string* e) override {
+    return d_.Launch(k, g, b, a, e);
+  }
+  bool Synchronize(std::string* e) override { return d_.Synchronize(e); }
+  bool BeginCapture(std::string* e) override { return d_.BeginCapture(e); }
+  bool EndCapture(rt::Graph* g, std::string* e) override { return d_.EndCapture(g, e); }
+  bool LaunchGraph(const rt::Graph& g, std::string* e) override { return d_.LaunchGraph(g, e); }
+  void FreeGraph(rt::Graph& g) noexcept override { d_.FreeGraph(g); }
+
+ private:
+  std::size_t UsedLocked() const { return alloc_ + (live_ + charged_.size()) * d_.PageBytes(); }
+  rt::Device& d_;
+  mutable std::mutex mu_;
+  std::size_t alloc_ = 0, live_ = 0;
+  std::map<void*, std::size_t> sizes_;
+  std::set<void*> reserved_;
+  std::map<void*, std::set<void*>> mapped_;  // page -> ranges it was mapped into
+  std::deque<std::set<void*>> charged_;      // released pages still charged: the reserved ranges they were in
+};
+
+}  // namespace
+
+// Making room by eviction sees the memory it frees (audit F3, not reproduced: DropSession releases the evicted
+// session's ranges, and with them its pages' charge; ReleasedPageChargeProbe). On a device ledger that keeps a
+// released page charged while its range is reserved (as the HIP runtime does), a prompt that fits once two of three
+// retained checkpoints are gone evicts exactly two and is admitted, and its tokens equal a cold run's; a prompt that
+// cannot fit even with every checkpoint gone is refused before its prefill.
+TEST(SessionCache, EvictionStopsOnceThePromptFits) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  constexpr std::uint32_t kCtx = 8192;
+  LedgerDevice ledger(*m->dev);
+  std::string e;
+  auto engine = engine::FlashNextGpu::Create(ledger, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  auto cold = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(engine && cold) << e;
+  server::FlashNextGenerator g(*engine, std::vector<text::TokenId>{}, kCtx, {});
+  server::FlashNextGenerator ref(*cold, std::vector<text::TokenId>{}, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
+  const auto prompt = [](std::uint32_t seed) {
+    std::vector<std::int32_t> v(1500);
+    for (auto& t : v) t = static_cast<std::int32_t>((seed = seed * 1664525u + 1013904223u) >> 8) % 1000;
+    return v;
+  };
+  server::TextGenerator::Params p;
+  p.max_tokens = 4;
+  const auto run = [&](server::FlashNextGenerator& gen, const std::vector<std::int32_t>& ids, std::vector<std::int32_t>* out) {
+    return gen.GenerateIds(ids, ids.size() - 1, p, [out](text::TokenId t) { return out->push_back(t), true; });
+  };
+  for (std::uint32_t s = 1; s <= 3; ++s) {
+    std::vector<std::int32_t> out;
+    ASSERT_TRUE(run(g, prompt(s), &out).error.empty());
+  }
+  ASSERT_EQ(g.cache().retained(), 3u);
+  const double each = double(g.cache().retained_bytes()) / 3;
+  ASSERT_GT(each, 0);
+  // The least headroom with which the next prompt is admitted without evicting, measured as Prepare checks it: with
+  // a fresh session (its recurrent buffers allocated) bound. Headroom here means before that session exists.
+  const auto ids = prompt(4);
+  const auto positions = static_cast<std::uint32_t>(ids.size() + p.max_tokens);
+  const auto headroom = [&] {
+    const std::size_t before = ledger.Used();
+    engine::FlashNextGpu::SessionId s = 0;
+    EXPECT_TRUE(engine->NewSession(&s, &e) && engine->BindSession(s, &e)) << e;
+    const std::size_t session = ledger.Used() - before;
+    const auto fits = [&](std::size_t avail) {
+      ledger.budget = ledger.Used() + avail;
+      return engine->KvRoomFor(positions, static_cast<std::uint32_t>(ids.size() - 1), nullptr);
+    };
+    std::size_t lo = 0, hi = std::size_t{64} << 30;
+    EXPECT_TRUE(fits(hi));
+    while (hi - lo > 4096) (fits((lo + hi) / 2) ? hi : lo) = (lo + hi) / 2;
+    EXPECT_TRUE(engine->BindSession(0, &e) && engine->DropSession(s, &e)) << e;
+    ledger.budget = SIZE_MAX;
+    return hi + session;
+  };
+  const std::size_t hi = headroom();
+  std::printf("each checkpoint holds %.1f MB; the prompt needs %.3f GB of headroom\n", each / 1e6, hi / 1e9);
+  // Short by 1.5 checkpoints: two must go, and no more.
+  ledger.budget = ledger.Used() + hi - static_cast<std::size_t>(1.5 * each);
+  std::vector<std::int32_t> got, want;
+  const auto r = run(g, ids, &got);
+  ASSERT_TRUE(r.error.empty()) << r.error << " (the eviction's gains were not seen)";
+  EXPECT_EQ(g.cache().retained(), 2u) << "evicted more than it needed (or less): 1 left + this prompt's checkpoint";
+  ASSERT_TRUE(run(ref, ids, &want).error.empty());
+  EXPECT_EQ(got, want);
+  // Short by more than everything retained holds: refused before the prefill.
+  const auto ids2 = prompt(5);
+  ledger.budget = ledger.Used() + hi - g.cache().retained_bytes() - static_cast<std::size_t>(each);
+  std::vector<std::int32_t> none;
+  const auto r2 = run(g, ids2, &none);
+  EXPECT_NE(r2.error.find("not enough memory"), std::string::npos) << r2.error;
+  EXPECT_TRUE(none.empty());
+  // Room again: served, and equal to a cold run.
+  ledger.budget = SIZE_MAX;
+  std::vector<std::int32_t> got2, want2;
+  ASSERT_TRUE(run(g, ids2, &got2).error.empty());
+  ASSERT_TRUE(run(ref, ids2, &want2).error.empty());
+  EXPECT_EQ(got2, want2);
+}

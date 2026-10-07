@@ -1299,3 +1299,13 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "SessionCache.ACancelStopsThePrefillAtTheNextChunk"
 why = "a client that left mid-prefill gets the rest of its prefill (minutes at long context) computed for nobody"
+
+[[mutant]]
+name = "guard-ignores-released"
+file = "src/engine/flash_next_gpu.cpp"
+find = '      dev_.ReleaseRange(r.va);'
+replace = '      (void)0;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.EvictionStopsOnceThePromptFits"
+why = "evicting a retained session frees nothing the memory guard can see (its pages stay charged while their range is reserved), so the cache empties itself and still refuses"
