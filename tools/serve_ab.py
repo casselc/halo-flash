@@ -138,6 +138,10 @@ def cmd_run(a) -> int:
                 u = res.get("usage") or {}
                 print(f"{res['name']}: {res['status']} {res['finish_reason']} {u.get('completion_tokens')} tokens, "
                       f"ttft {res['ttft_s']}, decode {res['decode_s']}", flush=True)
+        c = http.client.HTTPConnection("127.0.0.1", a.port, timeout=30)  # the counters after the set
+        c.request("GET", "/metrics")
+        with open(a.out + ".metrics", "w") as f:
+            f.write(c.getresponse().read().decode(errors="replace"))
     finally:
         proc.send_signal(signal.SIGINT)
         try:
