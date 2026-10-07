@@ -624,6 +624,19 @@ class SteppedGenerator : public TextGenerator {
   std::timed_mutex engine;
 };
 
+/// The in-memory store, with an injectable write failure (a full disk, a locked SQLite file).
+struct FailableStore : InMemoryResponseStore {
+  using InMemoryResponseStore::InMemoryResponseStore;
+  bool Put(const std::string& id, const StoredResponse& r, std::string* error) override {
+    if (fail.load()) {
+      if (error) *error = "injected store failure";
+      return false;
+    }
+    return InMemoryResponseStore::Put(id, r, error);
+  }
+  std::atomic<bool> fail{false};
+};
+
 struct ServingRig {
   ServingRig() : server({.send_timeout_ms = 200}) {
     ServiceOptions o;
@@ -637,7 +650,7 @@ struct ServingRig {
   }
   ~ServingRig() { server.Stop(); }
   SteppedGenerator gen;
-  InMemoryResponseStore store{100000};
+  FailableStore store{100000};
   Recording observed;
   HttpServer server;
   std::unique_ptr<OpenAiService> service;
@@ -738,6 +751,7 @@ struct Finished {
   Delivery got;
   std::shared_ptr<SteppedGenerator::Run> run;
   int work_at_leave = -1;  // the run's work when its client left (-1: it did not leave)
+  bool store_failed = false;  // its store write failed (injected)
 };
 
 std::string RequestBody(const std::string& marker, bool stream, std::uint32_t max_tokens, const std::string& prev = "") {
@@ -794,6 +808,14 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
       ASSERT_TRUE(Await([&] { return f.run->phase.load() == SteppedGenerator::kDone; })) << f.marker << " still runs";
       const auto rec = record_of(f);
       ASSERT_TRUE(rec) << "no record for " << f.marker;
+      if (f.store_failed) {
+        // Answered with an error, recorded as one, and nothing kept: the id the client may hold is unknown.
+        ASSERT_FALSE(f.got.full);
+        ASSERT_EQ(rec->finish_reason, "error");
+        ASSERT_NE(rec->error.find("not stored"), std::string::npos) << rec->error;
+        ASSERT_FALSE(rig.store.Get(rec->request_id)) << "a response answered with a store error is stored";
+        return;
+      }
       if (f.got.full) {
         ASSERT_TRUE(rec->finish_reason == "stop" || rec->finish_reason == "length") << rec->finish_reason;
         ASSERT_FALSE(f.run->cancelled.load());
@@ -802,6 +824,13 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
       }
       if (f.work_at_leave >= 0)
         ASSERT_LE(f.run->work.load(), f.work_at_leave) << f.marker << ": work after its client left";
+      if (!f.got.full && !f.stream) {
+        // A non-streaming client that left never got the id: nothing is kept. (Every handler has returned once
+        // the server holds no connection.)
+        ASSERT_TRUE(Await([&] { return rig.server.active_connections() == 0; }));
+        ASSERT_FALSE(rig.store.Get(rec->request_id)) << f.marker << ": a departed non-streaming response is stored";
+        return;
+      }
       std::optional<StoredResponse> stored;  // put just after the observer's record
       Await([&] { return (stored = rig.store.Get(rec->request_id)).has_value(); });
       ASSERT_TRUE(stored) << rec->request_id;
@@ -828,7 +857,8 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
     const int steps = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 6}));
     for (int step = 0; step < steps; ++step) {
       const auto rule = tc.draw(gs::sampled_from<std::string>(
-          {"complete", "leave-queued", "leave-prefill", "leave-decode", "stall", "retry", "continue"}));
+          {"complete", "leave-queued", "leave-prefill", "leave-decode", "stall", "retry", "continue",
+           "store-fails"}));
       const bool stream = tc.draw(gs::booleans());
       const int words = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 8}));
       const auto max_tokens = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 12}));
@@ -890,6 +920,29 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
         ASSERT_TRUE(Await([&] { return s.run->phase.load() == SteppedGenerator::kDone; }));
         sc.Close();
         finish(std::move(s));
+      } else if (rule == "store-fails") {
+        // The store refuses the write: the client gets an error instead of a finished response (non-streaming: a
+        // 500; streaming: an error event in place of response.completed), never an id that later 404s.
+        const auto m = fresh();
+        Finished f{m, RequestBody(m, stream, max_tokens), 0, stream, {}, rig.gen.Plan(m, -1, words)};
+        f.store_failed = true;
+        rig.store.fail = true;
+        Conn c(port, f.body);
+        c.ReadToEnd();
+        rig.store.fail = false;
+        f.got = Delivered(c, stream);
+        if (stream) {
+          ASSERT_EQ(c.Status(), 200);
+          bool ended = false;
+          const auto events = Events(c.Body(), &ended);
+          ASSERT_FALSE(events.empty());
+          ASSERT_EQ(events.back().find("type")->str(), "error") << c.raw.substr(0, 300);
+          ASSERT_NE(CompactJson(events.back()).find("not stored"), std::string::npos);
+        } else {
+          ASSERT_EQ(c.Status(), 500) << c.raw.substr(0, 300);
+          ASSERT_NE(c.Body().find("not stored"), std::string::npos) << c.Body();
+        }
+        finish(std::move(f));
       } else if (rule == "retry" && !done.empty()) {
         // The same body again (a client retrying after a lost answer): a new, independent response.
         const Finished prev = done[tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = done.size() - 1}))];
@@ -903,7 +956,11 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
         ASSERT_TRUE(rec);
         const auto m = fresh();
         const std::string body = RequestBody(m, stream, max_tokens, rec->request_id);
-        if (prev.got.full) {
+        if (prev.store_failed) {
+          Conn c(port, body);
+          c.ReadToEnd();
+          ASSERT_EQ(c.Status(), 404) << "continued from a response that was not stored: " << c.raw.substr(0, 300);
+        } else if (prev.got.full) {
           const std::size_t before = rig.gen.prompts.size();
           finish(complete(m, body, stream, words));
           std::lock_guard<std::mutex> lk(rig.gen.mu);
@@ -913,10 +970,108 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
         } else {
           Conn c(port, body);
           c.ReadToEnd();
-          ASSERT_EQ(c.Status(), 400) << "continued from a cancelled response: " << c.raw.substr(0, 300);
+          // Streaming: the cancelled object is kept (its client may hold the id), so a clear 400; non-streaming:
+          // nothing was kept, 404.
+          ASSERT_EQ(c.Status(), prev.stream ? 400 : 404) << "continued from a cancelled response: " << c.raw.substr(0, 300);
         }
       }
       for (const auto& f : done) check(f);
     }
   }, {.test_cases = 25});
 }
+
+// Audit F7: a store write that fails is answered with an error, never a finished response whose id later 404s.
+// Non-streaming: a 500 naming the store; streaming: an error event in place of response.completed. Nothing is
+// kept, the observer records an error, and continuing from the id is a 404; once the store works again the same
+// request succeeds (a retry is safe: every attempt is a new immutable response).
+TEST(OpenAiService, AFailedStoreWriteIsAnErrorAndKeepsNothing) {
+  ServingRig rig;
+  const int port = rig.server.port();
+  for (const bool stream : {false, true}) {
+    const std::string m = stream ? "m1x" : "m0x";
+    (void)rig.gen.Plan(m, -1, 3);
+    rig.store.fail = true;
+    Conn c(port, RequestBody(m, stream, 8));
+    c.ReadToEnd();
+    rig.store.fail = false;
+    if (stream) {
+      ASSERT_EQ(c.Status(), 200);
+      bool ended = false;
+      const auto events = Events(c.Body(), &ended);
+      ASSERT_FALSE(events.empty());
+      EXPECT_EQ(events.back().find("type")->str(), "error") << c.Body();
+      EXPECT_EQ(c.Body().find("response.completed"), std::string::npos) << "a finished event for an unstored response";
+    } else {
+      ASSERT_EQ(c.Status(), 500) << c.raw.substr(0, 300);
+      EXPECT_NE(c.Body().find("not stored"), std::string::npos) << c.Body();
+    }
+    const auto rec = AwaitRecord(rig.observed, stream ? 2 : 1);
+    ASSERT_TRUE(rec);
+    EXPECT_EQ(rec->finish_reason, "error");
+    EXPECT_NE(rec->error.find("injected store failure"), std::string::npos) << rec->error;
+    EXPECT_FALSE(rig.store.Get(rec->request_id));
+    Conn cont(port, RequestBody(stream ? "m3x" : "m2x", false, 8, rec->request_id));
+    cont.ReadToEnd();
+    EXPECT_EQ(cont.Status(), 404) << cont.raw.substr(0, 300);
+  }
+  Conn ok(port, RequestBody("m4x", false, 8));
+  ok.ReadToEnd();
+  EXPECT_EQ(ok.Status(), 200);
+  EXPECT_EQ(J(ok.Body()).find("status")->str(), "completed");
+}
+
+// Audit F5: a non-streaming client that leaves mid-decode stops the run at the next step, and nothing is stored
+// (it never received the id).
+TEST(OpenAiService, ADepartedNonStreamingResponseStopsAndIsNotStored) {
+  ServingRig rig;
+  const auto run = rig.gen.Plan("m0x", SteppedGenerator::kChunks + 2, 6);
+  {
+    Conn c(rig.server.port(), RequestBody("m0x", false, 64));
+    ASSERT_TRUE(Await([&] { return run->held.load(); }));
+  }
+  ASSERT_TRUE(Await([&] { return run->phase.load() == SteppedGenerator::kDone; }));
+  EXPECT_TRUE(run->cancelled.load());
+  EXPECT_LE(run->work.load(), SteppedGenerator::kChunks + 2) << "work after the client left";
+  const auto rec = AwaitRecord(rig.observed, 1);
+  ASSERT_TRUE(rec);
+  EXPECT_EQ(rec->finish_reason, "cancelled");
+  ASSERT_TRUE(Await([&] { return rig.server.active_connections() == 0; }));
+  EXPECT_FALSE(rig.store.Get(rec->request_id)) << "a response nobody received is stored";
+}
+
+// Keep-alive and pipelining: the next request's bytes arriving while a non-streaming request runs make the
+// connection readable, which is not a departure; the first request completes and then the second is answered.
+TEST(OpenAiService, APipelinedNextRequestIsNotADeparture) {
+  ServingRig rig;
+  const auto first = rig.gen.Plan("m0x", SteppedGenerator::kChunks + 1, 3);
+  (void)rig.gen.Plan("m1x", -1, 2);
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  const timeval tv{10, 0};
+  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_port = htons(static_cast<std::uint16_t>(rig.server.port()));
+  ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+  ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+  const auto request = [](const std::string& body, bool close) {
+    return "POST /v1/responses HTTP/1.1\r\n" + std::string(close ? "Connection: close\r\n" : "") +
+           "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+  };
+  const std::string r1 = request(RequestBody("m0x", false, 8), false);
+  ::send(fd, r1.data(), r1.size(), MSG_NOSIGNAL);
+  ASSERT_TRUE(Await([&] { return first->held.load(); }));
+  const std::string r2 = request(RequestBody("m1x", false, 8), true);
+  ::send(fd, r2.data(), r2.size(), MSG_NOSIGNAL);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));  // several liveness polls see the readable socket
+  first->release = true;
+  std::string raw;
+  char b[65536];
+  for (ssize_t n; (n = ::recv(fd, b, sizeof b, 0)) > 0;) raw.append(b, static_cast<std::size_t>(n));
+  ::close(fd);
+  EXPECT_FALSE(first->cancelled.load()) << "the pipelined request was taken for a departure";
+  std::size_t oks = 0;
+  for (std::size_t i = 0; (i = raw.find("HTTP/1.1 200", i)) != std::string::npos; ++i) ++oks;
+  EXPECT_EQ(oks, 2u) << raw.substr(0, 400);
+  EXPECT_EQ(raw.find("\"cancelled\""), std::string::npos);
+}
+

@@ -192,7 +192,12 @@ bool MetadataStore::PutResponse(std::string_view id, std::string_view conversati
     Exec("ROLLBACK", &ignored);
     return false;
   }
-  return Exec("COMMIT", err);
+  if (Exec("COMMIT", err)) return true;
+  // A failed COMMIT may leave the transaction open (SQLITE_BUSY): roll it back, so false means not written and
+  // the next write can begin (a no-op when SQLite already rolled back).
+  std::string ignored;
+  Exec("ROLLBACK", &ignored);
+  return false;
 }
 
 std::optional<std::pair<std::string, std::string>> MetadataStore::GetResponse(std::string_view id) {

@@ -127,6 +127,9 @@ class OpenAiService {
   /// `connected` (optional): whether the client is still there (HttpRequest::connected).
   HttpResponse Generate(Api api, GenerationRequest req, const json::Value* prior,
                         const std::function<bool()>& connected);
+  /// Stores a finished Responses turn (`final`, after `conversation`); empty on success, else why it was not
+  /// stored (then nothing was kept).
+  std::string Store(const std::string& id, const json::Value& conversation, const json::Value& final);
 
   TextGenerator& gen_;
   ServiceOptions opt_;

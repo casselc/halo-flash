@@ -6,10 +6,13 @@
 
 namespace halo::scope {
 
-void SqliteResponseStore::Put(const std::string& id, const server::StoredResponse& r) {
+bool SqliteResponseStore::Put(const std::string& id, const server::StoredResponse& r, std::string* error) {
   std::string err;
-  if (!store_.PutResponse(id, server::CompactJson(r.conversation), server::CompactJson(r.response), keep_, &err))
-    std::fprintf(stderr, "halo-scope: storing response %s failed: %s\n", id.c_str(), err.c_str());
+  if (store_.PutResponse(id, server::CompactJson(r.conversation), server::CompactJson(r.response), keep_, &err))
+    return true;
+  std::fprintf(stderr, "halo-scope: storing response %s failed: %s\n", id.c_str(), err.c_str());
+  if (error) *error = "storing the response failed: " + err;
+  return false;
 }
 
 std::optional<server::StoredResponse> SqliteResponseStore::Get(const std::string& id) {

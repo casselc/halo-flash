@@ -13,7 +13,7 @@ class SqliteResponseStore : public server::ResponseStore {
  public:
   /// Keeps the newest `keep` responses (0: all). `store` must outlive this.
   SqliteResponseStore(MetadataStore& store, std::size_t keep) : store_(store), keep_(keep) {}
-  void Put(const std::string& id, const server::StoredResponse& r) override;
+  bool Put(const std::string& id, const server::StoredResponse& r, std::string* error = nullptr) override;
   std::optional<server::StoredResponse> Get(const std::string& id) override;
 
  private:
