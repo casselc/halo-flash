@@ -1,12 +1,16 @@
 // halo_serve: the OpenAI-compatible server on Flash-Next.
 //   halo_serve --model <shard-00001.gguf> [--host 127.0.0.1] [--port 8080]
-//              [--device hip|hrx] [--max-context 32768] [--kv-f16 0|1] [--api-key KEY]
+//              [--device hip|hrx] [--max-context 32768] [--kv-f16 0|1] [--kv-f16-above 150000] [--api-key KEY]
 //              [--model-id NAME] [--decider-dir DIR [--decider-device hip|hrx|cpu]]
 // With halo-scope built in (HALO_SCOPE=ON): --scope-dir DIR records every
 // generation as a GENERATION observation in DIR/chdb and keeps stored
 // /v1/responses in DIR/metadata.sqlite, so they survive restarts; harnesses
 // annotate traces through POST /v1/scope/... (scope/http_annotations.hpp)
 // and read them back with GET /v1/scope/traces[/{id}] (scope/trace_reader.hpp)
+// KV kind (docs/SESSIONS.md section 7): without --kv-f16, halo_serve uses fp16-only KV (26.2 KB a token against
+// 75.3) when --max-context is above --kv-f16-above (default 150000, about what default KV holds; 0 disables the
+// automatic choice), the default kinds otherwise. --kv-f16 1 forces fp16-only KV, --kv-f16 0 the default kinds.
+// The choice is logged at startup ("kv: ..."). halo_run and the library default stay default KV.
 // [--scope-project NAME] [--scope-capture off|digest|full] [--scope-wal PATH].
 // Datasets, evaluators and experiments are served under /v1/scope/
 // (scope/eval_routes.hpp); runs call this server's own OpenAI endpoints
@@ -44,6 +48,7 @@
 #include "rt/device.hpp"
 #include "server/flash_next_generator.hpp"
 #include "server/http.hpp"
+#include "server/kv_choice.hpp"
 #include "server/metrics.hpp"
 #include "server/openai_service.hpp"
 #include "server/qwen35_generator.hpp"
@@ -92,6 +97,25 @@ int main(int argc, char** argv) {
   double ngram_cache_gb = 4.0;  // cache of n-gram rows read from disk, GiB (0: off)
   std::uint32_t max_context = 32768;
   server::SessionCacheOptions cache;  // prompt-prefix reuse across requests (server/session_cache.hpp)
+  server::KvChoiceOptions kv;         // --kv-f16 / --kv-f16-above (server/kv_choice.hpp)
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--help" || a == "-h") {
+      std::printf(
+          "usage: halo_serve --model <shard-00001.gguf> | --qwen35-model <gguf> --qwen35-tokenizer <gguf> [options]\n"
+          "  --host 127.0.0.1 --port 8080 --device hip|hrx --max-context 32768 --api-key KEY --model-id NAME\n"
+          "  --kv-f16 0|1          KV kind: 1 fp16-only (26.2 KB/token), 0 default kinds (75.3 KB/token).\n"
+          "                        Not given: fp16-only when --max-context > --kv-f16-above, else default.\n"
+          "  --kv-f16-above N      threshold for the automatic fp16-only choice (default 150000; 0: never).\n"
+          "                        Default KV reliably holds ~150K positions; 262144 needs fp16-only KV.\n"
+          "  --prefix-cache exact|fast|off  prompt-prefix reuse (default exact: byte-identical to a cold prefill)\n"
+          "  --prefix-cache-sessions N --prefix-cache-gb G --prefix-cache-align N\n"
+          "  --ngram-cache-gb G --moe-topk N --decider-dir DIR --decider-device hip|hrx|cpu --variant MANIFEST\n"
+          "  --scope-dir DIR --scope-project NAME --scope-capture off|digest|full --scope-wal PATH\n"
+          "  --scope-eval-endpoint URL\n");
+      return 0;
+    }
+  }
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i], v = argv[i + 1];
     if (a == "--model") model = v;
@@ -100,7 +124,10 @@ int main(int argc, char** argv) {
     else if (a == "--port") port = std::atoi(v.c_str());
     else if (a == "--max-context") max_context = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--ngram-cache-gb") ngram_cache_gb = std::atof(v.c_str());
-    else if (a == "--kv-f16") engine::FlashNextGpu::kv_f16_only_ = v == "1";  // fp16-only KV (docs/SESSIONS.md)
+    else if (a == "--kv-f16") {  // fp16-only KV (docs/SESSIONS.md); not given: by --kv-f16-above
+      if (v != "0" && v != "1") return std::fprintf(stderr, "--kv-f16 must be 0 or 1\n"), 2;
+      kv.explicit_kv_f16 = v == "1";
+    } else if (a == "--kv-f16-above") kv.f16_above = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--moe-topk") moe_topk = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--api-key") api_key = v;
     else if (a == "--prefix-cache") {  // exact (default) | fast | off
@@ -157,6 +184,10 @@ int main(int argc, char** argv) {
     if (!dev) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
     std::vector<rt::FileSource> sources;
     for (const auto& r : reader->GetMappedRegions()) sources.push_back({r.data, r.size, r.file_descriptor});
+    kv.max_context = max_context;
+    const server::KvChoice kv_choice = server::ResolveKvKind(kv);
+    engine::FlashNextGpu::kv_f16_only_ = kv_choice.f16;
+    std::fprintf(stderr, "kv: %s (%s)\n", kv_choice.f16 ? "fp16-only" : "default", kv_choice.reason.c_str());
     std::fprintf(stderr, "loading weights...\n");
     engine = engine::FlashNextGpu::Create(*dev, *weights, ngram.get(), nullptr, max_context, &error, sources);
     if (!engine) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
