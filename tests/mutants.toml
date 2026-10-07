@@ -1254,7 +1254,7 @@ find = 'if (::poll(&p, 1, static_cast<int>(left)) < 0 && errno != EINTR) return 
 replace = 'if (::poll(&p, 1, -1) < 0 && errno != EINTR) return false;'
 suite = "cpu-asan"
 binary = "server_tests"
-filter = "Http.AStalledReaderIsCutOffAfterTheSendTimeout"
+filter = "Http.AStalledReaderIsCutOffAfterTheSendTimeout:OpenAiService.ServingModelUnderDeparturesStallsAndRetries"
 timeout = 120
 why = "a client that stays connected but stops reading holds its handler (and the engine lock) until it closes"
 
@@ -1265,7 +1265,7 @@ find = 'const bool cancelled = client_gone || result.cancelled || !flush() || go
 replace = 'const bool cancelled = false;'
 suite = "cpu-asan"
 binary = "server_tests"
-filter = "OpenAiService.ADepartedStreamIsRecordedAndStoredAsCancelled"
+filter = "OpenAiService.ADepartedStreamIsRecordedAndStoredAsCancelled:OpenAiService.ServingModelUnderDeparturesStallsAndRetries"
 timeout = 120
 why = "a client that left mid-stream is recorded as finish_reason stop and its truncated turn stored as completed"
 
@@ -1276,7 +1276,7 @@ find = 'const auto gone = [connected] { return connected && !connected(); };'
 replace = 'const auto gone = [connected] { return connected && false; };'
 suite = "cpu-asan"
 binary = "server_tests"
-filter = "OpenAiService.ADepartedNonStreamingClientStopsGeneration"
+filter = "OpenAiService.ADepartedNonStreamingClientStopsGeneration:OpenAiService.ServingModelUnderDeparturesStallsAndRetries"
 timeout = 300
 why = "a request whose client left before its first byte (queued, prefilling) or a non-streaming one runs to completion"
 
