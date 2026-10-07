@@ -7,6 +7,7 @@
 #include <hegel/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,8 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "core/gguf.hpp"
@@ -294,4 +297,106 @@ TEST(SessionCache, ReuseIsByteIdenticalToColdPrefill) {
   std::printf("exact: %zu requests, %zu of %zu prompt tokens reused; fast: %zu reused, %zu requests differ from cold\n",
               requests, reused, prompt_tokens, fast_reused, fast_differs);
   EXPECT_GT(reused, prompt_tokens / 10) << "the cache hardly reused anything: the comparison is close to vacuous";
+}
+
+namespace {
+
+// GTT used (amdgpu sysfs) and the host's MemAvailable, in bytes (0 when unreadable).
+std::pair<std::size_t, std::size_t> GttUsedAndMemAvailable() {
+  std::size_t used = 0, avail = 0;
+  for (int card = 0; card < 8 && !used; ++card) {
+    std::ifstream u("/sys/class/drm/card" + std::to_string(card) + "/device/mem_info_gtt_used");
+    if (!(u >> used)) used = 0;
+  }
+  std::ifstream m("/proc/meminfo");
+  std::string key, unit;
+  std::size_t kb = 0;
+  while (m >> key >> kb >> unit)
+    if (key == "MemAvailable:") {
+      avail = kb * 1024;
+      break;
+    }
+  return {used, avail};
+}
+
+}  // namespace
+
+// Probe (not a gate; HALO_PAGE_PROBE=1): does a released VMM page stay charged to GTT (docs/SESSIONS.md "Released
+// pages stay charged"), so that rt::Device::AvailableBytes cannot see what an eviction frees? Prints the readings
+// after creating and mapping pages, after unmapping and releasing them, and after creating them again; then the
+// same through the engine (a session prefilled, dropped, and a new one prefilled).
+TEST(SessionCache, ReleasedPageChargeProbe) {
+  if (!std::getenv("HALO_PAGE_PROBE")) GTEST_SKIP() << "set HALO_PAGE_PROBE=1 (and HALO_SMALL_QUANT_DIR)";
+  std::string e;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &e);
+  ASSERT_TRUE(dev) << e;
+  const std::size_t pb = dev->PageBytes();
+  ASSERT_GT(pb, 0u);
+  const std::size_t n = (std::size_t{4} << 30) / pb;
+  const auto show = [&](const char* what) {
+    const auto [used, mem] = GttUsedAndMemAvailable();
+    std::printf("%-34s AvailableBytes %7.3f GB  GTT used %7.3f GB  MemAvailable %7.3f GB\n", what,
+                dev->AvailableBytes() / 1e9, used / 1e9, mem / 1e9);
+  };
+  rt::Buffer range = dev->ReserveRange(n * pb, &e);
+  ASSERT_TRUE(range.device) << e;
+  std::vector<void*> pages(n);
+  const auto create = [&] {
+    for (std::size_t i = 0; i < n; ++i) {
+      pages[i] = dev->CreatePage(&e);
+      ASSERT_TRUE(pages[i]) << e;
+      ASSERT_TRUE(dev->MapPage(range, i * pb, pages[i], &e)) << e;
+      ASSERT_TRUE(dev->Fill(rt::Buffer{static_cast<char*>(range.device) + i * pb, pb, nullptr}, 1, &e)) << e;
+    }
+    ASSERT_TRUE(dev->Synchronize(&e)) << e;
+  };
+  const auto release = [&] {
+    for (std::size_t i = 0; i < n; ++i) {
+      ASSERT_TRUE(dev->UnmapPage(range, i * pb, &e)) << e;
+      dev->ReleasePage(pages[i]);
+    }
+    ASSERT_TRUE(dev->Synchronize(&e)) << e;
+  };
+  std::printf("page %zu KB, %zu pages (%.2f GB)\n", pb >> 10, n, n * pb / 1e9);
+  show("start");
+  create();
+  show("created + mapped + filled");
+  release();
+  show("unmapped + released");
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  show("2 s later");
+  create();
+  show("created again");
+  release();
+  show("released again");
+  dev->ReleaseRange(range);
+  show("range released");
+
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "engine half: set HALO_SMALL_QUANT_DIR";
+  constexpr std::uint32_t kCtx = 131072;
+  auto engine = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(engine) << e;
+  const auto V = static_cast<std::int32_t>(m->weights->config.vocab_size);
+  std::vector<std::int32_t> tokens(100000);
+  for (std::size_t i = 0; i < tokens.size(); ++i) tokens[i] = static_cast<std::int32_t>((i * 2654435761u) % V);
+  const auto eshow = [&](const char* what) {
+    const auto [used, mem] = GttUsedAndMemAvailable();
+    std::printf("engine: %-26s AvailableBytes %7.3f GB  GTT used %7.3f GB  MemAvailable %7.3f GB\n", what,
+                m->dev->AvailableBytes() / 1e9, used / 1e9, mem / 1e9);
+  };
+  std::printf("engine: KV %.1f KB a token\n", engine->KvBytesPerToken() / 1e3);
+  eshow("start");
+  for (int round = 0; round < 2; ++round) {
+    engine::FlashNextGpu::SessionId s = 0;
+    ASSERT_TRUE(engine->NewSession(&s, &e)) << e;
+    ASSERT_TRUE(engine->BindSession(s, &e)) << e;
+    ASSERT_TRUE(engine->Prefill(tokens, {}, &e)) << e;
+    const auto b = engine->SessionMemory(s);
+    std::printf("engine: session %u holds %.3f GB of KV pages\n", s, b.kv_mapped / 1e9);
+    eshow(round ? "second session prefilled" : "first session prefilled");
+    ASSERT_TRUE(engine->BindSession(0, &e)) << e;
+    ASSERT_TRUE(engine->DropSession(s, &e)) << e;
+    eshow(round ? "second session dropped" : "first session dropped");
+  }
 }
