@@ -380,7 +380,7 @@ before a second client was served; with the send deadline alone the kernel took 
 Still open: the engine lock is held while a send waits (another client waits up to `--send-timeout` per stalled
 request; a bounded per-request output buffer drained by the connection thread would remove that); by default
 nothing is sent while a request is queued or prefilling, so a client's idle timeout can still fire first:
-`halo_serve --sse-keepalive S` (off by default, stream A2) writes an SSE comment `: keepalive` from the liveness
+`halo_serve --sse-keepalive S` (default 15 s since 2026-10-07, 0 turns it off; stream A2) writes an SSE comment `: keepalive` from the liveness
 poll when a stream has written nothing for S seconds (SSE parsers ignore comments; checked with the openai 2.24
 SDK, `tests/functional/sse_keepalive_sdk_check.py`), which also turns a departure into a failed write; a
 half-closed connection (`shutdown(SHUT_WR)` after the request) counts as gone; `Qwen35Generator` polls while

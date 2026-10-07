@@ -4,7 +4,7 @@
 //              [--model-id NAME] [--decider-dir DIR [--decider-device hip|hrx|cpu]] [--send-timeout 30]
 // --send-timeout S: a write to a client that makes no progress for S seconds fails, and the request is cancelled
 // as if the client had left (a client that stops reading cannot hold the engine for longer).
-// --sse-keepalive S (default 0: off): a streamed request writes an SSE comment after S seconds without a write
+// --sse-keepalive S (default 15; 0: off): a streamed request writes an SSE comment after S seconds without a write
 // (queued, prefilling), so a client's idle-read timeout does not fire before its first token.
 // With halo-scope built in (HALO_SCOPE=ON): --scope-dir DIR records every
 // generation as a GENERATION observation in DIR/chdb and keeps stored
@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
   std::vector<std::string> variant_paths;
   int port = 8080;
   double send_timeout_s = 30;
-  double sse_keepalive_s = 0;
+  double sse_keepalive_s = 15;
   std::uint32_t moe_topk = 0;  // --moe-topk N: experts per token (0: the file's count; CODESIGN arm B)
   double ngram_cache_gb = 4.0;  // cache of n-gram rows read from disk, GiB (0: off)
   std::uint32_t max_context = 32768;
@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
           "usage: halo_serve --model <shard-00001.gguf> | --qwen35-model <gguf> --qwen35-tokenizer <gguf> [options]\n"
           "  --host 127.0.0.1 --port 8080 --device hip|hrx --max-context 32768 --api-key KEY --model-id NAME\n"
           "  --send-timeout S      a client write with no progress for S seconds (default 30) cancels the request\n"
-          "  --sse-keepalive S     streams: an SSE comment after S idle seconds while queued or prefilling (0: off)\n"
+          "  --sse-keepalive S     streams: an SSE comment after S idle seconds while queued or prefilling (default 15; 0: off)\n"
           "  --kv-f16 0|1          KV kind: 1 fp16-only (26.2 KB/token), 0 default kinds (75.3 KB/token).\n"
           "                        Not given: fp16-only when --max-context > --kv-f16-above, else default.\n"
           "  --kv-f16-above N      threshold for the automatic fp16-only choice (default 150000; 0: never).\n"
