@@ -9,8 +9,13 @@
 //   vllm:time_to_first_token_seconds             histogram
 //   vllm:time_per_output_token_seconds           histogram
 //   vllm:e2e_request_latency_seconds             histogram
-// plus halo:prefix_cache_hit_tokens_total (cached prompt tokens). Every
-// series carries model_name.
+// plus halo:prefix_cache_hit_tokens_total (cached prompt tokens). MTP speculative decoding (docs/MTP.md) uses
+// vLLM's spec-decode names:
+//   vllm:spec_decode_num_drafts_total, vllm:spec_decode_num_draft_tokens_total,
+//   vllm:spec_decode_num_accepted_tokens_total, vllm:spec_decode_num_accepted_tokens_per_pos_total{position}
+// plus halo:mtp_decode_steps_total{depth} (decode steps by drafts run; 0: an ordinary step of a speculative
+// request) and halo:mtp_catchup_tokens_total (prompt positions the draft block caught up on). Every series
+// carries model_name.
 
 #include <array>
 #include <atomic>
@@ -48,6 +53,7 @@ class Metrics : public GenerationObserver {
   mutable std::mutex mu_;
   std::uint64_t prompt_tokens_ = 0, generation_tokens_ = 0, cached_tokens_ = 0;  // guarded by mu_
   std::map<std::string, std::uint64_t> finished_;                                // guarded by mu_
+  SpecDecodeStats spec_;                                                         // guarded by mu_ (summed)
   Histogram ttft_{{0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0,
                    40.0, 80.0, 160.0, 640.0, 2560.0},
                   {}};

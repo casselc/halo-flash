@@ -128,7 +128,10 @@ bool FlashNextGpu::Launch(const char* name, rt::Dim3 grid, rt::Dim3 block, std::
     return id >= 0 && dev_.Launch(id, {1}, {1}, a, error);
   };
   if (traced && !span_set(1)) return false;
-  if (!dev_.Launch(it->second, grid, block, std::span<const rt::Arg>(args.begin(), args.size()), error)) return false;
+  if (!dev_.Launch(it->second, grid, block, std::span<const rt::Arg>(args.begin(), args.size()), error)) {
+    if (error) *error += std::string(" (launching ") + name + ")";  // a fault surfaces here under AMD_SERIALIZE_KERNEL
+    return false;
+  }
   if (traced && !span_set(0)) return false;
   if (timing_)
     Stamp(std::string(name) + " [" + std::to_string(grid.x) + "x" + std::to_string(grid.y) + "x" +
@@ -1003,7 +1006,7 @@ bool FlashNextGpu::Run(std::int32_t token, Head head, const SampleRequest* reque
     // The draft block follows: its pending base step (last position's hidden, this token), then this step's
     // hidden becomes the pending one.
     if (MtpPending() && !MtpRun(token, &mtp_hpend_, {}, error)) return false;
-    if ((position_ == 0 || mtp_pos_ == position_) && !CopyFloats(mtp_hpend_, res_, c.HcDim(), error)) return false;
+    if (MtpKeepsHidden() && !CopyFloats(mtp_hpend_, res_, c.HcDim(), error)) return false;
   }
   ngram_history_ = history;
   for (auto& s : attn_) {
@@ -1486,7 +1489,7 @@ bool FlashNextGpu::Reset(std::string* error) {
   }
   ngram_history_.Reset();
   position_ = 0;
-  if (bound_ == mtp_owner_) mtp_pos_ = 0;
+  if (bound_ == mtp_owner_) mtp_pos_ = 0, mtp_base_ = 0;
   return dev_.Fill(ple_history_, 0, error) && dev_.Synchronize(error);
 }
 

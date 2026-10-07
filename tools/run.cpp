@@ -375,8 +375,10 @@ int main(int argc, char** argv) {
   // greedy speculative (SpecStep; --spec-depth K fixed, -1 gufo's adaptive policy, -2 (default) MtpDepthChooser with
   // --mtp-depth as its limit), outputs compared token for token, timed. --spec-trace F appends one line per cycle:
   // prompt, cycle, drafted, accepted, emitted, ms.
+  // --mtp-window W[,W...]: the draft block's prompt history window (MtpTrackFrom(prompt - W); -1: the whole prompt,
+  // the default). Each W runs the speculative pass again and reports its prefill (trunk + draft catch-up) and TTFT.
   bool spec = false, spec_skip_ar = false;
-  std::string spec_trace;
+  std::string spec_trace, spec_windows = "-1";
   // --spec-audit N (with --spec 1, --spec-depth K >= 1, --mtp-temp T, --audit-top-p P, --audit-top-k K,
   // --audit-scan S): distribution-exactness audit of sampled SpecStep. Per prompt, the context is the prompt plus
   // its greedy continuation up to the scanned step (of S) whose first-token distribution has the most entropy;
@@ -395,7 +397,7 @@ int main(int argc, char** argv) {
   std::string wmma_probe;
   // --count-files LIST --count-top N --mtp-vocab OUT: the N most frequent tokens over the files named in LIST
   // (one path a line), filled up by lowest id (BPE merge order), plus the chat-control tokens; int32 ids to OUT.
-  std::string count_files;
+  std::string count_files, token_count;
   std::uint32_t count_top = 32768;
   bool wmma_consec = false;
   std::uint32_t mtp_depth = 4, mtp_check = 0;
@@ -494,6 +496,7 @@ int main(int argc, char** argv) {
     else if (a == "--spec-depth") spec_depth = std::atoi(argv[i + 1]);
     else if (a == "--spec-skip-ar") spec_skip_ar = std::string(argv[i + 1]) == "1";
     else if (a == "--spec-trace") spec_trace = argv[i + 1];
+    else if (a == "--mtp-window") spec_windows = argv[i + 1];
     else if (a == "--spec-audit") spec_audit = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--audit-scan") audit_scan = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--audit-top-k") audit_top_k = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
@@ -502,6 +505,7 @@ int main(int argc, char** argv) {
     else if (a == "--mtp-cpu-replay") mtp_cpu_replay = argv[i + 1];
     else if (a == "--mtp-cpu-n") mtp_cpu_n = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--count-files") count_files = argv[i + 1];
+    else if (a == "--token-count") token_count = argv[i + 1];
     else if (a == "--count-top") count_top = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--wmma-probe") wmma_probe = argv[i + 1];
     else if (a == "--wmma-probe-consec") wmma_consec = std::string(argv[i + 1]) == "1";
@@ -556,6 +560,17 @@ int main(int argc, char** argv) {
   if (moe_topk && !weights->SetExpertsUsed(moe_topk, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 2;
   auto tok = text::Tokenizer::FromGguf(*reader, &error);
   if (!tok) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+  if (!token_count.empty()) {  // --token-count a,b: prompt token counts (the tokenizer only; no device)
+    for (std::size_t p = 0; p < token_count.size();) {
+      const auto q = token_count.find(',', p);
+      const std::string file = token_count.substr(p, q == std::string::npos ? std::string::npos : q - p);
+      std::ifstream f(file);
+      const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+      std::printf("%zu %s\n", tok->Encode(text, true).size(), file.c_str());
+      p = q == std::string::npos ? token_count.size() : q + 1;
+    }
+    return 0;
+  }
   const auto& c = weights->config;
   const auto& t = weights->ple_table;
   auto ngram = model::NgramTable::Open(reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset, t.rows,
@@ -1023,7 +1038,7 @@ int main(int argc, char** argv) {
         const std::vector<std::int32_t> toks(enc.begin(), enc.end());
         const auto prompt = std::span<const std::int32_t>(toks).first(toks.size() - 1);
         std::vector<std::int32_t> ar, sp;
-        double ar_ms = 0, sp_ms = 0;
+        double ar_ms = 0;
         if (!spec_skip_ar) {  // AR, draft block off
           if (!gpu->MtpTrack(false, &error) || !gpu->Reset(&error) || !gpu->Prefill(prompt, {}, &error)) return 1;
           std::int32_t t = toks.back();
@@ -1035,9 +1050,24 @@ int main(int argc, char** argv) {
             ar.push_back(t = r.token);
           }
         }
-        // Speculative.
-        if (!gpu->Reset(&error) || !gpu->MtpTrack(true, &error) || !gpu->Prefill(prompt, {}, &error))
+        std::vector<long> windows;
+        for (std::size_t p = 0; p < spec_windows.size();) {
+          const auto q = spec_windows.find(',', p);
+          windows.push_back(std::atol(spec_windows.substr(p, q == std::string::npos ? std::string::npos : q - p).c_str()));
+          p = q == std::string::npos ? spec_windows.size() : q + 1;
+        }
+        for (std::size_t wi = 0; wi < windows.size(); ++wi) {
+        const long window = windows[wi];
+        sp.clear();
+        double sp_ms = 0;  // per window (one timer across windows divided window k's tokens by k windows' time)
+        // Speculative: the draft block follows the last `window` prompt positions (all: -1).
+        const auto plen = static_cast<long>(prompt.size());
+        const auto start = static_cast<std::uint32_t>(window < 0 ? 0 : std::max(0L, plen - window));
+        const auto pst = clk::now();
+        if (!gpu->Reset(&error) || !gpu->MtpTrackFrom(start, &error) || !gpu->Prefill(prompt, {}, &error))
           return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+        const double prefill_ms = std::chrono::duration<double, std::milli>(clk::now() - pst).count();
+        double first_ms = 0;
         engine::MtpLengthController policy(engine::kMaxMtpDraftTokens);
         engine::MtpDepthChooser chooser(engine::MtpMeasuredCosts(), {.limit = mtp_depth});
         std::FILE* trace = spec_trace.empty() ? nullptr : std::fopen(spec_trace.c_str(), "a");
@@ -1053,6 +1083,7 @@ int main(int argc, char** argv) {
           const auto st = clk::now();
           if (!gpu->SpecStep(t, k, nullptr, &r, &error)) return std::fprintf(stderr, "spec: %s\n", error.c_str()), 1;
           const double ms = std::chrono::duration<double, std::milli>(clk::now() - st).count();
+          if (cycles == 0) first_ms = ms;
           if (sp.size() >= 4) sp_ms += ms, timed += r.tokens.size();
           if (trace)
             std::fprintf(trace, "%s %zu %u %u %zu %.3f\n", file.substr(file.find_last_of('/') + 1).c_str(), cycles,
@@ -1078,7 +1109,12 @@ int main(int argc, char** argv) {
                     spec_skip_ar ? "AR skipped" : (exact ? "IDENTICAL to AR" : ("DIFFERS at " + std::to_string(same)).c_str()),
                     ar_tok, sp_tok, ar_tok > 0 ? sp_tok / ar_tok : 0.0, cycles, drafted, accepted,
                     drafted ? double(accepted) / drafted : 0.0, double(n) / cycles);
-        ar_ms_all += ar_ms, sp_ms_all += sp_ms, ar_n_all += n - 4, sp_n_all += timed;
+        std::printf("spec window %s %ld: prefill %.1f ms (draft from %u), TTFT %.1f ms, tokens/cycle %.3f, MTP %.2f tok/s\n",
+                    name.c_str(), window, prefill_ms, start, prefill_ms + first_ms, double(n) / cycles, sp_tok);
+        std::fflush(stdout);
+        if (wi == 0) ar_ms_all += ar_ms, ar_n_all += n - 4;
+        sp_ms_all += sp_ms, sp_n_all += timed;
+        }
       }
       std::printf("spec total: AR %.2f tok/s, MTP %.2f tok/s, %s\n", ar_ms_all > 0 ? 1000.0 * ar_n_all / ar_ms_all : 0,
                   sp_ms_all > 0 ? 1000.0 * sp_n_all / sp_ms_all : 0,

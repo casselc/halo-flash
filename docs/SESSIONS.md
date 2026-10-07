@@ -557,3 +557,33 @@ later decision for the user** (HARNESS SR0 invariant 4 asks for encrypted datase
 - Spill files outlive nothing: the index is in the process. Resuming after a halo_serve restart needs the index (token
   lists) persisted next to the files (the blob already holds the tokens; the canonical / checkpoint flags would join it).
 - Prometheus counters for the spill outcomes; SR5's policy (what to spill, when) and yard-ctl's one-shot resume token.
+
+## 11. Sessions under MTP speculative decoding (stream MS, 2026-10-07; working files `/data/halo-work/streams/MS/`)
+
+`halo_serve --mtp-model` (docs/MTP.md "Server integration") decodes a qualifying request in cycles that run the
+step's token plus up to k drafts and emit 1 + accepted tokens. What that changes for a session:
+- **The session holds what the engine ran.** A cycle commits the token and its accepted drafts; when the
+  generation ends inside that run (a stop token, a stop string or a departure between a cycle's tokens), the
+  engine has run drafts that were never emitted. `RunDecode` (src/server/decode_loop.cpp) records exactly the
+  run tokens, so the session's token list may extend past the reply; the next request's prefix check decides reuse
+  as before (a mismatch only loses reuse). Exact mode drops the live session anyway; fast mode retains it with
+  those tokens. `SpecDecodeStats::ran_past_end` counts such endings.
+- **KV room**: `KvRoomFor` is asked for prompt + budget + `kMaxDrafts` positions (a verify writes up to k rows past
+  the last emitted one). The draft block's own cache (max-context rows, 2.74 GB with its weights) is reserved at
+  startup.
+- **Departures** (section 9): checked before every cycle and between a cycle's tokens; a departure leaves the
+  session as a request with `max_tokens` = tokens emitted would, plus the cycle's accepted drafts. The Hegel
+  machine `ServingModelUnderDeparturesStallsAndRetries` runs with and without speculative cycles.
+- **The draft block follows one session** (`mtp_owner_`): each request re-anchors it with `MtpTrackFrom` before its
+  prefill, at max(reused, prompt - W); batched sessions (StepBatch) stay AR.
+- **A fault this exposed, fixed in rt**: MTP serving hit an intermittent GPU write fault (amdgpu permission fault,
+  then a sticky `hipErrorIllegalAddress` that failed every later request) in 7 of 11 fresh bench runs (W 0 and 128,
+  decode graphs on and off), always in the next request's `ForkSession` of a cached prefix: the copy kernel faulted
+  on the first 4 KB pages of a page mapped just before it. Address forensics (a reserve / map / release log matched
+  against the kernel's fault addresses, three faulting runs): every faulting address lay in a range the runtime
+  had freed (`hipMemAddressFree`) for an earlier session and handed out again (`hipMemAddressReserve`). With no address ever
+  reused it did not reproduce (0 of 4 runs), nor with the fix: `HipDevice::ReleaseRange` keeps released ranges
+  reserved in a size-keyed pool that `ReserveRange` hands out again (0 of 4 runs at the shipped defaults; remapping
+  pages inside a kept reservation is what `EnsureKv` / `Reset` already did). Not explained: why AR serving, which
+  frees and reserves the same way, never faulted (MTP changes the request's page count and timing; the fault may
+  need both). Test `SessionCache.ReleasedRangesComeBackAndRemapCleanly`, mutant `rt-range-freed-on-release`.

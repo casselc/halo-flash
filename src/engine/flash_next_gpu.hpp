@@ -404,7 +404,16 @@ class FlashNextGpu {
   /// position's hidden waits for the next token). Turn on right after Reset (history starts at position 0).
   /// The trunk's results do not change.
   [[nodiscard]] bool MtpTrack(bool on, std::string* error);
+  /// Tracking for the bound session with a history window (the server, docs/MTP.md item 2b): the draft block
+  /// follows from trunk position `start` (>= the session's position; earlier positions' hiddens are gone), as
+  /// if the sequence began there (its own positions count from `start`: attention is relative under RoPE). Prefill
+  /// rows and steps before `start` do not feed it, so a prompt costs draft steps only for its last positions.
+  /// Drafting resumes once the draft block holds the hidden of the position before the one being run.
+  [[nodiscard]] bool MtpTrackFrom(std::uint32_t start, std::string* error);
   [[nodiscard]] bool MtpTracking() const noexcept { return mtp_track_; }
+  /// Trunk position where the tracked draft history starts (kMtpNever: not following).
+  [[nodiscard]] std::uint32_t MtpBase() const noexcept { return mtp_base_; }
+  static constexpr std::uint32_t kMtpNever = 0x7fffffffu;
   struct SpecResult {
     std::vector<std::int32_t> tokens;  ///< emitted after `token`, in order; the last one is not yet run
     std::uint32_t drafted = 0, accepted = 0;
@@ -428,7 +437,7 @@ class FlashNextGpu {
   /// The draft block's per-session state (position and pending hidden) for Save / Restore around SpecStep:
   /// Snapshot covers the trunk only.
   struct MtpCheckpoint {
-    std::uint32_t pos = 0;
+    std::uint32_t pos = 0, base = 0;
     std::vector<float> hpend;
   };
   [[nodiscard]] bool MtpSave(MtpCheckpoint* cp, std::string* error);
@@ -753,7 +762,14 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   rt::Buffer mtp_hpend_;
   std::vector<std::vector<rt::Buffer>> verify_snap_;
   bool verify_ = false;  // RecordBatch: the entries are consecutive rows of one session; snapshot after each
-  bool MtpPending() const noexcept { return mtp_track_ && bound_ == mtp_owner_ && position_ > 0 && mtp_pos_ + 1 == position_; }
+  // The draft block has run trunk positions [mtp_base_, mtp_base_ + mtp_pos_) and holds the hidden of the next
+  // one in mtp_hpend_: pending when that is position_ - 1 (it waits for the token at position_), following
+  // (the hidden of position_ is the next to keep) when mtp_base_ + mtp_pos_ == position_.
+  std::uint32_t mtp_base_ = 0;
+  bool MtpPending() const noexcept {
+    return mtp_track_ && bound_ == mtp_owner_ && position_ > 0 && mtp_base_ + mtp_pos_ + 1 == position_;
+  }
+  bool MtpKeepsHidden() const noexcept { return mtp_track_ && bound_ == mtp_owner_ && mtp_base_ + mtp_pos_ == position_; }
   bool MtpAfterPrefillRows(std::span<const std::int32_t> tokens, std::string* error);
   bool AllocVerifySnaps(std::uint32_t rows, std::string* error);
   /// SpecStep / SpecStepDrafts after drafting: verify rows_tok = [token, d1 .. dk] at position_ .. + k, accept,

@@ -429,7 +429,7 @@ bool FlashNextGpu::StepBatch(std::span<const BatchEntry> entries, std::string* e
   }
   const SessionId bound = bound_;
   for (const auto& e : entries)
-    if (mtp_track_ && e.session == mtp_owner_) mtp_pos_ = 0;  // its draft history no longer follows: no drafting
+    if (mtp_track_ && e.session == mtp_owner_) mtp_pos_ = 0, mtp_base_ = kMtpNever;  // no longer follows: no drafting
   // One session, or no batched kernels for this model / these options: the entries in turn.
   if (B == 1 || !BatchSupported()) {
     for (const auto& e : entries) {

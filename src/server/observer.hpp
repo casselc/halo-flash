@@ -7,6 +7,7 @@
 // session ids it sends (X-Halo-Trace-Id, X-Halo-Session-Id) and the
 // tool-call ids in the response.
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -14,6 +15,24 @@
 #include "core/sampling.hpp"
 
 namespace halo::server {
+
+/// MTP speculative decoding of one generation (docs/MTP.md; all zero when it did not run).
+struct SpecDecodeStats {
+  static constexpr std::size_t kDepths = 8;  ///< drafts per cycle 0 .. 7 (engine::FlashNextGpu::kMaxDrafts)
+  std::uint64_t cycles = 0;                  ///< decode cycles that drafted (verify passes)
+  std::uint64_t drafted = 0, accepted = 0;   ///< draft tokens proposed / accepted
+  std::array<std::uint64_t, kDepths> depth{};            ///< decode steps by drafts run (0: an ordinary step)
+  std::array<std::uint64_t, kDepths - 1> accepted_at{};  ///< accepted drafts by position (index 0: the first)
+  std::uint64_t catchup_tokens = 0;  ///< prompt positions the draft block caught up on (its history window)
+  std::uint64_t capped = 0;          ///< cycles whose drafts the max_tokens cap lowered below the chooser's depth
+  std::uint64_t ran_past_end = 0;    ///< 0 or 1: the generation ended inside a cycle's accepted run (a stop, a
+                                     ///< cancel or a refusal), so the engine ran drafts that were not emitted
+  [[nodiscard]] bool active() const {
+    std::uint64_t steps = 0;
+    for (const auto d : depth) steps += d;
+    return steps > 0;
+  }
+};
 
 struct GenerationRecord {
   std::string api;         // "chat", "responses" or "completions"
@@ -36,6 +55,7 @@ struct GenerationRecord {
   std::string input;   // the rendered prompt
   std::string output;  // the generated text, as generated
   std::string error;
+  SpecDecodeStats spec;
 };
 
 class GenerationObserver {

@@ -24,6 +24,12 @@ void Metrics::OnGeneration(const GenerationRecord& r) noexcept {
   if (r.first_text_ns > 0) ttft_.Observe(static_cast<double>(r.first_text_ns - r.start_ns) * 1e-9);
   for (auto gap : r.gaps_us) tpot_.Observe(gap * 1e-6);
   e2e_.Observe(static_cast<double>(r.end_ns - r.start_ns) * 1e-9);
+  spec_.cycles += r.spec.cycles;
+  spec_.drafted += r.spec.drafted;
+  spec_.accepted += r.spec.accepted;
+  spec_.catchup_tokens += r.spec.catchup_tokens;
+  for (std::size_t i = 0; i < spec_.depth.size(); ++i) spec_.depth[i] += r.spec.depth[i];
+  for (std::size_t i = 0; i < spec_.accepted_at.size(); ++i) spec_.accepted_at[i] += r.spec.accepted_at[i];
 }
 
 namespace {
@@ -70,6 +76,22 @@ std::string Metrics::Render() const {
          "# TYPE vllm:request_success_total counter\n";
   for (const auto& [reason, n] : finished_)
     out += "vllm:request_success_total{" + labels + ",finished_reason=\"" + reason + "\"} " + std::to_string(n) + "\n";
+  counter("vllm:spec_decode_num_drafts_total", "Speculative decode cycles that drafted (verify passes).",
+          spec_.cycles);
+  counter("vllm:spec_decode_num_draft_tokens_total", "Draft tokens proposed.", spec_.drafted);
+  counter("vllm:spec_decode_num_accepted_tokens_total", "Draft tokens accepted.", spec_.accepted);
+  out += "# HELP vllm:spec_decode_num_accepted_tokens_per_pos_total Accepted draft tokens by draft position.\n"
+         "# TYPE vllm:spec_decode_num_accepted_tokens_per_pos_total counter\n";
+  for (std::size_t i = 0; i < spec_.accepted_at.size(); ++i)
+    out += "vllm:spec_decode_num_accepted_tokens_per_pos_total{" + labels + ",position=\"" + std::to_string(i) +
+           "\"} " + std::to_string(spec_.accepted_at[i]) + "\n";
+  out += "# HELP halo:mtp_decode_steps_total Decode steps of speculative requests by drafts run (0: ordinary).\n"
+         "# TYPE halo:mtp_decode_steps_total counter\n";
+  for (std::size_t i = 0; i < spec_.depth.size(); ++i)
+    out += "halo:mtp_decode_steps_total{" + labels + ",depth=\"" + std::to_string(i) + "\"} " +
+           std::to_string(spec_.depth[i]) + "\n";
+  counter("halo:mtp_catchup_tokens_total", "Prompt positions the MTP draft block caught up on.",
+          spec_.catchup_tokens);
   Hist(out, "vllm:time_to_first_token_seconds", "Time to first output text, seconds.", labels, ttft_);
   Hist(out, "vllm:time_per_output_token_seconds", "Time between output pieces, seconds.", labels, tpot_);
   Hist(out, "vllm:e2e_request_latency_seconds", "Request latency, seconds.", labels, e2e_);

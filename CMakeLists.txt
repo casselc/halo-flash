@@ -48,6 +48,7 @@ target_link_libraries(halo_text PUBLIC halo_core)
 
 # --- server: OpenAI request and response formats -----------------------------
 add_library(halo_server STATIC
+  src/server/decode_loop.cpp
   src/server/openai_request.cpp
   src/server/openai_response.cpp
   src/server/http.cpp
@@ -226,7 +227,8 @@ if(HALO_BUILD_TESTS)
     tests/server/openai_service_test.cpp
     tests/server/systemone_service_test.cpp
     tests/server/metrics_test.cpp
-    tests/server/kv_choice_test.cpp)
+    tests/server/kv_choice_test.cpp
+    tests/server/decode_loop_test.cpp)
   target_link_libraries(server_tests PRIVATE halo_server)
   halo_test(decide_tests
     tests/decide/systemone_test.cpp
@@ -236,7 +238,8 @@ if(HALO_BUILD_TESTS)
   if(HALO_GPU)
     halo_test(gpu_tests tests/gpu/qwen35_gpu_test.cpp tests/gpu/quant_gpu_test.cpp tests/gpu/flash_next_gpu_test.cpp tests/gpu/select_gpu_test.cpp tests/gpu/decode2_gpu_test.cpp tests/gpu/sample_gpu_test.cpp
       tests/gpu/flash_next_generator_test.cpp tests/gpu/sessions_gpu_test.cpp tests/gpu/session_cache_gpu_test.cpp
-      tests/gpu/spill_gpu_test.cpp)
+      tests/gpu/spill_gpu_test.cpp
+      tests/gpu/mtp_serve_gpu_test.cpp)
     target_link_libraries(gpu_tests PRIVATE halo_gpu)
     target_link_libraries(decide_tests PRIVATE halo_gpu)
     add_executable(halo_step_stats tools/step_stats.cpp)

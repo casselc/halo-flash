@@ -40,6 +40,11 @@ Observation GenerationObserver::ToObservation(const server::GenerationRecord& r)
   o.output_tokens = r.completion_tokens;
   o.cached_tokens = r.cached_tokens;
   o.usage_details = {{"input", r.prompt_tokens}, {"output", r.completion_tokens}, {"cache_read", r.cached_tokens}};
+  if (r.spec.active())  // MTP speculative decoding (docs/MTP.md): its draft counts ride along as usage
+    o.usage_details.insert(o.usage_details.end(), {{"mtp_cycles", r.spec.cycles},
+                                                   {"mtp_drafted", r.spec.drafted},
+                                                   {"mtp_accepted", r.spec.accepted},
+                                                   {"mtp_catchup", r.spec.catchup_tokens}});
   o.tool_name = r.tool_names.empty() ? std::string() : r.tool_names.front();
   o.tool_call_ids = r.tool_call_ids;
   std::vector<std::uint32_t> gaps = r.gaps_us;

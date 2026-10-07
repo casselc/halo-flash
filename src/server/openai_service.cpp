@@ -377,6 +377,7 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
       }
       rec.input = run->prompt;
       rec.error = result.error;
+      rec.spec = result.spec;
       opt_.observer->OnGeneration(rec);
     }
     if (storing && cancelled && run->req.stream) {

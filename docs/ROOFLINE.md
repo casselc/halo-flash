@@ -1473,3 +1473,14 @@ open-ended chat, raw code, raw doc); AR 26.8 tok/s (37.3 ms). Greedy output iden
 | gufo's adaptive policy (ported) | ~depth 3 | 1.24x total (33.18 tok/s): backs off to AR for 16 tokens after a drop; raw text 1.03-1.05x | no (comparison only) |
 | Verify cost model C[k] (k = 1..5) | 53.4 / 67 / 80.6 / 97 / 111 ms | 54.15 / 69.73 / 84.75 / 102.25 / 113.14 (+1-5%); catch-up 1.37 / accepted draft; rollback 1.46 | (calibration) |
 | Measured-cost depth chooser (`MtpDepthChooser`, argmax E[tokens]/E[cost]) | >= best fixed depth (1.25x), each prompt within 2% of its best | **1.294x** (34.70 tok/s), +3.4% over d2, +0.8% over the per-prompt oracle, each prompt within 1.8%; raw text 1.12x | yes (`--spec-depth -2`) |
+
+## 16. 2026-10-07 (stream MS, branch `stream/mtp-serve`): MTP in halo_serve
+
+docs/MTP.md "Server integration". Pinned, chooser limit 4, 32K draft head; greedy output identical to AR throughout.
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| Draft history window W (`MtpTrackFrom`), halo_run, 2K / 8K ctx, doc, code | W matters little past a short window; tokens/cycle at W 0 ~0.90 of full | ctx flat; doc / code 0.61-0.76 of full tokens/cycle at W 0, still 0.75 at W 2048 (8K doc); catch-up 1.33-1.42 ms a position | yes (W 128) |
+| Serving, W 0 (eager catch-up none) | paper greedy 1.35x, T 0.8 1.20x, agent 1.20x; TTFT = AR | 1.21x / 1.22x / 1.27x (turn 2 1.37x); TTFT = AR +-3% | no (W 128 2% faster end to end) |
+| Serving, W 128 | W 0 + 0-3% decode, +0.17 s TTFT cold | 1.26x / 1.23x / 1.24x (turn 2 1.35x); TTFT +0.13-0.18 s cold | yes (default) |
+| MTP serving with decode graphs off (fault workaround) | fault gone, speed unchanged | speed unchanged (+-1%) but faulted in 1 of 9 runs: not the cause | no |

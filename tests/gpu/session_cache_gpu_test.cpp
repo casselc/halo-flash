@@ -939,3 +939,193 @@ TEST(SessionCache, EvictionStopsOnceThePromptFits) {
   ASSERT_TRUE(run(ref, ids2, &want2).error.empty());
   EXPECT_EQ(got2, want2);
 }
+
+// MTP in the server (docs/MTP.md "Server integration", server/decode_loop.hpp) through the generator and the exact
+// prefix cache: agent conversations as above, generator `a` decoding speculatively (SpecOptions::cycle runs
+// SpecStepDrafts with drafts from the cold run's own continuation or random, at the depth the loop asks for: the
+// small fixture has no draft block), `b` cold without MTP. Every greedy request emits exactly b's tokens and ends
+// the same way (stop token, max_tokens cut inside what a cycle could emit), and the next turn's reuse of what `a`
+// ran (accepted drafts past a stop included) stays byte-identical to cold. Requests with penalties never draft;
+// sampled ones without penalties reach the cycle with the request's sampler. Positive control: the cycle hook ran
+// and accepted drafts (else the comparison is AR against AR).
+TEST(SessionCache, SpeculativeDecodeIsGreedyIdenticalAndReuseStaysExact) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  constexpr std::uint32_t kCtx = 1024;
+  std::string e;
+  auto ea = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  auto eb = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(ea && eb) << e;
+  ASSERT_TRUE(ea->BatchSupported()) << ea->BatchUnsupported();
+  const auto V = static_cast<std::int32_t>(m->weights->config.vocab_size);
+  std::uint64_t cycles = 0, accepted = 0, stops_inside = 0, cuts = 0, reused = 0;
+  hegel::test([&](hegel::TestCase& tc) {
+    const auto tokens = [&](std::uint32_t lo, std::uint32_t hi) {
+      std::vector<std::int32_t> v(tc.draw(gs::integers<std::uint32_t>({.min_value = lo, .max_value = hi})));
+      for (auto& t : v) t = tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = V - 1}));
+      return v;
+    };
+    // Stop tokens: none, or tokens the cold run tends to produce (drawn from its first continuation below).
+    const std::vector<std::int32_t> gen_prompt = {7, 11, 13};
+    std::vector<std::int32_t> prompt = tokens(20, 200);
+    std::size_t stable = prompt.size();
+    prompt.insert(prompt.end(), gen_prompt.begin(), gen_prompt.end());
+    std::vector<text::TokenId> stops;
+    if (tc.draw(gs::booleans())) {
+      server::FlashNextGenerator probe(*eb, std::vector<text::TokenId>{}, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
+      std::vector<std::int32_t> cont;
+      server::TextGenerator::Params p;
+      p.max_tokens = 12;
+      ASSERT_TRUE(probe.GenerateIds(prompt, stable, p, [&](text::TokenId t) { return cont.push_back(t), true; }).error.empty());
+      stops.push_back(static_cast<text::TokenId>(cont[tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = cont.size() - 1}))]));
+    }
+    // The cold reference of the request in flight, which the cycle's drafts are drawn from.
+    std::vector<std::int32_t> want;
+    std::size_t emitted = 0;  // tokens `a` emitted (cycle outputs) in this request
+    bool penalties = false, sampled = false;
+    server::SpecOptions spec;
+    spec.enabled = true;
+    spec.cycle = [&](std::int32_t token, std::uint32_t k, sampling::SamplerState* sampler,
+                     engine::FlashNextGpu::SpecResult* r, std::string* err) {
+      EXPECT_FALSE(penalties) << "a request with penalties drafted";
+      EXPECT_EQ(sampler != nullptr, sampled) << "greedy requests verify on the device, sampled ones with their sampler";
+      if (sampler) {  // no sampled verification without a draft block: an ordinary step through the sampler
+        std::vector<float> l(static_cast<std::size_t>(V));
+        if (!ea->Step(token, l, err)) return false;
+        r->tokens.assign(1, static_cast<std::int32_t>(sampler->Sample(l)));
+        r->drafted = r->accepted = 0;
+        return true;
+      }
+      std::vector<std::int32_t> d(k);
+      for (std::uint32_t j = 0; j < k; ++j) {
+        const std::size_t i = emitted + j;
+        d[j] = i < want.size() && tc.draw(gs::booleans()) ? want[i]
+                                                         : tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = V - 1}));
+      }
+      if (!ea->SpecStepDrafts(token, d, r, err)) return false;
+      emitted += r->tokens.size();
+      ++cycles;
+      accepted += r->accepted;
+      return true;
+    };
+    server::FlashNextGenerator a(*ea, stops, kCtx, {.mode = server::SessionCacheOptions::Mode::kExact, .align = kAlign}, spec);
+    server::FlashNextGenerator b(*eb, stops, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
+    const int turns = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 4}));
+    for (int turn = 0; turn < turns && prompt.size() + 40 < kCtx; ++turn) {
+      server::TextGenerator::Params p;
+      p.max_tokens = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 16}));
+      const auto mode = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 3}));  // 0, 1: greedy
+      sampled = mode >= 2;
+      penalties = mode == 3;
+      if (sampled) {
+        p.sampling.temperature = 0.8F;
+        p.sampling.seed = tc.draw(gs::integers<std::int64_t>({.min_value = 0, .max_value = 1 << 20}));
+        if (penalties) p.sampling.repeat_penalty = 1.3F;
+      }
+      // Cold first (its tokens, plus a margin past the budget, are the oracle drafts), then speculative.
+      std::vector<std::int32_t> got;
+      want.clear();
+      {
+        server::TextGenerator::Params q = p;
+        q.max_tokens = p.max_tokens + engine::FlashNextGpu::kMaxDrafts;
+        std::vector<std::int32_t> longer;
+        server::FlashNextGenerator nb(*eb, std::vector<text::TokenId>{}, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
+        if (!sampled) ASSERT_TRUE(nb.GenerateIds(prompt, stable, q, [&](text::TokenId t) { return longer.push_back(t), true; }).error.empty());
+        want = longer;
+      }
+      std::vector<std::int32_t> cold;
+      const auto rb = b.GenerateIds(prompt, stable, p, [&](text::TokenId t) { return cold.push_back(t), true; });
+      emitted = 0;
+      const auto ra = a.GenerateIds(prompt, stable, p, [&](text::TokenId t) { return got.push_back(t), true; });
+      ASSERT_TRUE(ra.error.empty() && rb.error.empty()) << ra.error << rb.error;
+      reused += ra.cached_tokens;
+      if (penalties || sampled) {
+        ASSERT_EQ(ra.spec.cycles, 0u);
+        if (penalties) ASSERT_EQ(got, cold) << "with penalties the request steps as without MTP";
+      } else {
+        ASSERT_EQ(got, cold) << "turn " << turn << ", prompt " << prompt.size() << ", reused " << ra.cached_tokens;
+        ASSERT_EQ(ra.length_limited, rb.length_limited);
+        ASSERT_EQ(ra.completion_tokens, rb.completion_tokens);
+        // A stop inside an accepted run: `a` ran past the token it stopped at.
+        stops_inside += !ra.length_limited && got.size() < p.max_tokens && emitted > got.size() + 1;
+        cuts += ra.length_limited && ra.spec.cycles > 0;
+      }
+      // The next prompt: this one up to its generation prompt, then this turn echoed or rendered differently.
+      std::vector<std::int32_t> next(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(stable));
+      next.insert(next.end(), gen_prompt.begin(), gen_prompt.end());
+      if (tc.draw(gs::booleans())) next.insert(next.end(), got.begin(), got.end());
+      else {
+        const auto other = tokens(1, 20);
+        next.insert(next.end(), other.begin(), other.end());
+      }
+      const auto tool = tokens(1, 100);
+      next.insert(next.end(), tool.begin(), tool.end());
+      stable = next.size();
+      next.insert(next.end(), gen_prompt.begin(), gen_prompt.end());
+      prompt = std::move(next);
+    }
+  }, {.test_cases = 40});
+  std::printf("speculative: %llu cycles, %llu drafts accepted, %llu stops inside a cycle's output, %llu budget cuts, "
+              "%llu prompt tokens reused\n", static_cast<unsigned long long>(cycles),
+              static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(stops_inside),
+              static_cast<unsigned long long>(cuts), static_cast<unsigned long long>(reused));
+  EXPECT_GT(accepted, cycles / 4) << "positive control: hardly any draft was accepted";
+  EXPECT_GT(reused, 0u) << "the cache never reused a speculative session";
+}
+
+// rt::HipDevice keeps released ranges reserved and hands them out again (the runtime reusing a freed address made
+// a write to a freshly mapped page fault: docs/SESSIONS.md section 10). 32 ranges of 3 pages are used and released;
+// 96 ranges of 1 or 2 pages reserved meanwhile overlap none of them (they stay reserved; returned to the runtime,
+// their addresses are handed out again for other sizes); 32 new 3-page ranges are exactly the released ones. Every
+// range's fresh pages hold what was written through them.
+TEST(SessionCache, ReleasedRangesComeBackAndRemapCleanly) {
+  std::string e;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &e);
+  if (!dev) GTEST_SKIP() << "no GPU backend";
+  const std::size_t pb = dev->PageBytes();
+  if (pb == 0) GTEST_SKIP() << "no page mapping";
+  // Maps a fresh page at each page of `r`, fills it with `v`, reads it back, unmaps and releases the pages.
+  const auto use = [&](const rt::Buffer& r, std::uint8_t v) {
+    std::vector<void*> h(r.bytes / pb);
+    for (std::size_t j = 0; j < h.size(); ++j) {
+      h[j] = dev->CreatePage(&e);
+      ASSERT_TRUE(h[j] && dev->MapPage(r, j * pb, h[j], &e)) << e;
+    }
+    ASSERT_TRUE(dev->Fill(r, v, &e) && dev->Synchronize(&e)) << e;
+    std::vector<std::uint8_t> back(r.bytes);
+    ASSERT_TRUE(dev->Download(r, 0, back.data(), back.size(), &e)) << e;
+    ASSERT_TRUE(std::all_of(back.begin(), back.end(), [&](std::uint8_t b) { return b == v; })) << int(v);
+    for (std::size_t j = 0; j < h.size(); ++j) {
+      ASSERT_TRUE(dev->UnmapPage(r, j * pb, &e)) << e;
+      dev->ReleasePage(h[j]);
+    }
+  };
+  std::vector<rt::Buffer> big(32), small(96);
+  std::set<void*> released;
+  for (auto& r : big) {
+    r = dev->ReserveRange(3 * pb, &e);
+    ASSERT_TRUE(r.device) << e;
+  }
+  for (auto& r : big) {
+    ASSERT_NO_FATAL_FAILURE(use(r, 1));
+    released.insert(r.device);
+    dev->ReleaseRange(r);
+  }
+  for (std::size_t i = 0; i < small.size(); ++i) {
+    small[i] = dev->ReserveRange((1 + i % 2) * pb, &e);
+    ASSERT_TRUE(small[i].device) << e;
+    const auto* p = static_cast<const char*>(small[i].device);
+    for (void* q : released)
+      ASSERT_TRUE(p + small[i].bytes <= static_cast<const char*>(q) || static_cast<const char*>(q) + 3 * pb <= p)
+          << "range " << i << " overlaps a released range that should still be reserved";
+    ASSERT_NO_FATAL_FAILURE(use(small[i], static_cast<std::uint8_t>(2 + i)));
+  }
+  for (auto& r : big) {
+    r = dev->ReserveRange(3 * pb, &e);
+    ASSERT_TRUE(r.device) << e;
+    ASSERT_EQ(released.erase(r.device), 1u) << "a 3-page range did not come from the released ones";
+    ASSERT_NO_FATAL_FAILURE(use(r, 200));
+  }
+  for (auto& r : big) dev->ReleaseRange(r);
+  for (auto& r : small) dev->ReleaseRange(r);
+}
