@@ -128,3 +128,100 @@ that keeps 2-4 rows a wave would have to fake the 16-row WMMA tile (e.g. columns
    E[tokens/cycle] at depth 4 **3.73-4.38 (mean 4.06)**, the paper's ~4.1. Our earlier texts were raw continuations of
    a C++ file and a design doc (no chat template) and one open-ended chat question: the low acceptance is the text,
    not the engine.
+
+## Decode path (2026-10-06): SpecStep, greedy output identical to AR
+
+`FlashNextGpu::MtpTrack` / `SpecStep` (src/engine/spec_decode.cpp), off unless a caller uses them (`halo_run --spec
+1`). One cycle: the draft block proposes k tokens (its pending base step on the trunk hidden of p - 1, then its own
+chain), the trunk verifies [token, d1 .. dk] as k + 1 rows of one RecordBatch pass with every entry the bound session
+(each row's arithmetic is the single step's), the device greedy sample of each row (StepSample's kernels) is compared
+with the drafts and the longest agreeing prefix is kept. Rollback without replay: DeltaNet state, conv windows and the
+PLE history are copied after every row but the last (`verify_snap_`); KV and indexer rows past the committed position
+are overwritten later. The draft block then catches up on the committed rows from their true hiddens (`bb_.res`).
+Sampled cycles draw drafts from the top 64 of the trimmed draft logits and accept with p / q and a residual draw
+(gufo's `mtp_sampling`, ported; host unit tests in `tests/core/mtp_sampling_test.cpp`); penalties are not supported
+there.
+
+First measurements (pinned, 9 prompts: six GSM8K / HumanEval chat prompts, one open-ended chat, raw code, raw doc):
+fixed depth 3, 256 tokens each: 32.99 vs AR 27.03 tok/s = 1.22x, paper-style chat 1.12-1.55x (mean ~1.38x), raw
+code and doc 0.97x (acceptance 0.41-0.43); gufo's adaptive policy (ported) 1.19x: it backs off to AR for 16 tokens
+after any drop in its depth estimate. 7K prompt (`prose_long`, 384 tokens) 1.10x. Greedy output identical to AR in
+every run (9 x 512, 7K x 384, 9 x 256).
+
+## Round 3 (2026-10-06): measured-cost depth chooser, tests, sampling audit
+
+### Cost calibration (fixed depths 0..5, 9 prompts x 256, pinned, per-cycle traces, `streams/M/r1_*`)
+Fit ms = C[k] + c x accepted + r x [a rejection happened] over 4,284 cycles (`fit_costs.py`):
+
+| | k 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---:|---:|---:|---:|---:|---:|
+| C[k] predicted (verify model above + 1.77 ms trimmed drafts) | 38.4 | 53.4 | 67 | 80.6 | 97 | 111 |
+| C[k] measured | 37.3 | 54.15 | 69.73 | 84.75 | 102.25 | 113.14 |
+| total tok/s (AR 26.78) | 25.88 | 32.40 | **33.55** | 32.32 | 30.69 | 29.51 |
+
+Catch-up per accepted draft c = 1.37 ms (predicted 1.3), rollback copy r = 1.46 ms (not modelled before). Depth 0
+costs AR + 1.37 ms (the draft block follows every step). The best fixed depth depends on the text: depth 1 on raw
+code / doc (1.10x, where depth 3 loses), depth 2-5 on the chat prompts; no fixed depth is best overall (d2 1.25x).
+
+### Depth chooser (`MtpDepthChooser`, src/engine/mtp_depth.hpp; `halo_run --spec-depth -2`, the default there)
+Per session: depth = argmax over k of E[tokens](k) / E[cost](k) with the measured C[k], c, r; per-depth acceptance as a
+Beta with forgetting (lambda 0.9) around a persistent prior inherited from the shallower depth; depth 0 when no k beats
+AR, with a depth-1 probe every 8 AR tokens (backing off while AR keeps winning); limit 4.
+Prediction: total >= the best single fixed depth (1.25x), each prompt within 2% of its best fixed depth.
+Result (pinned, 9 x 256, `streams/M/r2_chooser.txt`): **34.70 vs AR 26.81 tok/s = 1.294x**, greedy output identical to
+AR on all nine.
+
+| Prompt | AR tok/s | chooser | x AR | best fixed depth (r1) | gufo policy |
+|---|---:|---:|---:|---:|---:|
+| gsm1 | 26.92 | 34.47 | 1.28 | 32.05 (d2) | 37.05 |
+| gsm2 | 26.91 | 38.44 | 1.43 | 37.84 (d3) | 36.60 |
+| gsm3 | 26.93 | 40.55 | 1.51 | 41.30 (d3) | 37.26 |
+| he1 | 26.87 | 37.96 | 1.41 | 38.54 (d5) | 37.08 |
+| he2 | 26.87 | 34.90 | 1.30 | 35.51 (d2) | 34.30 |
+| he3 | 26.89 | 39.32 | 1.46 | 39.93 (d4) | 38.85 |
+| chat (open-ended) | 26.93 | 31.37 | 1.17 | 31.44 (d2) | 27.88 |
+| raw code | 26.63 | 29.73 | 1.12 | 29.47 (d1) | 27.99 |
+| raw doc | 26.39 | 29.61 | 1.12 | 29.50 (d1) | 27.29 |
+| **total** | 26.81 | **34.70** | **1.294** | 33.55 (d2 everywhere); 34.43 per-prompt oracle | 33.18 |
+
+The prediction held: +3.4% over the best single fixed depth, +0.8% over the per-prompt oracle, every prompt within
+1.8% of its best fixed depth; raw code / doc go from a loss at depth 3 (0.97x) to 1.12x. Paper-style chat: mean
+1.40x (1.28-1.51x), short of the ~1.50x projected for the trimmed head at depth 3. Depth histogram: 0: 44, 1: 322,
+2: 259, 3: 275, 4: 40 cycles.
+
+**P5 gate "at least 1.5x AR on mixed text": not met** (1.29x over the set; 1.12x on raw text). The verify pass is
+the limit: k + 1 rows cost 1.45-2.7x a single step (C[k] / C[0]) with today's exact per-column kernels (docs/
+SESSIONS.md); a cheaper multi-row verify (round 2's batch-shaped probe lost at X 60-66 ms) is the only lever left
+at this acceptance.
+
+### Server integration: proposal only (not built)
+Today `FlashNextGenerator` (src/server/flash_next_generator.cpp) runs one sequence: prefill, then StepSample per
+token with device sampling (penalties and RNG in a `SamplerState`), prefix reuse when the new prompt extends
+`history_`. Proposed, behind `halo_serve --mtp-model F [--mtp-vocab V]`, **off by default**:
+1. **Load and track.** Load the sidecar (2.8 GB) and the trimmed head at startup; `MtpTrack(true)` after every
+   `Reset`, so the draft block follows from position 0 and prefix reuse keeps it in step (`MtpPending` holds while
+   the engine is only ever advanced by Prefill / Step / SpecStep).
+2. **Prompt cost first.** The draft block's prompt history runs as eager single steps, 1.3 ms a prompt token: +2.7 s
+   TTFT at 2K, +10 s at 8K, against 1.25 s / 5 s of trunk prefill. Before serving, either (a) a batched draft
+   prefill (the block's projections as GEMMs over the chunk, like the trunk's), or (b) a history window: catch the
+   block up on only the last W prompt tokens (e.g. 512). (b) changes acceptance only, never the output (every token
+   is verified), so it is safe to ship first; measure acceptance against W.
+3. **Decode loop.** Replace StepSample by `SpecStep(token, chooser.Depth(), ...)` while the request qualifies:
+   greedy (temperature 0) at any setting; sampled only without penalties (repeat / frequency / presence), else
+   StepSample as today. A `MtpDepthChooser` per generator, reset per request (its prior is the persistent part).
+   Cap drafts at `budget - completion_tokens - 1` so a cycle never emits past max_tokens.
+4. **Stops and history.** A cycle can emit several tokens; on a stop at emitted index j, emit nothing after it.
+   The engine has run the cycle's committed rows (token, d1 .. da) past the stop, so `history_` must record exactly
+   what the engine ran (token plus the accepted drafts), not what was emitted; the next request's prefix check
+   then decides reuse as today (a mismatch resets: correct, only the reuse is lost).
+5. **KV room.** `KvRoomFor` must reserve `kMaxDrafts` rows beyond prompt + budget (the verify writes k rows ahead).
+6. **Sampling reproducibility.** Sampled spec mode draws on the host from the request's RNG stream in a different
+   order than device StepSample, so a seeded request gives a different (equally distributed, per the audit) text with
+   MTP on. Document it; keep `--mtp-model` off when seed reproducibility against AR matters.
+7. **Metrics.** Per request drafted / accepted / cycles and the chooser's depth histogram in `/metrics` and the
+   observer.
+8. **Tests.** A server-level test on the small fixture is impossible (no sidecar); gate a real-model test like
+   `MtpSpec.GreedyEqualsArOnRealModel`: the same request with and without `--mtp-model`, greedy, identical text,
+   including a stop inside an accepted run and a max_tokens cut mid-cycle.
+Batched sessions (StepBatch) stay AR: the draft block follows one session (`mtp_owner_`), and B-session x (k + 1)-row
+verify batches are a P6/P5 follow-up.

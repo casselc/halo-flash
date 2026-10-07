@@ -300,6 +300,15 @@ not one-off checks:
 - **Gate:**
   - MTP outputs are identical to AR under greedy decoding, and distribution-correct under sampling (gufo's sampling-audit approach);
   - at least 1.5× AR on mixed text.
+- **Status (2026-10-06, stream M; docs/MTP.md, ROOFLINE section 15).** Off by default (`MtpTrack` / `SpecStep`,
+  `halo_run --spec 1`); not in the server (proposal in docs/MTP.md).
+  - Greedy: output identical to AR on every run (9 prompts x 512 / 256, 7K x 384); regression tests
+    `Sessions.SpecStepDraftsEqualsGreedyStepping` (small model, caller's drafts) and
+    `MtpSpec.GreedyEqualsArOnRealModel` (gated on the real model).
+  - Speed, pinned, measured-cost depth chooser: 1.29x AR over the 9-prompt set, 1.40x mean on GSM8K / HumanEval
+    chat, 1.12x on raw code / doc. **The 1.5x gate is not met**: the exact multi-row verify costs 1.45-2.7x a step.
+  - Rollback is a snapshot copy per verified row (as planned); the draft block runs its own QSA indexer (the
+    reference's semantics, not the target's indices); sampled acceptance p/q with residual (gufo port).
 
 **P6 — Sessions, batching and the prefix cache.**
 - Session pool, fork and snapshot, with COW KV pages.
