@@ -29,6 +29,7 @@
 #include "model/reference.hpp"
 #include "model/weights.hpp"
 #include "rt/device.hpp"
+#include "text/tokenizer.hpp"
 
 namespace gs = hegel::generators;
 using namespace halo;
@@ -872,4 +873,103 @@ TEST(FlashNextGpu, ChunkedPrefillMatchesStepping) {
                                      std::tuple{missed_split[m], kSplitRate, "argmax differences vs a split"}})
       EXPECT_GE(BinomialTail(count, n, rate), kTailFloor) << names[m] << ": " << count << " " << what << " of " << n;
   }
+}
+
+// P5 speculative decoding on the real model with its MTP sidecar (the small fixture has none; the verify /
+// rollback path alone is Sessions.SpecStepDraftsEqualsGreedyStepping). Gated, ~2 min with the model in page cache:
+//   HALO_FLASH_NEXT_GGUF  the trunk (first shard), HALO_FLASH_NEXT_MTP  the MTP sidecar,
+//   HALO_MTP_VOCAB        optional trimmed draft head ids (int32).
+// Greedy SpecStep at depths 1..4 (and 0) emits exactly greedy StepSample's tokens; a cycle repeated after
+// Save + MtpSave / Restore + MtpRestore gives the same result (greedy and seeded sampled).
+TEST(MtpSpec, GreedyEqualsArOnRealModel) {
+  const char* path = std::getenv("HALO_FLASH_NEXT_GGUF");
+  const char* mpath = std::getenv("HALO_FLASH_NEXT_MTP");
+  if (!path || !mpath) GTEST_SKIP() << "set HALO_FLASH_NEXT_GGUF and HALO_FLASH_NEXT_MTP";
+  std::string error;
+  auto reader = core::GgufReader::OpenFile(path, &error);
+  ASSERT_TRUE(reader) << error;
+  auto weights = model::ModelWeights::Bind(*reader, &error);
+  ASSERT_TRUE(weights) << error;
+  auto tok = text::Tokenizer::FromGguf(*reader, &error);
+  ASSERT_TRUE(tok) << error;
+  const auto& c = weights->config;
+  const auto& t = weights->ple_table;
+  auto ngram = model::NgramTable::Open(reader->GetMappedRegions()[t.shard].file_descriptor, t.file_offset, t.rows,
+                                       c.ple_head_dim, t.type, &error, std::size_t{1} << 30);
+  ASSERT_TRUE(ngram) << error;
+  auto mreader = core::GgufReader::OpenFile(mpath, &error);
+  ASSERT_TRUE(mreader) << error;
+  auto mtp = model::MtpWeights::Bind(*mreader, c, &error);
+  ASSERT_TRUE(mtp) << error;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &error);
+  if (!dev) GTEST_SKIP() << "no GPU backend";
+  std::vector<rt::FileSource> sources;
+  for (const auto& r : reader->GetMappedRegions()) sources.push_back({r.data, r.size, r.file_descriptor});
+  auto gpu = engine::FlashNextGpu::Create(*dev, *weights, ngram.get(), nullptr, 1024, &error, sources);
+  ASSERT_TRUE(gpu) << error;
+  ASSERT_TRUE(gpu->LoadMtp(*mtp, &error)) << error;
+  if (const char* v = std::getenv("HALO_MTP_VOCAB")) {
+    std::ifstream f(v, std::ios::binary | std::ios::ate);
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(f.tellg()) / 4);
+    f.seekg(0);
+    f.read(reinterpret_cast<char*>(ids.data()), static_cast<std::streamsize>(ids.size() * 4));
+    ASSERT_TRUE(gpu->SetDraftVocab(ids, &error)) << error;
+  }
+  const auto enc = tok->Encode(
+      "Question: A baker makes 12 trays of muffins with 18 muffins on each tray. She sells 150 muffins and gives "
+      "away a third of the rest. How many muffins does she have left?\nAnswer: Let's think step by step.", true);
+  const std::vector<std::int32_t> prompt(enc.begin(), enc.end());
+  const auto head = std::span<const std::int32_t>(prompt).first(prompt.size() - 1);
+  static const sampling::SamplingConfig greedy;
+  constexpr std::size_t kN = 96;
+  std::vector<std::int32_t> ar;
+  ASSERT_TRUE(gpu->Prefill(head, {}, &error)) << error;
+  for (std::int32_t x = prompt.back(); ar.size() < kN;) {
+    engine::FlashNextGpu::SampleResult r;
+    ASSERT_TRUE(gpu->StepSample(x, {&greedy, {}, 0}, &r, &error)) << error;
+    ar.push_back(x = r.token);
+  }
+  ASSERT_TRUE(gpu->Reset(&error) && gpu->MtpTrack(true, &error) && gpu->Prefill(head, {}, &error)) << error;
+  auto snap = gpu->NewSnapshot(&error);
+  ASSERT_TRUE(snap) << error;
+  std::vector<std::int32_t> sp;
+  std::size_t accepted = 0;
+  std::int32_t x = prompt.back();
+  for (std::uint32_t cycle = 0; sp.size() < kN; ++cycle) {
+    const std::uint32_t k = std::min<std::uint32_t>(cycle % 5, static_cast<std::uint32_t>(kN - sp.size() - 1));
+    if (cycle == 7) {  // checkpoint round trip: the same cycle twice, greedy, then sampled with one seed twice
+      engine::FlashNextGpu::MtpCheckpoint mcp;
+      ASSERT_TRUE(gpu->Save(*snap, &error) && gpu->MtpSave(&mcp, &error)) << error;
+      engine::FlashNextGpu::SpecResult a, b;
+      ASSERT_TRUE(gpu->SpecStep(x, 3, nullptr, &a, &error)) << error;
+      ASSERT_TRUE(gpu->Restore(*snap, &error) && gpu->MtpRestore(mcp, &error)) << error;
+      ASSERT_TRUE(gpu->SpecStep(x, 3, nullptr, &b, &error)) << error;
+      EXPECT_EQ(a.tokens, b.tokens);
+      EXPECT_EQ(a.accepted, b.accepted);
+      sampling::SamplingConfig cfg;
+      cfg.temperature = 0.8F;
+      cfg.seed = 5;
+      std::vector<std::int32_t> first;
+      for (int rep = 0; rep < 2; ++rep) {
+        ASSERT_TRUE(gpu->Restore(*snap, &error) && gpu->MtpRestore(mcp, &error)) << error;
+        sampling::SamplerState sampler(cfg);
+        engine::FlashNextGpu::SpecResult r;
+        ASSERT_TRUE(gpu->SpecStep(x, 3, &sampler, &r, &error)) << error;
+        ASSERT_FALSE(r.tokens.empty());
+        if (rep == 0) first = r.tokens;
+        else EXPECT_EQ(first, r.tokens) << "a seeded sampled cycle is not reproducible from the checkpoint";
+      }
+      ASSERT_TRUE(gpu->Restore(*snap, &error) && gpu->MtpRestore(mcp, &error)) << error;
+    }
+    engine::FlashNextGpu::SpecResult r;
+    ASSERT_TRUE(gpu->SpecStep(x, k, nullptr, &r, &error)) << error;
+    ASSERT_EQ(r.tokens.size(), r.accepted + 1u);
+    accepted += r.accepted;
+    for (const auto y : r.tokens) {
+      if (sp.size() < kN) ASSERT_EQ(y, ar[sp.size()]) << "spec output differs from AR at " << sp.size();
+      sp.push_back(y);
+    }
+    x = r.tokens.back();
+  }
+  EXPECT_GT(accepted, kN / 4) << "the draft block barely agrees: drafting is broken";
 }

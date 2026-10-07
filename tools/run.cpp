@@ -25,6 +25,7 @@
 #include <random>
 #include <iterator>
 #include <map>
+#include <set>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -35,6 +36,7 @@
 #include "core/gguf.hpp"
 #include "core/sampling.hpp"
 #include "engine/flash_next_gpu.hpp"
+#include "engine/mtp_depth.hpp"
 #include "engine/mtp_policy.hpp"
 #include "model/ngram.hpp"
 #include "model/reference.hpp"
@@ -137,6 +139,201 @@ struct Profiling final : rt::Device {
 
 }  // namespace
 
+
+// ---- --spec-audit: distribution exactness of sampled speculative decoding ----
+namespace audit {
+// Regularized upper incomplete gamma Q(a, x) (Numerical Recipes: series below a + 1, continued fraction above).
+double GammaQ(double a, double x) {
+  if (x <= 0) return 1.0;
+  const double gln = std::lgamma(a);
+  if (x < a + 1) {
+    double ap = a, sum = 1.0 / a, del = sum;
+    for (int n = 0; n < 1000 && std::fabs(del) > std::fabs(sum) * 1e-15; ++n) sum += del *= x / ++ap;
+    return 1.0 - sum * std::exp(-x + a * std::log(x) - gln);
+  }
+  double b = x + 1 - a, c = 1e300, d = 1 / b, h = d;
+  for (int i = 1; i < 1000; ++i) {
+    const double an = -i * (i - a);
+    b += 2;
+    d = an * d + b;
+    if (std::fabs(d) < 1e-300) d = 1e-300;
+    c = b + an / c;
+    if (std::fabs(c) < 1e-300) c = 1e-300;
+    d = 1 / d;
+    const double del = d * c;
+    h *= del;
+    if (std::fabs(del - 1) < 1e-15) break;
+  }
+  return std::exp(-x + a * std::log(x) - gln) * h;
+}
+struct Test {
+  double chi2 = 0, p = 1, tv = 0, tv_null95 = 0;
+  int df = 0, bins = 0, cells_out = 0;
+};
+// counts / expected probabilities over the same categories (the last category may be "everything else").
+Test Compare(const std::vector<double>& count, const std::vector<double>& prob, double n, std::mt19937_64& rng) {
+  Test t;
+  double pooled_c = 0, pooled_e = 0;
+  for (std::size_t i = 0; i < count.size(); ++i) {
+    const double e = n * prob[i];
+    t.tv += 0.5 * std::fabs(count[i] / n - prob[i]);
+    const double sd = std::sqrt(prob[i] * (1 - prob[i]) / n);
+    if (std::fabs(count[i] / n - prob[i]) > 6 * sd + 2.0 / n) ++t.cells_out;
+    if (e >= 5) t.chi2 += (count[i] - e) * (count[i] - e) / e, ++t.bins;
+    else pooled_c += count[i], pooled_e += e;
+  }
+  if (pooled_e > 0) t.chi2 += (pooled_c - pooled_e) * (pooled_c - pooled_e) / std::max(pooled_e, 1e-9), ++t.bins;
+  t.df = std::max(t.bins - 1, 1);
+  t.p = GammaQ(t.df / 2.0, t.chi2 / 2.0);
+  // TV under the null: multinomial draws of n from prob.
+  std::vector<double> tvs;
+  std::discrete_distribution<std::size_t> dist(prob.begin(), prob.end());
+  for (int r = 0; r < 200; ++r) {
+    std::vector<double> c(prob.size(), 0);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(n); ++i) ++c[dist(rng)];
+    double tv = 0;
+    for (std::size_t i = 0; i < c.size(); ++i) tv += 0.5 * std::fabs(c[i] / n - prob[i]);
+    tvs.push_back(tv);
+  }
+  std::sort(tvs.begin(), tvs.end());
+  t.tv_null95 = tvs[189];
+  return t;
+}
+void Print(const char* what, const Test& t) {
+  std::printf("  %-34s chi2 %8.2f df %3d p %.4f | TV %.4f (null 95%% %.4f) | cells beyond 6 sigma: %d\n", what, t.chi2,
+              t.df, t.p, t.tv, t.tv_null95, t.cells_out);
+}
+}  // namespace audit
+
+int SpecAudit(engine::FlashNextGpu& gpu, const text::Tokenizer& tok, const std::vector<std::string>& files,
+              std::uint32_t trials, int depth, double temp, double top_p, std::uint32_t top_k, std::uint32_t scan,
+              std::size_t V) {
+  std::string error;
+  const auto die = [&](const char* where) { return std::fprintf(stderr, "%s: %s\n", where, error.c_str()), 1; };
+  if (depth < 1) return std::fprintf(stderr, "--spec-audit needs --spec-depth >= 1\n"), 2;
+  sampling::SamplingConfig cfg;
+  cfg.temperature = static_cast<float>(temp);
+  cfg.top_p = static_cast<float>(top_p);
+  cfg.top_k = static_cast<std::int32_t>(top_k);
+  std::mt19937_64 rng(12345);
+  int failures = 0;
+  for (const auto& file : files) {
+    std::ifstream f(file);
+    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const auto enc = tok.Encode(text, true);
+    std::vector<std::int32_t> ctx(enc.begin(), enc.end());
+    // Context: the scanned step with the most entropic first-token distribution under cfg.
+    if (!gpu.MtpTrack(false, &error) || !gpu.Reset(&error) ||
+        !gpu.Prefill(std::span<const std::int32_t>(ctx).first(ctx.size() - 1), {}, &error))
+      return die("audit prefill");
+    std::vector<float> l(V);
+    std::vector<std::int32_t> gen;
+    double best_h = -1;
+    std::size_t best_at = 0;
+    for (std::int32_t x = ctx.back(); gen.size() < scan;) {
+      if (!gpu.Step(x, l, &error)) return die("audit scan");
+      const auto d = sampling::SamplerState(cfg).Distribution(l);
+      double h = 0;
+      for (const auto& e : d.entries()) h -= e.value > 0 ? e.value * std::log(e.value) : 0;
+      if (h > best_h) best_h = h, best_at = gen.size();
+      gen.push_back(x = static_cast<std::int32_t>(d.best_token()));
+    }
+    ctx.insert(ctx.end(), gen.begin(), gen.begin() + static_cast<std::ptrdiff_t>(best_at));
+    const auto head = std::span<const std::int32_t>(ctx).first(ctx.size() - 1);
+    const std::int32_t x = ctx.back();
+    if (!gpu.Reset(&error) || !gpu.MtpTrack(true, &error) || !gpu.Prefill(head, {}, &error)) return die("audit context");
+    auto snap = gpu.NewSnapshot(&error);
+    engine::FlashNextGpu::MtpCheckpoint mcp;
+    if (!snap || !gpu.Save(*snap, &error) || !gpu.MtpSave(&mcp, &error)) return die("audit save");
+    const auto restore = [&] { return gpu.Restore(*snap, &error) && gpu.MtpRestore(mcp, &error); };
+    // Exact references from single steps.
+    if (!restore() || !gpu.Step(x, l, &error)) return die("audit p1");
+    const auto p1 = sampling::SamplerState(cfg).Distribution(l);
+    std::vector<std::pair<double, std::int32_t>> top1;
+    for (const auto& e : p1.entries()) top1.push_back({e.value, static_cast<std::int32_t>(e.token)});
+    std::sort(top1.rbegin(), top1.rend());
+    const std::size_t M = std::min<std::size_t>(4, top1.size());
+    std::vector<sampling::SamplingDistribution> p2(M);
+    for (std::size_t i = 0; i < M; ++i) {
+      if (!restore() || !gpu.Step(x, {}, &error) || !gpu.Step(top1[i].second, l, &error)) return die("audit p2");
+      p2[i] = sampling::SamplerState(cfg).Distribution(l);
+    }
+    // Trials.
+    std::map<std::int32_t, double> c1, cd1;
+    std::vector<std::map<std::int32_t, double>> c2(M);
+    double accepted1 = 0, cycles2 = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (std::uint32_t i = 0; i < trials; ++i) {
+      if (!restore()) return die("audit restore");
+      auto c = cfg;
+      c.seed = static_cast<std::int64_t>(i) + 1;
+      sampling::SamplerState sampler(c);
+      engine::FlashNextGpu::SpecResult r;
+      if (!gpu.SpecStep(x, static_cast<std::uint32_t>(depth), &sampler, &r, &error)) return die("audit SpecStep");
+      if (r.drafts.empty()) return std::fprintf(stderr, "audit: the cycle did not draft\n"), 1;
+      const std::int32_t y1 = r.tokens[0];
+      ++c1[y1];
+      ++cd1[r.drafts[0]];
+      accepted1 += r.accepted > 0;
+      std::int32_t y2 = r.tokens.size() > 1 ? r.tokens[1] : -1;
+      if (y2 < 0) {
+        engine::FlashNextGpu::SpecResult r2;
+        if (!gpu.SpecStep(y1, static_cast<std::uint32_t>(depth), &sampler, &r2, &error)) return die("audit cycle 2");
+        y2 = r2.tokens[0];
+        ++cycles2;
+      }
+      for (std::size_t m = 0; m < M; ++m)
+        if (y1 == top1[m].second) ++c2[m][y2];
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const auto vectors = [&](const sampling::SamplingDistribution& p, const std::map<std::int32_t, double>& cnt,
+                             std::vector<double>* cv, std::vector<double>* pv) {
+      // Categories: every token with p >= 1e-4 or observed, then the rest of the support pooled.
+      std::set<std::int32_t> keys;
+      for (const auto& e : p.entries())
+        if (e.value >= 1e-4) keys.insert(static_cast<std::int32_t>(e.token));
+      for (const auto& [k, v] : cnt) keys.insert(k);
+      double cp = 0, cc = 0;
+      for (const auto k : keys) {
+        cv->push_back(cnt.count(k) ? cnt.at(k) : 0);
+        pv->push_back(p.probability(static_cast<sampling::TokenId>(k)));
+        cp += pv->back(), cc += cv->back();
+      }
+      double n = 0;
+      for (const auto& [k, v] : cnt) n += v;
+      cv->push_back(n - cc);
+      pv->push_back(std::max(0.0, 1.0 - cp));
+      return n;
+    };
+    const std::string name = file.substr(file.find_last_of('/') + 1);
+    std::printf("audit %s: context %zu tokens (+%zu generated), T %.2f top_p %.2f top_k %u, depth %d, %u trials in "
+                "%.0f s; p1 entropy %.3f nats, max p1 %.3f; first draft accepted %.3f; second cycle needed %.3f\n",
+                name.c_str(), ctx.size(), best_at, temp, top_p, top_k, depth, trials, secs, best_h, top1[0].first,
+                accepted1 / trials, cycles2 / trials);
+    std::vector<double> cv, pv;
+    double n = vectors(p1, c1, &cv, &pv);
+    auto t = audit::Compare(cv, pv, n, rng);
+    audit::Print("first token vs p(y1)", t);
+    failures += t.p < 0.001;
+    for (std::size_t m = 0; m < M; ++m) {
+      cv.clear(), pv.clear();
+      n = vectors(p2[m], c2[m], &cv, &pv);
+      if (n < 20) continue;
+      t = audit::Compare(cv, pv, n, rng);
+      const std::string label = "second | y1 = " + std::to_string(top1[m].second) + " (p " +
+                                std::to_string(top1[m].first).substr(0, 5) + ", n " + std::to_string(int(n)) + ")";
+      audit::Print(label.c_str(), t);
+      failures += t.p < 0.001;
+    }
+    cv.clear(), pv.clear();
+    n = vectors(p1, cd1, &cv, &pv);
+    t = audit::Compare(cv, pv, n, rng);
+    audit::Print("CONTROL raw proposal d1 vs p(y1)", t);
+  }
+  std::printf("audit: %s\n", failures ? "SOME DISTRIBUTION TEST FAILED (p < 0.001)" : "all tests p >= 0.001");
+  return failures ? 3 : 0;
+}
+
 int main(int argc, char** argv) {
   std::string model, prompt = "The capital of France is", device = "hip";
   int n = 16, prefill_bench = 0, reps = 3;
@@ -174,9 +371,22 @@ int main(int argc, char** argv) {
   // acceptance against the same tokens, and agreement with the GPU's drafts.
   std::string mtp_dump, mtp_cpu_replay;
   // --spec 1 --mtp-model F [--mtp-vocab V] --mtp-prompts a,b: per prompt, --n tokens greedy AR (StepSample) and
-  // greedy speculative (SpecStep; --spec-depth K fixed, -1 adaptive), outputs compared token for token, timed.
+  // greedy speculative (SpecStep; --spec-depth K fixed, -1 gufo's adaptive policy, -2 (default) MtpDepthChooser with
+  // --mtp-depth as its limit), outputs compared token for token, timed. --spec-trace F appends one line per cycle:
+  // prompt, cycle, drafted, accepted, emitted, ms.
   bool spec = false, spec_skip_ar = false;
-  int spec_depth = -1;
+  std::string spec_trace;
+  // --spec-audit N (with --spec 1, --spec-depth K >= 1, --mtp-temp T, --audit-top-p P, --audit-top-k K,
+  // --audit-scan S): distribution-exactness audit of sampled SpecStep. Per prompt, the context is the prompt plus
+  // its greedy continuation up to the scanned step (of S) whose first-token distribution has the most entropy;
+  // N trials from one Save / MtpSave checkpoint, trial i seeded i + 1, each yields the first two emitted tokens
+  // (a second cycle when the first emitted one token). Exact references from single Steps' logits: p(y1) and
+  // p(y2 | y1) for the likeliest y1. Chi-square (bins with expected count >= 5, the rest pooled), total variation
+  // vs its null spread, gufo's per-cell 6 sigma bound; the raw draft proposals d1 are audited the same way as a
+  // positive control of the detector.
+  std::uint32_t spec_audit = 0, audit_scan = 48, audit_top_k = 0;
+  double audit_top_p = 1.0;
+  int spec_depth = -2;
   std::uint32_t mtp_cpu_n = 40;  // --mtp-vocab FILE: int32 ids of the trimmed draft head
   // --wmma-probe a.bin,b.bin (route traces): PROBE ONLY. Per B = 1..8, six decode steps (eager, kernel timing on)
   // each followed by the batch-shaped WMMA probe kernels for B columns; routing of the B columns drawn from the
@@ -275,6 +485,11 @@ int main(int argc, char** argv) {
     else if (a == "--spec") spec = std::string(argv[i + 1]) == "1";
     else if (a == "--spec-depth") spec_depth = std::atoi(argv[i + 1]);
     else if (a == "--spec-skip-ar") spec_skip_ar = std::string(argv[i + 1]) == "1";
+    else if (a == "--spec-trace") spec_trace = argv[i + 1];
+    else if (a == "--spec-audit") spec_audit = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--audit-scan") audit_scan = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--audit-top-k") audit_top_k = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--audit-top-p") audit_top_p = std::atof(argv[i + 1]);
     else if (a == "--mtp-dump") mtp_dump = argv[i + 1];
     else if (a == "--mtp-cpu-replay") mtp_cpu_replay = argv[i + 1];
     else if (a == "--mtp-cpu-n") mtp_cpu_n = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
@@ -722,6 +937,8 @@ int main(int argc, char** argv) {
       }
       using clk = std::chrono::steady_clock;
       static sampling::SamplingConfig greedy;
+      if (spec_audit > 0) return SpecAudit(*gpu, *tok, sfiles, spec_audit, spec_depth, mtp_temp > 0 ? mtp_temp : 0.8,
+                                           audit_top_p, audit_top_k, audit_scan, c.vocab_size);
       double ar_ms_all = 0, sp_ms_all = 0;
       std::size_t ar_n_all = 0, sp_n_all = 0, all_same = 1;
       for (const auto& file : sfiles) {
@@ -747,24 +964,32 @@ int main(int argc, char** argv) {
         if (!gpu->Reset(&error) || !gpu->MtpTrack(true, &error) || !gpu->Prefill(prompt, {}, &error))
           return std::fprintf(stderr, "%s\n", error.c_str()), 1;
         engine::MtpLengthController policy(engine::kMaxMtpDraftTokens);
+        engine::MtpDepthChooser chooser(engine::MtpMeasuredCosts(), {.limit = mtp_depth});
+        std::FILE* trace = spec_trace.empty() ? nullptr : std::fopen(spec_trace.c_str(), "a");
         std::int32_t t = toks.back();
         std::size_t drafted = 0, accepted = 0, cycles = 0, timed = 0;
         std::vector<std::size_t> hist_acc(engine::kMaxMtpDraftTokens + 2, 0);
         while (static_cast<int>(sp.size()) < n) {
           const std::uint32_t budget = static_cast<std::uint32_t>(n - static_cast<int>(sp.size()));
-          const std::uint32_t k = spec_depth >= 0 ? std::min<std::uint32_t>(spec_depth, budget - 1)
-                                                  : policy.Choose(budget > 0 ? budget - 1 : 0);
+          const std::uint32_t k = spec_depth >= 0  ? std::min<std::uint32_t>(spec_depth, budget - 1)
+                                  : spec_depth == -2 ? chooser.Choose(budget - 1)
+                                                     : policy.Choose(budget > 0 ? budget - 1 : 0);
           engine::FlashNextGpu::SpecResult r;
           const auto st = clk::now();
           if (!gpu->SpecStep(t, k, nullptr, &r, &error)) return std::fprintf(stderr, "spec: %s\n", error.c_str()), 1;
           const double ms = std::chrono::duration<double, std::milli>(clk::now() - st).count();
           if (sp.size() >= 4) sp_ms += ms, timed += r.tokens.size();
+          if (trace)
+            std::fprintf(trace, "%s %zu %u %u %zu %.3f\n", file.substr(file.find_last_of('/') + 1).c_str(), cycles,
+                         r.drafted, r.accepted, r.tokens.size(), ms);
+          chooser.Observe(r.accepted, r.drafted);
           if (r.drafted) policy.Observe(r.accepted, r.drafted), drafted += r.drafted, accepted += r.accepted, ++hist_acc[r.accepted];
           else policy.ObserveArToken();
           ++cycles;
           for (auto x : r.tokens) sp.push_back(x);
           t = r.tokens.back();
         }
+        if (trace) std::fclose(trace);
         sp.resize(static_cast<std::size_t>(n));
         const std::string name = file.substr(file.find_last_of('/') + 1);
         std::size_t same = 0;

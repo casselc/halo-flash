@@ -41,6 +41,25 @@ bool FlashNextGpu::MtpTrack(bool on, std::string* error) {
   return true;
 }
 
+bool FlashNextGpu::MtpSave(MtpCheckpoint* cp, std::string* error) {
+  if (!mtp_hpend_) {
+    if (error) *error = "MtpSave: the draft block is not tracking";
+    return false;
+  }
+  cp->pos = mtp_pos_;
+  cp->hpend.resize(w_.config.HcDim());
+  return dev_.Download(mtp_hpend_, 0, cp->hpend.data(), cp->hpend.size() * 4, error);
+}
+
+bool FlashNextGpu::MtpRestore(const MtpCheckpoint& cp, std::string* error) {
+  if (!mtp_hpend_ || cp.hpend.size() != w_.config.HcDim()) {
+    if (error) *error = "MtpRestore: not tracking, or not a checkpoint of this model";
+    return false;
+  }
+  mtp_pos_ = cp.pos;  // the draft block's cache rows past it are overwritten by later steps
+  return dev_.Upload(mtp_hpend_, 0, cp.hpend.data(), cp.hpend.size() * 4, error);
+}
+
 bool FlashNextGpu::AllocVerifySnaps(std::uint32_t rows, std::string* error) {
   const auto& c = w_.config;
   while (verify_snap_.size() < rows) {
@@ -67,6 +86,7 @@ bool FlashNextGpu::SpecStep(std::int32_t token, std::uint32_t drafts, sampling::
   };
   if (!result) return fail("SpecStep needs a result");
   result->tokens.clear();
+  result->drafts.clear();
   result->drafted = result->accepted = 0;
   const std::uint32_t p = position_;
   std::uint32_t k = std::min({drafts, kMaxDrafts, kMaxBatch - 1});
@@ -118,6 +138,41 @@ bool FlashNextGpu::SpecStep(std::int32_t token, std::uint32_t drafts, sampling::
     if (!MtpRun(rows_tok[j], nullptr, q, error)) return false;
     rows_tok[j + 1] = draft_token(j);
   }
+  return SpecVerify(rows_tok, props, sampler, result, error);
+}
+
+bool FlashNextGpu::SpecStepDrafts(std::int32_t token, std::span<const std::int32_t> drafts, SpecResult* result,
+                                  std::string* error) {
+  const auto& c = w_.config;
+  if (!result || drafts.empty() || drafts.size() > std::min(kMaxDrafts, kMaxBatch - 1) ||
+      position_ + drafts.size() + 1 > max_context_ || !BatchSupported() || (mtp_track_ && bound_ == mtp_owner_)) {
+    if (error) *error = "SpecStepDrafts: bad drafts, full context, no batch path, or the draft block is tracking";
+    return false;
+  }
+  for (const auto d : drafts)
+    if (d < 0 || static_cast<std::uint32_t>(d) >= c.vocab_size) {
+      if (error) *error = "SpecStepDrafts: draft token out of range";
+      return false;
+    }
+  result->tokens.clear();
+  result->drafted = result->accepted = 0;
+  if (!AllocBatch(error) || !AllocVerifySnaps(static_cast<std::uint32_t>(drafts.size()), error) ||
+      !EnsureKv(position_ + static_cast<std::uint32_t>(drafts.size()) + 1, position_, error))
+    return false;
+  std::vector<std::int32_t> rows_tok{token};
+  rows_tok.insert(rows_tok.end(), drafts.begin(), drafts.end());
+  return SpecVerify(rows_tok, {}, nullptr, result, error);
+}
+
+bool FlashNextGpu::SpecVerify(std::span<const std::int32_t> rows_tok, std::span<const MtpProposal> props,
+                              sampling::SamplerState* sampler, SpecResult* result, std::string* error) {
+  const auto& c = w_.config;
+  const auto fail = [&](const char* what) {
+    if (error) *error = what;
+    return false;
+  };
+  static const sampling::SamplingConfig greedy;
+  const std::uint32_t p = position_, k = static_cast<std::uint32_t>(rows_tok.size()) - 1;
   // 2. Verify the k + 1 rows in one batched pass.
   const std::uint32_t B = k + 1, ratio = c.compress_ratio, budget = c.indexer_top_k / ratio;
   std::vector<model::NgramHistory> hist(B + 1);
@@ -218,6 +273,7 @@ bool FlashNextGpu::SpecStep(std::int32_t token, std::uint32_t drafts, sampling::
   }
   result->drafted = k;
   result->accepted = a;
+  result->drafts.assign(rows_tok.begin() + 1, rows_tok.end());
   // 4. Commit rows 0 .. a: roll back the recurrent state when a row was rejected.
   if (a < k) {
     const auto& v = verify_snap_[a];
@@ -234,6 +290,7 @@ bool FlashNextGpu::SpecStep(std::int32_t token, std::uint32_t drafts, sampling::
     s.valid16 = std::min(s.valid16, position_);
   }
   // 5. The draft block catches up on the committed rows (their true hiddens), the last one stays pending.
+  if (!(mtp_track_ && bound_ == mtp_owner_)) return dev_.Synchronize(error);  // SpecStepDrafts: no draft block
   const std::size_t D = c.HcDim();
   mtp_pos_ = p;
   for (std::uint32_t e = 0; e < a; ++e) {
