@@ -14,6 +14,11 @@
 // automatic choice), the default kinds otherwise. --kv-f16 1 forces fp16-only KV, --kv-f16 0 the default kinds.
 // The choice is logged at startup ("kv: ..."). halo_run and the library default stay default KV.
 // [--scope-project NAME] [--scope-capture off|digest|full] [--scope-wal PATH].
+// MTP speculative decoding (docs/MTP.md, off by default): --mtp-model SIDECAR (the shared-* MTP gguf) loads the
+// draft block; --mtp-vocab IDS (int32 token ids, e.g. a 32K trimmed draft head) restricts its head; --mtp-window W
+// (default 512) is how many of a request's last prefilled prompt positions the draft block catches up on;
+// --mtp-depth N (default 4) the deepest draft. Greedy requests, and sampled ones without penalties, decode
+// speculatively (greedy output identical to MTP off); requests with penalties decode as without it.
 // Datasets, evaluators and experiments are served under /v1/scope/
 // (scope/eval_routes.hpp); runs call this server's own OpenAI endpoints
 // (and /v1/systemone for decider evaluators) unless
@@ -32,7 +37,9 @@
 // refused at startup.
 
 #include <algorithm>
+#include <chrono>
 #include <csignal>
+#include <fstream>
 #include <filesystem>
 #include <cstdio>
 #include <cstdlib>
@@ -102,6 +109,8 @@ int main(int argc, char** argv) {
   std::uint32_t max_context = 32768;
   server::SessionCacheOptions cache;  // prompt-prefix reuse across requests (server/session_cache.hpp)
   server::KvChoiceOptions kv;         // --kv-f16 / --kv-f16-above (server/kv_choice.hpp)
+  std::string mtp_model, mtp_vocab;   // --mtp-model / --mtp-vocab (docs/MTP.md)
+  server::SpecOptions spec;           // --mtp-window / --mtp-depth
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--help" || a == "-h") {
@@ -115,6 +124,8 @@ int main(int argc, char** argv) {
           "                        Default KV reliably holds ~150K positions; 262144 needs fp16-only KV.\n"
           "  --prefix-cache exact|fast|off  prompt-prefix reuse (default exact: byte-identical to a cold prefill)\n"
           "  --prefix-cache-sessions N --prefix-cache-gb G --prefix-cache-align N\n"
+          "  --mtp-model SIDECAR [--mtp-vocab IDS] [--mtp-window W (512)] [--mtp-depth N (4)]\n"
+          "                        MTP speculative decoding (off without --mtp-model)\n"
           "  --ngram-cache-gb G --moe-topk N --decider-dir DIR --decider-device hip|hrx|cpu --variant MANIFEST\n"
           "  --scope-dir DIR --scope-project NAME --scope-capture off|digest|full --scope-wal PATH\n"
           "  --scope-eval-endpoint URL\n");
@@ -148,6 +159,14 @@ int main(int argc, char** argv) {
     else if (a == "--prefix-cache-gb") cache.budget_bytes = static_cast<std::size_t>(std::atof(v.c_str()) * (1ull << 30));
     else if (a == "--prefix-cache-align") cache.align = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--model-id") model_id = v;
+    else if (a == "--mtp-model") mtp_model = v;
+    else if (a == "--mtp-vocab") mtp_vocab = v;
+    else if (a == "--mtp-window") spec.window = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+    else if (a == "--mtp-depth") {
+      spec.depth.limit = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+      if (spec.depth.limit < 1 || spec.depth.limit > engine::FlashNextGpu::kMaxDrafts)
+        return std::fprintf(stderr, "--mtp-depth must be 1..%u\n", engine::FlashNextGpu::kMaxDrafts), 2;
+    }
     else if (a == "--decider-dir") decider_dir = v;
     else if (a == "--decider-device") decider_device = v;
     else if (a == "--scope-dir") scope_dir = v;
@@ -162,6 +181,7 @@ int main(int argc, char** argv) {
   }
   if (model.empty() == qwen35_model.empty())
     return std::fprintf(stderr, "usage: halo_serve --model <gguf> | --qwen35-model <gguf> --qwen35-tokenizer <gguf> [options]\n"), 2;
+  if (!mtp_model.empty() && model.empty()) return std::fprintf(stderr, "--mtp-model needs --model (Flash-Next)\n"), 2;
   std::string error;
   std::unique_ptr<server::TextGenerator> generator;
   // Flash-Next (--model) or a Qwen3.5 dense model with variants (--qwen35-model).
@@ -171,6 +191,8 @@ int main(int argc, char** argv) {
   std::unique_ptr<text::Tokenizer> tok;
   std::unique_ptr<model::NgramTable> ngram;
   std::unique_ptr<rt::Device> dev;
+  std::unique_ptr<core::GgufReader> mtp_reader;  // the draft block's weights outlive the engine's use of them
+  std::optional<model::MtpWeights> mtp_weights;
   std::unique_ptr<engine::FlashNextGpu> engine;
   std::unique_ptr<engine::Qwen35Gpu> q35_engine;
   server::Qwen35Generator* q35_generator = nullptr;
@@ -200,7 +222,43 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "loading weights...\n");
     engine = engine::FlashNextGpu::Create(*dev, *weights, ngram.get(), nullptr, max_context, &error, sources);
     if (!engine) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
-    generator = std::make_unique<server::FlashNextGenerator>(*engine, *tok, max_context, cache);
+    if (!mtp_model.empty()) {  // the MTP draft block (and its trimmed head)
+      using clk = std::chrono::steady_clock;
+      const auto t0 = clk::now();
+      const std::size_t free0 = dev->AvailableBytes();
+      mtp_reader = core::GgufReader::OpenFile(mtp_model, &error);
+      if (mtp_reader) mtp_weights = model::MtpWeights::Bind(*mtp_reader, weights->config, &error);
+      if (!mtp_reader || !mtp_weights || !engine->LoadMtp(*mtp_weights, &error))
+        return std::fprintf(stderr, "--mtp-model %s: %s\n", mtp_model.c_str(), error.c_str()), 1;
+      const std::size_t file_bytes = std::filesystem::file_size(mtp_model);
+      const auto t1 = clk::now();
+      const std::size_t free1 = dev->AvailableBytes();
+      std::size_t ids_n = 0;
+      if (!mtp_vocab.empty()) {
+        std::ifstream f(mtp_vocab, std::ios::binary | std::ios::ate);
+        if (!f) return std::fprintf(stderr, "--mtp-vocab %s: cannot read\n", mtp_vocab.c_str()), 1;
+        std::vector<std::int32_t> ids(static_cast<std::size_t>(f.tellg()) / 4);
+        f.seekg(0);
+        f.read(reinterpret_cast<char*>(ids.data()), static_cast<std::streamsize>(ids.size() * 4));
+        for (const auto id : ids)
+          if (id < 0 || static_cast<std::uint32_t>(id) >= weights->config.vocab_size)
+            return std::fprintf(stderr, "--mtp-vocab %s: id %d out of range\n", mtp_vocab.c_str(), id), 1;
+        if (!engine->SetDraftVocab(ids, &error)) return std::fprintf(stderr, "--mtp-vocab: %s\n", error.c_str()), 1;
+        ids_n = ids.size();
+      }
+      const auto t2 = clk::now();
+      const std::size_t free2 = dev->AvailableBytes();
+      const auto s = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+      const auto gb = [](std::size_t a, std::size_t b) { return a > b ? double(a - b) / (1ull << 30) : 0.0; };
+      std::fprintf(stderr,
+                   "mtp: draft block %s (%.2f GB file) loaded in %.1f s, %.2f GB device (weights and its %u-position "
+                   "cache); draft head %s in %.1f s, %.3f GB device; window %u, depth limit %u\n",
+                   mtp_model.c_str(), double(file_bytes) / (1ull << 30), s(t0, t1), gb(free0, free1), max_context,
+                   ids_n ? (std::to_string(ids_n) + " ids (" + mtp_vocab + ")").c_str() : "full vocabulary", s(t1, t2),
+                   gb(free1, free2), spec.window, spec.depth.limit);
+      spec.enabled = true;
+    }
+    generator = std::make_unique<server::FlashNextGenerator>(*engine, *tok, max_context, cache, spec);
   } else {
     q35_reader = core::GgufReader::OpenFile(qwen35_model, &error);
     if (!q35_reader) return std::fprintf(stderr, "%s\n", error.c_str()), 1;

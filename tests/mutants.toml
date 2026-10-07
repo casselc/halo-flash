@@ -1320,3 +1320,55 @@ binary = "server_tests"
 filter = "Http.ASlowStalledReaderIsCutOffToo"
 timeout = 120
 why = "a client that stops reading a token-rate stream is noticed only once the kernel's buffers are full (about 1 MB: minutes of tokens)"
+
+# ---- MTP in the server (src/server/decode_loop.cpp, flash_next_generator.cpp; docs/MTP.md) -------------------
+
+[[mutant]]
+name = "spec-draft-past-budget"
+file = "src/server/decode_loop.hpp"
+find = 'return left == 0 ? 0 : chooser.Choose(left - 1);'
+replace = 'return left == 0 ? 0 : chooser.Choose(left);'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "DecodeLoop.*"
+why = "a cycle may emit 1 + accepted tokens: drafting up to the tokens left lets a max_tokens request emit one too many"
+
+[[mutant]]
+name = "spec-history-drops-accepted-drafts"
+file = "src/server/decode_loop.cpp"
+find = 'for (std::uint32_t i = 0; i < c.accepted; ++i) io.ran(c.tokens[i]);'
+replace = '(void)c.accepted;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "DecodeLoop.*"
+why = "the session record misses the accepted drafts the engine ran, so the prefix cache reuses a state it does not hold"
+
+[[mutant]]
+name = "spec-no-departure-inside-cycle"
+file = "src/server/decode_loop.cpp"
+find = 'if (i > 0 && gone()) {'
+replace = 'if (false && gone()) {'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "DecodeLoop.*"
+why = "a requester that left mid-cycle still gets the cycle's remaining tokens (no cancel until the next step)"
+
+[[mutant]]
+name = "spec-ignores-penalties"
+file = "src/server/flash_next_generator.cpp"
+find = 'const bool spec = spec_.enabled && !params.sampling.penalties_enabled();'
+replace = 'const bool spec = spec_.enabled;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.SpeculativeDecodeIsGreedyIdenticalAndReuseStaysExact"
+why = "speculative acceptance does not model repeat / frequency / presence penalties: such requests must step"
+
+[[mutant]]
+name = "spec-sampled-verified-greedy"
+file = "src/server/flash_next_generator.cpp"
+find = 'sampling::SamplerState* sampler = greedy ? nullptr : &state;'
+replace = 'sampling::SamplerState* sampler = nullptr;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.SpeculativeDecodeIsGreedyIdenticalAndReuseStaysExact"
+why = "a sampled request verified greedily returns the argmax text instead of a sample"

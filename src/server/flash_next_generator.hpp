@@ -21,24 +21,43 @@
 #include <string>
 #include <vector>
 
+#include "core/sampling.hpp"
 #include "engine/flash_next_gpu.hpp"
+#include "engine/mtp_depth.hpp"
 #include "server/openai_service.hpp"
 #include "server/session_cache.hpp"
 #include "text/tokenizer.hpp"
 
 namespace halo::server {
 
+/// MTP speculative decoding in the server (docs/MTP.md "Server integration"; halo_serve --mtp-model).
+struct SpecOptions {
+  /// The engine's draft block is loaded (LoadMtp, and SetDraftVocab for the trimmed head). Requests then decode
+  /// with SpecStep and a per-request MtpDepthChooser: greedy (temperature 0) and sampled requests without
+  /// repeat / frequency / presence penalties; requests with penalties step as without MTP.
+  bool enabled = false;
+  /// Draft-block history: it catches up on the last `window` prompt positions the request prefills (its cost is
+  /// one eager draft step, ~1.4 ms, a position); reused prefix positions are not replayed. 0: none.
+  std::uint32_t window = 512;
+  engine::MtpDepthOptions depth{};
+  /// Test hook: one speculative cycle in place of FlashNextGpu::SpecStep (the generator then leaves the draft
+  /// block's tracking alone), e.g. SpecStepDrafts with an oracle's drafts on a model without a draft block.
+  std::function<bool(std::int32_t token, std::uint32_t drafts, sampling::SamplerState* sampler,
+                     engine::FlashNextGpu::SpecResult* result, std::string* error)>
+      cycle;
+};
+
 class FlashNextGenerator : public TextGenerator {
  public:
   /// `engine` and `tokenizer` must outlive the generator.
   FlashNextGenerator(engine::FlashNextGpu& engine, const text::Tokenizer& tokenizer, std::uint32_t max_context,
-                     SessionCacheOptions cache = {});
+                     SessionCacheOptions cache = {}, SpecOptions spec = {});
 
   Result Generate(const Params& params, const std::function<bool(std::string_view)>& on_text) override;
 
   /// Token-level only (GenerateIds; Generate fails): no tokenizer, generation stops at `stops`.
   FlashNextGenerator(engine::FlashNextGpu& engine, std::vector<text::TokenId> stops, std::uint32_t max_context,
-                     SessionCacheOptions cache = {});
+                     SessionCacheOptions cache = {}, SpecOptions spec = {});
 
   /// Tokens the last generation's session ran (prompt and generated).
   [[nodiscard]] std::size_t cached_tokens() const { return cache_.live_tokens(); }
@@ -50,6 +69,9 @@ class FlashNextGenerator : public TextGenerator {
   /// queued behind another generation, between prefill chunks and before each decode step: a request whose
   /// client left gives up within one chunk or step (Result::cancelled) and leaves the cache as a cold replay of
   /// what was retained would (a partly prefilled live session is dropped; a decode stop keeps what ran).
+  /// With SpecOptions::enabled a qualifying request decodes speculatively (server/decode_loop.hpp): the same
+  /// tokens as without it when greedy; the session records every token the engine ran, also the accepted drafts
+  /// past a stop or a cancel inside a cycle.
   Result GenerateIds(std::span<const std::int32_t> prompt, std::size_t stable, const Params& params,
                      const std::function<bool(text::TokenId)>& on_token);
 
@@ -62,6 +84,8 @@ class FlashNextGenerator : public TextGenerator {
   std::vector<text::TokenId> stops_;
   std::timed_mutex mu_;  // one generation at a time (timed: a queued request polls Params::cancelled)
   SessionCache cache_;
+  SpecOptions spec_;
+  engine::MtpDepthChooser chooser_;  // per generator, reset per request (its prior is the persistent part)
   text::TokenId im_start_ = text::kNoToken;
 };
 

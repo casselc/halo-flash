@@ -71,8 +71,11 @@ class SessionCache {
   /// `cancelled` (optional) is polled before the prefill and between its chunks; when it stops the prefill the
   /// live session is dropped (its state is partly advanced) and only states equal to a cold prefill of their
   /// tokens stay retained (a checkpoint parked before the stop is one).
+  /// `before_prefill` (optional) runs once the live session is bound with `reused` positions, before any prefill
+  /// (the generator sets the draft block's history window there); false fails the Prepare with its error.
   [[nodiscard]] bool Prepare(std::span<const std::int32_t> prompt, std::size_t stable, std::uint32_t positions,
-                             Prepared* out, std::string* error, const std::function<bool()>& cancelled = {});
+                             Prepared* out, std::string* error, const std::function<bool()>& cancelled = {},
+                             const std::function<bool(std::size_t reused, std::string* error)>& before_prefill = {});
   /// The bound session ran `token` (a decode step).
   void Ran(std::int32_t token);
   /// The generation ended: fast mode retains the live session, exact mode drops it.

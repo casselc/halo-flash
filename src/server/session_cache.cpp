@@ -51,7 +51,8 @@ void SessionCache::Evict() {
 }
 
 bool SessionCache::Prepare(std::span<const std::int32_t> prompt, std::size_t stable, std::uint32_t positions,
-                           Prepared* out, std::string* error, const std::function<bool()>& cancelled) {
+                           Prepared* out, std::string* error, const std::function<bool()>& cancelled,
+                           const std::function<bool(std::size_t, std::string*)>& before_prefill) {
   *out = {};
   if (has_live_) Abandon();  // a Prepare without Finish: the previous state is not trusted
   const auto stop = [&] { return out->cancelled = out->cancelled || (cancelled && cancelled()); };
@@ -98,6 +99,8 @@ bool SessionCache::Prepare(std::span<const std::int32_t> prompt, std::size_t sta
       return *error = why, false;
     }
   }
+
+  if (before_prefill && !before_prefill(out->reused, error)) return Abandon(), false;
 
   // Checkpoint position: where the generation prompt starts (exact: rounded down to the alignment).
   std::size_t ck = std::min(stable, n);
