@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <random>
 #include <iterator>
@@ -402,6 +403,13 @@ int main(int argc, char** argv) {
   std::string decode_ab;            // --decode-ab M1,M2,..: decode masks compared in forks after --prefill-prompt
   int decode_ab_rounds = 3;         // --decode-ab-rounds R
   bool sb_snapshot = true;          // --sb-snapshot 0: the session bench skips the whole-state snapshot
+  // SR4 (docs/SESSIONS.md section 10). --spill-bench N1,N2,..: per context, prefill N tokens (--prompt-file repeated;
+  // timed after a warm-up prefill: the re-prefill cost), spill to --spill-dir, then restore into a new session
+  // (the old one dropped, as a resume does) --spill-reps times, each checked bitwise by the next step's logits.
+  // --spill-roundtrip DIR (with --prefill-prompt): spill after the prompt's prefill, drop the session, restore it
+  // into a new one, then decode as usual (compare --decode-logits-out with a run without it: cmp).
+  std::string spill_bench, spill_dir, spill_roundtrip;
+  int spill_reps = 3;
   std::uint32_t prompt_tokens = 0;  // --prompt-tokens N: the prompt's tokens repeated / cut to N (long-context runs)
   std::uint32_t span_sample = 1;
   bool eager = false, profile = false, device_sample = false;
@@ -524,6 +532,11 @@ int main(int argc, char** argv) {
     else if (a == "--decode-ab") decode_ab = argv[i + 1];
     else if (a == "--decode-ab-rounds") decode_ab_rounds = std::max(1, std::atoi(argv[i + 1]));
     else if (a == "--sb-snapshot") sb_snapshot = std::string(argv[i + 1]) == "1";
+    else if (a == "--spill-bench") spill_bench = argv[i + 1];
+    else if (a == "--spill-dir") spill_dir = argv[i + 1];
+    else if (a == "--spill-reps") spill_reps = std::atoi(argv[i + 1]);
+    else if (a == "--spill-roundtrip") spill_roundtrip = argv[i + 1];
+    else if (a == "--spill-threads") engine::FlashNextGpu::spill_threads_ = static_cast<unsigned>(std::atoi(argv[i + 1]));
     else if (a == "--prompt-tokens") prompt_tokens = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else {
       std::fprintf(stderr, "unknown option %s\n", a.c_str());
@@ -690,6 +703,68 @@ int main(int argc, char** argv) {
       for (auto& [name, v] : rows)
         std::printf("  %-28s %8.1f ms/prefill %6.1f%%  %8ld launches/prefill\n", name.c_str(), 1e3 * v.first / reps,
                     100 * v.first / total, v.second / reps);
+    }
+    return 0;
+  }
+  if (!spill_bench.empty()) {
+    if (!gpu || spill_dir.empty()) return std::fprintf(stderr, "--spill-bench needs a GPU device and --spill-dir\n"), 2;
+    std::string text = prompt;
+    if (!prompt_file.empty()) {
+      std::ifstream f(prompt_file);
+      text.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    const auto enc = tok->Encode(text);
+    if (enc.empty()) return std::fprintf(stderr, "empty prompt\n"), 2;
+    using clk = std::chrono::steady_clock;
+    const auto ms = [](clk::time_point a) { return std::chrono::duration<double, std::milli>(clk::now() - a).count(); };
+    const std::string file = spill_dir + "/bench.spill";
+    engine::FlashNextGpu::SessionId cur = 0;
+    // A new session bound, the previous one dropped (what a resume after a suspend has).
+    const auto fresh_session = [&]() -> bool {
+      engine::FlashNextGpu::SessionId id;
+      if (!gpu->NewSession(&id, &error) || !gpu->BindSession(id, &error) || !gpu->DropSession(cur, &error)) return false;
+      cur = id;
+      return true;
+    };
+    std::vector<float> want(c.vocab_size), got(c.vocab_size);
+    for (std::size_t p = 0; p < spill_bench.size();) {
+      const auto q = spill_bench.find(',', p);
+      const auto N = static_cast<std::uint32_t>(std::strtoul(spill_bench.substr(p, q - p).c_str(), nullptr, 0));
+      p = q == std::string::npos ? spill_bench.size() : q + 1;
+      std::vector<std::int32_t> toks;
+      while (toks.size() < N) toks.insert(toks.end(), enc.begin(), enc.end());
+      toks.resize(N);
+      const std::int32_t next = toks[N / 2];
+      // Warm-up prefill (chunk buffers, graphs), then the timed one: what re-prefilling this context costs.
+      if (!fresh_session() || !gpu->Prefill(std::span<const std::int32_t>(toks).first(std::min<std::size_t>(N, 2048)), {}, &error))
+        return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      if (!fresh_session()) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      auto t = clk::now();
+      if (!gpu->Prefill(toks, {}, &error) || !dev->Synchronize(&error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      const double prefill_ms = ms(t);
+      const auto mem = gpu->SessionMemory(cur);
+      engine::FlashNextGpu::SpillInfo si;
+      if (!gpu->SpillSession(file, {}, &si, &error)) return std::fprintf(stderr, "spill: %s\n", error.c_str()), 1;
+      if (!gpu->Step(next, want, &error)) return 1;  // the uninterrupted session's next logits
+      std::printf("spill bench N=%u kv=%s: prefill %.0f ms; KV mapped %.1f MB, recurrent %.1f MB; file %.1f MB "
+                  "(%.1f KB/token over the recurrent); spill %.1f ms (%.2f GB/s)\n",
+                  N, engine::FlashNextGpu::kv_f16_only_ ? "fp16" : "default", prefill_ms, mem.kv_mapped / 1e6,
+                  mem.recurrent / 1e6, si.file_bytes / 1e6, (double(si.file_bytes) - mem.recurrent) / N / 1e3, si.ms,
+                  si.file_bytes / si.ms / 1e6);
+      for (int r = 0; r < spill_reps; ++r) {
+        t = clk::now();
+        if (!fresh_session()) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+        const double new_ms = ms(t);
+        engine::FlashNextGpu::SpillInfo ri;
+        if (!gpu->RestoreSession(file, nullptr, &ri, &error)) return std::fprintf(stderr, "restore: %s\n", error.c_str()), 1;
+        const double total = ms(t);
+        if (!gpu->Step(next, got, &error)) return 1;
+        const bool same = std::memcmp(got.data(), want.data(), want.size() * 4) == 0;
+        std::printf("  restore %d: new session %.1f ms + restore %.1f ms = %.1f ms (%.2f GB/s); next-step logits %s\n", r,
+                    new_ms, ri.ms, total, ri.file_bytes / ri.ms / 1e6, same ? "BIT-IDENTICAL" : "DIFFER");
+        if (!same) return 3;
+      }
+      std::filesystem::remove(file);
     }
     return 0;
   }
@@ -1322,6 +1397,18 @@ int main(int argc, char** argv) {
     const auto m = gpu->SessionMemory(0);
     std::printf("session memory: recurrent %.1f MB, KV mapped %.1f MB\n", m.recurrent / 1e6, m.kv_mapped / 1e6);
     first_step = ids.size() - 1;
+    if (!spill_roundtrip.empty()) {  // SR4: suspend after the prefill, resume into a new session
+      const std::string file = spill_roundtrip + "/roundtrip.spill";
+      engine::FlashNextGpu::SpillInfo si, ri;
+      engine::FlashNextGpu::SessionId id;
+      const auto from = gpu->BoundSession();
+      if (!gpu->SpillSession(file, {}, &si, &error) || !gpu->NewSession(&id, &error) || !gpu->BindSession(id, &error) ||
+          !gpu->DropSession(from, &error) || !gpu->RestoreSession(file, nullptr, &ri, &error))
+        return std::fprintf(stderr, "spill roundtrip: %s\n", error.c_str()), 1;
+      std::printf("spill roundtrip: %.1f MB, spill %.1f ms, restore into a new session %.1f ms\n", si.file_bytes / 1e6,
+                  si.ms, ri.ms);
+      std::filesystem::remove(file);
+    }
     if (!decode_ab.empty()) {
       // Decode A/B at this depth from one prefill: each round, each mask decodes in its own fork of the prefilled
       // session (pages shared, graphs captured under that mask). The first 8 steps return logits (compared

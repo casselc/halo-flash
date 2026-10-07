@@ -5,6 +5,7 @@
 //                           real-model probe (minutes; run alone under the GPU lock)
 
 #include <hegel/gtest.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -17,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -302,6 +304,112 @@ TEST(SessionCache, ReuseIsByteIdenticalToColdPrefill) {
   std::printf("exact: %zu requests, %zu of %zu prompt tokens reused; fast: %zu reused, %zu requests differ from cold\n",
               requests, reused, prompt_tokens, fast_reused, fast_differs);
   EXPECT_GT(reused, prompt_tokens / 10) << "the cache hardly reused anything: the comparison is close to vacuous";
+}
+
+// SR4: the exact cache with a disk tier. Eviction spills (max_retained 1-2), and between turns an admin spills
+// every resident entry, restores some, or flips a bit in a spilled file. Every request's tokens equal a cache-off
+// engine's (exact mode's contract survives spill and restore), a damaged file only costs a re-prefill, and spilled
+// states are actually restored and reused (non-vacuous).
+TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  const char* d = std::getenv("HALO_SPILL_TEST_DIR");
+  const std::string dir = (d && *d ? std::filesystem::path(d) : std::filesystem::temp_directory_path() / "halo-spill-test") /
+                          ("cache-" + std::to_string(::getpid()));
+  constexpr std::uint32_t kCtx = 2048;
+  std::string e;
+  auto ea = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  auto eb = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(ea && eb) << e;
+  const auto V = static_cast<std::int32_t>(m->weights->config.vocab_size);
+  std::size_t restored = 0, restore_failed = 0, spilled = 0, reused = 0, corrupted = 0;
+  hegel::test([&](hegel::TestCase& tc) {
+    server::SessionCacheOptions exact{.mode = server::SessionCacheOptions::Mode::kExact, .align = kAlign,
+                                      .max_retained = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 2}))};
+    exact.spill_dir = dir;
+    exact.spill_on_evict = true;
+    exact.max_spilled = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 6}));
+    server::FlashNextGenerator a(*ea, std::vector<text::TokenId>{}, kCtx, exact);
+    server::FlashNextGenerator b(*eb, std::vector<text::TokenId>{}, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
+    const auto tokens = [&](std::uint32_t lo, std::uint32_t hi) {
+      std::vector<std::int32_t> v(tc.draw(gs::integers<std::uint32_t>({.min_value = lo, .max_value = hi})));
+      for (auto& t : v) t = tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = V - 1}));
+      return v;
+    };
+    const auto collect = [](std::vector<std::int32_t>* out) {
+      return [out](text::TokenId t) { return out->push_back(static_cast<std::int32_t>(t)), true; };
+    };
+    const std::vector<std::int32_t> gen_prompt = {7, 11, 13};
+    std::set<std::uint64_t> damaged;  // entries whose file had a bit flipped
+    std::vector<std::int32_t> prompt = tokens(20, 300);
+    std::size_t stable = prompt.size();
+    prompt.insert(prompt.end(), gen_prompt.begin(), gen_prompt.end());
+    const int turns = tc.draw(gs::integers<int>({.min_value = 2, .max_value = 5}));
+    for (int turn = 0; turn < turns && prompt.size() + 40 < kCtx; ++turn) {
+      server::TextGenerator::Params p;
+      p.max_tokens = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 8}));
+      std::vector<std::int32_t> got, want;
+      const auto ra = a.GenerateIds(prompt, stable, p, collect(&got));
+      const auto rb = b.GenerateIds(prompt, stable, p, collect(&want));
+      ASSERT_TRUE(ra.error.empty() && rb.error.empty()) << ra.error << rb.error;
+      ASSERT_EQ(got, want) << "turn " << turn << ", prompt " << prompt.size() << ", reused " << ra.cached_tokens;
+      reused += ra.cached_tokens;
+      // Unrelated requests push the conversation's checkpoint out (spilled at max_retained 1-2).
+      for (int k = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 2})); k > 0; --k) {
+        auto other = tokens(10, 120);
+        std::vector<std::int32_t> oa, ob;
+        server::TextGenerator::Params q;
+        q.max_tokens = 3;
+        ASSERT_TRUE(a.GenerateIds(other, other.size() - 1, q, collect(&oa)).error.empty());
+        ASSERT_TRUE(b.GenerateIds(other, other.size() - 1, q, collect(&ob)).error.empty());
+        ASSERT_EQ(oa, ob);
+      }
+      // Admin between turns.
+      const int admin = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 3}));
+      a.WithCache([&](server::SessionCache& c) {
+        std::string why;
+        for (const auto& en : c.List()) {
+          if (admin == 1 && !en.spilled) EXPECT_TRUE(c.Spill(en.key, &why)) << why;
+          if (admin == 2 && en.spilled) {
+            const bool ok = c.Restore(en.key, &why);
+            EXPECT_TRUE(ok || damaged.contains(en.key)) << "an intact spilled entry did not restore: " << why;
+          }
+        }
+        if (admin == 3)
+          for (const auto& f : std::filesystem::directory_iterator(dir)) {
+            std::fstream io(f.path(), std::ios::in | std::ios::out | std::ios::binary);
+            const auto size = std::filesystem::file_size(f.path());
+            const auto at = static_cast<std::streamoff>(tc.draw(gs::integers<std::uint64_t>({.min_value = 0, .max_value = size - 1})));
+            char ch;
+            io.seekg(at);
+            io.get(ch);
+            io.seekp(at);
+            io.put(static_cast<char>(ch ^ 0x20));
+            ++corrupted;
+            const std::string name = f.path().filename().string();  // s<pid>-<key>.spill
+            damaged.insert(std::strtoull(name.c_str() + name.find('-') + 1, nullptr, 10));
+          }
+        return true;
+      });
+      std::vector<std::int32_t> next(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(stable));
+      next.insert(next.end(), gen_prompt.begin(), gen_prompt.end());
+      const auto other = tokens(1, 20);
+      next.insert(next.end(), other.begin(), other.end());
+      const auto tool = tokens(1, 150);
+      next.insert(next.end(), tool.begin(), tool.end());
+      stable = next.size();
+      next.insert(next.end(), gen_prompt.begin(), gen_prompt.end());
+      prompt = std::move(next);
+    }
+    const auto& k = a.cache().spill_counters();
+    restored += k.restored;
+    restore_failed += k.restore_failed;
+    spilled += k.spilled;
+  }, {.test_cases = 40, .phases = {hegel::Phase::Explicit, hegel::Phase::Reuse, hegel::Phase::Generate}});
+  std::filesystem::remove_all(dir);
+  std::printf("spill cache: %zu spilled, %zu restored, %zu restores failed (%zu bit flips), %zu prompt tokens reused\n",
+              spilled, restored, restore_failed, corrupted, reused);
+  EXPECT_GT(restored, 5u) << "spilled states were hardly ever restored: the comparison is close to vacuous";
 }
 
 namespace {

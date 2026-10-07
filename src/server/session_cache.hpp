@@ -47,6 +47,13 @@ struct SessionCacheOptions {
   std::uint32_t align = 64;
   std::size_t max_retained = 8;                 ///< checkpoints and live sessions kept between requests
   std::size_t budget_bytes = 8ull << 30;        ///< device bytes they may hold (recurrent + exclusive KV pages)
+  /// SR4 disk tier (docs/SESSIONS.md section 10). Directory for spill files (created 0700; files 0600). Empty: no
+  /// disk tier (Spill refuses; eviction drops). Set: Spill(key) works, and Prepare restores a spilled entry that holds
+  /// the longest usable prefix instead of re-prefilling it.
+  std::string spill_dir;
+  bool spill_on_evict = false;              ///< eviction (count, budget, KvRoomFor) spills instead of dropping
+  std::size_t max_spilled = 64;             ///< spilled entries kept (oldest file deleted beyond)
+  std::size_t spill_budget_bytes = 64ull << 30;  ///< disk bytes they may hold
 };
 
 class SessionCache {
@@ -87,6 +94,29 @@ class SessionCache {
   [[nodiscard]] std::size_t live_tokens() const { return last_live_tokens_; }
   [[nodiscard]] const SessionCacheOptions& options() const { return opt_; }
 
+  // ---- SR4: suspend / resume of retained states by key (an internal API for an admin route and yard-ctl) ----
+  struct EntryInfo {
+    std::uint64_t key = 0;       ///< stable while the entry exists (resident or spilled)
+    std::size_t tokens = 0;
+    bool checkpoint = false, canonical = false, spilled = false;
+    std::size_t device_bytes = 0;  ///< resident: recurrent + exclusive KV pages
+    std::uint64_t file_bytes = 0;  ///< spilled: the file's size
+    std::uint64_t used = 0;        ///< LRU clock
+  };
+  [[nodiscard]] std::vector<EntryInfo> List() const;
+  /// Writes a resident entry's state to the spill directory and frees its device memory. Outcomes: true = done
+  /// (file complete and durable, device state dropped); false with the entry still resident = not done (nothing
+  /// changed but a removed temp file); the entry is never half-spilled.
+  [[nodiscard]] bool Spill(std::uint64_t key, std::string* error);
+  /// Brings a spilled entry back onto the device (a resume ahead of its request). On false the entry is gone (its
+  /// file refused or damaged, or no memory): its next request re-prefills, which is exactly a cold prefill.
+  [[nodiscard]] bool Restore(std::uint64_t key, std::string* error);
+  /// Counters since construction (tests, metrics).
+  struct SpillCounters {
+    std::size_t spilled = 0, spill_failed = 0, restored = 0, restore_failed = 0, files_deleted = 0;
+  };
+  [[nodiscard]] const SpillCounters& spill_counters() const { return counters_; }
+
  private:
   struct Entry {
     Engine::SessionId id = 0;
@@ -94,10 +124,18 @@ class SessionCache {
     bool checkpoint = false;           // parked (forked from); else a finished live session (fast mode)
     bool canonical = false;            // byte-identical to one cold prefill of `tokens`
     std::uint64_t used = 0;
+    std::uint64_t key = 0;             // SR4: stable handle (List / Spill / Restore)
+    bool spilled = false;              // SR4: state in `path`, no engine session (id meaningless)
+    std::string path;
+    std::uint64_t file_bytes = 0;
   };
   bool Drop(Engine::SessionId id, std::string* error);
   void Evict();  // down to max_retained and budget_bytes
-  bool EvictOne();
+  bool EvictOne();  // the least recently used resident entry: spilled (spill_on_evict) or dropped
+  bool SpillEntry(Entry& en, std::string* error);
+  bool RestoreEntry(Entry& en, std::string* error);  // on false the caller erases the entry
+  void TrimSpilled();  // down to max_spilled and spill_budget_bytes (oldest files deleted)
+  void EraseEntry(std::size_t index);  // drops its session or deletes its file
   std::size_t Bytes(const Entry& e) const;
 
   Engine& e_;
@@ -107,6 +145,8 @@ class SessionCache {
   bool has_live_ = false;
   std::uint64_t clock_ = 0;
   std::size_t last_live_tokens_ = 0;
+  std::uint64_t next_key_ = 1;
+  SpillCounters counters_;
 };
 
 }  // namespace halo::server

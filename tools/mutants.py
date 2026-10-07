@@ -104,7 +104,7 @@ class Runner:
 
     def build(self, suite: Suite, binary: str) -> tuple[bool, str]:
         p = subprocess.run(["cmake", "--build", os.path.join(ROOT, suite.build_dir), "--target", binary, "-j",
-                            str(os.cpu_count() or 8)], capture_output=True, text=True)
+                            os.environ.get("HALO_BUILD_JOBS", str(os.cpu_count() or 8))], capture_output=True, text=True)
         return p.returncode == 0, p.stdout + p.stderr
 
     def test(self, suite: Suite, binary: str, filt: str, timeout: int) -> tuple[str, str]:

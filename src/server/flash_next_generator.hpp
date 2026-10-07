@@ -43,6 +43,12 @@ class FlashNextGenerator : public TextGenerator {
   /// Tokens the last generation's session ran (prompt and generated).
   [[nodiscard]] std::size_t cached_tokens() const { return cache_.live_tokens(); }
   [[nodiscard]] const SessionCache& cache() const { return cache_; }
+  /// SR4: runs `f(SessionCache&)` between generations, under the generation lock (admin: List / Spill / Restore).
+  template <class F>
+  auto WithCache(F&& f) {
+    std::lock_guard<std::timed_mutex> lk(mu_);
+    return f(cache_);
+  }
 
   /// The token-level generation (tests drive it without a tokenizer): `prompt` ids, the stable prefix length
   /// (see SessionCache::Prepare), sampling and limits from `params` (its prompt text unused); `on_token` gets each
