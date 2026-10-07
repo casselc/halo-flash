@@ -38,7 +38,8 @@ struct SpecOptions {
   bool enabled = false;
   /// Draft-block history: it catches up on the last `window` prompt positions the request prefills (its cost is
   /// one eager draft step, ~1.4 ms, a position); reused prefix positions are not replayed. 0: none.
-  std::uint32_t window = 512;
+  /// Default 128, measured (docs/MTP.md "Server integration"): 2% faster than 0 end to end on the serving bench.
+  std::uint32_t window = 128;
   engine::MtpDepthOptions depth{};
   /// Test hook: one speculative cycle in place of FlashNextGpu::SpecStep (the generator then leaves the draft
   /// block's tracking alone), e.g. SpecStepDrafts with an oracle's drafts on a model without a draft block.

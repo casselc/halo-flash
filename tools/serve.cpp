@@ -16,9 +16,9 @@
 // [--scope-project NAME] [--scope-capture off|digest|full] [--scope-wal PATH].
 // MTP speculative decoding (docs/MTP.md, off by default): --mtp-model SIDECAR (the shared-* MTP gguf) loads the
 // draft block; --mtp-vocab IDS (int32 token ids, e.g. a 32K trimmed draft head) restricts its head; --mtp-window W
-// (default 512) is how many of a request's last prefilled prompt positions the draft block catches up on;
-// --mtp-depth N (default 4) the deepest draft. Greedy requests, and sampled ones without penalties, decode
-// speculatively (greedy output identical to MTP off); requests with penalties decode as without it.
+// (default 128, measured: docs/MTP.md) is how many of a request's last prefilled prompt positions the draft block
+// catches up on; --mtp-depth N (default 4) the deepest draft. Greedy requests, and sampled ones without penalties,
+// decode speculatively (greedy output identical to MTP off); requests with penalties decode as without it.
 // Datasets, evaluators and experiments are served under /v1/scope/
 // (scope/eval_routes.hpp); runs call this server's own OpenAI endpoints
 // (and /v1/systemone for decider evaluators) unless
@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
           "                        Default KV reliably holds ~150K positions; 262144 needs fp16-only KV.\n"
           "  --prefix-cache exact|fast|off  prompt-prefix reuse (default exact: byte-identical to a cold prefill)\n"
           "  --prefix-cache-sessions N --prefix-cache-gb G --prefix-cache-align N\n"
-          "  --mtp-model SIDECAR [--mtp-vocab IDS] [--mtp-window W (512)] [--mtp-depth N (4)]\n"
+          "  --mtp-model SIDECAR [--mtp-vocab IDS] [--mtp-window W (128)] [--mtp-depth N (4)]\n"
           "                        MTP speculative decoding (off without --mtp-model)\n"
           "  --ngram-cache-gb G --moe-topk N --decider-dir DIR --decider-device hip|hrx|cpu --variant MANIFEST\n"
           "  --scope-dir DIR --scope-project NAME --scope-capture off|digest|full --scope-wal PATH\n"
