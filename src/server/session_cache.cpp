@@ -60,22 +60,43 @@ void SessionCache::EraseEntry(std::size_t i) {
   entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
 }
 
+std::string SessionCache::Label(const Entry& en) const {
+  return en.session.empty() ? "s" + std::to_string(::getpid()) + "-" + std::to_string(en.key) : en.session;
+}
+
 bool SessionCache::SpillEntry(Entry& en, std::string* error) {
   if (opt_.spill_dir.empty()) return *error = "no spill directory configured", false;
   if (en.spilled) return true;
+  // The key first: a provider without a key for this session refuses the spill (never a plaintext fallback);
+  // with no provider, plaintext only when the operator chose it.
+  Engine::SpillProtection prot;
+  core::crypt::Kek kek;
+  const std::string label = Label(en);
+  if (opt_.spill_keys) {
+    prot.kek = &kek;
+    if (!opt_.spill_keys->Key(label, SpillKeys::Use::kSeal, &kek, error)) {  // no key, no spill: never plaintext
+      ++counters_.spill_failed;
+      ++counters_.no_key;
+      return false;
+    }
+  } else if (!opt_.spill_plaintext_ok) {
+    ++counters_.spill_failed;
+    return *error = "no spill key configured (--spill-key) and plaintext spills not allowed (--spill-plaintext-ok)", false;
+  }
   const std::string path = opt_.spill_dir + "/s" + std::to_string(::getpid()) + "-" + std::to_string(en.key) + ".spill";
   const auto prev = e_.BoundSession();
   if (!e_.BindSession(en.id, error)) return false;
   std::vector<std::uint8_t> blob(en.tokens.size() * 4);
   if (!blob.empty()) std::memcpy(blob.data(), en.tokens.data(), blob.size());
   Engine::SpillInfo info;
-  const bool ok = e_.SpillSession(path, blob, &info, error);
+  const bool ok = e_.SpillSession(path, prot, blob, &info, error);
   std::string e2;
   (void)e_.BindSession(prev == en.id ? 0 : prev, &e2);
   if (!ok) {  // not done: the entry stays resident and unchanged
     ++counters_.spill_failed;
     return false;
   }
+  if (opt_.spill_keys) opt_.spill_keys->Used(label, SpillKeys::Use::kSeal);
   // Done: the file holds the state; the device copy goes (the memory guard sees it at once: DropSession frees the
   // session's ranges, docs/SESSIONS.md section 7).
   (void)Drop(en.id, &e2);
@@ -83,21 +104,33 @@ bool SessionCache::SpillEntry(Entry& en, std::string* error) {
   en.spilled = true;
   en.path = path;
   en.file_bytes = info.file_bytes;
+  en.key_id = info.key_id;
   ++counters_.spilled;
   return true;
 }
 
-bool SessionCache::RestoreEntry(Entry& en, std::string* error) {
-  if (!en.spilled) return true;
+SessionCache::Restored SessionCache::RestoreEntry(Entry& en, std::string* error) {
+  if (!en.spilled) return Restored::kDone;
+  Engine::SpillProtection prot;
+  prot.accept_v1 = opt_.spill_accept_v1;
+  core::crypt::Kek kek;
+  const std::string label = Label(en);
+  if (opt_.spill_keys && !en.key_id.empty()) {
+    if (!opt_.spill_keys->KeyForFile(label, en.key_id, &kek, error)) {
+      ++counters_.no_key;
+      return Restored::kNoKey;  // nothing touched: the file waits for its key
+    }
+    prot.kek = &kek;
+  }
   const auto prev = e_.BoundSession();
   Engine::SessionId id;
-  if (!e_.NewSession(&id, error)) return ++counters_.restore_failed, false;
+  if (!e_.NewSession(&id, error)) return ++counters_.restore_failed, Restored::kRefused;
   std::string e2;
   const auto give_up = [&] {
     (void)e_.BindSession(prev, &e2);
     (void)e_.DropSession(id, &e2);
     ++counters_.restore_failed;
-    return false;
+    return Restored::kRefused;
   };
   if (!e_.BindSession(id, error)) return give_up();
   // Room for its pages: other resident entries are evicted (spilled or dropped) first, least recently used first.
@@ -107,12 +140,13 @@ bool SessionCache::RestoreEntry(Entry& en, std::string* error) {
     if (!EvictOne()) return *error = why, give_up();
   }
   std::vector<std::uint8_t> blob;
-  if (!e_.RestoreSession(en.path, &blob, nullptr, error)) return give_up();
+  if (!e_.RestoreSession(en.path, prot, &blob, nullptr, error)) return give_up();
   // The file must hold exactly the entry's tokens (it is the entry's own file; a mismatch means it was replaced).
   if (blob.size() != en.tokens.size() * 4 || (!blob.empty() && std::memcmp(blob.data(), en.tokens.data(), blob.size()) != 0)) {
     *error = "spill file holds other tokens than its entry";
     return give_up();
   }
+  if (opt_.spill_keys && prot.kek) opt_.spill_keys->Used(label, SpillKeys::Use::kOpen);
   (void)e_.BindSession(prev, &e2);
   std::error_code ec;
   std::filesystem::remove(en.path, ec);
@@ -120,8 +154,9 @@ bool SessionCache::RestoreEntry(Entry& en, std::string* error) {
   en.spilled = false;
   en.path.clear();
   en.file_bytes = 0;
+  en.key_id.clear();
   ++counters_.restored;
-  return true;
+  return Restored::kDone;
 }
 
 void SessionCache::TrimSpilled() {
@@ -144,13 +179,14 @@ std::vector<SessionCache::EntryInfo> SessionCache::List() const {
   std::vector<EntryInfo> out;
   for (const auto& en : entries_)
     out.push_back({en.key, en.tokens.size(), en.checkpoint, en.canonical, en.spilled, en.spilled ? 0 : Bytes(en),
-                   en.file_bytes, en.used});
+                   en.file_bytes, en.used, Label(en), en.key_id});
   return out;
 }
 
-bool SessionCache::Spill(std::uint64_t key, std::string* error) {
+bool SessionCache::Spill(std::uint64_t key, std::string* error, std::string_view session) {
   for (auto& en : entries_)
     if (en.key == key) {
+      if (!session.empty() && !en.spilled) en.session = std::string(session);
       if (!SpillEntry(en, error)) return false;
       TrimSpilled();
       return true;
@@ -158,16 +194,56 @@ bool SessionCache::Spill(std::uint64_t key, std::string* error) {
   return *error = "no such entry", false;
 }
 
-bool SessionCache::Restore(std::uint64_t key, std::string* error) {
+bool SessionCache::Restore(std::uint64_t key, std::string* error, bool* kept) {
+  if (kept) *kept = false;
   for (std::size_t i = 0; i < entries_.size(); ++i)
     if (entries_[i].key == key) {
-      if (RestoreEntry(entries_[i], error)) return true;
+      const Restored r = RestoreEntry(entries_[i], error);
+      if (r == Restored::kDone) return true;
+      if (r == Restored::kNoKey) {
+        if (kept) *kept = true;
+        return false;
+      }
       // Gone for good: its next request re-prefills (a cold prefill).
       for (std::size_t j = 0; j < entries_.size(); ++j)
         if (entries_[j].key == key) EraseEntry(j);
       return false;
     }
   return *error = "no such entry", false;
+}
+
+std::size_t SessionCache::DropSpilledOf(std::string_view session) {
+  std::size_t n = 0;
+  for (std::size_t i = 0; i < entries_.size();)
+    if (entries_[i].spilled && entries_[i].session == session) {
+      EraseEntry(i);
+      ++n;
+    } else {
+      ++i;
+    }
+  return n;
+}
+
+std::size_t SessionCache::DropUnreadable() {
+  std::size_t n = 0;
+  for (std::size_t i = 0; i < entries_.size();) {
+    const Entry& en = entries_[i];
+    bool unreadable = false;
+    if (en.spilled && opt_.spill_keys && !en.key_id.empty()) {
+      core::crypt::Kek kek;
+      std::string why;
+      // A provider that has no key now (yard: not registered) may get one later: only a different current id
+      // (rotated master, a later epoch) makes the file unreadable for good.
+      unreadable = opt_.spill_keys->KeyForFile(Label(en), en.key_id, &kek, &why) && kek.id != en.key_id;
+    }
+    if (unreadable) {
+      EraseEntry(i);
+      ++n;
+    } else {
+      ++i;
+    }
+  }
+  return n;
 }
 
 bool SessionCache::Drop(Engine::SessionId id, std::string* error) {
@@ -230,12 +306,14 @@ bool SessionCache::Prepare(std::span<const std::int32_t> prompt, std::size_t sta
   // The retained state with the longest usable prefix of the prompt. A spilled one is restored first (SR4); one
   // whose restore fails is erased and the search runs again (its tokens are then re-prefilled: a cold prefill).
   Entry* best = nullptr;
+  std::vector<std::uint64_t> waiting;  // spilled entries whose key is not available now (left as they are)
   for (bool again = true; again;) {
     again = false;
     best = nullptr;
     if (opt_.mode != SessionCacheOptions::Mode::kOff)
       for (auto& en : entries_) {
         if (en.tokens.size() > n || en.tokens.empty()) continue;
+        if (std::find(waiting.begin(), waiting.end(), en.key) != waiting.end()) continue;
         if (exact && !en.canonical) continue;
         if (!std::equal(en.tokens.begin(), en.tokens.end(), prompt.begin())) continue;
         if (!best || en.tokens.size() > best->tokens.size()) best = &en;
@@ -243,8 +321,11 @@ bool SessionCache::Prepare(std::span<const std::int32_t> prompt, std::size_t sta
     if (best && best->spilled) {
       const auto key = best->key;
       std::string why;
-      if (!Restore(key, &why)) again = true;
-      else
+      bool kept = false;
+      if (!Restore(key, &why, &kept)) {
+        again = true;
+        if (kept) waiting.push_back(key);
+      } else
         for (auto& en : entries_)
           if (en.key == key) best = &en;  // Restore may have erased other entries (eviction): find it again
     }

@@ -30,6 +30,7 @@
           rocm.clr # HIP runtime (libamdhip64) and hipcc
           rocm.rocminfo
           rocm.rocprofiler-sdk # rocprofv3, matching the runtime above
+          pkgs.openssl # libcrypto: spill file encryption (AES-256-GCM, HKDF, ECDSA for yard JWTs; docs/SESSIONS.md 10)
         ];
         env = {
           HALO_TOOLCHAIN = "nix-rocm-${rocm.clr.version}";

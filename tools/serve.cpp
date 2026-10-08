@@ -64,6 +64,7 @@
 #include "server/metrics.hpp"
 #include "server/openai_service.hpp"
 #include "server/qwen35_generator.hpp"
+#include "server/spill_keys.hpp"
 #include "server/systemone_service.hpp"
 #include "text/tokenizer.hpp"
 #if HALO_WITH_SCOPE
@@ -100,9 +101,18 @@ class StrandsEngine : public server::DecisionEngine {
 }  // namespace
 
 
+// Printable ASCII without quotes or backslashes (labels and key ids are; anything else is dropped).
+static std::string JsonSafe(const std::string& s) {
+  std::string o;
+  for (char ch : s)
+    if (ch >= 0x20 && ch < 0x7f && ch != '"' && ch != '\\') o += ch;
+  return o;
+}
+
 // SR4 admin routes over the session cache (docs/SESSIONS.md section 10): list retained states, spill one to the
 // spill directory, restore one. Each runs between generations (the generation lock).
-static void RegisterSpillRoutes(halo::server::HttpServer& http, halo::server::FlashNextGenerator& g) {
+static void RegisterSpillRoutes(halo::server::HttpServer& http, halo::server::FlashNextGenerator& g,
+                                halo::server::SpillKeys* keys) {
   using halo::server::HttpRequest;
   using halo::server::HttpResponse;
   using halo::server::SessionCache;
@@ -111,13 +121,14 @@ static void RegisterSpillRoutes(halo::server::HttpServer& http, halo::server::Fl
     g.WithCache([&](SessionCache& c) {
       bool first = true;
       for (const auto& e : c.List()) {
-        char b[320];
+        char b[640];  // labels and key ids are printable ASCII without quotes (spill_crypt.cpp, yard session ids)
         std::snprintf(b, sizeof(b),
                       "%s{\"key\":%llu,\"tokens\":%zu,\"checkpoint\":%s,\"canonical\":%s,\"spilled\":%s,"
-                      "\"device_bytes\":%zu,\"file_bytes\":%llu}",
+                      "\"device_bytes\":%zu,\"file_bytes\":%llu,\"session\":\"%s\",\"key_id\":\"%s\"}",
                       first ? "" : ",", static_cast<unsigned long long>(e.key), e.tokens, e.checkpoint ? "true" : "false",
                       e.canonical ? "true" : "false", e.spilled ? "true" : "false", e.device_bytes,
-                      static_cast<unsigned long long>(e.file_bytes));
+                      static_cast<unsigned long long>(e.file_bytes), JsonSafe(e.session).c_str(),
+                      JsonSafe(e.key_id).c_str());
         body += b;
         first = false;
       }
@@ -140,6 +151,21 @@ static void RegisterSpillRoutes(halo::server::HttpServer& http, halo::server::Fl
     return ok ? HttpResponse::Json(200, "{\"ok\":true}")
               : HttpResponse::Json(409, "{\"ok\":false,\"error\":\"" + esc + "\"}");
   });
+  // Spill encryption, phase A: a new key epoch for the master provider. Files sealed before are unreadable from
+  // now on (crypto-shredding); their entries are erased and the files deleted.
+  http.Route("POST", "/admin/spill/rotate", [&g, keys](const HttpRequest&) {
+    std::string why;
+    if (!keys) return HttpResponse::Json(409, "{\"ok\":false,\"error\":\"no spill key provider\"}");
+    std::size_t dropped = 0;
+    const bool ok = g.WithCache([&](SessionCache& c) {
+      if (!keys->Rotate(&why)) return false;
+      dropped = c.DropUnreadable();
+      return true;
+    });
+    if (!ok) return HttpResponse::Json(409, "{\"ok\":false,\"error\":\"" + JsonSafe(why) + "\"}");
+    return HttpResponse::Json(200, "{\"ok\":true,\"keys\":\"" + JsonSafe(keys->Describe()) +
+                                       "\",\"dropped\":" + std::to_string(dropped) + "}");
+  });
 }
 
 int main(int argc, char** argv) {
@@ -157,6 +183,8 @@ int main(int argc, char** argv) {
   server::KvChoiceOptions kv;         // --kv-f16 / --kv-f16-above (server/kv_choice.hpp)
   std::string mtp_model, mtp_vocab;   // --mtp-model / --mtp-vocab (docs/MTP.md)
   server::SpecOptions spec;           // --mtp-window / --mtp-depth
+  std::string spill_key = "none";     // --spill-key (server/spill_keys.hpp)
+  std::uint64_t spill_epoch = 1;      // --spill-epoch
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--help" || a == "-h") {
@@ -173,7 +201,15 @@ int main(int argc, char** argv) {
           "  --prefix-cache-sessions N --prefix-cache-gb G --prefix-cache-align N\n"
           "  --spill-dir DIR       session spill files (default /data/halo-work/spill; 0700 dir, 0600 files)\n"
           "  --spill-evict 0|1     cache eviction spills to DIR instead of dropping (default 0). Admin routes:\n"
-          "                        GET /admin/sessions, POST /admin/sessions/{key}/spill | /restore\n"
+          "                        GET /admin/sessions, POST /admin/sessions/{key}/spill | /restore,\n"
+          "                        POST /admin/spill/rotate (new key epoch: older files become unreadable)\n"
+          "  --spill-key tpm[:CRED]|file:PATH|none  spill encryption key (format v2, AES-256-GCM). tpm: the\n"
+          "                        TPM2-sealed systemd credential halo-spill-master (default CRED\n"
+          "                        $XDG_CONFIG_HOME/halo-flash/spill-master.cred; $CREDENTIALS_DIRECTORY first).\n"
+          "                        Default none: spills are REFUSED (eviction drops) unless --spill-plaintext-ok 1\n"
+          "  --spill-plaintext-ok 0|1  with no --spill-key, write plaintext v1 files (default 0)\n"
+          "  --spill-accept-v1 0|1 restore plaintext v1 files (default 0)\n"
+          "  --spill-epoch N       first key epoch of the master provider (default 1)\n"
           "  --mtp-model SIDECAR [--mtp-vocab IDS] [--mtp-window W (128)] [--mtp-depth N (4)]\n"
           "                        MTP speculative decoding (off without --mtp-model)\n"
           "  --ngram-cache-gb G --moe-topk N --decider-dir DIR --decider-device hip|hrx|cpu --variant MANIFEST\n"
@@ -213,6 +249,10 @@ int main(int argc, char** argv) {
     else if (a == "--prefix-cache-align") cache.align = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--spill-dir") cache.spill_dir = v;
     else if (a == "--spill-evict") cache.spill_on_evict = v == "1";
+    else if (a == "--spill-key") spill_key = v;
+    else if (a == "--spill-plaintext-ok") cache.spill_plaintext_ok = v == "1";
+    else if (a == "--spill-accept-v1") cache.spill_accept_v1 = v == "1";
+    else if (a == "--spill-epoch") spill_epoch = std::strtoull(v.c_str(), nullptr, 10);
     else if (a == "--model-id") model_id = v;
     else if (a == "--mtp-model") mtp_model = v;
     else if (a == "--mtp-vocab") mtp_vocab = v;
@@ -239,6 +279,14 @@ int main(int argc, char** argv) {
   if (cache.spill_dir.empty()) cache.spill_dir = "/data/halo-work/spill";  // SR4 default: not /tmp (docs/SESSIONS.md 10)
   if (!mtp_model.empty() && model.empty()) return std::fprintf(stderr, "--mtp-model needs --model (Flash-Next)\n"), 2;
   std::string error;
+  // Spill encryption keys: loaded before the cache exists and destroyed after it (masters zeroed on exit).
+  std::unique_ptr<server::SpillKeys> spill_keys;
+  if (!server::MakeSpillKeys(spill_key, spill_epoch, &spill_keys, &error))
+    return std::fprintf(stderr, "--spill-key %s: %s\n", spill_key.c_str(), error.c_str()), 1;
+  cache.spill_keys = spill_keys.get();
+  if (spill_keys) std::fprintf(stderr, "spill: encrypted (v2), key %s\n", spill_keys->Describe().c_str());
+  else if (cache.spill_plaintext_ok) std::fprintf(stderr, "spill: PLAINTEXT v1 files (--spill-plaintext-ok 1)\n");
+  else std::fprintf(stderr, "spill: refused (no --spill-key; eviction drops)\n");
   std::unique_ptr<server::TextGenerator> generator;
   server::FlashNextGenerator* flash_generator = nullptr;  // SR4 admin routes
   // Flash-Next (--model) or a Qwen3.5 dense model with variants (--qwen35-model).
@@ -407,7 +455,7 @@ int main(int argc, char** argv) {
                            .api_key = api_key});
   service.Register(http);
   metrics.Register(http);
-  if (flash_generator) RegisterSpillRoutes(http, *flash_generator);
+  if (flash_generator) RegisterSpillRoutes(http, *flash_generator, spill_keys.get());
 #if HALO_WITH_SCOPE
   if (scope) {
     scope::RegisterAnnotationRoutes(http, scope::AnnotatorOf(scope));  // harnesses in other processes

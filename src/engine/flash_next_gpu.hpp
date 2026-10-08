@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "core/sampling.hpp"
+#include "core/spill_crypt.hpp"
 #include "model/lora.hpp"
 #include "model/ngram.hpp"
 #include "model/weights.hpp"
@@ -356,35 +357,51 @@ class FlashNextGpu {
   /// K/V or fp16 K/V rows, live indexer keys, pooled blocks, PLE history, n-gram window, position) and, when the
   /// session is the draft block's owner with an unbroken history, the draft block's (position, pending hidden,
   /// its K/V / indexer / block rows). Bound to the model (fingerprint), the numerics options, the KV kind and the
-  /// position; every part is CRC32C-checked on read.
+  /// position. Format v2 (the default): the meta and every payload piece are AES-256-GCM sealed under a fresh data
+  /// key wrapped by the caller's KEK, the whole header is their AAD, and the tags are the integrity check. Format
+  /// v1 (plaintext, CRC32C per part) only when the caller asks for plaintext.
   struct SpillInfo {
     std::uint64_t file_bytes = 0;
     std::uint32_t position = 0;
     bool mtp = false;     ///< the draft block's history is in the file (restored when this engine tracks)
     double ms = 0;        ///< wall time of the whole call
+    std::uint32_t version = 0;  ///< file format: 1 plaintext, 2 encrypted
+    std::string key_id;         ///< v2: the id of the KEK that wraps the file's data key
+  };
+  /// How a spill file is protected (docs/SESSIONS.md section 10). Spill: `kek` set writes format v2 under it; null
+  /// writes plaintext v1 (only for a caller that chose plaintext). Restore / peek: a v2 file opens only with the KEK
+  /// whose id it names (else refused before the session is touched); a v1 file is taken only with `accept_v1`.
+  struct SpillProtection {
+    const core::crypt::Kek* kek = nullptr;
+    bool accept_v1 = false;
   };
   /// Writes the bound session's state to `path`: a temp file next to it (mode 0600), fsync, rename, fsync of the
   /// directory. True: the file at `path` is complete and durable. False: `path` is what it was before (absent or
   /// an older complete file); a temp file may be left only by a crash (SpillCleanTemps removes those).
-  /// `blob`: caller bytes stored with the state (the session cache's token list), covered by the checksum.
-  [[nodiscard]] bool SpillSession(const std::string& path, std::span<const std::uint8_t> blob, SpillInfo* info,
-                                  std::string* error);
+  /// `blob`: caller bytes stored with the state (the session cache's token list), sealed (v2) or checksummed (v1).
+  [[nodiscard]] bool SpillSession(const std::string& path, const SpillProtection& prot,
+                                  std::span<const std::uint8_t> blob, SpillInfo* info, std::string* error);
   /// Replaces the bound session's state with the one in `path`. Refuses (false, nothing read into the session)
-  /// a file of another model, numerics options, KV kind or format, a position past max_context, a damaged
-  /// header; a payload whose checksum fails is found while restoring: then the bound session is reset to empty.
-  /// So on false the session is either unchanged (refused before any write) or empty (`*reset` true), and the
-  /// caller re-prefills; never a partly restored state.
-  [[nodiscard]] bool RestoreSession(const std::string& path, std::vector<std::uint8_t>* blob, SpillInfo* info,
-                                    std::string* error, bool* reset = nullptr);
-  /// Reads and checks a spill file's header only (identity, options, kind, layout, header checksum).
-  [[nodiscard]] bool SpillPeek(const std::string& path, std::vector<std::uint8_t>* blob, SpillInfo* info,
-                               std::string* error) const;
+  /// a file of another model, numerics options, KV kind or format, a position past max_context, a damaged or
+  /// unauthenticated header or meta, another key id or a KEK that does not unwrap its data key, a v1 file without
+  /// `accept_v1`; a payload piece whose tag (v2) or checksum (v1) fails is found while restoring: then the bound
+  /// session is reset to empty. So on false the session is either unchanged (refused before any write) or empty
+  /// (`*reset` true), and the caller re-prefills; never a partly restored state, never unauthenticated bytes.
+  [[nodiscard]] bool RestoreSession(const std::string& path, const SpillProtection& prot,
+                                    std::vector<std::uint8_t>* blob, SpillInfo* info, std::string* error,
+                                    bool* reset = nullptr);
+  /// Reads and checks a spill file's header and meta only (format, key, authentication or checksums).
+  [[nodiscard]] bool SpillPeek(const std::string& path, const SpillProtection& prot, std::vector<std::uint8_t>* blob,
+                               SpillInfo* info, std::string* error) const;
   /// Removes `<dir>/*.tmp.*` spill temp files a crash left.
   static void SpillCleanTemps(const std::string& dir);
   [[nodiscard]] std::uint64_t ModelFingerprint() const noexcept { return model_fp_; }
   /// Test hooks (crash simulation): 1 = stop after half the payload (temp file left, no rename); 2 = stop after
   /// the fsync, before the rename.
   static inline int spill_fault_ = 0;
+  /// Test hook: write an authentic file of another identity (1 model fingerprint, 2 options, 3 KV kind,
+  /// 4 position + 1), to show the identity checks run behind the authentication.
+  static inline int spill_test_identity_ = 0;
   static inline unsigned spill_threads_ = 4;  ///< I/O threads (each: one pinned staging buffer of a piece)
   static inline std::size_t spill_piece_bytes_ = 16u << 20;  ///< I/O and checksum unit, a multiple of 4096
 

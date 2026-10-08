@@ -1484,3 +1484,14 @@ docs/MTP.md "Server integration". Pinned, chooser limit 4, 32K draft head; greed
 | Serving, W 0 (eager catch-up none) | paper greedy 1.35x, T 0.8 1.20x, agent 1.20x; TTFT = AR | 1.21x / 1.22x / 1.27x (turn 2 1.37x); TTFT = AR +-3% | no (W 128 2% faster end to end) |
 | Serving, W 128 | W 0 + 0-3% decode, +0.17 s TTFT cold | 1.26x / 1.23x / 1.24x (turn 2 1.35x); TTFT +0.13-0.18 s cold | yes (default) |
 | MTP serving with decode graphs off (fault workaround) | fault gone, speed unchanged | speed unchanged (+-1%) but faulted in 1 of 9 runs: not the cause | no |
+
+## 17. 2026-10-07 (stream SE, branch `stream/spill-crypt`): encrypted spill files (format v2)
+
+Not a kernel change: the cost of AES-256-GCM on the SR4 spill path (docs/SESSIONS.md section 10). Real model,
+default KV, `halo_run --spill-bench --spill-format 12` (v1 and v2 from the same prefill, restores interleaved),
+unpinned, `/data` XFS on the SN5000 (Gen3 x4). Prediction (SE PREDICTIONS P1): within +-3% (GCM at 14.3 GB/s a core
+replaces CRC32C at ~13 GB/s, 4 I/O threads, disk-bound).
+
+| Change | Predicted | Measured (v1 -> v2) | Kept |
+|---|---|---|---|
+| v2: per-piece AES-256-GCM (VAES/AVX-512 path) instead of CRC32C, wrapped DEK, sealed meta | +-3% spill and restore | restore 2K 81.2 -> 79.7 ms (-1.8%), 12K 266.9 -> 267.1 ms (+0.1%), median of 3; spill (1 sample each) 2K 75 -> 68 ms, 12K 229 -> 213 ms, 128K 1984 -> 1962 ms and 1978 -> 2030 ms: noise, disk-bound. 128K restore not measured: `hipMemCreate` out of memory on main efaece7's own halo_run too (b0.txt), not SE's | yes (default; within noise) |

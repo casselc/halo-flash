@@ -440,6 +440,77 @@ results never depend on the draft block (greedy verification emits AR's tokens),
 - The blob (the cache's token list) is covered by the meta CRC; the caller trusts the blob, not its own record, for what
   the state holds.
 
+### File format v2: encrypted (stream SE, 2026-10-07; working files `/data/halo-work/streams/SE/`)
+
+Spill files hold whole conversations (the tokens, and states from which text can be recovered). Since SE they are
+encrypted at the application level (envelope encryption; the user chose it over a LUKS volume), and **v2 is the only
+format halo_serve writes unless the operator asks for plaintext**.
+
+| Bytes | Content |
+|---|---|
+| 0-447 | header, all of it the **AAD** of everything below: magic `HALOSPL2`, version 2, header size, model fingerprint, options fingerprint, KV kind, index window, position, layer and task counts, draft-block fields, n-gram size, blob size, file size, meta size, piece size (v1's offsets 0-83), the **file salt** (8 random bytes), the **key id** (<= 128 printable bytes), the wrap nonce, zero reserved bytes |
+| 448-511 | the **wrapped DEK** (32), its GCM tag (16), the meta's GCM tag (16) |
+| 512 .. 4096k | meta, AES-256-GCM sealed: block counts, n-gram window, the task table (offset, bytes, section, **GCM tag** per piece), the caller's blob |
+| payload | the same sections and 16 MB pieces as v1, each AES-256-GCM sealed in place |
+
+- **Keys.** Each file gets a fresh random 256-bit data key (DEK), stored only wrapped (AES-256-GCM, random nonce) under
+  a key-encryption key: `KEK = HKDF-SHA256(ikm, info = "halo-spill-v2" || be32(len) || session || be64(epoch))`, the
+  ikm being the provider's master key (phase A) or the session key yard-ctl registered (phase B). The key id names
+  provider, master (or session key) name, epoch and session (`tpm:<16 hex>:e1:s<pid>-<key>`, `yard:<16 hex>:e7:<sess>`);
+  a key name is the first 8 bytes of HMAC-SHA256(key, "halo-spill-master-id"), never the key.
+- **Nonces.** Piece i: `salt || be32(i)`; the meta: `salt || 0xffffffff` (pieces are < 2^32 - 1). Unique within a file
+  because indices are; across files the DEK differs (and the salt is a second guard). The DEK-wrap nonce is random
+  under a KEK that wraps one DEK per file.
+- **Integrity.** The GCM tags replace v1's CRC32Cs. Restore: magic and version; sizes (file size = recorded); the
+  key id against the caller's KEK (another session, epoch, provider or master: refused with both ids in the message);
+  the DEK unwrap, which authenticates the whole header; the meta's tag; then v1's identity and layout checks; each
+  piece's tag before its bytes go to the device (a failure resets the session, as v1's checksum did). Every refusal
+  before the payload leaves the session untouched.
+- **v1** (plaintext, CRC32C) is still written when there is no provider and `--spill-plaintext-ok 1`, and read only
+  with `--spill-accept-v1 1`.
+- Crypto: OpenSSL 3.6.3 libcrypto from the pinned nixpkgs (`pkgs.openssl` in flake.nix; no new fetch: the store path
+  was already in the closure), EVP AES-256-GCM. On this CPU (Zen 5, `vaes vpclmulqdq avx512*`) it takes the
+  VAES/AVX-512 path: 14.3 GB/s a core for 16 MB buffers; with VAES/VPCLMULQDQ or AVX-512F masked
+  (`OPENSSL_ia32cap`) 3.0 GB/s, without AES-NI 0.44 GB/s. Code: `src/core/spill_crypt.*` (primitives, the envelope),
+  `src/engine/session_spill.cpp` (the format), `src/server/spill_keys.*` (providers).
+
+### Key providers and flags (phase A)
+
+| `--spill-key` | Master key | Notes |
+|---|---|---|
+| `tpm` / `tpm:CRED` | the systemd credential `halo-spill-master`: `$CREDENTIALS_DIRECTORY/halo-spill-master` when run as a service (`LoadCredentialEncrypted=`), else `systemd-creds decrypt --user --name=halo-spill-master CRED -` (default CRED `$XDG_CONFIG_HOME/halo-flash/spill-master.cred`) | made once by `/data/halo-work/platform/ops/spill-key-seal.sh`, **no root**: a user-scoped credential (systemd 259) is sealed and decrypted unprivileged through the `io.systemd.Credentials` socket; key type host + TPM2 (the file holds a TPM2 blob; user scope ignores PCR binding). chuck is not in group `tss` and need not be |
+| `file:PATH` | 32 raw bytes or 64 hex digits in a 0600 regular file (no symlink) | tests, machines without a TPM |
+| `none` (default) | - | spills are **refused** (the admin route answers 409, eviction drops) unless `--spill-plaintext-ok 1` |
+
+The master (and every derived KEK and DEK) lives in `SecretBytes`: own mmap pages, `mlock`ed, `MADV_DONTDUMP`,
+`MADV_WIPEONFORK`, zeroed (`OPENSSL_cleanse`) before unmapping; the master is read once at startup (before the model
+loads: a missing key fails fast) and zeroed at exit. Nothing logs key bytes; halo_serve logs `spill: encrypted (v2),
+key tpm:<name> epoch N`.
+
+**Default: refuse, not plaintext.** Without a key, a spill is refused. A refused spill costs a re-prefill later (latency,
+exactly a cold prefill); a plaintext default would silently write whole conversations to plain XFS. So plaintext
+needs the explicitly named `--spill-plaintext-ok 1`; and when a provider is configured but has no key for a session,
+the spill is refused even then (never a plaintext fallback: mutant `cache-plaintext-on-key-error`).
+
+**Epochs and crypto-shredding.** `--spill-epoch N` (default 1) is the master provider's first epoch;
+`POST /admin/spill/rotate` moves to the next one: every file sealed before names an old key id and can no longer be
+opened (the KEK differs too); the cache erases those entries and deletes their files (`DropUnreadable`). Deleting the
+credential shreds every file of that master.
+
+**Cost** (ROOFLINE section 17): restore 2K 81.2 -> 79.7 ms, 12K 266.9 -> 267.1 ms (v1 -> v2, medians); spills within
+disk noise. Predicted +-3%: the GCM pass replaces the CRC32C pass at about the same bytes a second.
+
+### Threat model
+
+| Threat | Phase A (TPM master) | Phase B (yard session keys) | Not covered |
+|---|---|---|---|
+| The disk, a backup or a copied file leaves the machine | protected: files are unreadable without the master, which exists only TPM-sealed (host + TPM2 key) and in halo_serve's locked memory | protected, and also without yard's K | - |
+| Tampering, bit rot, truncation, a file swapped between sessions, epochs or models | refused (GCM tags, header as AAD, key id, identity checks); never partly restored | same | denial of service: a deleted or damaged file costs a re-prefill |
+| Old files after a key change | `POST /admin/spill/rotate` or deleting the credential: unreadable | epoch bump, revocation or yard deleting K: unreadable; only yard-ctl can authorise a resume | copies of plaintext a process had in memory before |
+| Another local user | the credential is scoped to chuck's uid; files and dir 0600 / 0700 | same | root |
+| A process running as chuck, or root, while halo_serve runs | **not protected**: it can run `systemd-creds decrypt --user` itself, or read halo_serve's memory (ptrace as the same uid) | a process as chuck cannot mint yard tokens, so it cannot make halo open a yard-sealed file; but it can read keys halo holds at that moment, and plaintext state in device memory | memory and GPU memory of the live process; swap is not involved (keys mlocked; the 16 MB staging buffers are pinned) |
+| A stolen admin API key | can spill / restore phase-A entries (halo opens them itself) | cannot open yard-sealed files without a fresh yard token bound to the key | - |
+
 ### I/O path
 
 Spill: `Synchronize`, then 4 threads (`spill_threads_`), each with one pinned 16 MB staging buffer (`AllocHost`):
@@ -522,10 +593,31 @@ files in `Spill.RefusesDamagedTruncatedAndMismatchedFiles` and the machines. Cou
 
 Files are created `0600` (`O_EXCL`), the spill directory `0700`, under `--spill-dir` (default `/data/halo-work/spill`,
 not `/tmp`: tmpfs would hold multi-GB files in RAM, the memory a spill exists to free). A spill file holds the whole
-conversation's state (its tokens in the blob, and states from which text can be recovered): **encryption at rest is a
-later decision for the user** (HARNESS SR0 invariant 4 asks for encrypted datasets; `/data` is plain XFS today).
+conversation's state (its tokens in the blob, and states from which text can be recovered): since SE they are
+encrypted (format v2 above; HARNESS SR0 invariant 4).
 
 ### Tests and mutants
+
+SE (format v2, keys): `Spill.*` and the cache test above run on v2 (a random test master, KEK per "test" session);
+`Spill.RefusesDamagedTruncatedAndMismatchedFiles` runs its cases for both formats, and for v2 adds flips in the model
+fingerprint, salt, reserved (authenticated) bytes, key id, wrap nonce, wrapped key, wrap tag, meta tag and meta
+ciphertext, no key, wrong epoch, wrong session, the right id with another key, another master, and authentic files
+of another model / options / KV kind / position (test hook `spill_test_identity_`), and a v1 file without
+`accept_v1`; `Spill.EncryptedFilesNeverReuseANonceOrHoldKeys` reads real files with the format's own rules (every
+piece opens under salt || be32(i), no keystream block repeats within or across files though thousands of pieces are
+all-zero plaintext, no DEK / KEK / master / blob / `HALOSPL1` in the file); `SessionCache.SpilledStates...` also
+rotates the epoch (shred: `DropUnreadable`) and checks every file is v2; `SessionCache.SpillKeysRefuseKeepAndShred`:
+no key -> no file (also on eviction), no provider -> refused, plaintext only when chosen, v1 restored only with
+accept_v1, a withheld open key keeps the entry, rotation shreds. CPU (`crypt_tests`, no GPU): GCM refuses every
+changed bit (Hegel), nonces are salt || be32(i) and never repeat (Hegel), HKDF RFC 5869 A.1, the KEK separates
+sessions / epochs / masters, the wrap authenticates bytes 0-495 and hides the DEK (Hegel), providers (file modes,
+symlinks, the `systemd-creds` path, rotation; opt-in `HALO_TEST_SYSTEMD_CREDS=1`: the real user-scoped TPM
+credential). Mutants (tests/mutants.toml, all killed: `streams/SE/m1_cpu.txt`, `m1g_a.txt`, `m1g_b.txt`,
+`m1g_c.txt`): `crypt-` / `spill-nonce-constant`, `-header-not-aad`, `-tag-unchecked`, `-dek-in-clear` (CPU and GPU
+each), `crypt-kek-ignores-epoch`, `cache-plaintext-on-key-error`; SR4's nine re-run on v2 code (the v1 ones through
+the v1 cases).
+
+SR4:
 
 - `Spill.RoundTripIsBitIdentical` (Hegel, 40): random histories of prefill chunks and steps, both KV kinds, pieces 16 KB
   (sections cut into many pieces) or 16 MB, 1-4 threads; restored into the same session (after rewriting it), another

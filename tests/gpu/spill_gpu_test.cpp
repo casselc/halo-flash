@@ -17,10 +17,14 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
+#include <array>
+#include <algorithm>
 #include <string>
 #include <vector>
 
 #include "core/gguf.hpp"
+#include "core/spill_crypt.hpp"
 #include "engine/flash_next_gpu.hpp"
 #include "model/ngram.hpp"
 #include "model/weights.hpp"
@@ -73,15 +77,39 @@ struct Statics {
   bool kv16 = E::kv_f16_only_, w8a8 = E::prefill_shexp_w8a8_;
   std::size_t piece = E::spill_piece_bytes_;
   unsigned threads = E::spill_threads_;
-  int fault = E::spill_fault_;
+  int fault = E::spill_fault_, identity = E::spill_test_identity_;
   ~Statics() {
     E::kv_f16_only_ = kv16;
     E::prefill_shexp_w8a8_ = w8a8;
     E::spill_piece_bytes_ = piece;
     E::spill_threads_ = threads;
     E::spill_fault_ = fault;
+    E::spill_test_identity_ = identity;
   }
 };
+
+// Spill keys: one random master per test process; the tests' files are v2 under KEK(master, "test", epoch 1).
+namespace sc = halo::core::crypt;
+const sc::SecretBytes& TestMaster() {
+  static const sc::SecretBytes m = [] {
+    sc::SecretBytes k(32);
+    if (!k.ok() || !sc::RandomBytes({k.data(), 32})) std::abort();
+    return k;
+  }();
+  return m;
+}
+sc::Kek MakeKek(std::string_view session, std::uint64_t epoch, const sc::SecretBytes& master = TestMaster()) {
+  sc::Kek k;
+  std::string e;
+  if (!sc::DeriveKek(master.span(), session, epoch, "test:" + sc::KeyName(master.span()), &k, &e)) std::abort();
+  return k;
+}
+const sc::Kek& TestKek() {
+  static const sc::Kek k = MakeKek("test", 1);
+  return k;
+}
+E::SpillProtection Prot() { return {&TestKek(), false}; }
+E::SpillProtection Prot1() { return {nullptr, true}; }  // plaintext v1, accepted
 
 struct Op {
   bool prefill = false;
@@ -190,7 +218,7 @@ TEST(Spill, RoundTripIsBitIdentical) {
     for (const auto& o : ops)
       ASSERT_TRUE(Apply(*gpu, o, {}, &error) && Apply(*oracle, o, {}, &error)) << error;
     E::SpillInfo si;
-    ASSERT_TRUE(gpu->SpillSession(path, {}, &si, &error)) << error;
+    ASSERT_TRUE(gpu->SpillSession(path, Prot(), {}, &si, &error)) << error;
     ASSERT_EQ(si.position, pos);
     ASSERT_EQ(std::filesystem::file_size(path), si.file_bytes);
     ASSERT_EQ(std::filesystem::status(path).permissions() & std::filesystem::perms::all,
@@ -212,7 +240,7 @@ TEST(Spill, RoundTripIsBitIdentical) {
       target = fresh.get();
     }
     E::SpillInfo ri;
-    ASSERT_TRUE(target->RestoreSession(path, nullptr, &ri, &error)) << error;
+    ASSERT_TRUE(target->RestoreSession(path, Prot(), nullptr, &ri, &error)) << error;
     ASSERT_EQ(target->Position(), pos);
     // Then steps and prefill chunks (a prefill reads the fp16 K/V copy, which a restore must re-derive).
     std::vector<float> got(V), want(V);
@@ -260,9 +288,9 @@ TEST(Spill, LongContextRoundTripAndDropPath) {
       }
     std::vector<float> cold(V), got(V), want(V);
     ASSERT_TRUE(gpu->Prefill(prompt, cold, &error) && oracle->Prefill(prompt, {}, &error)) << error;
-    ASSERT_TRUE(gpu->SpillSession(path, {}, nullptr, &error)) << error;
+    ASSERT_TRUE(gpu->SpillSession(path, Prot(), {}, nullptr, &error)) << error;
     auto fresh = E::Create(*dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
-    ASSERT_TRUE(fresh && fresh->RestoreSession(path, nullptr, nullptr, &error)) << error;
+    ASSERT_TRUE(fresh && fresh->RestoreSession(path, Prot(), nullptr, nullptr, &error)) << error;
     for (std::size_t j = 0; j < tail.size(); ++j) {
       ASSERT_TRUE(fresh->Step(tail[j], got, &error) && oracle->Step(tail[j], want, &error)) << error;
       ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0) << "kv16 " << kv16 << " step " << j;
@@ -275,9 +303,10 @@ TEST(Spill, LongContextRoundTripAndDropPath) {
   }
 }
 
-// Every damaged or foreign file is refused. Header-level problems are refused before the session is touched (it
-// keeps its state, checked by stepping it against the oracle); payload damage is found while reading, and then the
-// session is empty (reset), never partly restored.
+// Every damaged, foreign or unauthenticated file is refused, for both formats. Header-level problems (v2: anything
+// in the header, the key id, the wrapped key, the meta or its tag; a wrong key, epoch or session; a v1 file without
+// accept_v1) are refused before the session is touched (it keeps its state, checked by stepping it against the
+// oracle); payload damage is found while reading, and then the session is empty (reset), never partly restored.
 TEST(Spill, RefusesDamagedTruncatedAndMismatchedFiles) {
   Small* s = LoadSmall();
   if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
@@ -288,7 +317,7 @@ TEST(Spill, RefusesDamagedTruncatedAndMismatchedFiles) {
   E::spill_piece_bytes_ = 64u << 10;
   const std::size_t V = s->weights->config.vocab_size;
   constexpr std::uint32_t kMaxContext = 512;
-  const std::string good = SpillDir() + "/good.spill", bad = SpillDir() + "/bad.spill";
+  const std::string good = SpillDir() + "/good.spill", good1 = SpillDir() + "/good1.spill", bad = SpillDir() + "/bad.spill";
   auto gpu = E::Create(*dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
   auto oracle = E::Create(*dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
   ASSERT_TRUE(gpu && oracle) << error;
@@ -296,17 +325,23 @@ TEST(Spill, RefusesDamagedTruncatedAndMismatchedFiles) {
   for (std::size_t i = 0; i < a.size(); ++i) a[i] = static_cast<std::int32_t>((i * 7919) % V);
   for (std::size_t i = 0; i < b.size(); ++i) b[i] = static_cast<std::int32_t>((i * 104729 + 5) % V);
   ASSERT_TRUE(gpu->Prefill(a, {}, &error)) << error;
-  ASSERT_TRUE(gpu->SpillSession(good, {}, nullptr, &error)) << error;
+  E::SpillInfo gi;
+  ASSERT_TRUE(gpu->SpillSession(good, Prot(), {}, &gi, &error)) << error;
+  ASSERT_EQ(gi.version, 2u);
+  ASSERT_EQ(gi.key_id, TestKek().id);
+  ASSERT_TRUE(gpu->SpillSession(good1, Prot1(), {}, &gi, &error)) << error;
+  ASSERT_EQ(gi.version, 1u);
+  // Authentic files of another identity (the engine's test hook): refused by the identity checks behind the tags.
+  const char* idents[] = {"another model", "other numerics options", "other KV kind", "wrong position"};
+  std::vector<std::vector<std::uint8_t>> ident_files;
+  for (int i = 1; i <= 4; ++i) {
+    E::spill_test_identity_ = i;
+    ASSERT_TRUE(gpu->SpillSession(bad, Prot(), {}, nullptr, &error)) << error;
+    E::spill_test_identity_ = 0;
+    ident_files.push_back(ReadFile(bad));
+  }
   // The target session holds b; the oracle holds b too, so "unchanged" is checkable.
   ASSERT_TRUE(gpu->Reset(&error) && gpu->Prefill(b, {}, &error) && oracle->Prefill(b, {}, &error)) << error;
-  const auto bytes = ReadFile(good);
-  ASSERT_GT(bytes.size(), 8192u);
-  std::uint64_t header_bytes = 0;
-  {
-    std::uint32_t hb;
-    std::memcpy(&hb, bytes.data() + 12, 4);
-    header_bytes = hb;
-  }
   int step = 0;
   const auto unchanged = [&](const std::string& what) {
     ASSERT_EQ(gpu->Position(), b.size() + step) << what;
@@ -316,96 +351,233 @@ TEST(Spill, RefusesDamagedTruncatedAndMismatchedFiles) {
     ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0) << what << ": the refused restore changed the session";
   };
   struct Case {
-    const char* what;
+    std::string what;
     std::vector<std::uint8_t> file;
     bool payload;  // found while reading: the session is reset
+    E::SpillProtection prot;
   };
+  const sc::Kek other_epoch = MakeKek("test", 2), other_session = MakeKek("test2", 1);
+  sc::Kek same_id_other_key = MakeKek("test", 1);  // the right id, other key bytes (a forged or rotated master)
+  same_id_other_key.key.data()[0] ^= 1;
+  sc::SecretBytes master2(32);
+  ASSERT_TRUE(sc::RandomBytes({master2.data(), 32}));
+  const sc::Kek other_master = MakeKek("test", 1, master2);
   std::vector<Case> cases;
-  const auto with = [&](auto f) {
-    auto c = bytes;
-    f(c);
-    return c;
-  };
-  cases.push_back({"truncated by one piece", with([&](auto& c) { c.resize(c.size() - 4096); }), false});
-  cases.push_back({"truncated to the header", with([&](auto& c) { c.resize(header_bytes); }), false});
-  cases.push_back({"empty", {}, false});
-  cases.push_back({"extended", with([&](auto& c) { c.resize(c.size() + 4096, 0); }), false});
-  cases.push_back({"magic", with([&](auto& c) { c[0] ^= 1; }), false});
-  cases.push_back({"header bit flip (position)", with([&](auto& c) { c[40] ^= 1; }), false});
-  // A field nothing else validates (draft-block blocks, no draft block in this file): only the header checksum.
-  cases.push_back({"header bit flip (unused field)", with([&](auto& c) { c[60] ^= 1; }), false});
-  cases.push_back({"meta bit flip (a task's checksum)", with([&](auto& c) { c[200] ^= 0x10; }), false});
-  cases.push_back({"payload bit flip (first piece)", with([&](auto& c) { c[header_bytes + 5] ^= 0x40; }), true});
-  cases.push_back({"payload bit flip (last piece)", with([&](auto& c) { c[c.size() - 4096 - 100] ^= 1; }), true});
-  cases.push_back({"another model", with([&](auto& c) {
-                     std::uint64_t fp;
-                     std::memcpy(&fp, c.data() + 16, 8);
-                     fp ^= 1;
-                     PatchHeader(c, 16, &fp, 8);
-                   }), false});
-  cases.push_back({"other numerics options", with([&](auto& c) {
-                     std::uint64_t fp;
-                     std::memcpy(&fp, c.data() + 24, 8);
-                     fp += 1;
-                     PatchHeader(c, 24, &fp, 8);
-                   }), false});
-  cases.push_back({"other KV kind", with([&](auto& c) {
-                     std::uint32_t k;
-                     std::memcpy(&k, c.data() + 32, 4);
-                     k ^= 1;
-                     PatchHeader(c, 32, &k, 4);
-                   }), false});
-  cases.push_back({"wrong position (well-formed header)", with([&](auto& c) {
-                     std::uint32_t p;
-                     std::memcpy(&p, c.data() + 40, 4);
-                     p += 1;
-                     PatchHeader(c, 40, &p, 4);
-                   }), false});
-  cases.push_back({"version", with([&](auto& c) {
-                     std::uint32_t v = 2;
-                     PatchHeader(c, 8, &v, 4);
-                   }), false});
+  for (int fmt : {1, 2}) {
+    const auto bytes = ReadFile(fmt == 1 ? good1 : good);
+    ASSERT_GT(bytes.size(), 8192u);
+    std::uint32_t header_bytes;
+    std::memcpy(&header_bytes, bytes.data() + 12, 4);
+    const E::SpillProtection prot = fmt == 1 ? Prot1() : Prot();
+    const auto with = [&](auto f) {
+      auto c = bytes;
+      f(c);
+      return c;
+    };
+    const auto add = [&](std::string what, std::vector<std::uint8_t> file, bool payload, E::SpillProtection p) {
+      cases.push_back({"v" + std::to_string(fmt) + " " + what, std::move(file), payload, p});
+    };
+    const auto flip = [&](std::string what, std::size_t at, std::uint8_t bit, bool payload) {
+      add(std::move(what), with([&](auto& c) { c[at] ^= bit; }), payload, prot);
+    };
+    add("truncated by one piece", with([&](auto& c) { c.resize(c.size() - 4096); }), false, prot);
+    add("truncated to the header", with([&](auto& c) { c.resize(header_bytes); }), false, prot);
+    add("empty", {}, false, prot);
+    add("extended", with([&](auto& c) { c.resize(c.size() + 4096, 0); }), false, prot);
+    flip("magic", 0, 1, false);
+    flip("header bit flip (position)", 40, 1, false);
+    // A field nothing else validates (draft-block blocks, no draft block in this file): only the header checksum
+    // (v1) or the authentication (v2).
+    flip("header bit flip (unused field)", 60, 1, false);
+    flip("payload bit flip (first piece)", header_bytes + 5, 0x40, true);
+    flip("payload bit flip (last piece)", bytes.size() - 4096 - 100, 1, true);
+    add("version", with([&](auto& c) {
+          std::uint32_t v = 3;
+          std::memcpy(c.data() + 8, &v, 4);
+          if (fmt == 1) PatchHeader(c, 8, &v, 4);
+        }), false, prot);
+    if (fmt == 1) {
+      flip("meta bit flip (a task's checksum)", 200, 0x10, false);
+      add("another model", with([&](auto& c) {
+            std::uint64_t fp;
+            std::memcpy(&fp, c.data() + 16, 8);
+            fp ^= 1;
+            PatchHeader(c, 16, &fp, 8);
+          }), false, prot);
+      add("other numerics options", with([&](auto& c) {
+            std::uint64_t fp;
+            std::memcpy(&fp, c.data() + 24, 8);
+            fp += 1;
+            PatchHeader(c, 24, &fp, 8);
+          }), false, prot);
+      add("other KV kind", with([&](auto& c) {
+            std::uint32_t k;
+            std::memcpy(&k, c.data() + 32, 4);
+            k ^= 1;
+            PatchHeader(c, 32, &k, 4);
+          }), false, prot);
+      add("wrong position (well-formed header)", with([&](auto& c) {
+            std::uint32_t p;
+            std::memcpy(&p, c.data() + 40, 4);
+            p += 1;
+            PatchHeader(c, 40, &p, 4);
+          }), false, prot);
+      add("plaintext v1 without accept_v1", bytes, false, E::SpillProtection{&TestKek(), false});
+    } else {
+      flip("header bit flip (model fingerprint)", 17, 4, false);
+      flip("header bit flip (salt)", 90, 1, false);
+      flip("header bit flip (reserved, authenticated)", 300, 0x80, false);
+      flip("key id", 110, 1, false);
+      flip("wrap nonce", sc::kWrapNonceOff + 3, 1, false);
+      flip("wrapped data key", sc::kWrappedDekOff + 7, 1, false);
+      flip("wrap tag", sc::kWrapTagOff + 15, 0x80, false);
+      flip("meta tag", sc::kMetaTagOff, 1, false);
+      flip("meta ciphertext (block counts)", sc::kHeaderBytes + 1, 1, false);
+      flip("meta ciphertext (a task's tag)", sc::kHeaderBytes + 200, 0x10, false);
+      add("no key", bytes, false, E::SpillProtection{nullptr, true});
+      add("wrong epoch", bytes, false, E::SpillProtection{&other_epoch, false});
+      add("wrong session", bytes, false, E::SpillProtection{&other_session, false});
+      add("wrong key under the right id", bytes, false, E::SpillProtection{&same_id_other_key, false});
+      add("another master", bytes, false, E::SpillProtection{&other_master, false});
+      for (int i = 0; i < 4; ++i) add(idents[i], ident_files[static_cast<std::size_t>(i)], false, prot);
+    }
+  }
   for (const auto& c : cases) {
     WriteFile(bad, c.file);
     bool reset = false;
     std::string why;
-    ASSERT_FALSE(gpu->RestoreSession(bad, nullptr, nullptr, &why, &reset)) << c.what << ": restored";
+    ASSERT_FALSE(gpu->RestoreSession(bad, c.prot, nullptr, nullptr, &why, &reset)) << c.what << ": restored";
     EXPECT_FALSE(why.empty()) << c.what;
     ASSERT_EQ(reset, c.payload) << c.what << ": " << why;
     if (!c.payload) {
-      unchanged(std::string(c.what) + " (" + why + ")");
+      unchanged(c.what + " (" + why + ")");
     } else {
       // Reset: equal to a new session; re-prefill b and catch the oracle up (the oracle stepped `step` tokens).
       ASSERT_EQ(gpu->Position(), 0u) << c.what;
       ASSERT_TRUE(gpu->Prefill(b, {}, &error)) << error;
       for (int j = 0; j < step; ++j) ASSERT_TRUE(gpu->Step(11 + j, {}, &error)) << error;
-      unchanged(std::string(c.what) + " then re-prefilled");
+      unchanged(c.what + " then re-prefilled");
     }
   }
-  // Engines of other options refuse the good file: fp16-only KV, a precision option, a smaller max context.
-  {
+  // Engines of other options refuse the good files: fp16-only KV, a precision option, a smaller max context.
+  for (const auto& [file, prot] : {std::pair{good, Prot()}, std::pair{good1, Prot1()}}) {
     E::kv_f16_only_ = true;
     auto other = E::Create(*dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
     E::kv_f16_only_ = false;
     ASSERT_TRUE(other) << error;
-    EXPECT_FALSE(other->RestoreSession(good, nullptr, nullptr, &error)) << "fp16-only engine took a default-KV file";
+    EXPECT_FALSE(other->RestoreSession(file, prot, nullptr, nullptr, &error)) << "fp16-only engine took a default-KV file";
     E::prefill_shexp_w8a8_ = !E::prefill_shexp_w8a8_;
-    EXPECT_FALSE(gpu->RestoreSession(good, nullptr, nullptr, &error)) << "restored under another precision option";
+    EXPECT_FALSE(gpu->RestoreSession(file, prot, nullptr, nullptr, &error)) << "restored under another precision option";
     E::prefill_shexp_w8a8_ = !E::prefill_shexp_w8a8_;
     unchanged("refused under another option");
     auto small_ctx = E::Create(*dev, *s->weights, s->ngram.get(), nullptr, 128, &error);
     ASSERT_TRUE(small_ctx) << error;
-    EXPECT_FALSE(small_ctx->RestoreSession(good, nullptr, nullptr, &error)) << "position past max_context restored";
+    EXPECT_FALSE(small_ctx->RestoreSession(file, prot, nullptr, nullptr, &error)) << "position past max_context restored";
   }
-  // The good file still restores exactly.
-  ASSERT_TRUE(gpu->RestoreSession(good, nullptr, nullptr, &error)) << error;
+  // The good files still restore exactly (v1 only with accept_v1).
   auto ref = E::Create(*dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
   ASSERT_TRUE(ref && ref->Prefill(a, {}, &error)) << error;
-  std::vector<float> got(V), want(V);
-  ASSERT_TRUE(gpu->Step(3, got, &error) && ref->Step(3, want, &error)) << error;
-  ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0);
+  std::vector<float> want(V);
+  ASSERT_TRUE(ref->Step(3, want, &error)) << error;
+  for (const auto& [file, prot] : {std::pair{good, Prot()}, std::pair{good1, Prot1()}}) {
+    ASSERT_TRUE(gpu->RestoreSession(file, prot, nullptr, nullptr, &error)) << error;
+    std::vector<float> got(V);
+    ASSERT_TRUE(gpu->Step(3, got, &error)) << error;
+    ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0) << file;
+  }
   std::filesystem::remove(good);
+  std::filesystem::remove(good1);
   std::filesystem::remove(bad);
+}
+
+// What a v2 file reveals: checked from outside with the test's own reading of the format (docs/SESSIONS.md 10).
+//   - every payload piece and the meta open under nonce = salt || be32(index) (the format, not PieceNonce);
+//   - no AES-CTR keystream block is used twice: within a file (its pieces, its meta) or across two files of the same
+//     state (each file has its own data key), so no two ciphertexts can be xored into the plaintexts' xor;
+//   - the data key, the KEK and the master are nowhere in the file; neither are the caller's blob (the tokens)
+//     nor the plaintext v1 magic.
+// A fresh session spilled at position 0 with 16 KB pieces has thousands of all-zero pieces (equal plaintexts).
+TEST(Spill, EncryptedFilesNeverReuseANonceOrHoldKeys) {
+  Small* s = LoadSmall();
+  if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  std::string error;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &error);
+  if (!dev) GTEST_SKIP() << "no HIP device";
+  Statics guard;
+  E::spill_piece_bytes_ = 16u << 10;
+  auto gpu = E::Create(*dev, *s->weights, s->ngram.get(), nullptr, 256, &error);
+  ASSERT_TRUE(gpu) << error;
+  std::vector<std::uint8_t> blob(4096);
+  for (std::size_t i = 0; i < blob.size(); ++i) blob[i] = static_cast<std::uint8_t>("halo-spill-secret-tokens"[i % 24]);
+  std::set<std::array<std::uint8_t, 16>> keystream;  // the first keystream block of every sealed part, all files
+  std::size_t parts = 0;
+  for (int file_no = 0; file_no < 2; ++file_no) {
+    const std::string path = SpillDir() + "/nonce" + std::to_string(file_no) + ".spill";
+    ASSERT_TRUE(gpu->SpillSession(path, Prot(), blob, nullptr, &error)) << error;
+    const auto f = ReadFile(path);
+    ASSERT_GE(f.size(), sc::kHeaderBytes);
+    std::span<const std::uint8_t, sc::kHeaderBytes> head(f.data(), sc::kHeaderBytes);
+    sc::SecretBytes dek;
+    ASSERT_TRUE(sc::UnwrapDek(TestKek(), head, &dek));
+    const auto aad = head.first(sc::kAadBytes);
+    std::uint8_t salt[8];
+    std::memcpy(salt, f.data() + 88, 8);
+    const auto nonce = [&](std::uint32_t i) {
+      std::array<std::uint8_t, 12> n{};
+      std::memcpy(n.data(), salt, 8);
+      for (int k = 0; k < 4; ++k) n[8 + k] = static_cast<std::uint8_t>(i >> (24 - 8 * k));
+      return n;
+    };
+    const auto first_block_keystream = [&](const std::uint8_t* ct, const std::uint8_t* pt) {
+      std::array<std::uint8_t, 16> ks{};
+      for (int k = 0; k < 16; ++k) ks[static_cast<std::size_t>(k)] = ct[k] ^ pt[k];
+      return ks;
+    };
+    // Meta.
+    std::uint32_t meta_bytes, n_tasks, num_layers, ngram_n;
+    std::memcpy(&meta_bytes, f.data() + 80, 4);
+    std::memcpy(&n_tasks, f.data() + 48, 4);
+    std::memcpy(&num_layers, f.data() + 44, 4);
+    std::memcpy(&ngram_n, f.data() + 64, 4);
+    std::vector<std::uint8_t> meta(f.begin() + sc::kHeaderBytes, f.begin() + sc::kHeaderBytes + meta_bytes);
+    sc::Gcm gcm;
+    ASSERT_TRUE(gcm.Open(dek.span(), nonce(0xffffffffu), aad, meta.data(), meta.size(),
+                         std::span<const std::uint8_t, 16>(f.data() + sc::kMetaTagOff, 16)))
+        << "the meta does not open under salt || 0xffffffff";
+    ASSERT_TRUE(keystream.insert(first_block_keystream(f.data() + sc::kHeaderBytes, meta.data())).second);
+    ++parts;
+    ASSERT_GT(n_tasks, 100u);
+    const std::size_t tasks_at = std::size_t{num_layers} * 4 + std::size_t{ngram_n} * 4;
+    ASSERT_EQ(std::memcmp(meta.data() + tasks_at + std::size_t{n_tasks} * 40, blob.data(), blob.size()), 0);
+    std::size_t zero_pieces = 0;
+    for (std::uint32_t t = 0; t < n_tasks; ++t) {
+      std::uint64_t off, bytes;
+      std::memcpy(&off, meta.data() + tasks_at + t * 40, 8);
+      std::memcpy(&bytes, meta.data() + tasks_at + t * 40 + 8, 8);
+      ASSERT_LE(off + bytes, f.size());
+      std::vector<std::uint8_t> piece(f.begin() + static_cast<std::ptrdiff_t>(off),
+                                      f.begin() + static_cast<std::ptrdiff_t>(off + bytes));
+      ASSERT_TRUE(gcm.Open(dek.span(), nonce(t), aad, piece.data(), piece.size(),
+                           std::span<const std::uint8_t, 16>(meta.data() + tasks_at + t * 40 + 24, 16)))
+          << "piece " << t << " does not open under salt || be32(" << t << ")";
+      zero_pieces += std::all_of(piece.begin(), piece.end(), [](std::uint8_t x) { return x == 0; });
+      ASSERT_TRUE(keystream.insert(first_block_keystream(f.data() + off, piece.data())).second)
+          << "keystream reused (file " << file_no << ", piece " << t << ")";
+      ++parts;
+    }
+    EXPECT_GT(zero_pieces, 2u) << "the test needs equal plaintexts (all-zero pieces) to mean anything";
+    // Secrets and plaintext markers are nowhere in the file.
+    const auto contains = [&](std::span<const std::uint8_t> needle) {
+      return std::search(f.begin(), f.end(), needle.begin(), needle.end()) != f.end();
+    };
+    EXPECT_FALSE(contains(dek.span())) << "the data key is in the file in the clear";
+    EXPECT_FALSE(contains(TestKek().key.span())) << "the KEK is in the file";
+    EXPECT_FALSE(contains(TestMaster().span())) << "the master key is in the file";
+    EXPECT_FALSE(contains(std::span<const std::uint8_t>(blob.data(), 24))) << "the blob is in the file in the clear";
+    EXPECT_FALSE(contains(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>("HALOSPL1"), 8)));
+    std::filesystem::remove(path);
+  }
+  EXPECT_EQ(keystream.size(), parts);
 }
 
 // A crash mid-write (fault 1: half the payload written, no rename; fault 2: written and synced, no rename) leaves
@@ -429,10 +601,10 @@ TEST(Spill, CrashMidWriteLeavesTheOldFileOrNone) {
     for (bool had_old : {false, true}) {
       std::filesystem::remove(path);
       ASSERT_TRUE(gpu->Reset(&error) && gpu->Prefill(a, {}, &error)) << error;
-      if (had_old) ASSERT_TRUE(gpu->SpillSession(path, {}, nullptr, &error)) << error;
+      if (had_old) ASSERT_TRUE(gpu->SpillSession(path, Prot(), {}, nullptr, &error)) << error;
       ASSERT_TRUE(gpu->Prefill(more, {}, &error)) << error;
       E::spill_fault_ = fault;
-      EXPECT_FALSE(gpu->SpillSession(path, {}, nullptr, &error));
+      EXPECT_FALSE(gpu->SpillSession(path, Prot(), {}, nullptr, &error));
       E::spill_fault_ = 0;
       std::size_t temps = 0;
       for (const auto& e : std::filesystem::directory_iterator(dir))
@@ -442,7 +614,7 @@ TEST(Spill, CrashMidWriteLeavesTheOldFileOrNone) {
       if (had_old) {  // the old file is whole: it restores the old state exactly
         auto fresh = E::Create(*dev, *s->weights, s->ngram.get(), nullptr, 256, &error);
         auto ref = E::Create(*dev, *s->weights, s->ngram.get(), nullptr, 256, &error);
-        ASSERT_TRUE(fresh && ref && fresh->RestoreSession(path, nullptr, nullptr, &error)) << error;
+        ASSERT_TRUE(fresh && ref && fresh->RestoreSession(path, Prot(), nullptr, nullptr, &error)) << error;
         ASSERT_TRUE(ref->Prefill(a, {}, &error)) << error;
         std::vector<float> got(V), want(V);
         ASSERT_TRUE(fresh->Step(1, got, &error) && ref->Step(1, want, &error)) << error;
@@ -550,7 +722,7 @@ TEST(Spill, SuspendResumeEvictCrashMachine) {
           if (!l.live) break;
           ASSERT_TRUE(gpu->BindSession(*l.live, &error)) << error;
           E::spill_fault_ = r == kCrash ? tc.draw(gs::integers<int>({.min_value = 1, .max_value = 2})) : 0;
-          const bool ok = gpu->SpillSession(file(li), EncodeOps(l.ops), nullptr, &error);
+          const bool ok = gpu->SpillSession(file(li), Prot(), EncodeOps(l.ops), nullptr, &error);
           E::spill_fault_ = 0;
           ASSERT_EQ(ok, r == kSuspend) << error;
           if (ok) l.on_disk = l.ops, l.damaged = false;  // done: the file holds exactly this state
@@ -568,7 +740,7 @@ TEST(Spill, SuspendResumeEvictCrashMachine) {
           std::vector<std::uint8_t> blob;
           bool reset = false;
           const bool exists = std::filesystem::exists(file(li));
-          const bool restored = exists && gpu->RestoreSession(file(li), &blob, nullptr, &error, &reset);
+          const bool restored = exists && gpu->RestoreSession(file(li), Prot(), &blob, nullptr, &error, &reset);
           // A whole, undamaged file of the last done spill always restores (no needless re-prefill).
           ASSERT_TRUE(restored || !exists || l.damaged) << "an intact spill file was refused: " << error;
           if (restored) {
@@ -655,7 +827,7 @@ TEST(MtpSpec, SpillRestoreKeepsDraftHistoryOnRealModel) {
     }
     ASSERT_TRUE(gpu->Reset(&error) && gpu->MtpTrack(true, &error) && gpu->Prefill(head, {}, &error)) << error;
     E::SpillInfo si;
-    ASSERT_TRUE(gpu->SpillSession(file, {}, &si, &error)) << error;
+    ASSERT_TRUE(gpu->SpillSession(file, Prot(), {}, &si, &error)) << error;
     ASSERT_TRUE(si.mtp) << "the tracked session's draft history was not spilled";
     const auto run = [&](std::vector<std::int32_t>* toks, std::uint32_t* drafted, std::uint32_t* accepted) {
       std::int32_t tk = 1234;
@@ -678,7 +850,7 @@ TEST(MtpSpec, SpillRestoreKeepsDraftHistoryOnRealModel) {
                 gpu->Prefill(std::vector<std::int32_t>(n + 50, 42), {}, &error))
         << error;
     E::SpillInfo ri;
-    ASSERT_TRUE(gpu->RestoreSession(file, nullptr, &ri, &error)) << error;
+    ASSERT_TRUE(gpu->RestoreSession(file, Prot(), nullptr, &ri, &error)) << error;
     ASSERT_TRUE(ri.mtp);
     run(&b, &db, &ab);
     EXPECT_GT(da, 0u) << "no drafting at all: the test would not see the draft history";

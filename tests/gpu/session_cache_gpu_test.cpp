@@ -34,6 +34,7 @@
 #include "model/weights.hpp"
 #include "rt/device.hpp"
 #include "server/flash_next_generator.hpp"
+#include "server/spill_keys.hpp"
 #include "text/tokenizer.hpp"
 
 namespace gs = hegel::generators;
@@ -322,12 +323,17 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
   auto eb = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
   ASSERT_TRUE(ea && eb) << e;
   const auto V = static_cast<std::int32_t>(m->weights->config.vocab_size);
-  std::size_t restored = 0, restore_failed = 0, spilled = 0, reused = 0, corrupted = 0;
+  std::size_t restored = 0, restore_failed = 0, spilled = 0, reused = 0, corrupted = 0, rotations = 0;
   hegel::test([&](hegel::TestCase& tc) {
     server::SessionCacheOptions exact{.mode = server::SessionCacheOptions::Mode::kExact, .align = kAlign,
                                       .max_retained = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 2}))};
     exact.spill_dir = dir;
     exact.spill_on_evict = true;
+    // Encrypted spills (v2) under a master provider; admin 4 rotates its epoch (crypto-shredding).
+    core::crypt::SecretBytes master(32);
+    ASSERT_TRUE(core::crypt::RandomBytes({master.data(), 32}));
+    server::MasterSpillKeys keys("test", std::move(master), 1);
+    exact.spill_keys = &keys;
     exact.max_spilled = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 6}));
     server::FlashNextGenerator a(*ea, std::vector<text::TokenId>{}, kCtx, exact);
     server::FlashNextGenerator b(*eb, std::vector<text::TokenId>{}, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
@@ -365,9 +371,18 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
         ASSERT_EQ(oa, ob);
       }
       // Admin between turns.
-      const int admin = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 3}));
+      const int admin = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 4}));
       a.WithCache([&](server::SessionCache& c) {
         std::string why;
+        // Every file in the spill directory is encrypted (v2) (checked before this turn's bit flips; a file
+        // flipped earlier has been restored-and-refused or still holds a flip outside the magic's byte).
+        for (const auto& f : std::filesystem::directory_iterator(dir)) {
+          const std::string name = f.path().filename().string();
+          if (damaged.contains(std::strtoull(name.c_str() + name.find('-') + 1, nullptr, 10))) continue;
+          char magic[8] = {};
+          std::ifstream(f.path(), std::ios::binary).read(magic, 8);
+          EXPECT_EQ(std::string(magic, 8), "HALOSPL2") << f.path();
+        }
         for (const auto& en : c.List()) {
           if (admin == 1 && !en.spilled) EXPECT_TRUE(c.Spill(en.key, &why)) << why;
           if (admin == 2 && en.spilled) {
@@ -389,6 +404,14 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
             const std::string name = f.path().filename().string();  // s<pid>-<key>.spill
             damaged.insert(std::strtoull(name.c_str() + name.find('-') + 1, nullptr, 10));
           }
+        if (admin == 4) {  // a new epoch: every spilled entry is unreadable, erased, its file deleted
+          std::size_t had = 0;
+          for (const auto& en : c.List()) had += en.spilled;
+          EXPECT_TRUE(keys.Rotate(&why));
+          EXPECT_EQ(c.DropUnreadable(), had);
+          for (const auto& en : c.List()) EXPECT_FALSE(en.spilled);
+          ++rotations;
+        }
         return true;
       });
       std::vector<std::int32_t> next(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(stable));
@@ -407,9 +430,149 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
     spilled += k.spilled;
   }, {.test_cases = 40, .phases = {hegel::Phase::Explicit, hegel::Phase::Reuse, hegel::Phase::Generate}});
   std::filesystem::remove_all(dir);
-  std::printf("spill cache: %zu spilled, %zu restored, %zu restores failed (%zu bit flips), %zu prompt tokens reused\n",
-              spilled, restored, restore_failed, corrupted, reused);
+  std::printf("spill cache: %zu spilled, %zu restored, %zu restores failed (%zu bit flips, %zu rotations), %zu prompt "
+              "tokens reused\n", spilled, restored, restore_failed, corrupted, rotations, reused);
   EXPECT_GT(restored, 5u) << "spilled states were hardly ever restored: the comparison is close to vacuous";
+}
+
+namespace {
+// A provider whose seal and open keys can be withheld (a yard session without a registered key, a failing TPM).
+struct GateKeys final : server::SpillKeys {
+  explicit GateKeys(server::MasterSpillKeys& k) : inner(k) {}
+  server::MasterSpillKeys& inner;
+  bool seal = true, open = true;
+  std::string Describe() const override { return "gate:" + inner.Describe(); }
+  bool Key(std::string_view session, Use use, core::crypt::Kek* out, std::string* why) override {
+    if ((use == Use::kSeal && !seal) || (use == Use::kOpen && !open)) return *why = "key withheld", false;
+    return inner.Key(session, use, out, why);
+  }
+};
+std::size_t FilesIn(const std::string& dir) {
+  std::size_t n = 0;
+  std::error_code ec;
+  for (const auto& f : std::filesystem::directory_iterator(dir, ec)) n += f.is_regular_file();
+  return n;
+}
+}  // namespace
+
+// Spill keys in the cache (docs/SESSIONS.md section 10): a provider without a key refuses the spill and nothing is
+// written (never a plaintext fallback; eviction then drops); no provider refuses unless plaintext was chosen; a
+// plaintext v1 file restores only with spill_accept_v1; an entry whose open key is withheld stays spilled and
+// untouched until the key is there; a rotated epoch makes spilled files unreadable (DropUnreadable erases them and
+// the next request re-prefills, still equal to a cold engine's tokens).
+TEST(SessionCache, SpillKeysRefuseKeepAndShred) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  const char* d = std::getenv("HALO_SPILL_TEST_DIR");
+  const std::string dir = (d && *d ? std::filesystem::path(d) : std::filesystem::temp_directory_path() / "halo-spill-test") /
+                          ("keys-" + std::to_string(::getpid()));
+  constexpr std::uint32_t kCtx = 1024;
+  std::string e;
+  auto ea = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  auto eb = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(ea && eb) << e;
+  core::crypt::SecretBytes master(32);
+  ASSERT_TRUE(core::crypt::RandomBytes({master.data(), 32}));
+  server::MasterSpillKeys master_keys("test", std::move(master), 1);
+  GateKeys gate(master_keys);
+  std::vector<std::int32_t> prompt(200);
+  for (std::size_t i = 0; i < prompt.size(); ++i) prompt[i] = static_cast<std::int32_t>((i * 7919 + 3) % 1000);
+  const auto collect = [](std::vector<std::int32_t>* out) {
+    return [out](text::TokenId t) { return out->push_back(static_cast<std::int32_t>(t)), true; };
+  };
+  server::FlashNextGenerator cold(*eb, std::vector<text::TokenId>{}, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
+  server::TextGenerator::Params p;
+  p.max_tokens = 4;
+  std::vector<std::int32_t> want;
+  ASSERT_TRUE(cold.GenerateIds(prompt, 190, p, collect(&want)).error.empty());
+  // One request parks a checkpoint (at 128: align 64); returns its key.
+  const auto run = [&](server::FlashNextGenerator& g, std::size_t* reused = nullptr) {
+    std::vector<std::int32_t> got;
+    const auto r = g.GenerateIds(prompt, 190, p, collect(&got));
+    EXPECT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(got, want) << "tokens differ from a cold engine's";
+    if (reused) *reused = r.cached_tokens;
+  };
+  const auto first_key = [](server::SessionCache& c) {
+    const auto l = c.List();
+    return l.empty() ? 0 : l.front().key;
+  };
+  for (int mode = 0; mode < 5; ++mode) {
+    std::filesystem::remove_all(dir);
+    server::SessionCacheOptions o{.mode = server::SessionCacheOptions::Mode::kExact, .align = 64, .max_retained = 4};
+    o.spill_dir = dir;
+    gate.seal = gate.open = true;
+    if (mode == 0) o.spill_keys = &gate;            // provider withholds the seal key
+    if (mode == 1) o.spill_keys = nullptr;          // no provider, plaintext not allowed
+    if (mode == 2 || mode == 3) o.spill_plaintext_ok = true, o.spill_accept_v1 = mode == 3;  // plaintext v1
+    if (mode == 4) o.spill_keys = &gate;            // encrypted; open key withheld, then granted, then rotated
+    server::FlashNextGenerator g(*ea, std::vector<text::TokenId>{}, kCtx, o);
+    run(g);
+    g.WithCache([&](server::SessionCache& c) {
+      const auto key = first_key(c);
+      EXPECT_NE(key, 0u);
+      std::string why;
+      bool kept = false;
+      if (mode == 0) {
+        gate.seal = false;
+        EXPECT_FALSE(c.Spill(key, &why)) << "spilled without a key";
+        EXPECT_EQ(FilesIn(dir), 0u) << "a file was written without a key (plaintext fallback?)";
+        EXPECT_EQ(c.spill_counters().no_key, 1u);
+        EXPECT_FALSE(c.List().front().spilled);
+      } else if (mode == 1) {
+        EXPECT_FALSE(c.Spill(key, &why));
+        EXPECT_EQ(FilesIn(dir), 0u);
+      } else if (mode == 2 || mode == 3) {
+        EXPECT_TRUE(c.Spill(key, &why)) << why;
+        EXPECT_EQ(c.List().front().key_id, "");
+        EXPECT_EQ(c.Restore(key, &why), mode == 3) << why;  // v1 only with accept_v1; refused: entry erased
+        EXPECT_EQ(c.List().size(), mode == 3 ? 1u : 0u);
+      } else {
+        EXPECT_TRUE(c.Spill(key, &why)) << why;
+        EXPECT_NE(c.List().front().key_id, "");
+        gate.open = false;
+        EXPECT_FALSE(c.Restore(key, &why, &kept));
+        EXPECT_TRUE(kept) << "an entry waiting for its key was dropped";
+        EXPECT_TRUE(c.List().front().spilled);
+        EXPECT_EQ(FilesIn(dir), 1u);
+        EXPECT_EQ(c.DropUnreadable(), 0u) << "a withheld key is not a rotated one";
+        gate.open = true;
+        EXPECT_TRUE(c.Restore(key, &why, &kept)) << why;
+        EXPECT_TRUE(c.Spill(key, &why)) << why;
+        EXPECT_TRUE(master_keys.Rotate(&why));
+        EXPECT_FALSE(c.Restore(key, &why, &kept)) << "a file of the previous epoch restored";
+        EXPECT_FALSE(kept);
+        EXPECT_EQ(c.List().size(), 0u);
+        EXPECT_EQ(FilesIn(dir), 0u);
+      }
+      return true;
+    });
+    // Whatever happened, the next request's tokens equal a cold engine's.
+    std::size_t reused = 0;
+    run(g, &reused);
+    if (mode == 3) EXPECT_GT(reused, 0u) << "the restored v1 entry was not reused";
+  }
+  // Eviction with a provider that has no key: the entry is dropped, nothing is written.
+  {
+    std::filesystem::remove_all(dir);
+    server::SessionCacheOptions o{.mode = server::SessionCacheOptions::Mode::kExact, .align = 64, .max_retained = 1};
+    o.spill_dir = dir;
+    o.spill_on_evict = true;
+    o.spill_keys = &gate;
+    gate.seal = false;
+    server::FlashNextGenerator g(*ea, std::vector<text::TokenId>{}, kCtx, o);
+    run(g);
+    std::vector<std::int32_t> other(100, 5), got;
+    server::TextGenerator::Params q;
+    q.max_tokens = 2;
+    ASSERT_TRUE(g.GenerateIds(other, 99, q, collect(&got)).error.empty());
+    EXPECT_EQ(FilesIn(dir), 0u) << "eviction wrote a file without a key";
+    g.WithCache([&](server::SessionCache& c) {
+      EXPECT_GE(c.spill_counters().no_key, 1u);
+      return true;
+    });
+  }
+  std::filesystem::remove_all(dir);
 }
 
 namespace {

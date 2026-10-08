@@ -34,8 +34,12 @@ add_library(halo_core STATIC
   src/core/lowbit.cpp
   src/core/json.cpp
   src/core/sampling.cpp
+  src/core/spill_crypt.cpp
 )
 target_include_directories(halo_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Spill file encryption (docs/SESSIONS.md section 10): libcrypto from the pinned nixpkgs (flake.nix).
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+target_link_libraries(halo_core PUBLIC OpenSSL::Crypto)
 
 # --- text: Unicode, NFC, tokenizer, chat template, output parser -------------
 add_library(halo_text STATIC
@@ -56,6 +60,7 @@ add_library(halo_server STATIC
   src/server/systemone_service.cpp
   src/server/metrics.cpp
   src/server/kv_choice.cpp
+  src/server/spill_keys.cpp
 )
 target_link_libraries(halo_server PUBLIC Threads::Threads)
 target_link_libraries(halo_server PUBLIC halo_core halo_text halo_decide)
@@ -230,6 +235,11 @@ if(HALO_BUILD_TESTS)
     tests/server/kv_choice_test.cpp
     tests/server/decode_loop_test.cpp)
   target_link_libraries(server_tests PRIVATE halo_server)
+  # Spill encryption (CPU): primitives, key providers, yard key registration.
+  halo_test(crypt_tests
+    tests/core/spill_crypt_test.cpp
+    tests/server/spill_keys_test.cpp)
+  target_link_libraries(crypt_tests PRIVATE halo_server)
   halo_test(decide_tests
     tests/decide/systemone_test.cpp
     tests/decide/decider_test.cpp)

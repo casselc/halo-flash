@@ -1487,8 +1487,8 @@ why = "default KV: the fp16 copy the chunked prefill reads is taken as current a
 [[mutant]]
 name = "spill-no-payload-checksum"
 file = "src/engine/session_spill.cpp"
-find = '        if (Crc32c(buf, k.bytes) != k.crc)'
-replace = '        if (false)'
+find = '        } else if (Crc32c(buf, k.bytes) != k.crc) {'
+replace = '        } else if (false) {'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "Spill.RefusesDamagedTruncatedAndMismatchedFiles"
@@ -1497,8 +1497,8 @@ why = "payload pieces are not checked: a flipped bit is restored into the sessio
 [[mutant]]
 name = "spill-no-header-checksum"
 file = "src/engine/session_spill.cpp"
-find = '  if (Crc32c(&h, sizeof(h)) != want) return Fail(error, "spill file header checksum mismatch");'
-replace = '  (void)want;'
+find = '    if (Crc32c(&h, sizeof(h)) != want) return Fail(error, "spill file header checksum mismatch");'
+replace = '    (void)want;'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "Spill.RefusesDamagedTruncatedAndMismatchedFiles"
@@ -1537,12 +1537,121 @@ why = "the draft block's K rows are not spilled: after a restore it drafts from 
 [[mutant]]
 name = "cache-uses-unrestored-entry"
 file = "src/server/session_cache.cpp"
-find = '      if (!Restore(key, &why)) again = true;'
-replace = '      if (!Restore(key, &why)) again = false;'
+find = '      if (!Restore(key, &why, &kept)) {'
+replace = '      if (!Restore(key, &why, &kept) && false) {'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "SessionCache.SpilledStatesServeByteIdenticalToColdPrefill"
 why = "a spilled entry whose restore failed (damaged file) is used anyway instead of re-prefilling its tokens"
+
+# ---- SE: spill encryption, format v2 (src/core/spill_crypt.cpp, session_spill.cpp, session_cache.cpp) ----------
+# Each crypto defect twice where it matters: the CPU unit (crypt_tests, seconds) and the black-box GPU test that
+# reads real spill files with the format's own rules (no shared code with the writer for nonces and secrets).
+
+[[mutant]]
+name = "crypt-nonce-constant"
+file = "src/core/spill_crypt.cpp"
+find = '  const std::uint32_t be = __builtin_bswap32(index);  // big-endian index'
+replace = '  const std::uint32_t be = 0 * index;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "SpillCrypt.PieceNoncesAreSaltIndexAndNeverRepeat"
+timeout = 300
+why = "every piece and the meta of a file share one GCM nonce under one DEK: keystream reuse (xor of two ciphertexts = xor of plaintexts) and forgeable tags; round trips still pass"
+
+[[mutant]]
+name = "spill-nonce-constant"
+file = "src/core/spill_crypt.cpp"
+find = '  const std::uint32_t be = __builtin_bswap32(index);  // big-endian index'
+replace = '  const std::uint32_t be = 0 * index;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Spill.EncryptedFilesNeverReuseANonceOrHoldKeys"
+why = "as crypt-nonce-constant, seen from the files: pieces do not open under salt || be32(index), keystream blocks repeat"
+
+[[mutant]]
+name = "crypt-header-not-aad"
+file = "src/core/spill_crypt.cpp"
+find = '  return header.first(kAadBytes);'
+replace = '  return header.first(0);'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "SpillCrypt.DekWrapAuthenticatesTheHeaderAndHidesTheKey"
+timeout = 300
+why = "the header is not authenticated (empty AAD for the wrap, the meta and the pieces): identity, sizes and the salt can be changed undetected"
+
+[[mutant]]
+name = "spill-header-not-aad"
+file = "src/core/spill_crypt.cpp"
+find = '  return header.first(kAadBytes);'
+replace = '  return header.first(0);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Spill.RefusesDamagedTruncatedAndMismatchedFiles"
+why = "as crypt-header-not-aad, end to end: a flipped header field nothing else validates is restored"
+
+[[mutant]]
+name = "crypt-tag-unchecked"
+file = "src/core/spill_crypt.cpp"
+find = '  return EVP_DecryptFinal_ex(c, nullptr, &len) == 1;'
+replace = '  return EVP_DecryptFinal_ex(c, nullptr, &len) == 1 || true;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "SpillCrypt.GcmRefusesEveryChangedBit"
+timeout = 300
+why = "GCM decrypts but the tag is not checked: changed ciphertext, AAD, nonce or key is accepted"
+
+[[mutant]]
+name = "spill-tag-unchecked"
+file = "src/core/spill_crypt.cpp"
+find = '  return EVP_DecryptFinal_ex(c, nullptr, &len) == 1;'
+replace = '  return EVP_DecryptFinal_ex(c, nullptr, &len) == 1 || true;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Spill.RefusesDamagedTruncatedAndMismatchedFiles"
+why = "as crypt-tag-unchecked, end to end: a flipped payload bit, a wrong key or a damaged meta is restored into the session"
+
+[[mutant]]
+name = "crypt-dek-in-clear"
+file = "src/core/spill_crypt.cpp"
+find = '  std::memcpy(wrapped, dek.data(), kKeyBytes);'
+replace = '  std::memcpy(wrapped, dek.data(), kKeyBytes); std::memcpy(header.data() + 244, dek.data(), kKeyBytes);'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "SpillCrypt.DekWrapAuthenticatesTheHeaderAndHidesTheKey"
+timeout = 300
+why = "the data key is also written unwrapped (into the reserved header bytes): anyone with the file decrypts it; round trips still pass"
+
+[[mutant]]
+name = "spill-dek-in-clear"
+file = "src/core/spill_crypt.cpp"
+find = '  std::memcpy(wrapped, dek.data(), kKeyBytes);'
+replace = '  std::memcpy(wrapped, dek.data(), kKeyBytes); std::memcpy(header.data() + 244, dek.data(), kKeyBytes);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Spill.EncryptedFilesNeverReuseANonceOrHoldKeys"
+why = "as crypt-dek-in-clear, found by searching real files for the data key"
+
+[[mutant]]
+name = "crypt-kek-ignores-epoch"
+file = "src/core/spill_crypt.cpp"
+find = '  for (int s = 56; s >= 0; s -= 8) info.push_back(static_cast<std::uint8_t>(epoch >> s));'
+replace = '  (void)epoch;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "SpillCrypt.KekSeparatesSessionsEpochsAndMasters"
+timeout = 300
+why = "the KEK does not depend on the epoch: a rotation (or a yard epoch bump) no longer crypto-shreds; only the key id would still refuse"
+
+[[mutant]]
+name = "cache-plaintext-on-key-error"
+file = "src/server/session_cache.cpp"
+find = '    if (!opt_.spill_keys->Key(label, SpillKeys::Use::kSeal, &kek, error)) {  // no key, no spill: never plaintext'
+replace = '    if (!opt_.spill_keys->Key(label, SpillKeys::Use::kSeal, &kek, error) && (prot.kek = nullptr, false)) {'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.SpillKeysRefuseKeepAndShred"
+why = "when the provider has no key the spill falls back to a plaintext v1 file instead of being refused"
 
 # ---- MTP in the server (src/server/decode_loop.cpp, flash_next_generator.cpp; docs/MTP.md) -------------------
 
