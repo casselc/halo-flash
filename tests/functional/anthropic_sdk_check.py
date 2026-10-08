@@ -74,9 +74,13 @@ def main():
         assert final.usage.output_tokens > 0
         return repr(text.strip())
 
+    # The session cache keeps checkpoints at multiples of 64 prompt tokens (exact mode): a conversation shorter
+    # than that has nothing to reuse, so this one starts with a longer system prompt.
+    system = "You are a careful arithmetic assistant. " * 12
+
     def thinking_round_trip():
         msgs = [{"role": "user", "content": "What is 17 * 3? Answer with the number."}]
-        with client.messages.stream(model=MODEL, max_tokens=2048, thinking={"type": "adaptive"},
+        with client.messages.stream(model=MODEL, max_tokens=2048, thinking={"type": "adaptive"}, system=system,
                                     output_config={"effort": "low"}, messages=msgs) as s:
             first = s.get_final_message()
         kinds = [b.type for b in first.content]
@@ -86,7 +90,7 @@ def main():
         # Send the thinking block back (display omitted on the second turn: its text comes from the signature).
         msgs += [{"role": "assistant", "content": first.content},
                  {"role": "user", "content": "And 51 + 1? Answer with the number."}]
-        second = client.messages.create(model=MODEL, max_tokens=2048, messages=msgs,
+        second = client.messages.create(model=MODEL, max_tokens=2048, messages=msgs, system=system,
                                         thinking={"type": "adaptive", "display": "omitted"},
                                         output_config={"effort": "low"})
         thinking = [b for b in second.content if b.type == "thinking"]

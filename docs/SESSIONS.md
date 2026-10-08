@@ -640,3 +640,14 @@ mapped VM memory reads zeros; map returns before the mapping is visible to GPU w
 open) and ROCm/legacy-rocm-build#6692 (reusing a VA after hipMemUnmap corrupts live VMM buffers). Our gfx1151 data
 (writes land in the released page; ~60-100 us suffice) is drafted as a comment for #11693 in
 /data/halo-work/platform/upstream/rocm-vmm-remap-gfx1151.md, not posted.
+
+## 12. What a request added to the cache (stream G2, 2026-10-07; docs/ANTHROPIC.md)
+
+Reuse semantics are unchanged. The Anthropic routes report the cache in the API's usage fields, so
+`TextGenerator::Result` gained `cache_write_tokens` beside `cached_tokens`: after `SessionCache::Finish`,
+`RetainedPrefix(prompt)` (the longest prefix of the prompt a retained state, resident or spilled, holds whole: a
+checkpoint whose tokens are a prefix of the prompt, or a finished fast-mode session that extends it) minus the
+tokens the request reused. Exact mode: the checkpoint parked at the generation prompt's start, rounded down to 64,
+minus the reuse (0 when the prompt is shorter than 64 tokens or eviction dropped the checkpoint); fast mode: the
+whole prompt. `cache_control` breakpoints do not steer it. Tested by `FlashNextGenerator.CacheUsageCountsWhatIs
+ReusedAndWhatIsRetained` (mutant `anth-cache-write-is-prefilled`).
