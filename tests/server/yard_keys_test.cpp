@@ -21,6 +21,7 @@
 #include <string>
 #include <thread>
 
+#include "core/poison_flag.hpp"
 #include "server/state_file.hpp"
 #include "server/yard_keys.hpp"
 #include "yard_test_util.hpp"
@@ -1224,4 +1225,82 @@ TEST(YardKeys, ExpiredThenCancelledStaysCancelled) {
   const auto a = f.y->Register("sess-1", late);
   EXPECT_EQ(a.status, 409) << a.body;
   EXPECT_TRUE(Has(a, "cancelled")) << a.body;
+}
+
+// ---- round 6 ----
+
+
+// The poison flag is set by one thread (a failed restore) and polled by another (halo_serve's main loop) without a
+// lock: an atomic with release / acquire (run under ThreadSanitizer in build/cpu-tsan).
+TEST(PoisonFlag, SetAndPolledConcurrently) {
+  halo::core::PoisonFlag flag;
+  int published = 0;  // what the setter did before setting: visible to a reader that sees the flag
+  std::atomic<bool> saw{false};
+  std::thread poller([&] {
+    for (int i = 0; i < 2000 && !saw; ++i) {
+      if (flag.Get()) {
+        EXPECT_EQ(published, 42);
+        saw = true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  published = 42;
+  flag.Set();
+  poller.join();
+  EXPECT_TRUE(saw) << "the poller never saw the poison";
+}
+
+// One identity predicate everywhere: a distinct op B with the same key and epoch while A is live is a new, recorded
+// operation (never a silent duplicate of A); a revoke then cancels both, and delayed tokens of either are refused. An
+// id-less retry of A is A (deduplicated by key) and does not relabel it.
+TEST(YardKeys, DistinctOpsWithOneKeyAreBothTracked) {
+  Fixture f;
+  const std::string k = Key32(63);
+  std::string a1 = SealBody(f.signer, 2, k, "op-a"), a_late = SealBody(f.signer, 2, k, "op-a");
+  std::string b1 = SealBody(f.signer, 2, k, "op-b"), b_late = SealBody(f.signer, 2, k, "op-b");
+  std::string a_noid = SealBody(f.signer, 2, k, "");
+  ASSERT_EQ(f.y->Register("sess-1", a1).status, 200);
+  auto r = f.y->Register("sess-1", a_noid);
+  ASSERT_EQ(r.status, 200);
+  EXPECT_TRUE(Has(r, "\"duplicate\":true")) << "an id-less retry of op-a is op-a: " << r.body;
+  r = f.y->Register("sess-1", b1);
+  ASSERT_EQ(r.status, 200) << r.body;
+  EXPECT_TRUE(Has(r, "\"duplicate\":false")) << "op-b was taken for a duplicate of op-a (untracked): " << r.body;
+  ASSERT_EQ(f.Reg("revoke", 2, "").status, 200);  // nothing spilled: no fence, both operations cancelled
+  r = f.y->Register("sess-1", a_late);
+  EXPECT_EQ(r.status, 409) << r.body;
+  EXPECT_TRUE(Has(r, "cancelled")) << r.body;
+  r = f.y->Register("sess-1", b_late);
+  EXPECT_EQ(r.status, 409) << r.body;
+  EXPECT_TRUE(Has(r, "cancelled")) << "op-b was never recorded, so its delayed token re-armed: " << r.body;
+}
+
+// Operation history is kept (a non-secret tombstone) for as long as its guarantees must hold, however many other
+// operations come and go; a full table refuses new operations instead of evicting history.
+TEST(YardKeys, OperationTombstonesOutliveOtherTraffic) {
+  Fixture f(nullptr, false, 2);
+  std::string x1 = SealBody(f.signer, 3, Key32(64), "op-x"), x2 = SealBody(f.signer, 3, Key32(64), "op-x");
+  ASSERT_EQ(f.y->Register("sess-1", x1).status, 200);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+  (void)f.y->Sweep();
+  for (int i = 0; i < 40; ++i) {
+    std::string o = SealBody(f.signer, 3, Key32(static_cast<std::uint8_t>(150 + i)), "other-" + std::to_string(i), 100 + i);
+    ASSERT_EQ(f.y->Register("sess-1", o).status, 200);
+  }
+  const auto a = f.y->Register("sess-1", x2);
+  EXPECT_EQ(a.status, 409) << "op-x's TTL history was evicted by other traffic: " << a.body;
+  EXPECT_TRUE(Has(a, "new op id")) << a.body;
+  Fixture g;
+  g.o.max_ops_per_session = 3;
+  g.Restart();
+  for (int i = 0; i < 3; ++i) {
+    std::string b0 = SealBody(g.signer, 1, Key32(static_cast<std::uint8_t>(200 + i)), "o" + std::to_string(i), 1 + i);
+    ASSERT_EQ(g.y->Register("sess-1", b0).status, 200);
+  }
+  std::string full = SealBody(g.signer, 1, Key32(210), "o9", 9);
+  const auto b = g.y->Register("sess-1", full);
+  EXPECT_EQ(b.status, 409) << "a full tombstone table evicted history instead of refusing: " << b.body;
+  EXPECT_TRUE(Has(b, "too many")) << b.body;
 }

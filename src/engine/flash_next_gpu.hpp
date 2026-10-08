@@ -10,6 +10,7 @@
 // needs no host round trip except the n-gram rows and the final logits.
 
 #include <array>
+#include "core/poison_flag.hpp"
 #include <atomic>
 #include <functional>
 #include <chrono>
@@ -342,7 +343,7 @@ class FlashNextGpu {
   [[nodiscard]] bool HasSession(SessionId id) const noexcept;
   /// True after a failure that left the device in a state the engine cannot vouch for (a failed restore whose
   /// cleanup synchronize failed): every session, step, prefill, spill and restore call is refused from then on.
-  [[nodiscard]] bool poisoned() const noexcept { return poisoned_; }
+  [[nodiscard]] bool poisoned() const noexcept { return poisoned_.Get(); }  ///< any thread (atomic)
   /// Sessions that hold device memory (tests: a poisoned engine releases none of them).
   [[nodiscard]] std::size_t LiveSessions() const noexcept {
     std::size_t n = 0;
@@ -524,7 +525,7 @@ class FlashNextGpu {
   [[nodiscard]] bool RouteTrace(std::vector<std::uint32_t>* ids, std::string* error);
 
  private:
-  bool poisoned_ = false;
+  core::PoisonFlag poisoned_;  // atomic: set by a restore, read by every call and by halo_serve's poll
   static bool PoisonedFail(std::string* error) {
     if (error) *error = "engine poisoned (an earlier device failure left its state unverifiable): restart";
     return false;

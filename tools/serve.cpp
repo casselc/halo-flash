@@ -353,6 +353,9 @@ int main(int argc, char** argv) {
     return std::fprintf(stderr, "usage: halo_serve --model <gguf> | --qwen35-model <gguf> --qwen35-tokenizer <gguf> [options]\n"), 2;
   if (cache.spill_dir.empty()) cache.spill_dir = "/data/halo-work/spill";  // SR4 default: not /tmp (docs/SESSIONS.md 10)
   if (!mtp_model.empty() && model.empty()) return std::fprintf(stderr, "--mtp-model needs --model (Flash-Next)\n"), 2;
+  // Test hook (the poison integration test): every failed restore's cleanup synchronize "fails".
+  if (const char* f = std::getenv("HALO_TEST_RESTORE_SYNC_FAULT"); f && std::string(f) == "1")
+    engine::FlashNextGpu::restore_sync_fault_ = true;
   std::string error;
   // Spill encryption keys: loaded before the cache exists and destroyed after it (masters zeroed on exit).
   // The spill directory holds the spill files and the key state (master epoch, yard epochs): created 0700 here,
@@ -633,6 +636,11 @@ int main(int argc, char** argv) {
 #endif
   http.Stop();
   if (admin) admin->Stop();
+  // The generator (its session cache) uses the engine: it goes first. It is declared before the engine, so scope exit
+  // alone would destroy the engine under it (a use-after-free at every shutdown, which a poisoned engine's quarantine
+  // turned into a crash).
+  admin.reset();
+  generator.reset();
 #if HALO_WITH_SCOPE
   if (scope) {
     halo_scope_flush(scope);

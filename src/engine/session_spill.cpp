@@ -790,7 +790,7 @@ bool FlashNextGpu::RestoreSession(const std::string& path, const SpillProtection
     // write of this restore lands after it returns. If that cannot be established (the synchronize fails), queued
     // writes may still land in storage a reset would reuse: the engine poisons itself and refuses all further use.
     if (restore_sync_fault_ || !dev_.Synchronize(&e2)) {
-      poisoned_ = true;
+      poisoned_.Set();
       std::fprintf(stderr, "engine: POISONED: device synchronize failed while cleaning up a failed restore (%s)\n",
                    e2.c_str());
       if (reset) *reset = false;

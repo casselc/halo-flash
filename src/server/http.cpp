@@ -291,11 +291,11 @@ bool HttpServer::StartUnix(std::string* error) {
     // Live, stale, or unknown: a bounded non-blocking connect. Only a refusal (nobody listens: ECONNREFUSED) or the
     // path vanishing (ENOENT) proves it stale; a connect, a full backlog (EAGAIN), a timeout or any other error
     // fails closed (the start is refused, nothing is unlinked).
-    const int probe = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (probe < 0) return *error = "cannot probe " + path + ": " + std::strerror(errno), false;
     sockaddr_un pa{};
     pa.sun_family = AF_UNIX;
     if (path.size() >= sizeof pa.sun_path) return *error = "unix socket path too long: " + path, false;  // also above
+    const int probe = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (probe < 0) return *error = "cannot probe " + path + ": " + std::strerror(errno), false;
     std::memcpy(pa.sun_path, path.c_str(), path.size() + 1);
     int rc = ::connect(probe, reinterpret_cast<sockaddr*>(&pa), sizeof pa);
     int err = rc == 0 ? 0 : errno;

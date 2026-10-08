@@ -491,7 +491,13 @@ format halo_serve writes unless the operator asks for plaintext**.
   destructor's early return leaves the members to their own destructors: buffers and graphs are plain handles
   (static_assert), and the KV pages and sessions, whose destructors would release pages, are leaked on purpose
   (round 5, tested with a page-release probe). halo_serve does not recover in the same device context: it notices the
-  poison, stops serving and exits with status 3 for its supervisor to restart it.
+  poison, stops serving and exits with status 3 for its supervisor to restart it. The flag is an atomic
+  (`core::PoisonFlag`, release / acquire), written by the restore and polled by the main loop without a lock (round 6;
+  ThreadSanitizer test). Integration: `streams/SE/s6.txt` (a real-model halo_serve with
+  `HALO_TEST_RESTORE_SYNC_FAULT=1` exits 3 after a failed restore). That test also found a shutdown-order bug from
+before SE: halo_serve's generator (its session cache) was destroyed after the engine it uses (a use-after-free at
+every shutdown, harmless by luck until the poisoned engine's quarantine left null sessions); halo_serve now destroys
+the generator first.
 - **Spill outcomes.** `SpillInfo::published` tells "nothing published" (the path is what it was) from "published but
   the directory fsync failed" (durability unknown). The cache reports the latter to the key provider as
   `Outcome::kUncertain`: the key counts as used (never handed back for another file), and the file is removed.
@@ -627,9 +633,13 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
   fresh per checkpoint). An op id never names two operations (another key or epoch: 409).
   - **Cancelled stays cancelled.** A revoke that cancels an unused operation (registered, or expired unused) without
     fencing a file marks it revoked; any later token of that operation (a delayed one minted before the revoke) is
-    refused (409 "cancelled"). Revoked records are kept at least 330 s after the cancel (the longest a pre-cancel
-    token can still arrive: 300 s lifetime + 30 s skew), whatever else the session does; the "last 32" retention
-    applies only to the other records. A new checkpoint at the same epoch (new op id and key) is allowed.
+    refused (409 "cancelled"). Round 6: one identity predicate serves lookup, live-slot deduplication, recording and
+    cancellation (two distinct op ids with the same key and epoch are two tracked operations; an id-less retry of an
+    id-bearing operation is that operation and never relabels it). Every operation leaves a non-secret tombstone (op
+    id, use, epoch, key hash, first-registration cap, state) kept at least 330 s (300 s token lifetime + 30 s skew)
+    past both its last use and its first registration + TTL, whatever else the session does; while it lives,
+    cancelled and consumed are final. At most 1024 tombstones a session: a full table refuses new operations (409,
+    retry later) instead of evicting history. A new checkpoint at the same epoch (new op id and key) is allowed.
   - **Expired, never used.** An operation whose key expired unused may be registered again with a fresh token while
     its first registration + TTL lasts (its slot died with a token, not the operation); after that it is over (409:
     register a new operation, a new op id). A revoked or consumed operation is never registered again.

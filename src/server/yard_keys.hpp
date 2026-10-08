@@ -108,6 +108,7 @@ class YardSpillKeys final : public SpillKeys {
     bool sweeper = true;            ///< a thread that zeroes expired keys (tests may sweep by hand)
     std::string incarnation;        ///< this server incarnation's id: 32 hex digits (empty: 128 random bits)
     std::size_t max_sessions = 4096;  ///< persisted sessions (the state file is rewritten whole: bounded)
+    std::size_t max_ops_per_session = 1024;  ///< operation tombstones; a full table refuses new operations (409)
     std::function<void()> clock_gap_for_test;  ///< test seam: runs between the steady and the wall clock samples
   };
   struct Answer {
@@ -187,7 +188,7 @@ class YardSpillKeys final : public SpillKeys {
   struct Session {
     Epochs e;
     std::optional<Slot> seal, open;
-    std::vector<OpRecord> ops;  // the last 32, and every revoked one until its keep_until
+    std::vector<OpRecord> ops;  // tombstones, each until its keep_until (bounded: max_ops_per_session)
   };
   bool LoadState(std::string* error);
   /// Publishes the state with `cand` as `name`'s epochs (under mu_). kDurable: memory takes `cand`. kUnpublished:
@@ -200,6 +201,9 @@ class YardSpillKeys final : public SpillKeys {
   OpRecord* FindOp(Session& s, Use use, std::uint64_t epoch, const std::array<std::uint8_t, 32>& h,
                    const std::string& op);
   std::size_t SweepLocked(Clock::time_point now);
+  static bool SameOperation(const std::string& a_op, std::uint64_t a_epoch, const std::array<std::uint8_t, 32>& a_h,
+                            const std::string& b_op, std::uint64_t b_epoch, const std::array<std::uint8_t, 32>& b_h);
+  void PruneOps(Session& s, Clock::time_point now);  // tombstones past their keep_until
   /// The steady anchor, then the wall clock (ms; `fixed_now` seconds if non-zero).
   Clock::time_point SampleClocks(std::int64_t fixed_now, std::int64_t* wall_ms) const;
   std::shared_ptr<const Jwks> Keys() const;

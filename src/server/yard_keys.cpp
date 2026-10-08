@@ -479,15 +479,23 @@ YardSpillKeys::OpRecord* YardSpillKeys::FindOp(Session& s, Use use, std::uint64_
                                                const std::array<std::uint8_t, 32>& h, const std::string& op) {
   // With op ids on both sides the op id decides (a new op id is a newly authorized operation, even with the same key:
   // a reopen of the same file); otherwise (use, epoch, key hash) does.
-  for (auto& r : s.ops) {
-    if (r.use != use) continue;
-    if (!op.empty() && !r.op.empty()) {
-      if (r.op == op) return &r;
-    } else if (r.epoch == epoch && crypt::Equal(r.key_hash, h)) {
-      return &r;
-    }
-  }
+  for (auto& r : s.ops)
+    if (r.use == use && SameOperation(r.op, r.epoch, r.key_hash, op, epoch, h)) return &r;
   return nullptr;
+}
+
+void YardSpillKeys::PruneOps(Session& s, Clock::time_point now) {
+  std::erase_if(s.ops, [&](const OpRecord& x) { return now >= x.keep_until; });
+}
+
+bool YardSpillKeys::SameOperation(const std::string& a_op, std::uint64_t a_epoch, const std::array<std::uint8_t, 32>& a_h,
+                                  const std::string& b_op, std::uint64_t b_epoch,
+                                  const std::array<std::uint8_t, 32>& b_h) {
+  // The one identity predicate (lookup, live-slot dedup, recording, cancellation): op ids decide when both sides
+  // have one; otherwise (epoch, key hash). An id-less retry of an id-bearing operation matches it by key and never
+  // relabels it (Record only fills an op id that was empty).
+  if (!a_op.empty() && !b_op.empty()) return a_op == b_op;
+  return a_epoch == b_epoch && crypt::Equal(a_h, b_h);
 }
 
 YardSpillKeys::OpRecord* YardSpillKeys::Record(Session& s, Use use, std::uint64_t epoch,
@@ -499,23 +507,14 @@ YardSpillKeys::OpRecord* YardSpillKeys::Record(Session& s, Use use, std::uint64_
     s.ops.push_back({use, epoch, h, entry, op, st, now + std::chrono::seconds(o_.key_ttl_s), {}});
     r = &s.ops.back();
   }
-  // A cancellation never weakens into anything else while its replay window is open.
-  if (r->state != OpState::kRevoked || now >= r->keep_until) r->state = st;
+  // Revoked and consumed are final: nothing weakens them while the record (the tombstone) lives.
+  if (r->state != OpState::kRevoked && r->state != OpState::kConsumed) r->state = st;
   r->entry = entry;
-  if (!op.empty()) r->op = op;
-  if (st == OpState::kRevoked) r->keep_until = now + kCancelKeep;
-  // Retention: revoked records until their keep_until; of the others, the newest 32.
-  std::erase_if(s.ops, [&](const OpRecord& x) { return x.state == OpState::kRevoked && now >= x.keep_until; });
-  std::size_t others = 0;
-  for (const auto& x : s.ops) others += x.state != OpState::kRevoked;
-  for (auto it = s.ops.begin(); others > 32 && it != s.ops.end();)
-    if (it->state != OpState::kRevoked && &*it != r) {
-      it = s.ops.erase(it);
-      --others;
-    } else {
-      ++it;
-    }
-  return FindOp(s, use, epoch, h, op);  // the vector may have moved
+  if (r->op.empty() && !op.empty()) r->op = op;  // label an id-less record once; never relabel
+  // A tombstone lives until no token minted while the operation could still be authorized can arrive: past both now
+  // and its first registration + TTL, by the longest token lifetime + skew.
+  r->keep_until = std::max({r->keep_until, now + kCancelKeep, r->cap + kCancelKeep});
+  return r;
 }
 
 void YardSpillKeys::ZeroSlot(Session& s, std::optional<Slot>& slot, OpState why) {
@@ -527,6 +526,7 @@ void YardSpillKeys::ZeroSlot(Session& s, std::optional<Slot>& slot, OpState why)
 
 std::size_t YardSpillKeys::SweepLocked(Clock::time_point now) {
   std::size_t n = 0;
+  for (auto& [name, s] : sessions_) PruneOps(s, now);
   for (auto& [name, s] : sessions_)
     for (auto* slot : {&s.seal, &s.open})
       if (*slot && !(*slot)->reserved && now >= (*slot)->deadline) {
@@ -757,7 +757,7 @@ YardSpillKeys::Answer YardSpillKeys::Register(std::string_view session, std::str
         if ((r.state == OpState::kRegistered || r.state == OpState::kExpired) &&
             hit(r.epoch, r.use == Use::kSeal ? r.epoch : r.epoch - 1)) {
           r.state = OpState::kRevoked;  // cancelled: no token of this operation registers again (Register)
-          r.keep_until = Clock::now() + kCancelKeep;
+          r.keep_until = std::max(r.keep_until, Clock::now() + kCancelKeep);
         }
     }
     const bool dup = !zeroed && cand.fence == s.e.fence && cand.high == s.e.high;
@@ -790,11 +790,16 @@ YardSpillKeys::Answer YardSpillKeys::Register(std::string_view session, std::str
   if (E < s.e.high) return answer(409, "stale epoch " + std::to_string(E) + " (session at " + std::to_string(s.e.high) + ")");
   // One-shot: the same registration again reports what happened to it (a consumed key is never re-armed).
   OpRecord* known = FindOp(s, u, E, key_hash, op);
+  // Backpressure, never eviction: a session whose tombstone table is full takes no new operation until old ones age
+  // out (their guarantees would otherwise be lost).
+  if (!known && s.ops.size() >= o_.max_ops_per_session)
+    return answer(409, "too many recent operations in this session (" + std::to_string(o_.max_ops_per_session) +
+                           "): retry later");
   if (known && (known->epoch != E || !crypt::Equal(known->key_hash, key_hash) || (!op.empty() && !known->op.empty() && known->op != op)))
     return answer(409, "operation id " + op + " already names another operation (key or epoch)");
   // A cancelled operation stays cancelled: a delayed token minted before the revoke never re-installs its key (a new
   // checkpoint at the same epoch has a new key and op id, and is allowed).
-  if (known && known->state == OpState::kRevoked && tnow < known->keep_until)
+  if (known && known->state == OpState::kRevoked)
     return answer(409, std::string(use) + " operation at epoch " + std::to_string(E) + " was cancelled by a revoke");
   // An expired, never-used operation may be registered again with a fresh token while its first registration + TTL
   // lasts; after that it is over: yard registers a new operation (a new op id) instead.
@@ -810,8 +815,8 @@ YardSpillKeys::Answer YardSpillKeys::Register(std::string_view session, std::str
   const bool used = u == Use::kSeal ? E <= s.e.last_spill : E <= s.e.last_restore;
   // The live slot of this very operation (constant-time comparison of the whole key, not its name). A used epoch
   // only answers "in use" while its own lease runs; otherwise the used check below refuses it.
-  if (slot && slot->epoch == E && crypt::Equal(slot->key.span(), key.span()) && slot->entry == entry &&
-      (!used || slot->reserved)) {
+  if (slot && SameOperation(slot->op, slot->epoch, slot->key_hash, op, E, key_hash) && slot->epoch == E &&
+      crypt::Equal(slot->key.span(), key.span()) && slot->entry == entry && (!used || slot->reserved)) {
     // A retry with a newer token: never past the first registration + TTL.
     slot->deadline = std::min(std::max(slot->deadline, deadline), slot->cap);
     seen_jti_[jti] = exp;

@@ -2310,17 +2310,6 @@ timeout = 300
 why = "fresh-token retries keep a key alive past its first registration + TTL"
 
 [[mutant]]
-name = "r3-key-name-equality"
-file = "src/server/yard_keys.cpp"
-find = '  if (slot && slot->epoch == E && crypt::Equal(slot->key.span(), key.span()) && slot->entry == entry &&'
-replace = '  if (slot && slot->epoch == E && slot->name == name && slot->entry == entry &&'
-suite = "cpu"
-binary = "crypt_tests"
-filter = "YardKeys.KeyNamesNeverDecideEquality"
-timeout = 300
-why = "two keys with the same 64-bit name are taken for one registration (the second is dropped)"
-
-[[mutant]]
 name = "r3-gcm-ctx-not-reset"
 file = "src/core/spill_crypt.cpp"
 find = '  (void)EVP_CIPHER_CTX_reset(c);  // no key schedule outlives the call'
@@ -2533,24 +2522,13 @@ why = "the cache cleanup releases a poisoned session whose device writes may sti
 [[mutant]]
 name = "r5-cancelled-reinstalled"
 file = "src/server/yard_keys.cpp"
-find = '  if (known && known->state == OpState::kRevoked && tnow < known->keep_until)'
+find = '  if (known && known->state == OpState::kRevoked)'
 replace = '  if (false)'
 suite = "cpu"
 binary = "crypt_tests"
 filter = "YardKeys.CancelledOperationsStayCancelled"
 timeout = 600
 why = "a delayed pre-cancel token re-installs the key of a cancelled operation"
-
-[[mutant]]
-name = "r5-cancel-evicted"
-file = "src/server/yard_keys.cpp"
-find = '    if (it->state != OpState::kRevoked && &*it != r) {'
-replace = '    if (&*it != r) {'
-suite = "cpu"
-binary = "crypt_tests"
-filter = "YardKeys.CancelledOperationsStayCancelled"
-timeout = 600
-why = "the last-32 retention evicts a cancellation whose tokens can still arrive"
 
 [[mutant]]
 name = "r5-expired-not-cancelled"
@@ -2673,6 +2651,63 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "SessionCache.PoisonedRestoreQuarantinesItsMemory"
 why = "a poisoned engine destructor releases KV pages through the member destructors"
+
+# ---- SE round 6: atomic poison flag, one operation identity, tombstones ------------------------------------
+
+[[mutant]]
+name = "r6-poison-flag-plain"
+file = "src/core/poison_flag.hpp"
+find = '  std::atomic<bool> v_{false};'
+replace = '  struct Plain { bool b = false; void store(bool x, std::memory_order) noexcept { b = x; } bool load(std::memory_order) const noexcept { return b; } } v_;'
+suite = "cpu-tsan"
+binary = "crypt_tests"
+filter = "PoisonFlag.SetAndPolledConcurrently"
+timeout = 600
+why = "the poison flag is a plain bool: a data race between the restore thread and the main-loop poll"
+
+[[mutant]]
+name = "r6-dedup-ignores-op"
+file = "src/server/yard_keys.cpp"
+find = '  if (slot && SameOperation(slot->op, slot->epoch, slot->key_hash, op, E, key_hash) && slot->epoch == E &&'
+replace = '  if (slot && slot->epoch == E &&'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.DistinctOpsWithOneKeyAreBothTracked"
+timeout = 600
+why = "a distinct op with the same key is a silent duplicate: untracked, its delayed token re-arms after a revoke"
+
+[[mutant]]
+name = "r6-tombstone-evicted"
+file = "src/server/yard_keys.cpp"
+find = '  std::erase_if(s.ops, [&](const OpRecord& x) { return now >= x.keep_until; });'
+replace = '  std::erase_if(s.ops, [&](const OpRecord& x) { return now >= x.keep_until || x.state == OpState::kExpired; });'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.OperationTombstonesOutliveOtherTraffic"
+timeout = 600
+why = "an expired operation loses its history early: a fresh token starts a new TTL"
+
+[[mutant]]
+name = "r6-tombstone-short"
+file = "src/server/yard_keys.cpp"
+find = '  r->keep_until = std::max({r->keep_until, now + kCancelKeep, r->cap + kCancelKeep});'
+replace = '  r->keep_until = std::max(r->keep_until, now);'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.OperationTombstonesOutliveOtherTraffic"
+timeout = 600
+why = "tombstones live only until the next sweep"
+
+[[mutant]]
+name = "r6-backpressure-off"
+file = "src/server/yard_keys.cpp"
+find = '  if (!known && s.ops.size() >= o_.max_ops_per_session)'
+replace = '  if (false)'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.OperationTombstonesOutliveOtherTraffic"
+timeout = 600
+why = "a full tombstone table takes new operations (history would have to be evicted)"
 
 # ---- MTP in the server (src/server/decode_loop.cpp, flash_next_generator.cpp; docs/MTP.md) -------------------
 
