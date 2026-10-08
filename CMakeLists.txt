@@ -61,6 +61,7 @@ add_library(halo_server STATIC
   src/server/metrics.cpp
   src/server/kv_choice.cpp
   src/server/spill_keys.cpp
+  src/server/yard_keys.cpp
 )
 target_link_libraries(halo_server PUBLIC Threads::Threads)
 target_link_libraries(halo_server PUBLIC halo_core halo_text halo_decide)
@@ -238,7 +239,8 @@ if(HALO_BUILD_TESTS)
   # Spill encryption (CPU): primitives, key providers, yard key registration.
   halo_test(crypt_tests
     tests/core/spill_crypt_test.cpp
-    tests/server/spill_keys_test.cpp)
+    tests/server/spill_keys_test.cpp
+    tests/server/yard_keys_test.cpp)
   target_link_libraries(crypt_tests PRIVATE halo_server)
   halo_test(decide_tests
     tests/decide/systemone_test.cpp

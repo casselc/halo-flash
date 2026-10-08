@@ -65,6 +65,7 @@
 #include "server/openai_service.hpp"
 #include "server/qwen35_generator.hpp"
 #include "server/spill_keys.hpp"
+#include "server/yard_keys.hpp"
 #include "server/systemone_service.hpp"
 #include "text/tokenizer.hpp"
 #if HALO_WITH_SCOPE
@@ -112,7 +113,7 @@ static std::string JsonSafe(const std::string& s) {
 // SR4 admin routes over the session cache (docs/SESSIONS.md section 10): list retained states, spill one to the
 // spill directory, restore one. Each runs between generations (the generation lock).
 static void RegisterSpillRoutes(halo::server::HttpServer& http, halo::server::FlashNextGenerator& g,
-                                halo::server::SpillKeys* keys) {
+                                halo::server::SpillKeys* keys, halo::server::YardSpillKeys* yard) {
   using halo::server::HttpRequest;
   using halo::server::HttpResponse;
   using halo::server::SessionCache;
@@ -144,13 +145,32 @@ static void RegisterSpillRoutes(halo::server::HttpServer& http, halo::server::Fl
     const unsigned long long key = std::strtoull(rest.c_str(), &end, 10);
     if (slash == std::string::npos || end != rest.c_str() + slash || (op != "spill" && op != "restore"))
       return HttpResponse::Json(404, "{\"error\":\"POST /admin/sessions/{key}/spill or /restore\"}");
+    // ?session=<yard session>: the entry's key label (its file is sealed with that session's registered key).
+    std::string session;
+    if (r.query.rfind("session=", 0) == 0) session = r.query.substr(8);
+    if (!session.empty() && !halo::server::YardSpillKeys::ValidSession(session))
+      return HttpResponse::Json(400, "{\"error\":\"session must match [A-Za-z0-9._-]{1,128}\"}");
     std::string why;
-    const bool ok = g.WithCache([&](SessionCache& c) { return op == "spill" ? c.Spill(key, &why) : c.Restore(key, &why); });
+    const bool ok = g.WithCache([&](SessionCache& c) { return op == "spill" ? c.Spill(key, &why, session) : c.Restore(key, &why); });
     std::string esc;
     for (char ch : why) esc += ch == '"' || ch == '\\' ? std::string("\\") + ch : std::string(1, ch);
     return ok ? HttpResponse::Json(200, "{\"ok\":true}")
               : HttpResponse::Json(409, "{\"ok\":false,\"error\":\"" + esc + "\"}");
   });
+  // Spill encryption, phase B: yard-ctl registers per-session keys (docs/SESSIONS.md section 10, "The key route").
+  if (yard) {
+    http.Route("GET", "/admin/keys", [yard](const HttpRequest&) { return HttpResponse::Json(200, yard->ListJson()); });
+    http.RoutePrefix("POST", "/admin/keys/", [&g, yard](const HttpRequest& r) {
+      const std::string session = r.path.substr(std::string_view("/admin/keys/").size());
+      auto a = yard->Register(session, r.body);
+      std::size_t dropped = 0;
+      if (a.status == 200)
+        for (const auto& s : yard->TakeRevoked())
+          g.WithCache([&](SessionCache& c) { return dropped += c.DropSpilledOf(s), true; });
+      if (dropped) a.body.insert(a.body.size() - 1, ",\"dropped\":" + std::to_string(dropped));
+      return HttpResponse::Json(a.status, a.body);
+    });
+  }
   // Spill encryption, phase A: a new key epoch for the master provider. Files sealed before are unreadable from
   // now on (crypto-shredding); their entries are erased and the files deleted.
   http.Route("POST", "/admin/spill/rotate", [&g, keys](const HttpRequest&) {
@@ -185,6 +205,8 @@ int main(int argc, char** argv) {
   server::SpecOptions spec;           // --mtp-window / --mtp-depth
   std::string spill_key = "none";     // --spill-key (server/spill_keys.hpp)
   std::uint64_t spill_epoch = 1;      // --spill-epoch
+  server::YardSpillKeys::Options yard_opt;  // --yard-* (phase B)
+  bool yard_fallback_master = false;  // --spill-yard-fallback
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--help" || a == "-h") {
@@ -210,6 +232,10 @@ int main(int argc, char** argv) {
           "  --spill-plaintext-ok 0|1  with no --spill-key, write plaintext v1 files (default 0)\n"
           "  --spill-accept-v1 0|1 restore plaintext v1 files (default 0)\n"
           "  --spill-epoch N       first key epoch of the master provider (default 1)\n"
+          "  --yard-jwks PATH      phase B: yard-ctl registers per-session keys (POST /admin/keys/{session}, RS256 JWT\n"
+          "                        verified against this JWKS file); --yard-issuer ISS --yard-audience AUD (halo_serve)\n"
+          "                        --yard-key-ttl S (600) --spill-yard-fallback master|refuse (default refuse: a session\n"
+          "                        without a registered key is not spilled; master: sealed under --spill-key)\n"
           "  --mtp-model SIDECAR [--mtp-vocab IDS] [--mtp-window W (128)] [--mtp-depth N (4)]\n"
           "                        MTP speculative decoding (off without --mtp-model)\n"
           "  --ngram-cache-gb G --moe-topk N --decider-dir DIR --decider-device hip|hrx|cpu --variant MANIFEST\n"
@@ -253,6 +279,14 @@ int main(int argc, char** argv) {
     else if (a == "--spill-plaintext-ok") cache.spill_plaintext_ok = v == "1";
     else if (a == "--spill-accept-v1") cache.spill_accept_v1 = v == "1";
     else if (a == "--spill-epoch") spill_epoch = std::strtoull(v.c_str(), nullptr, 10);
+    else if (a == "--yard-jwks") yard_opt.jwks_path = v;
+    else if (a == "--yard-issuer") yard_opt.issuer = v;
+    else if (a == "--yard-audience") yard_opt.audience = v;
+    else if (a == "--yard-key-ttl") yard_opt.key_ttl_s = std::strtoll(v.c_str(), nullptr, 10);
+    else if (a == "--spill-yard-fallback") {
+      if (v != "master" && v != "refuse") return std::fprintf(stderr, "--spill-yard-fallback must be master or refuse\n"), 2;
+      yard_fallback_master = v == "master";
+    }
     else if (a == "--model-id") model_id = v;
     else if (a == "--mtp-model") mtp_model = v;
     else if (a == "--mtp-vocab") mtp_vocab = v;
@@ -284,7 +318,17 @@ int main(int argc, char** argv) {
   if (!server::MakeSpillKeys(spill_key, spill_epoch, &spill_keys, &error))
     return std::fprintf(stderr, "--spill-key %s: %s\n", spill_key.c_str(), error.c_str()), 1;
   cache.spill_keys = spill_keys.get();
-  if (spill_keys) std::fprintf(stderr, "spill: encrypted (v2), key %s\n", spill_keys->Describe().c_str());
+  std::unique_ptr<server::YardSpillKeys> yard_keys;
+  if (!yard_opt.jwks_path.empty()) {
+    if (yard_fallback_master && !spill_keys)
+      return std::fprintf(stderr, "--spill-yard-fallback master needs --spill-key tpm|file:PATH\n"), 2;
+    if (yard_opt.issuer.empty()) return std::fprintf(stderr, "--yard-jwks needs --yard-issuer\n"), 2;
+    yard_opt.fallback = yard_fallback_master ? spill_keys.get() : nullptr;
+    yard_keys = std::make_unique<server::YardSpillKeys>(yard_opt);
+    if (!yard_keys->LoadJwks(&error)) return std::fprintf(stderr, "--yard-jwks: %s\n", error.c_str()), 1;
+    cache.spill_keys = yard_keys.get();
+    std::fprintf(stderr, "spill: encrypted (v2), keys %s\n", yard_keys->Describe().c_str());
+  } else if (spill_keys) std::fprintf(stderr, "spill: encrypted (v2), key %s\n", spill_keys->Describe().c_str());
   else if (cache.spill_plaintext_ok) std::fprintf(stderr, "spill: PLAINTEXT v1 files (--spill-plaintext-ok 1)\n");
   else std::fprintf(stderr, "spill: refused (no --spill-key; eviction drops)\n");
   std::unique_ptr<server::TextGenerator> generator;
@@ -455,7 +499,7 @@ int main(int argc, char** argv) {
                            .api_key = api_key});
   service.Register(http);
   metrics.Register(http);
-  if (flash_generator) RegisterSpillRoutes(http, *flash_generator, spill_keys.get());
+  if (flash_generator) RegisterSpillRoutes(http, *flash_generator, spill_keys.get(), yard_keys.get());
 #if HALO_WITH_SCOPE
   if (scope) {
     scope::RegisterAnnotationRoutes(http, scope::AnnotatorOf(scope));  // harnesses in other processes

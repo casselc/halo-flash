@@ -500,6 +500,46 @@ credential shreds every file of that master.
 **Cost** (ROOFLINE section 17): restore 2K 81.2 -> 79.7 ms, 12K 266.9 -> 267.1 ms (v1 -> v2, medians); spills within
 disk noise. Predicted +-3%: the GCM pass replaces the CRC32C pass at about the same bytes a second.
 
+### The key route: per-session keys from yard-ctl (phase B)
+
+`--yard-jwks PATH --yard-issuer ISS [--yard-audience halo_serve] [--yard-key-ttl 600] [--spill-yard-fallback
+master|refuse]` adds the provider "yard" (`src/server/yard_keys.*`). yard-ctl registers a 256-bit key K per session
+and checkpoint; the file's KEK is `HKDF(K, "halo-spill-v2" || sess || E)`. The yard-ctl side (custody of K, the
+token, the call sequence) is specified in the research repo's IDENTITY.md, "Spill keys"; the shared key-service model
+of yard SR1 (yard `spec/keys/`) covers both consumers (spill keys, ZFS workspace keys) and this route follows its
+epoch, revocation and shred meaning.
+
+- `POST /admin/keys/{sess}` body `{"token","use":"seal|open|revoke","key":"<base64url 32 bytes>"}`. The token: RS256
+  (yard's issuer signs RS256, not ES256: internal/sts/jwt.go), `kid` in the JWKS file (re-read on an unknown kid at
+  most once a minute), `aud` halo_serve, `iss`, `exp - iat <= 300`, `jti`, `yard_sess` = `{sess}`, `yard_epoch`, and
+  `halo_spill: {use, key_sha256}` binding the use and the key. 200 / 400 / 401 / 409; errors never echo the key or
+  the token. `GET /admin/keys`: highest epoch, last seal epoch, slots (epoch, key name; never the key).
+- `POST /admin/sessions/{key}/spill?session=sess`: the entry belongs to yard session `sess`; its file is sealed with
+  the registered seal key (the key is then forgotten: one-shot). `restore` needs the open key: until it is
+  registered the restore answers 409 and the entry and its file stay untouched (the cache's `kNoKey`).
+- Epochs (yard's lifecycle bumps at SuspendCommit): seal at E (>= every epoch seen); open at E' > the seal epoch,
+  opening exactly the file of E' - 1; revoke at >= every epoch seen: keys forgotten, the session's spilled entries
+  erased (`DropSpilledOf`). A registration below the highest epoch seen is stale (409); a seen jti is a replay (409);
+  the same use, epoch and key again (fresh token) is a no-op 200 (`"duplicate":true`).
+- Keys: mlocked `SecretBytes`; forgotten after the spill or restore they were for, or after the TTL. The key passes
+  through the HTTP request's body string (heap, not wiped) on its way in: halo_serve binds 127.0.0.1 by default;
+  across machines only over the tailnet (WireGuard). halo_serve has no TLS.
+- Fallback: a session with no registered key is sealed under the `--spill-key` master (`master`) or not spilled
+  (`refuse`, the default); a fallback-sealed file opens with the fallback, a yard-sealed file only with yard's open key.
+
+**Ambiguity of the registration call** (TEMPLATE.md: request, effect, answer; the caller is yard-ctl):
+
+| Outcome | What halo_serve did | What yard-ctl sees | Caller rule |
+|---|---|---|---|
+| lost request | nothing | no answer / timeout | **verify** `GET /admin/keys` (slot at E with K's name?) then **idempotent retry** with a fresh token (same use, epoch, key) |
+| lost answer | registered | no answer or a 5xx | verify shows the slot; a retry is a no-op 200 (`duplicate`) |
+| late (a copy lands after a newer registration) | refused: stale epoch (older E) or replayed jti; a late copy of the same E and key is a no-op | the late answer, if any, is 409 | none needed (fence by epoch and jti) |
+| duplicate (retry, queue replay, captured token) | same token: 409 replay; fresh token, same body: no-op | 409 or `duplicate:true` | treat both as done after verify |
+| stale epoch (yard moved on: commit, revocation) | refused 409, nothing changed | 409 "stale epoch" | the file of the old epoch is shredded: re-prefill; never retry at the old epoch |
+| spill without a seal key (registration not landed, or TTL passed) | spill refused (409), nothing written | 409 from the spill route | register again, then spill again (SR4: a spill is safe to repeat) |
+| restore without an open key | 409, entry kept | 409 | register the open key, then restore again |
+| revoke lost | keys may still be held until their TTL (<= 600 s), an open token works until its exp (<= 300 s) | no answer | **verify** (`high_epoch` >= the revoke epoch) and retry; independently yard deletes K, so nothing re-registers it |
+
 ### Threat model
 
 | Threat | Phase A (TPM master) | Phase B (yard session keys) | Not covered |
@@ -616,6 +656,18 @@ credential). Mutants (tests/mutants.toml, all killed: `streams/SE/m1_cpu.txt`, `
 `m1g_c.txt`): `crypt-` / `spill-nonce-constant`, `-header-not-aad`, `-tag-unchecked`, `-dek-in-clear` (CPU and GPU
 each), `crypt-kek-ignores-epoch`, `cache-plaintext-on-key-error`; SR4's nine re-run on v2 code (the v1 ones through
 the v1 cases).
+Phase B: `YardKeys.*` (CPU, a test RSA key and JWKS, tokens in internal/sts/jwt.go's shape): refusals each for its
+own reason (expired, audience, issuer, another session, lifetime, future, no `halo_spill`, use, key binding, no epoch,
+alg none / HS256, an unpublished signer, a forged signature, malformed bodies); seal / open / revoke epochs, replay,
+duplicates, a skipped epoch shreds, fallback to the master; `SessionCache.YardKeysAuthoriseResume` (GPU): no key ->
+no file, the entry waits for the open key, open at the seal epoch refused, restore at E + 1, one-shot seal, revoke
+erases. Mutants (all killed, `streams/SE/m2_cpu.txt`): `yard-open-at-seal-epoch`, `yard-no-stale-check`,
+`yard-jti-replay`, `yard-open-recorded-epoch`, `yard-audience-unchecked`, `yard-key-unbound`,
+`cache-yard-open-key-ignored`. End to end (`streams/SE/s1.txt`, real model): `--spill-key tpm` (the user-scoped
+credential) and `--yard-jwks`: master spill (v2, 0600) and reuse (cached 1216 tokens); yard seal (and a duplicate),
+spill under `yard:` id, restore refused without the open key, open at the seal epoch refused, open at E + 1,
+restore, reuse; a fallback spill, rotate (`dropped: 1`); key bytes not in the log.
+`MtpSpec.SpillRestoreKeepsDraftHistoryOnRealModel` passes on v2 (`t5.txt`).
 
 SR4:
 

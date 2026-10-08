@@ -35,6 +35,8 @@
 #include "rt/device.hpp"
 #include "server/flash_next_generator.hpp"
 #include "server/spill_keys.hpp"
+#include "server/yard_keys.hpp"
+#include "../server/yard_test_util.hpp"
 #include "text/tokenizer.hpp"
 
 namespace gs = hegel::generators;
@@ -1291,4 +1293,81 @@ TEST(SessionCache, ReleasedRangesComeBackAndRemapCleanly) {
   }
   for (auto& r : big) dev->ReleaseRange(r);
   for (auto& r : small) dev->ReleaseRange(r);
+}
+
+// Phase B in the cache: a yard session's entry is sealed only under the key yard-ctl registered for it, cannot be
+// restored until yard registers the open key at the next epoch (the entry waits, untouched), restores bit-exact
+// then, needs a new seal registration for the next spill (keys are one-shot), and a revocation erases it.
+TEST(SessionCache, YardKeysAuthoriseResume) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  const char* d = std::getenv("HALO_SPILL_TEST_DIR");
+  const std::string dir = (d && *d ? std::filesystem::path(d) : std::filesystem::temp_directory_path() / "halo-spill-test") /
+                          ("yard-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  yardtest::Signer signer("kid-a");
+  yardtest::WriteFile(dir + "/jwks.json", yardtest::JwksJson({&signer}));
+  server::YardSpillKeys::Options yo;
+  yo.jwks_path = dir + "/jwks.json";
+  yo.issuer = "https://id.example.org/yard";
+  server::YardSpillKeys yard(yo);
+  std::string e;
+  ASSERT_TRUE(yard.LoadJwks(&e)) << e;
+  constexpr std::uint32_t kCtx = 1024;
+  auto ea = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  auto eb = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(ea && eb) << e;
+  std::vector<std::int32_t> prompt(200);
+  for (std::size_t i = 0; i < prompt.size(); ++i) prompt[i] = static_cast<std::int32_t>((i * 7919 + 3) % 1000);
+  const auto collect = [](std::vector<std::int32_t>* out) {
+    return [out](text::TokenId t) { return out->push_back(static_cast<std::int32_t>(t)), true; };
+  };
+  server::FlashNextGenerator cold(*eb, std::vector<text::TokenId>{}, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
+  server::TextGenerator::Params p;
+  p.max_tokens = 4;
+  std::vector<std::int32_t> want;
+  ASSERT_TRUE(cold.GenerateIds(prompt, 190, p, collect(&want)).error.empty());
+  server::SessionCacheOptions o{.mode = server::SessionCacheOptions::Mode::kExact, .align = 64, .max_retained = 4};
+  o.spill_dir = dir + "/spill";
+  o.spill_keys = &yard;
+  server::FlashNextGenerator g(*ea, std::vector<text::TokenId>{}, kCtx, o);
+  std::vector<std::int32_t> got;
+  ASSERT_TRUE(g.GenerateIds(prompt, 190, p, collect(&got)).error.empty());
+  ASSERT_EQ(got, want);
+  const std::string k1 = yardtest::Key32(1), k2 = yardtest::Key32(2);
+  g.WithCache([&](server::SessionCache& c) {
+    const auto key = c.List().front().key;
+    std::string why;
+    bool kept = false;
+    EXPECT_FALSE(c.Spill(key, &why, "sess-1")) << "spilled without a registered key";
+    EXPECT_EQ(FilesIn(o.spill_dir), 0u);
+    EXPECT_EQ(yardtest::Register(yard, signer, "sess-1", "seal", 3, k1).status, 200);
+    EXPECT_TRUE(c.Spill(key, &why, "sess-1")) << why;
+    EXPECT_EQ(c.List().front().key_id.rfind("yard:", 0), 0u) << c.List().front().key_id;
+    EXPECT_EQ(c.List().front().session, "sess-1");
+    EXPECT_FALSE(c.Restore(key, &why, &kept));
+    EXPECT_TRUE(kept) << "an entry waiting for yard's open key was dropped: " << why;
+    EXPECT_EQ(yardtest::Register(yard, signer, "sess-1", "open", 3, k1).status, 409) << "open before the commit";
+    EXPECT_EQ(yardtest::Register(yard, signer, "sess-1", "open", 4, k1).status, 200);
+    EXPECT_TRUE(c.Restore(key, &why, &kept)) << why;
+    EXPECT_FALSE(c.Spill(key, &why, "sess-1")) << "a used seal key sealed a second file";
+    EXPECT_EQ(yardtest::Register(yard, signer, "sess-1", "seal", 4, k2).status, 200);
+    EXPECT_TRUE(c.Spill(key, &why, "sess-1")) << why;
+    EXPECT_EQ(yardtest::Register(yard, signer, "sess-1", "revoke", 5, "").status, 200);
+    for (const auto& s : yard.TakeRevoked()) EXPECT_EQ(c.DropSpilledOf(s), 1u);
+    EXPECT_EQ(c.List().size(), 0u);
+    EXPECT_EQ(FilesIn(o.spill_dir), 0u);
+    return true;
+  });
+  got.clear();
+  std::size_t reused = 0;
+  {
+    const auto r = g.GenerateIds(prompt, 190, p, collect(&got));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    reused = r.cached_tokens;
+  }
+  EXPECT_EQ(got, want);
+  EXPECT_EQ(reused, 0u) << "a revoked entry was reused";
+  std::filesystem::remove_all(dir);
 }

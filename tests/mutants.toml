@@ -1653,6 +1653,84 @@ binary = "gpu_tests"
 filter = "SessionCache.SpillKeysRefuseKeepAndShred"
 why = "when the provider has no key the spill falls back to a plaintext v1 file instead of being refused"
 
+# ---- SE phase B: the yard key route (src/server/yard_keys.cpp) -----------------------------------------------
+
+[[mutant]]
+name = "yard-open-at-seal-epoch"
+file = "src/server/yard_keys.cpp"
+find = '  if (E <= *s.sealed)'
+replace = '  if (E < *s.sealed)'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.EpochRulesReplayDuplicatesAndShredding"
+timeout = 300
+why = "an open token minted at the seal's epoch (before the suspend committed) is accepted: halo opens without yard's resume"
+
+[[mutant]]
+name = "yard-no-stale-check"
+file = "src/server/yard_keys.cpp"
+find = '  if (E < s.high)'
+replace = '  if (false)'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.EpochRulesReplayDuplicatesAndShredding"
+timeout = 300
+why = "a late registration of an older epoch is applied: a revoked or superseded key comes back"
+
+[[mutant]]
+name = "yard-jti-replay"
+file = "src/server/yard_keys.cpp"
+find = '  if (seen_jti_.contains(jti)) return answer(409, "token replayed (jti already used)");'
+replace = '  (void)0;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.EpochRulesReplayDuplicatesAndShredding"
+timeout = 300
+why = "a captured token can be replayed until it expires"
+
+[[mutant]]
+name = "yard-open-recorded-epoch"
+file = "src/server/yard_keys.cpp"
+find = '      return crypt::DeriveKek(slot.key.span(), session, slot.epoch - 1, "yard:" + slot.name, out, why);'
+replace = '      return crypt::DeriveKek(slot.key.span(), session, it->second.sealed.value_or(0), "yard:" + slot.name, out, why);'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.EpochRulesReplayDuplicatesAndShredding"
+timeout = 300
+why = "an open opens the last sealed file whatever its epoch: an epoch bump no longer crypto-shreds"
+
+[[mutant]]
+name = "yard-audience-unchecked"
+file = "src/server/yard_keys.cpp"
+find = '    if (!ok) return fail("audience");'
+replace = '    (void)ok;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.TokenRefusals"
+timeout = 300
+why = "a token for another audience (scope, a cloud) registers spill keys"
+
+[[mutant]]
+name = "yard-key-unbound"
+file = "src/server/yard_keys.cpp"
+find = '        !crypt::Equal(want, key_hash))'
+replace = '        false)'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.TokenRefusals"
+timeout = 300
+why = "a captured token registers a key of the holder's choosing"
+
+[[mutant]]
+name = "cache-yard-open-key-ignored"
+file = "src/server/session_cache.cpp"
+find = '    if (!opt_.spill_keys->KeyForFile(label, en.key_id, &kek, error)) {'
+replace = '    if (!opt_.spill_keys->KeyForFile(label, en.key_id, &kek, error) && false) {'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.YardKeysAuthoriseResume"
+why = "a restore without yard's open key is attempted anyway: refused by the engine and the waiting entry is erased"
+
 # ---- MTP in the server (src/server/decode_loop.cpp, flash_next_generator.cpp; docs/MTP.md) -------------------
 
 [[mutant]]
