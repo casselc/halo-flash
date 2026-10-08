@@ -426,3 +426,5 @@ Decisions for the user: (1) whole-prompt history now costs ~8% of the trunk pref
 rounding-level difference in draft state, and the eh_proj columns could share their embedding half (exact; -37% of
 eh_proj's FMAs, predicted ~0.046 ms a row); (2) recalibrate the depth chooser's full cost model for state-only
 catch-up (its c = 1.37 is stale; the preserved mixed-context fit gives ~0.26-0.27).
+
+Next GPU experiments are queued, with dependencies and deciding gates, in [KYOJIN-QUEUE.md](KYOJIN-QUEUE.md).
