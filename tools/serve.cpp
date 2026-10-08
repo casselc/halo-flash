@@ -241,7 +241,6 @@ int main(int argc, char** argv) {
   if (cache.spill_dir.empty()) cache.spill_dir = "/data/halo-work/spill";  // SR4 default: not /tmp (docs/SESSIONS.md 10)
   if (!mtp_model.empty() && model.empty()) return std::fprintf(stderr, "--mtp-model needs --model (Flash-Next)\n"), 2;
   std::string error;
-  std::unique_ptr<server::TextGenerator> generator;
   server::FlashNextGenerator* flash_generator = nullptr;  // SR4 admin routes
   // Flash-Next (--model) or a Qwen3.5 dense model with variants (--qwen35-model).
   std::unique_ptr<core::GgufReader> reader, q35_reader, q35_tok_reader;
@@ -254,6 +253,9 @@ int main(int argc, char** argv) {
   std::optional<model::MtpWeights> mtp_weights;
   std::unique_ptr<engine::FlashNextGpu> engine;
   std::unique_ptr<engine::Qwen35Gpu> q35_engine;
+  // Generators own session caches that call their engines during destruction.
+  // Declare them last so normal exit and every early return preserve that lifetime.
+  std::unique_ptr<server::TextGenerator> generator;
   server::Qwen35Generator* q35_generator = nullptr;
   if (!model.empty()) {
     reader = core::GgufReader::OpenFile(model, &error);

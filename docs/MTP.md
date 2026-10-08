@@ -236,7 +236,8 @@ Startup loads the sidecar in 0.4 s (2.74 GB device: weights plus a max-context d
 1. **Load and track.** Each request re-anchors the draft block before its prefill (`MtpTrackFrom`, set through a
    `SessionCache::Prepare` hook once the live session is bound): it follows from max(reused, prompt - W).
 2. **Prompt cost: a history window** (`FlashNextGpu::MtpTrackFrom`, `halo_run --mtp-window W[,W..]`). Measured below;
-   default W = 128. A batched draft prefill is not built.
+   default W = 128. A batched draft prefill is not built. (Superseded by "Batched draft prefill" below: default
+   W = all.)
 3. **Decode loop** (`RunDecode`, src/server/decode_loop.cpp, shared by both modes): greedy at any sampler setting,
    sampled only without repeat / frequency / presence penalties (else StepSample as before); one `MtpDepthChooser`
    per generator, reset per request; drafts capped at (tokens left - 1), so no cycle emits past max_tokens.
@@ -313,6 +314,115 @@ released range). Fix: `HipDevice` holds GPU work until 1 ms after the last mappi
 pages before copying (0 of 4 runs even with the runtime reusing addresses). MS's range pool is removed: it kept
 released pages charged and ran 128K contexts out of memory.
 
-Still open: batched sessions (StepBatch) stay AR (the draft block follows one session, `mtp_owner_`); a batched draft
-prefill would make full history affordable (+0.17-0.25x on doc / code at 8K); the paper-style gate (1.5x) is not
-met (verify cost, as in round 3).
+Still open: batched sessions (StepBatch) stay AR (the draft block follows one session, `mtp_owner_`); the
+paper-style gate (1.5x) is not met (verify cost, as in round 3).
+
+### Batched draft prefill (stream DP, 2026-10-07; working files `/data/halo-work/streams/DP/`)
+
+**What a catch-up step needs.** A draft-block base step whose output nobody drafts from (the prompt's rows, the
+pending step after an ordinary decode step, the accepted rows after a verify) leaves only its attention cache
+rows: K and V (projected, normed, rotated), the indexer key and the pooled block. Those depend on the row's token,
+the trunk hidden of the position before it and the draft block's position, never on the earlier steps' outputs.
+The query, the attention itself, attn_out, both combines, the FFN mixer and the MoE (~60% of the step) feed only
+the block's output. Three catch-up modes (`FlashNextGpu::mtp_catchup_`, `halo_run --mtp-catchup`), all leaving
+the cache rows bit-identical:
+- `full`: the old eager draft steps.
+- `state`: eager steps of only the launches that write cache rows (`Attention` with `attn_state_only_`, every
+  kept launch unchanged). Also used for the decode-time catch-up (after verification and after ordinary steps).
+- `batched` (default from `mtp_batch_min_` = 8 rows; fewer rows step in `state` mode): the chunk's rows in groups
+  of 256 (`mtp_catchup.cpp`): embeddings, norms and the per-stream [enorm(e) ; hnorm(h)_s] rows over all rows;
+  eh_proj, the attention mixer (the path `HcMix` takes: fused `halo_hc_mix_a_cu_b*` / `_b_u_b*`, or unfused
+  GEMVs + `halo_hc_mix_rows`), k / v through the batched-decode GEMVs (`_s` variant, 8 columns a group: each
+  column the single kernel's FMA chain, weights read once a group); the indexer key through
+  `halo_matvec_bf16_dual_y` (the dual kernel's arithmetic, column on grid y); k norm and rope, the appends, and
+  every pooled block the rows touch (as stepping leaves it). New kernels: `halo_matvec_bf16_dual_y`,
+  `halo_mtp_cat_rows`. Its scratch (~85 MB) is allocated and touched at `LoadMtp`.
+Not built: chunked WMMA GEMMs (the trunk prefill's kernels). They would round activations to fp16 / int8 and sum
+in another order, so the draft state, drafts and acceptance would differ from stepping at rounding level; the
+exact-column path was preferred (decision for the user below).
+
+**Exactness (real model, Q8_0 sidecar, 32K head).** Draft-state hash (K, V, indexer keys, complete pooled blocks,
+pending hidden; `--mtp-state-hash`) equal across full / state / batched at W 5, 128 and all (doc 2K), and across
+GEMV variants and group sizes (doc 8K); per-cycle drafts and acceptance (`--spec-trace`) identical across the
+three modes; greedy output identical to AR in every run (30 W-sweep runs at 2K / 8K, 9 mode runs); tokens / cycle
+per prompt and window equal stream MS's eager numbers (e.g. doc 8K 2.19 / 2.37 / 2.37 / 2.70 / 3.61). Trunk
+prefill logits (2K) and 24 decode steps' logits byte-identical to main. Small model (`MtpCatchUp.*`, gpu_tests,
+synthetic draft block on an attention layer of the fixture): kernel properties (dual_y columns vs the single dual
+kernel, cat rows); 40 Hegel cases of the three modes on one prompt (1-3 prefill pieces, window start, group size,
+threshold, fused / unfused mixer, fp32 / fp16 / bf16 prefill residual, graphs): identical cache rows after the
+prefill and after up to 40 decoded tokens of SpecStep cycles, identical drafts / acceptance / tokens, greedy =
+AR; and the draft block following AR steps leaves the trunk's tokens and logits bit-identical. Mutants (all
+killed): wrong rope position, own-row hidden, first pooled block skipped, other mixer path, stale pending hidden
+(fp32 and 16-bit residual), dual_y column input, cat stream, state-only step skipping the K rope.
+
+**Cost (pinned, wall time of the catch-up after each prefill chunk).**
+
+| Catch-up, doc prompts, whole history | predicted | measured |
+|---|---|---|
+| full eager steps | (MS: 1.33-1.42 ms a row) | 1.49 ms a row (2K: 3.08 s) |
+| state-only eager steps | 0.62 ms (0.55-0.70) | 0.38 (2K) / 0.32 (8K) ms a row |
+| batched, plain GEMV variant, 8 columns a group | 0.05 ms (0.03-0.10) | 0.097-0.125 ms a row (8K: 785 ms) |
+| batched, `_s` variant (default) | 0.05 ms (0.03-0.10) | **0.064 ms a row**: 2K 127 ms, 8K 510 ms, 13K ~0.8 s |
+| fraction of the trunk prefill | | ~8% (2K 1.5 s, 8K 5.7 s, 13K 10.3 s) |
+| decode-time catch-up per accepted draft (fit over the W-sweep traces) | ~0.6 | 0.26-0.27 ms (was 1.37; closeout fit below) |
+
+The prediction priced the column FMAs at the batched decode's measured rate (0.68 ps a FMA); eh_proj (52 M FMAs a
+row, 85% of the work) ran at about half that until the 16 KB-LDS variant (more resident blocks). The batched mode
+beats state-only steps from a few rows, so `mtp_batch_min_` = 8 keeps both. Overlap with the trunk prefill is not
+built: the catch-up of a chunk needs that chunk's final residual rows, the runtime has one stream, and the exact
+columns are VALU-bound where the trunk's GEMMs are, so overlap would hide at most the ~8%.
+
+**W tradeoff with the batched catch-up** (`halo_run --spec 1 --spec-depth -2`, 256 greedy tokens, MS's prompts;
+speedup = MTP / AR decode, end to end = TTFT + 256 tokens; prefill varies +-0.5 s run to run at 8K):
+
+| prompt | W 0 | 128 | 512 | 2048 | all | catch-up at all | end to end W 128 -> all |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ctx 2K | 1.41x | 1.49 | 1.49 | 1.48 | 1.46 | 126 ms | 8.46 -> 8.59 s |
+| doc 2K | 1.25x | 1.27 | 1.29 | 1.42 | 1.44 | 127 ms | 9.68 -> 8.77 s |
+| code 2K | 1.22x | 1.26 | 1.26 | 1.38 | 1.40 | 120 ms | 9.62 -> 8.91 s |
+| ctx 8K | 1.42x | 1.50 | 1.50 | 1.50 | 1.50 | 459 ms | 12.45 -> 12.76 s |
+| doc 8K | 1.22x | 1.25 | 1.21 | 1.33 | 1.47 | 510 ms | 14.14 -> 13.46 s |
+| code 8K | 1.22x | 1.24 | 1.26 | 1.25 | 1.38 | 434 ms | 13.84 -> 13.16 s |
+
+Serving (`tools/serve_ab.py`, MS's bench.jsonl, pinned; medians, off 2 runs, W 128 3, all 3; greedy end to end is
+the pre-registered decision metric):
+
+| | off | W 128 | W all (new default) |
+|---|---:|---:|---:|
+| greedy end to end, sum (runs) | 80.3 s (79.5, 81.1) | 69.4 s (82.3*, 69.4, 67.3) | **68.9 s** (68.4, 68.9, 71.8) |
+| paper-style greedy / T 0.8 decode | 1 / 1 | 1.28x / 1.26x | 1.27x / 1.24x |
+| agent cold (13K): decode / TTFT | 1 / 10.3 s | 1.27x / 11.4 s | **1.56x** / 11.8 s |
+| agent turn 2: decode / TTFT | 1 / 0.93 s | 1.43x / 1.49 s | 1.43x / 1.29 s |
+
+\* r1's agent prefill took 22.9 s (10.2-13.6 s in every other run; its next two requests were slow too); not
+reproduced in 10 later runs of main's and this branch's server. Agent cold at W 512 / 2048 / 4096: the same 25 / 24
+cycles as W 128 (all: 19): the agent's useful history is far back, only the whole prompt helps. Main's server at
+W 128 (one run): 73.3 s, paper greedy 1.25x (the state-only decode catch-up is worth ~2%).
+**Default: W = all** (`--mtp-window all`; smallest greedy end-to-end sum, W 128 within 1%; wins 0.7-0.9 s a
+256-token doc / code request at 2K and 8K, loses 0.1-0.3 s on context-only prompts). Check battery through
+halo_serve with the default: 22 of 22 identical to MTP off.
+On a cold request this follows the whole prompt. With prefix reuse, the draft history starts at the reuse
+point (`max(reused, prompt - W)`); `all` does not rebuild the reused prefix's discarded draft history.
+
+**Closeout (2026-10-08).** Independent GLM review found no catch-up correctness blocker. Full GPU suite:
+88 passed, 16 missing-fixture skips, one failure in `Sessions.Fp16OnlyKvPrefillEqualsDefault`
+(`closeout-gpu.txt`). That same tolerance test failed on main in the prior `r3_main.txt` baseline; the new
+baseline rerun passed (`closeout-main-fp16.txt`). It remains an unresolved pre-existing randomized tolerance
+failure, not a fully green-suite claim. All catch-up/session-cache/spill tests passed. The three remaining
+CPU serving mutants (budget, accepted history, mid-cycle departure) were re-killed (`closeout-mutants.txt`).
+Generator lifetime is now structurally ordered after its engines, including early returns; a rebuilt server
+served a real request and exited 0 after SIGTERM (assertions in `closeout-shutdown.py`; logged rc 0 in
+`/data/halo-work/streams/LOG.md`; `closeout-shutdown.log` preserves server startup output).
+
+The preserved `fit_in.txt` reproduces a joint fit of `ms = C[k] + c * accepted + r * [accepted < k]`:
+`fit-closeout.py` / `fit-closeout.txt`, 2,750 cycles, c = 0.258 ms; excluding each run's first four cycles gives
+2,630 cycles, c = 0.268 ms (RMSE 4.86 ms). This replaces the unreproduced 0.33-ms point estimate in the draft.
+The chooser's original calibration is deliberately retained for this release so the serving results above
+describe the shipped behavior. Recalibrating all depth costs needs a fresh fixed-depth sweep, not just changing
+one coefficient of this noisy mixed-context fit.
+
+Decisions for the user: (1) whole-prompt history now costs ~8% of the trunk prefill; a WMMA-GEMM catch-up
+(predicted ~1%, ~7 us a row from the WMMA rate at the trunk GEMMs' efficiency) would trade exact drafts for a
+rounding-level difference in draft state, and the eh_proj columns could share their embedding half (exact; -37% of
+eh_proj's FMAs, predicted ~0.046 ms a row); (2) recalibrate the depth chooser's full cost model for state-only
+catch-up (its c = 1.37 is stale; the preserved mixed-context fit gives ~0.26-0.27).
