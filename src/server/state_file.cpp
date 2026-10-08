@@ -12,12 +12,6 @@ namespace halo::server {
 
 namespace {
 
-std::pair<std::string, std::string> Split(const std::string& path) {
-  const auto slash = path.rfind('/');
-  if (slash == std::string::npos) return {".", path};
-  return {slash == 0 ? "/" : path.substr(0, slash), path.substr(slash + 1)};
-}
-
 bool WriteAll(int fd, std::string_view bytes) {
   std::size_t done = 0;
   while (done < bytes.size()) {
@@ -29,12 +23,13 @@ bool WriteAll(int fd, std::string_view bytes) {
   return true;
 }
 
-bool Exists(const std::string& p) {
-  struct stat st {};
-  return ::lstat(p.c_str(), &st) == 0;
-}
-
 }  // namespace
+
+std::pair<std::string, std::string> SplitPath(const std::string& path) {
+  const auto slash = path.rfind('/');
+  if (slash == std::string::npos) return {".", path};
+  return {slash == 0 ? "/" : path.substr(0, slash), path.substr(slash + 1)};
+}
 
 const char* PersistName(Persist p) {
   switch (p) {
@@ -58,48 +53,62 @@ bool ParseU64(std::string_view s, std::uint64_t max, std::uint64_t* out) {
   return true;
 }
 
-Persist WriteStateFile(const std::string& path, std::string_view bytes, std::string* error) {
-  const int fault = g_state_write_fault;
-  g_state_write_fault = 0;
-  const std::string tmp = path + ".tmp." + std::to_string(::getpid());
-  ::unlink(tmp.c_str());
-  const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-  if (fd < 0) return *error = "cannot create " + tmp + ": " + std::strerror(errno), Persist::kUnpublished;
+std::unique_ptr<StateDir> StateDir::Open(const std::string& path, std::string* error) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) return *error = "state directory " + path + ": " + std::strerror(errno), nullptr;
+  struct stat st {};
+  if (::fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != ::geteuid() || (st.st_mode & 022) != 0) {
+    ::close(fd);
+    return *error = "state directory " + path + " must be a directory of ours, not writable by group or others",
+           nullptr;
+  }
+  return std::unique_ptr<StateDir>(new StateDir(fd, path));
+}
+
+StateDir::~StateDir() {
+  if (fd_ >= 0) ::close(fd_);
+}
+
+bool StateDir::Exists(const std::string& name) const {
+  struct stat st {};
+  return ::fstatat(fd_, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0;
+}
+
+Persist StateDir::Write(const std::string& name, std::string_view bytes, std::string* error) const {
+  const int fault = g_state_write_fault.exchange(0);
+  const std::string tmp = name + ".tmp." + std::to_string(::getpid());
+  ::unlinkat(fd_, tmp.c_str(), 0);
+  const int fd = ::openat(fd_, tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (fd < 0) return *error = "cannot create " + path_ + "/" + tmp + ": " + std::strerror(errno), Persist::kUnpublished;
   const bool synced = WriteAll(fd, bytes) && ::fsync(fd) == 0;
   ::close(fd);
-  if (!synced || fault == 1 || ::rename(tmp.c_str(), path.c_str()) != 0) {
-    ::unlink(tmp.c_str());
-    return *error = "cannot publish " + path + (fault == 1 ? " (injected)" : ""), Persist::kUnpublished;
+  if (!synced || fault == 1 || ::renameat(fd_, tmp.c_str(), fd_, name.c_str()) != 0) {
+    ::unlinkat(fd_, tmp.c_str(), 0);
+    return *error = "cannot publish " + path_ + "/" + name + (fault == 1 ? " (injected)" : ""), Persist::kUnpublished;
   }
-  // Published: from here a failure is "uncertain", never "not done".
-  const auto [dir, base] = Split(path);
-  const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  const bool dir_ok = fault != 2 && dfd >= 0 && ::fsync(dfd) == 0;
-  if (dfd >= 0) ::close(dfd);
-  if (!dir_ok) return *error = "fsync of " + dir + " failed after publishing " + path, Persist::kUncertain;
+  // Published: from here a failure is "uncertain", never "not done". The fsync is of the pinned directory itself.
+  if (fault == 2 || ::fsync(fd_) != 0)
+    return *error = "fsync of " + path_ + " failed after publishing " + name, Persist::kUncertain;
   return Persist::kDurable;
 }
 
-StateRead ReadStateFile(const std::string& path, std::size_t max_bytes, std::string* out, std::string* error) {
+StateRead StateDir::Read(const std::string& name, std::size_t max_bytes, std::string* out, std::string* error) const {
   out->clear();
-  const auto [dir, base] = Split(path);
-  const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (dfd < 0) return *error = "state directory " + dir + ": " + std::strerror(errno), StateRead::kError;
-  const int fd = ::openat(dfd, base.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-  const int open_errno = errno;
-  ::close(dfd);
+  const std::string full = path_ + "/" + name;
+  const int fd = ::openat(fd_, name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) {
-    if (open_errno != ENOENT) return *error = path + ": " + std::strerror(open_errno), StateRead::kError;
-    if (Exists(path + ".init"))
-      return *error = path + " is missing but was initialized (" + path +
-                      ".init exists): recovery required, refusing to start from zero",
+    const int e = errno;
+    if (e != ENOENT) return *error = full + ": " + std::strerror(e), StateRead::kError;
+    if (Exists(name + ".init"))
+      return *error = full + " is missing but was initialized (" + name +
+                      ".init exists): recovery required (docs/SESSIONS.md section 10, \"Recovery\")",
              StateRead::kError;
     return StateRead::kFresh;
   }
   struct stat st {};
   const auto fail = [&](std::string why) {
     ::close(fd);
-    *error = path + ": " + why;
+    *error = full + ": " + why;
     out->clear();
     return StateRead::kError;
   };
@@ -129,18 +138,31 @@ StateRead ReadStateFile(const std::string& path, std::size_t max_bytes, std::str
   return StateRead::kOk;
 }
 
-bool InitStateFile(const std::string& path, std::string_view bytes, std::string* error) {
-  if (WriteStateFile(path + ".init", "initialized\n", error) != Persist::kDurable) return false;
-  return WriteStateFile(path, bytes, error) == Persist::kDurable;
+bool StateDir::Init(const std::string& name, std::string_view bytes, std::string* error) const {
+  // State first, marker second: an interruption between them leaves a markerless state, which EnsureMarker completes
+  // on the next load (the initial state holds nothing to lose).
+  if (Write(name, bytes, error) != Persist::kDurable) return false;
+  return Write(name + ".init", "initialized\n", error) == Persist::kDurable;
 }
 
-std::unique_ptr<StateLock> StateLock::Acquire(const std::string& path, std::string* error) {
-  const std::string lp = path + ".lock";
-  const int fd = ::open(lp.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
-  if (fd < 0) return *error = "cannot open " + lp + ": " + std::strerror(errno), nullptr;
+bool StateDir::EnsureMarker(const std::string& name, std::string* error) const {
+  if (Exists(name + ".init")) return true;
+  return Write(name + ".init", "initialized\n", error) == Persist::kDurable;
+}
+
+std::unique_ptr<StateLock> StateDir::Lock(const std::string& name, std::string* error) const {
+  const std::string ln = name + ".lock";
+  const int fd = ::openat(fd_, ln.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (fd < 0) return *error = "cannot open " + path_ + "/" + ln + ": " + std::strerror(errno), nullptr;
+  struct stat st {};
+  if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != ::geteuid() || (st.st_mode & 077) != 0) {
+    ::close(fd);
+    return *error = path_ + "/" + ln + " must be a regular 0600 file of ours", nullptr;
+  }
   if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
     ::close(fd);
-    return *error = lp + " is held by another process (another halo_serve on this spill directory?)", nullptr;
+    return *error = path_ + "/" + ln + " is held by another process (another halo_serve on this spill directory?)",
+           nullptr;
   }
   return std::unique_ptr<StateLock>(new StateLock(fd));
 }

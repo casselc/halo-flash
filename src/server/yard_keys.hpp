@@ -105,7 +105,7 @@ class YardSpillKeys final : public SpillKeys {
     std::string state_path;         ///< the persisted per-session epochs (0600, owned via "<path>.lock"); empty: memory
     SpillKeys* fallback = nullptr;  ///< entries never yard-bound: this provider (A), or refused (null)
     bool sweeper = true;            ///< a thread that zeroes expired keys (tests may sweep by hand)
-    std::string incarnation;        ///< this server incarnation's id (empty: 16 random hex digits)
+    std::string incarnation;        ///< this server incarnation's id: 32 hex digits (empty: 128 random bits)
     std::size_t max_sessions = 4096;  ///< persisted sessions (the state file is rewritten whole: bounded)
   };
   struct Answer {
@@ -137,6 +137,8 @@ class YardSpillKeys final : public SpillKeys {
   /// Persistence became uncertain (a state file published but not durable): the provider stopped (every key zeroed,
   /// every registration and lease refused) until halo_serve restarts and reloads what the disk holds.
   [[nodiscard]] bool stopped() const;
+  /// Test seam: holds the provider's state lock (a registration then waits at its transition boundary).
+  [[nodiscard]] std::unique_lock<std::mutex> LockForTest() { return std::unique_lock<std::mutex>(mu_); }
 
   [[nodiscard]] std::string Describe() const override;
   [[nodiscard]] bool SealLease(std::string_view entry, std::string_view label, bool yard_bound, SpillLease* out,
@@ -197,13 +199,15 @@ class YardSpillKeys final : public SpillKeys {
   std::map<std::string, std::int64_t, std::less<>> seen_jti_;  // jti -> exp
   std::uint64_t gen_ = 0;
   bool stopped_ = false;
+  std::unique_ptr<StateDir> dir_;
+  std::string state_name_;
   std::unique_ptr<StateLock> lock_;
   // JWKS: an immutable snapshot swapped under jwks_mu_; refresh bookkeeping under refresh_mu_.
   mutable std::mutex jwks_mu_;
   std::shared_ptr<const Jwks> jwks_;
   std::mutex refresh_mu_;
   Clock::time_point jwks_loaded_{}, jwks_forced_{};
-  std::uint64_t jwks_sig_[3] = {0, 0, 0};  // ino, size, mtime ns of the loaded file
+  std::uint64_t jwks_sig_[4] = {0, 0, 0, 0};  // ino, size, mtime ns, ctime ns of the loaded file
   std::atomic<std::uint64_t> jwks_loads_{0};
   std::thread sweeper_;
   std::condition_variable cv_;

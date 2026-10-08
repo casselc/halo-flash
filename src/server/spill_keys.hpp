@@ -101,8 +101,10 @@ class MasterSpillKeys final : public SpillKeys {
  private:
   MasterSpillKeys() = default;
   bool Derive(std::string_view label, SpillLease* out, std::string* why);
-  std::string provider_, prefix_, epoch_file_;
+  std::string provider_, prefix_, epoch_name_;
+  std::unique_ptr<StateDir> dir_;
   std::unique_ptr<StateLock> lock_;
+  bool unconfirmed_ = false;  // an uncertain fence: no seal until a durable write confirms the epoch (under mu_)
   core::crypt::SecretBytes master_;
   std::atomic<std::uint64_t> epoch_{1};
   std::mutex mu_;

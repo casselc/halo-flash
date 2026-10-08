@@ -23,6 +23,7 @@ std::string TempDir(const std::string& tag) {
   auto p = std::filesystem::temp_directory_path() / ("halo-spill-keys-" + std::to_string(::getpid()) + "-" + tag);
   std::filesystem::remove_all(p);
   std::filesystem::create_directories(p);
+  std::filesystem::permissions(p, std::filesystem::perms::owner_all);
   return p.string();
 }
 void Write(const std::string& path, const std::string& bytes, mode_t mode) {

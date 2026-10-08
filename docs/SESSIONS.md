@@ -484,6 +484,10 @@ format halo_serve writes unless the operator asks for plaintext**.
   partial restore is never exposed or used; it may physically exist in a session that is then discarded. If that
   synchronize itself fails, quiescence is not established: the engine **poisons** itself (no reset; every session,
   step, prefill, spill and restore call is refused until restart; `Spill.FailedSyncInRestoreCleanupPoisonsTheEngine`).
+  Round 4: a poisoned engine also **quarantines** its device memory: `DropSession`, `ReleaseKvPages`, the session
+  free path and the destructor release nothing for reuse (queued writes may still target it; the process exit
+  releases it with the device context), so the cache's own failure cleanup cannot hand those pages to another
+  session (`SessionCache.PoisonedRestoreQuarantinesItsMemory`). `SpillPeek` touches no device memory.
 - **Spill outcomes.** `SpillInfo::published` tells "nothing published" (the path is what it was) from "published but
   the directory fsync failed" (durability unknown). The cache reports the latter to the key provider as
   `Outcome::kUncertain`: the key counts as used (never handed back for another file), and the file is removed.
@@ -552,8 +556,9 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
   connection's peer uid (`SO_PEERCRED`) must be halo_serve's own). **Same uid only** (round 3): the cross-uid option
   `--admin-socket-peer-uid` was removed (a 0700 directory and a 0600 socket deny another uid before `SO_PEERCRED` is
   even read, so it never worked) and is refused. A yard-ctl of another uid uses the encrypted-transport route below.
-  A live socket at the path (a connect succeeds) refuses the start instead of being taken over; a stale one is
-  replaced; `Stop()` unlinks the path only while it is still this server's socket (same inode). That is the same-host
+  The path is probed with a bounded non-blocking connect: only a refusal (`ECONNREFUSED`, nobody listens) or the
+  path vanishing (`ENOENT`) proves it stale and lets it be replaced; a live peer, a full backlog, a timeout (500 ms)
+  or any other error refuses the start (round 4: fail closed); `Stop()` unlinks the path only while it is still this server's socket (same inode). That is the same-host
   default. The key is in the body and halo_serve has no TLS: `--yard-keys-tcp 1` also serves it on
   `--host:--port`, which is allowed only behind an authenticated, encrypted transport (the tailnet's WireGuard to
   that host, nothing in between); a signed token does not keep K confidential.
@@ -571,12 +576,15 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
   string is zeroed after its dispatch, whatever the path (an API-key refusal included).
 - **JWKS.** A key is used only if `kty` RSA, `alg` absent or RS256, `use` absent or `sig`, `key_ops` absent or
   containing `verify`, a canonical modulus of 2048..16384 bits (`BN_num_bits`, not encoded bytes) and `e` = 65537. A
-  duplicate `kid` makes the whole document invalid (the loaded set is kept). The file is re-read when it changes
-  (inode, size, mtime) and at least every 60 s; an unknown kid forces a re-read at most once per 5 s (a flood cannot
+  duplicate `kid` makes the whole document invalid: an empty key set is swapped in (deny-all) until a valid
+  document appears. The file is opened `O_NOFOLLOW` and must be a regular file of at most 1 MB, not writable by
+  group or others, owned by halo's uid or root (yard publishes it as one of them); otherwise the same deny-all. It
+  is re-read when it changes (inode, size, mtime, ctime: a chmod is noticed) and at least every 60 s; an unknown kid forces a re-read at most once per 5 s (a flood cannot
   keep halo loading keys). The file's size is checked on the opened descriptor (<= 1 MB) before it is read. Loading
   and validating a new set happens outside the provider lock and the result is swapped in (an immutable snapshot),
   so leases and the expiry sweeper never wait for it. A removed signing key stops verifying at the next registration;
-  keys already registered under it keep their (short) deadline. A missing, unreadable, malformed or empty document
+  keys already registered under it keep their (short) deadline, and a verification already running on the old snapshot
+  completes on it. A missing, unreadable, malformed or empty document
   denies everything until fixed. Startup
   refuses an empty issuer or audience, a TTL outside 1..3600 s, and a JWKS with no usable key.
 - `GET /admin/keys`: the server `incarnation` and whether the provider is `stopped`; per session the highest epoch, the revoke fence (`revoked_through`), the last seal, spilled and
@@ -584,7 +592,8 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
   hidden.
 - `POST /admin/sessions/{key}/spill` (no query: `?session=` was removed). The **seal registration names the entry**
   (`halo_spill.entry` = its `entry_id`, `"<incarnation>.<key>"`, shown by `GET /admin/sessions`; the incarnation is
-  16 random hex digits drawn at every start, round 3): a numeric key is reused by the next process for another
+  32 random hex digits, 128 bits, drawn at every start; round 3, widened in round 4; an entry id must be exactly the
+  incarnation, a dot and a canonical decimal key): a numeric key is reused by the next process for another
   conversation, so a seal for an entry of another incarnation (a token minted before a restart) is refused (409).
   Only a seal registration for that entry seals it, under its own session's label, so an admin
   caller can neither relabel an entry nor spend another session's registration. From its first yard seal an entry is
@@ -595,10 +604,13 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
   - seal at E: `E > fence`, `E >= highest`, `E > last spill`; for exactly one entry;
   - open at E: `E - 1 > fence`, `E >= highest`, `E == last seal + 1`, `E > last restore`; opens exactly the file of
     `E - 1`;
-  - revoke at token epoch T, `through` R <= T; **default R = the session's last spilled epoch, none if nothing was
-    spilled** (round 3; GLM NL3: a token-epoch default fenced an abort before any checkpoint and refused the next seal
-    at that epoch). With R: `fence = max(fence, R)`, keys at file epochs <= fence are zeroed (newer ones stay), the
-    last seal is forgotten if fenced. Without R: no fence, but every key of the session is zeroed. The route then
+  - revoke at token epoch T: **every effect is bounded by T** (round 4: a delayed revoke never touches newer state).
+    The fence R is the claim `through` (<= T), else min(last spilled epoch, T), none if nothing was spilled (round 3,
+    GLM NL3: an abort before any spill does not poison its epoch). With R: `fence = max(fence, R)`. Keys zeroed: a
+    slot registered at an epoch <= T (a pending operation the token may cancel) or whose file epoch is fenced (it could
+    never be used); a registration after T survives. The last seal is forgotten if fenced. A revoke whose T is below
+    the highest epoch is not refused as stale (yard may legitimately revoke an older checkpoint): it is applied, bounded
+    by its T. The route then
     erases that session's entries (spilled or resident) whose key epoch is <= fence (`DropRevoked`; a newer
     checkpoint survives a late cleanup). A revoke is never stale and repeating it is a no-op 200
     (`"duplicate":true`). yard-ctl sends `through` = the epoch of the last checkpoint it wants gone when it knows it.
@@ -606,9 +618,14 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
 - **One-shot, really.** halo keeps a non-secret record per operation (use, epoch, key hash, entry; registered /
   consumed / expired / revoked). The same registration again (fresh token, same use, epoch, key and entry) is a no-op
   200: `"state":"registered"` while the key is live, `"state":"consumed"` after its spill or restore, and then the key
-  is **not** re-armed. Another key at a used epoch is refused (409).
+  is **not** re-armed. Another key at a used epoch is refused (409 "used"). A persisted used fence means "an attempt
+  started", not "a checkpoint is available": a 409 "used" is answered both when the spill or restore happened and
+  when its key was disabled after a failure (nothing published, the rollback not durable); either way the caller
+  re-prefills (the entry stayed resident or its file is gone).
 - **Expiry is erasure.** A key's authorization ends at `min(token exp, registration + TTL)` (steady clock for the
-  TTL); a retry with a fresh token may extend it to that token's exp, but never past the first registration + TTL; a sweeper thread zeroes and unmaps expired keys once a second (a key reserved by a running spill or restore is
+  TTL). The token is checked again at the transition boundary, after the provider lock is taken (another
+  registration's fsync may have held it past exp): an expired one is refused, and the key's deadline is computed from
+  that in-lock wall-clock sample in milliseconds, so it never outlives the token's absolute exp (round 4); a retry with a fresh token may extend it to that token's exp, but never past the first registration + TTL; a sweeper thread zeroes and unmaps expired keys once a second (a key reserved by a running spill or restore is
   zeroed when that finishes).
 - **Leases and races.** A spill or restore takes a lease on the exact registration (its generation) under the
   provider's lock; finishing consumes that registration and no newer one; a registration cannot replace a slot a
@@ -625,19 +642,34 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
   epochs are kept in `--yard-state` (default `<spill dir>/yard-state`, 0600, written durably; at most 4096 sessions,
   rewritten whole under the lock). A registration is acknowledged only after they are on disk; a spill or restore
   raises its used fence on disk **before** the key is used (a failed spill puts it back).
-- **State files (round 3; `src/server/state_file.*`).** Both state files (yard's and the master's epoch) are owned
-  exclusively: an flock on `<file>.lock`, taken before the file is read and held for the provider's lifetime; a
-  second halo_serve on the same spill directory refuses to start (before it loads the model). Publication is typed:
+- **State files (round 3, round 4; `src/server/state_file.*`).** halo_serve owns the whole spill directory for its
+  lifetime (`spill-dir.lock`, taken before any key or the model loads): a second halo_serve on the same directory
+  refuses to start whatever its keys. Each state file (yard's and the master's epoch) is also owned exclusively
+  (`<file>.lock`). The state directory is opened once and pinned (`O_DIRECTORY | O_NOFOLLOW`, ours, not
+  group/other-writable); the lock, the reads, every publish (`openat`, `renameat`) and the directory fsync go through
+  that descriptor, so a renamed or replaced path cannot split a write from its fsync. Its ancestors are trusted. Publication is typed:
   *unpublished* (nothing changed), *durable*, or *uncertain* (renamed into place, directory fsync failed). A
   transition is staged: memory takes the new epochs only after a durable publish, and no live key is destroyed before
-  that (except a revoke's keys: fail-closed, documented). On *uncertain* the yard provider **stops** (every key zeroed,
-  every registration 503 and every lease refused until a restart reloads what the disk holds); the master takes the
-  new epoch (what the disk shows, the stricter fence) and reports the failure. Loading opens the directory and then
+  that (except a revoke's keys: fail-closed, documented). On *uncertain* the outcome is unknown, not "not done": the
+  yard provider **stops** (its key slots are zeroed; leases already handed out keep their own KEK copies and finish;
+  every registration answers 503 and every new lease is refused until a restart reloads what the disk holds); the
+  master takes the new epoch (what the disk shows, the stricter fence), reports the failure, and seals nothing at that
+  epoch until a later durable write confirms it (each seal attempt retries that write), since a crash could revert
+  the epoch and orphan files sealed at it. Loading opens the directory and then
   the file relative to it with `O_NOFOLLOW`, requires a regular file owned by us with no group/other bits, reads it
   to EOF bounded by its size, and refuses junk, unterminated lines, duplicate sessions and inconsistent epochs.
   `<file>.init` marks a state that was initialized: a missing state with its marker refuses the start ("recovery
-  required"; delete the marker to reset deliberately). Restoring an older copy of both from a backup is out of scope
-  (no external monotonic anchor). Keys, leases and seen jtis are memory only: a restart forgets every key (yard
+  required"). The first initialization writes the state, then the marker; a state without its marker (from before
+  round 3, or a first start interrupted between the two writes) gets the marker on its next load, under the lock.
+  Restoring an older copy of both from a backup is out of scope (no external monotonic anchor).
+  **Recovery** when a start says "recovery required":
+  - *aborted first initialization*: cannot happen any more (state first, marker second); a marker without any state
+    from an older build may be deleted;
+  - *unexpected loss of an established state*: do not just delete the marker (that silently re-opens every fenced
+    epoch). Either restore the authoritative fences (yard's view of each session's epochs and revokes), or start a new
+    authorization namespace: delete the spill files and the marker, and have yard re-register only at epochs above
+    everything it ever issued (and wait out the token lifetime, 300 s, plus the key TTL first);
+  - *deliberate reset*: the same as a new namespace. Keys, leases and seen jtis are memory only: a restart forgets every key (yard
   re-registers after verifying `GET /admin/keys`); a replayed token after a restart is either refused by the
   persisted fences or re-registers the same, unused operation (harmless). Cache entries are memory only too, so after
   a restart old spill files are not restored at all (they are re-prefilled).
@@ -671,8 +703,9 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
 | A process running as chuck, or root, while halo_serve runs | **not protected**: it can run `systemd-creds decrypt --user` itself, or read halo_serve's memory (ptrace as the same uid) | a process as chuck cannot mint yard tokens, so it cannot make halo open a yard-sealed file; but it can read keys halo holds at that moment, and plaintext state in device memory | memory and GPU memory of the live process; swap is not involved (key memory is mlocked or refused; the 16 MB staging buffers are pinned) |
 | A stolen admin API key | can spill / restore phase-A entries (halo opens them itself) | cannot open yard-sealed files without a fresh yard token bound to the key; cannot relabel an entry or move it to the master (custody) | - |
 | The key in transit | - | the Unix socket (0600, peer uid) or an authenticated encrypted transport only (above) | a misconfigured `--yard-keys-tcp 1` on a plain network |
-| Residual copies of K in halo_serve | - | the body, its parsed JSON strings, the HTTP layer's buffer (consumed, grown, dropped) and receive buffer are overwritten; K is decoded straight into `SecretBytes` after a length check | copies a library made internally (the JSON parser's reallocation of strings it was growing, the kernel's socket buffers) |
-| Two halo_serve processes on one spill directory | the second refuses to start (state lock) | same | - |
+| Residual copies of K in halo_serve | - | the body, its parsed JSON strings, every header value (the API key), the HTTP layer's buffer (consumed, grown, dropped) and receive buffer are overwritten (cleansed, not mlocked: live request bytes can be swapped); K is decoded straight into `SecretBytes` after a length check | copies a library made internally (the JSON parser's reallocation of strings it was growing, the kernel's socket buffers) |
+| Two halo_serve processes on one spill directory | the second refuses to start (`spill-dir.lock`, whatever its keys) | same | - |
+| A delayed or replayed revoke | - | bounded by its token epoch: never fences, erases or zeroes state after it | - |
 
 ### I/O path
 
@@ -831,6 +864,17 @@ uncertain spill (`spill_fault_ = 3`) and incarnation entry ids. Mutants: 23 new 
 ones re-targeted; all killed (`streams/SE/m4_cpu.txt`, `m4b_cpu.txt`, `m4g_a.txt`, `m4g_b.txt`). Still not mutated:
 the lease eligibility check and the duplicate branch's used guard (each masked by the rollback's key disabling: defense
 in depth), and the out-of-place DEK wrap on the success path. 12K restore: v2 271.3 ms median (v1 268.8; b3.txt).
+
+Round 4 (third-pass reviews): `YardKeys.RevokeIsBoundedByItsTokenEpoch` (a delayed revoke at T after a spill and after
+a registration at T + 1: both survive), `ExpiryIsCheckedUnderTheLock` (the lock held past exp: refused; held but not
+past exp: the key still ends at exp), `MarkerlessStateIsUpgraded`, `StateDirectoryIsPinned`, `JwksFileIsChecked`,
+`ConcurrentMasterAndYardPersistence` (also under ThreadSanitizer: `build/cpu-tsan`, crypt_tests 39/39 clean), the
+master's unconfirmed epoch, a 128-bit incarnation and canonical entry ids; `Http.UnixSocketProbeFailsClosed` (full
+backlog); GPU `SessionCache.PoisonedRestoreQuarantinesItsMemory`. Mutants (`streams/SE/m5_cpu.txt`, `m5b_cpu.txt`,
+`m5g.txt`, `m5g2.txt`): 13 new `r4-*` killed (12 CPU, 1 GPU), the re-targeted ones and every earlier CPU mutant of
+these files re-killed. A ThreadSanitizer positive control for the old plain fault-hook global could not be made: TSan
+treats file-descriptor number reuse as synchronization, which orders the two writers, so no planted race in that path
+is reported; the fix (an atomic exchange) stands on its own.
 
 SR4:
 

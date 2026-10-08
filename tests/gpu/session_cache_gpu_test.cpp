@@ -1328,6 +1328,7 @@ TEST(SessionCache, YardKeysAuthoriseResume) {
                           ("yard-" + std::to_string(::getpid()));
   std::filesystem::remove_all(dir);
   std::filesystem::create_directories(dir);
+  std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
   yardtest::Signer signer("kid-a");
   yardtest::WriteFile(dir + "/jwks.json", yardtest::JwksJson({&signer}));
   std::string e;
@@ -1529,3 +1530,67 @@ TEST(SessionCache, PoisonModeReportsAWriteIntoAReleasedRange) {
   dev->ReleaseRange(next);
 }
 
+
+// A restore that fails and whose cleanup cannot synchronize the device poisons the engine, and the cache's own
+// failure cleanup (give_up: DropSession of the half-restored session) then releases nothing: the session and its
+// device memory stay quarantined, every later engine call is refused.
+TEST(SessionCache, PoisonedRestoreQuarantinesItsMemory) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  const char* d = std::getenv("HALO_SPILL_TEST_DIR");
+  const std::string dir = (d && *d ? std::filesystem::path(d) : std::filesystem::temp_directory_path() / "halo-spill-test") /
+                          ("poison-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(dir);
+  constexpr std::uint32_t kCtx = 1024;
+  std::string e;
+  auto ea = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(ea) << e;
+  core::crypt::SecretBytes mk(32);
+  ASSERT_TRUE(core::crypt::RandomBytes({mk.data(), 32}));
+  auto keys = server::MasterSpillKeys::Create("test", std::move(mk), "", &e);
+  ASSERT_TRUE(keys) << e;
+  server::SessionCacheOptions o{.mode = server::SessionCacheOptions::Mode::kExact, .align = 64, .max_retained = 4};
+  o.spill_dir = dir;
+  o.spill_keys = keys.get();
+  {
+    server::FlashNextGenerator g(*ea, std::vector<text::TokenId>{}, kCtx, o);
+    std::vector<std::int32_t> prompt(300), got;
+    for (std::size_t i = 0; i < prompt.size(); ++i) prompt[i] = static_cast<std::int32_t>((i * 7919 + 3) % 1000);
+    server::TextGenerator::Params p;
+    p.max_tokens = 2;
+    ASSERT_TRUE(g.GenerateIds(prompt, 290, p, [&](text::TokenId t) { return got.push_back(t), true; }).error.empty());
+    const auto saved_piece = engine::FlashNextGpu::spill_piece_bytes_;
+    engine::FlashNextGpu::spill_piece_bytes_ = 64u << 10;
+    g.WithCache([&](server::SessionCache& c) {
+      const auto key = c.List().front().key;
+      std::string why;
+      EXPECT_TRUE(c.Spill(key, &why)) << why;
+      const std::string file = dir + "/s" + std::to_string(::getpid()) + "-" + std::to_string(key) + ".spill";
+      std::fstream io(file, std::ios::in | std::ios::out | std::ios::binary);
+      const auto size = std::filesystem::file_size(file);
+      for (std::uint64_t at = size * 3 / 4; at < size; at += 4096) {
+        char ch;
+        io.seekg(static_cast<std::streamoff>(at));
+        io.get(ch);
+        io.seekp(static_cast<std::streamoff>(at));
+        io.put(static_cast<char>(ch ^ 0x55));
+      }
+      io.close();
+      engine::FlashNextGpu::SessionId extra = 0;  // an unbound session: its drop must be refused once poisoned
+      EXPECT_TRUE(ea->NewSession(&extra, &why)) << why;
+      const std::size_t live = ea->LiveSessions();
+      engine::FlashNextGpu::restore_sync_fault_ = true;
+      EXPECT_FALSE(c.Restore(key, &why));
+      engine::FlashNextGpu::restore_sync_fault_ = false;
+      EXPECT_TRUE(ea->poisoned());
+      EXPECT_EQ(ea->LiveSessions(), live + 1) << "the cache's cleanup released the half-restored session's memory";
+      EXPECT_FALSE(ea->DropSession(extra, &why)) << "a poisoned engine released a session for reuse";
+      EXPECT_EQ(ea->LiveSessions(), live + 1);
+      engine::FlashNextGpu::SessionId id = 0;
+      EXPECT_FALSE(ea->NewSession(&id, &why));
+      return true;
+    });
+    engine::FlashNextGpu::spill_piece_bytes_ = saved_piece;
+  }
+  std::filesystem::remove_all(dir);
+}

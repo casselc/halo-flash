@@ -343,6 +343,12 @@ class FlashNextGpu {
   /// True after a failure that left the device in a state the engine cannot vouch for (a failed restore whose
   /// cleanup synchronize failed): every session, step, prefill, spill and restore call is refused from then on.
   [[nodiscard]] bool poisoned() const noexcept { return poisoned_; }
+  /// Sessions that hold device memory (tests: a poisoned engine releases none of them).
+  [[nodiscard]] std::size_t LiveSessions() const noexcept {
+    std::size_t n = 0;
+    for (const auto& s : sessions_) n += s != nullptr;
+    return n;
+  }
   [[nodiscard]] std::uint32_t SessionPositionOf(SessionId id) const;
   /// Device bytes of physical memory the session's state holds, counting shared KV pages once per holder
   /// (`exclusive`: pages only this session references) - for the memory tables.
@@ -405,7 +411,8 @@ class FlashNextGpu {
   [[nodiscard]] bool RestoreSession(const std::string& path, const SpillProtection& prot,
                                     std::vector<std::uint8_t>* blob, SpillInfo* info, std::string* error,
                                     bool* reset = nullptr);
-  /// Reads and checks a spill file's header and meta only (format, key, authentication or checksums).
+  /// Reads and checks a spill file's header and meta only (format, key, authentication or checksums). It touches no
+  /// device memory, so it needs no poison check.
   [[nodiscard]] bool SpillPeek(const std::string& path, const SpillProtection& prot, std::vector<std::uint8_t>* blob,
                                SpillInfo* info, std::string* error) const;
   /// Removes `<dir>/*.tmp.*` spill temp files a crash left.

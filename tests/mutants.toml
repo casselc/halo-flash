@@ -14,6 +14,10 @@ env = []
 build_dir = "build/gpu"
 env = ["HALO_TINY_HF_DIR", "HALO_TINY_QWEN35_DIR", "HALO_SMALL_QUANT_DIR", "HALO_DECIDER_MODELS_DIR"]
 
+[suite.cpu-tsan]
+build_dir = "build/cpu-tsan"
+env = []
+
 [suite.cpu]
 build_dir = "build/cpu-debug"
 
@@ -1780,8 +1784,8 @@ why = "an expired key is only hidden: it stays in memory and still seals"
 [[mutant]]
 name = "yard-auth-ignores-exp"
 file = "src/server/yard_keys.cpp"
-find = '  const auto deadline = tnow + std::min<Clock::duration>(ttl, std::chrono::seconds(std::max<std::int64_t>(exp - t, 0)));'
-replace = '  const auto deadline = tnow + ttl;'
+find = '      tnow + std::min<Clock::duration>(ttl, std::chrono::milliseconds(std::max<std::int64_t>(exp * 1000 - t_ms, 0)));'
+replace = '      tnow + ttl;'
 suite = "cpu"
 binary = "crypt_tests"
 filter = "YardKeys.ExpiryZeroesKeys"
@@ -1791,7 +1795,7 @@ why = "a key registered just before its token expires stays usable for the whole
 [[mutant]]
 name = "yard-state-not-persisted"
 file = "src/server/yard_keys.cpp"
-find = '  const Persist p = WriteStateFile(o_.state_path, out, why);'
+find = '  const Persist p = dir_->Write(state_name_, out, why);'
 replace = '  (void)out; const Persist p = Persist::kDurable;'
 suite = "cpu"
 binary = "crypt_tests"
@@ -1867,7 +1871,7 @@ why = "the master provider seals an entry the cache says is yard-bound"
 [[mutant]]
 name = "master-epoch-not-persisted"
 file = "src/server/spill_keys.cpp"
-find = '    const Persist p = WriteStateFile(epoch_file_, std::to_string(next) + "\n", why);'
+find = '    const Persist p = dir_->Write(epoch_name_, std::to_string(next) + "\n", why);'
 replace = '    const Persist p = Persist::kDurable;'
 suite = "cpu"
 binary = "crypt_tests"
@@ -2121,7 +2125,7 @@ why = "an entry whose file is of a fenced epoch is kept waiting for a key that c
 [[mutant]]
 name = "r3-entry-any-incarnation"
 file = "src/server/yard_keys.cpp"
-find = '    if (entry.rfind(pre, 0) != 0 || !ParseU64(std::string_view(entry).substr(pre.size()), ~0ull, &k))'
+find = '    if (entry.rfind(pre, 0) != 0 || !ParseU64(suffix, ~0ull, &k) || std::to_string(k) != suffix)'
 replace = '    if (false)'
 suite = "cpu"
 binary = "crypt_tests"
@@ -2143,8 +2147,8 @@ why = "two halo_serve processes own one state file: a stale writer overwrites fe
 [[mutant]]
 name = "r3-uncertain-as-unpublished"
 file = "src/server/state_file.cpp"
-find = '  if (!dir_ok) return *error = "fsync of " + dir + " failed after publishing " + path, Persist::kUncertain;'
-replace = '  if (!dir_ok) return *error = "fsync of " + dir + " failed after publishing " + path, Persist::kUnpublished;'
+find = '    return *error = "fsync of " + path_ + " failed after publishing " + name, Persist::kUncertain;'
+replace = '    return *error = "fsync of " + path_ + " failed after publishing " + name, Persist::kUnpublished;'
 suite = "cpu"
 binary = "crypt_tests"
 filter = "YardKeys.PersistenceOutcomesAreTyped"
@@ -2220,8 +2224,8 @@ why = "a registration of the other use destroys a slot a running spill or restor
 [[mutant]]
 name = "r3-revoke-default-token-epoch"
 file = "src/server/yard_keys.cpp"
-find = '    const std::optional<std::uint64_t> R = through ? through : (s.e.last_spill ? std::optional(s.e.last_spill) : std::nullopt);'
-replace = '    const std::optional<std::uint64_t> R = through ? through : std::optional(E);'
+find = '        through ? through : (s.e.last_spill ? std::optional(std::min(s.e.last_spill, T)) : std::nullopt);'
+replace = '        through ? through : std::optional(T);'
 suite = "cpu"
 binary = "crypt_tests"
 filter = "YardKeys.RevokeDefaultFencesWhatWasSpilled"
@@ -2253,7 +2257,7 @@ why = "a valid prefix followed by junk loads as the whole state"
 [[mutant]]
 name = "r3-state-missing-resets"
 file = "src/server/state_file.cpp"
-find = '    if (Exists(path + ".init"))'
+find = '    if (Exists(name + ".init"))'
 replace = '    if (false)'
 suite = "cpu"
 binary = "crypt_tests"
@@ -2275,8 +2279,8 @@ why = "a group-readable or group-writable state file is trusted"
 [[mutant]]
 name = "r3-state-follows-symlink"
 file = "src/server/state_file.cpp"
-find = '  const int fd = ::openat(dfd, base.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);'
-replace = '  const int fd = ::openat(dfd, base.c_str(), O_RDONLY | O_CLOEXEC);'
+find = '  const int fd = ::openat(fd_, name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);'
+replace = '  const int fd = ::openat(fd_, name.c_str(), O_RDONLY | O_CLOEXEC);'
 suite = "cpu"
 binary = "crypt_tests"
 filter = "YardKeys.StateLoadingRefusesUnsafeOrPartialState"
@@ -2352,8 +2356,8 @@ why = "request storage is freed without being zeroed (growth, teardown, a client
 [[mutant]]
 name = "r3-socket-steal-live"
 file = "src/server/http.cpp"
-find = '    if (live) return *error = path + " is served by another live process: refusing to take it over", false;'
-replace = ''
+find = '    if (err != ECONNREFUSED && err != ENOENT)'
+replace = '    if (err != 0 && err != ECONNREFUSED && err != ENOENT)'
 suite = "cpu"
 binary = "server_tests"
 filter = "Http.UnixSocketOwnership"
@@ -2390,6 +2394,139 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "SessionCache.YardKeysAuthoriseResume"
 why = "a spill published but not durable gives its key back for another file"
+
+# ---- SE round 4: bounded revoke, expiry under the lock, pinned state dir, markers, quarantine, probe ------------
+
+[[mutant]]
+name = "r4-revoke-default-uncapped"
+file = "src/server/yard_keys.cpp"
+find = '        through ? through : (s.e.last_spill ? std::optional(std::min(s.e.last_spill, T)) : std::nullopt);'
+replace = '        through ? through : (s.e.last_spill ? std::optional(s.e.last_spill) : std::nullopt);'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.RevokeIsBoundedByItsTokenEpoch"
+timeout = 600
+why = "a delayed revoke without through fences a checkpoint spilled after its token epoch"
+
+[[mutant]]
+name = "r4-revoke-unscoped-zeroing"
+file = "src/server/yard_keys.cpp"
+find = '        return reg <= T || (cand.fence && file <= *cand.fence);'
+replace = '        return true;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.RevokeIsBoundedByItsTokenEpoch"
+timeout = 600
+why = "an older revoke zeroes registrations made after its token epoch"
+
+[[mutant]]
+name = "r4-expiry-not-rechecked"
+file = "src/server/yard_keys.cpp"
+find = '  if (t_ms >= exp * 1000) return refuse("expired while waiting for the key state");'
+replace = ''
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.ExpiryIsCheckedUnderTheLock"
+timeout = 600
+why = "a token that expired while the state lock was held still takes effect"
+
+[[mutant]]
+name = "r4-marker-not-upgraded"
+file = "src/server/state_file.cpp"
+find = '  if (Exists(name + ".init")) return true;'
+replace = '  return true;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.MarkerlessStateIsUpgraded"
+timeout = 600
+why = "a state from before the markers never gets one: its later loss silently resets the fences"
+
+[[mutant]]
+name = "r4-dir-not-pinned"
+file = "src/server/state_file.cpp"
+find = '  if (!synced || fault == 1 || ::renameat(fd_, tmp.c_str(), fd_, name.c_str()) != 0) {'
+replace = '  if (!synced || fault == 1 || ::renameat(fd_, tmp.c_str(), AT_FDCWD, (path_ + "/" + name).c_str()) != 0) {'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.StateDirectoryIsPinned"
+timeout = 600
+why = "a publish follows the path (which may now be another directory) instead of the pinned directory"
+
+[[mutant]]
+name = "r4-statedir-unchecked"
+file = "src/server/state_file.cpp"
+find = '  if (::fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != ::geteuid() || (st.st_mode & 022) != 0) {'
+replace = '  if (::fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode)) {'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.StateDirectoryIsPinned"
+timeout = 600
+why = "a group-writable state directory is trusted"
+
+[[mutant]]
+name = "r4-incarnation-any-length"
+file = "src/server/yard_keys.cpp"
+find = '  if (o.incarnation.size() != 32) return *error = '
+replace = '  if (o.incarnation.empty()) return *error = '
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.ConfigurationFailsClosed"
+timeout = 600
+why = "a short (guessable) incarnation is accepted"
+
+[[mutant]]
+name = "r4-entry-noncanonical"
+file = "src/server/yard_keys.cpp"
+find = ' || std::to_string(k) != suffix)'
+replace = ')'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.SealEntriesAreIncarnationBound"
+timeout = 600
+why = "a non-canonical entry id (leading zeros) is accepted"
+
+[[mutant]]
+name = "r4-jwks-file-unchecked"
+file = "src/server/yard_keys.cpp"
+find = '            (st.st_mode & 022) == 0 && (st.st_uid == ::geteuid() || st.st_uid == 0);'
+replace = '            true;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.JwksFileIsChecked"
+timeout = 600
+why = "a world-writable JWKS is trusted"
+
+[[mutant]]
+name = "r4-master-seals-unconfirmed"
+file = "src/server/spill_keys.cpp"
+find = '    if (unconfirmed_) {'
+replace = '    if (false) {'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.PersistenceOutcomesAreTyped"
+timeout = 600
+why = "the master seals new files at an epoch whose publish was not durable (a crash may revert it)"
+
+[[mutant]]
+name = "r4-probe-ambiguous-stale"
+file = "src/server/http.cpp"
+find = '    if (err != ECONNREFUSED && err != ENOENT)'
+replace = '    if (err == 0)'
+suite = "cpu"
+binary = "server_tests"
+filter = "Http.UnixSocketProbeFailsClosed"
+timeout = 600
+why = "an endpoint that cannot be classified (full backlog) is unlinked as stale"
+
+[[mutant]]
+name = "r4-quarantine-off"
+file = "src/engine/flash_next_gpu.cpp"
+find = '  if (poisoned_) return PoisonedFail(error);  // quarantine: the session and its memory stay allocated'
+replace = ''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.PoisonedRestoreQuarantinesItsMemory"
+why = "the cache cleanup releases a poisoned session whose device writes may still be queued"
 
 # ---- MTP in the server (src/server/decode_loop.cpp, flash_next_generator.cpp; docs/MTP.md) -------------------
 

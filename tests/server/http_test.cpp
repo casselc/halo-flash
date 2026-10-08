@@ -545,3 +545,34 @@ TEST(Http, UnixSocketOwnership) {
   d.Stop();
   std::filesystem::remove_all(dir);
 }
+
+// The socket probe fails closed: an endpoint that cannot be classified (a full backlog: EAGAIN) is not "stale".
+TEST(Http, UnixSocketProbeFailsClosed) {
+  const std::string dir = (std::filesystem::temp_directory_path() / ("halo-http-probe-" + std::to_string(::getpid()))).string();
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
+  const std::string path = dir + "/admin.sock";
+  const int lfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  sockaddr_un sa{};
+  sa.sun_family = AF_UNIX;
+  std::memcpy(sa.sun_path, path.c_str(), path.size() + 1);
+  ASSERT_EQ(::bind(lfd, reinterpret_cast<sockaddr*>(&sa), sizeof sa), 0);
+  ASSERT_EQ(::listen(lfd, 0), 0);
+  std::vector<int> fill;  // never accepted: the backlog fills and further connects get EAGAIN
+  for (int i = 0; i < 64; ++i) {
+    const int c = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    const int rc = ::connect(c, reinterpret_cast<sockaddr*>(&sa), sizeof sa);
+    fill.push_back(c);
+    if (rc != 0 && errno == EAGAIN) break;
+  }
+  HttpServerOptions o;
+  o.unix_path = path;
+  HttpServer s(o);
+  std::string err;
+  EXPECT_FALSE(s.Start(&err)) << "an endpoint with a full backlog was taken for stale";
+  EXPECT_TRUE(std::filesystem::exists(path));
+  for (int c : fill) ::close(c);
+  ::close(lfd);
+  std::filesystem::remove_all(dir);
+}

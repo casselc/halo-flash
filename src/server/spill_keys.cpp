@@ -24,17 +24,21 @@ std::unique_ptr<MasterSpillKeys> MasterSpillKeys::Create(std::string provider, c
   k->provider_ = std::move(provider);
   k->prefix_ = k->provider_ + ":" + name;
   k->master_ = std::move(master);
-  k->epoch_file_ = epoch_file;
   if (!epoch_file.empty()) {
-    // One owner: a second halo_serve on these files is refused (it would overwrite fences with a stale epoch).
-    k->lock_ = StateLock::Acquire(epoch_file, error);
+    // The directory is pinned once; one owner: a second halo_serve on this file is refused (it would overwrite
+    // fences with a stale epoch).
+    const auto [dir, name] = SplitPath(epoch_file);
+    k->dir_ = StateDir::Open(dir, error);
+    if (!k->dir_) return nullptr;
+    k->epoch_name_ = name;
+    k->lock_ = k->dir_->Lock(name, error);
     if (!k->lock_) return nullptr;
     // The epoch never goes back: a restart continues from the persisted one (an older epoch's files stay fenced).
     std::string text, e2;
-    const StateRead r = ReadStateFile(epoch_file, 64, &text, &e2);
+    const StateRead r = k->dir_->Read(name, 64, &text, &e2);
     if (r == StateRead::kError) return *error = "spill key: epoch file: " + e2 + " (refusing to start)", nullptr;
     if (r == StateRead::kFresh) {
-      if (!InitStateFile(epoch_file, "1\n", error)) return nullptr;
+      if (!k->dir_->Init(name, "1\n", error)) return nullptr;
     } else {
       // Exactly "<digits>\n": no prefix-plus-junk, no sign, no zero.
       std::uint64_t e = 0;
@@ -42,6 +46,8 @@ std::unique_ptr<MasterSpillKeys> MasterSpillKeys::Create(std::string provider, c
           !ParseU64(std::string_view(text).substr(0, text.size() - 1), std::uint64_t{1} << 62, &e) || e == 0)
         return *error = "spill key: epoch file " + epoch_file + " is malformed (refusing to start)", nullptr;
       k->epoch_.store(e);
+      // A state from before the init markers: it gets its marker now, under the lock, before the provider is used.
+      if (!k->dir_->EnsureMarker(name, error)) return nullptr;
     }
   }
   return k;
@@ -68,6 +74,17 @@ bool MasterSpillKeys::Derive(std::string_view label, SpillLease* out, std::strin
 bool MasterSpillKeys::SealLease(std::string_view, std::string_view label, bool yard_bound, SpillLease* out,
                                 std::string* why) {
   if (yard_bound) return *why = "a yard-bound entry is never sealed under the master key", false;
+  {
+    // After an uncertain fence the epoch in memory may not survive a crash: no new file is sealed at it until a
+    // durable write confirms it (otherwise a crash could revert the epoch and orphan those files).
+    std::lock_guard<std::mutex> lk(mu_);
+    if (unconfirmed_) {
+      std::string e;
+      if (dir_->Write(epoch_name_, std::to_string(epoch_.load()) + "\n", &e) != Persist::kDurable)
+        return *why = "the master epoch is not confirmed durable yet (" + e + "): spill refused", false;
+      unconfirmed_ = false;
+    }
+  }
   return Derive(label, out, why);
 }
 
@@ -86,17 +103,20 @@ bool MasterSpillKeys::FenceEpoch(std::string* why) {
   std::lock_guard<std::mutex> lk(mu_);
   const std::uint64_t next = epoch_.load() + 1;
   // Persisted before it takes effect: a crash cannot bring an older epoch back.
-  if (!epoch_file_.empty()) {
-    const Persist p = WriteStateFile(epoch_file_, std::to_string(next) + "\n", why);
+  if (dir_) {
+    const Persist p = dir_->Write(epoch_name_, std::to_string(next) + "\n", why);
     if (p == Persist::kUnpublished) return false;
     if (p == Persist::kUncertain) {
-      // The disk shows the new epoch (maybe not after a crash): take it, the stricter fence. Reported as a failure.
+      // The disk shows the new epoch (maybe not after a crash): take it, the stricter fence, but seal nothing at it
+      // until a durable write confirms it (SealLease). Reported as a failure.
       epoch_.store(next);
+      unconfirmed_ = true;
       *why = "epoch " + std::to_string(next) + " taken, but its durability is uncertain: " + *why;
       return false;
     }
   }
   epoch_.store(next);
+  unconfirmed_ = false;  // a durable epoch confirms itself
   return true;
 }
 

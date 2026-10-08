@@ -288,14 +288,31 @@ bool HttpServer::StartUnix(std::string* error) {
     return *error = "unix socket directory " + dir + " must exist, be ours and mode 0700", false;
   if (::lstat(path.c_str(), &st) == 0) {
     if (!S_ISSOCK(st.st_mode)) return *error = path + " exists and is not a socket", false;
-    // Live (another server answers) or stale (an earlier run's): only a stale one is removed.
-    const int probe = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    // Live, stale, or unknown: a bounded non-blocking connect. Only a refusal (nobody listens: ECONNREFUSED) or the
+    // path vanishing (ENOENT) proves it stale; a connect, a full backlog (EAGAIN), a timeout or any other error
+    // fails closed (the start is refused, nothing is unlinked).
+    const int probe = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (probe < 0) return *error = "cannot probe " + path + ": " + std::strerror(errno), false;
     sockaddr_un pa{};
     pa.sun_family = AF_UNIX;
     std::memcpy(pa.sun_path, path.c_str(), path.size() + 1);
-    const bool live = probe >= 0 && ::connect(probe, reinterpret_cast<sockaddr*>(&pa), sizeof pa) == 0;
-    if (probe >= 0) ::close(probe);
-    if (live) return *error = path + " is served by another live process: refusing to take it over", false;
+    int rc = ::connect(probe, reinterpret_cast<sockaddr*>(&pa), sizeof pa);
+    int err = rc == 0 ? 0 : errno;
+    if (rc != 0 && (err == EINPROGRESS || err == EINTR)) {
+      pollfd pf{probe, POLLOUT, 0};
+      if (::poll(&pf, 1, 500) == 1) {
+        socklen_t len = sizeof err;
+        if (::getsockopt(probe, SOL_SOCKET, SO_ERROR, &err, &len) != 0) err = EIO;
+      } else {
+        err = ETIMEDOUT;
+      }
+    }
+    ::close(probe);
+    if (err != ECONNREFUSED && err != ENOENT)
+      return *error = path + (err == 0 ? " is served by another live process" : " could not be probed (" +
+                                                                                    std::string(std::strerror(err)) + ")") +
+                      ": refusing to take it over",
+             false;
     ::unlink(path.c_str());
   }
   listen_fd_ = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -455,10 +472,12 @@ void HttpServer::Serve(int fd) {
   int idle_ms = 0;
   while (!stopping_.load()) {
     HttpRequest req;
-    struct BodyWipe {  // every path out of this request (handled, refused at the API key, streamed, failed)
-      HttpRequest& r;
+    struct BodyWipe {  // every path out of this request (handled, refused at the API key, streamed, failed): the body
+      HttpRequest& r;  // and every header value (Authorization carries the API key) are zeroed
       ~BodyWipe() {
         if (!r.body.empty()) explicit_bzero(r.body.data(), r.body.size());
+        for (auto& [k, v] : r.headers)
+          if (!v.empty()) explicit_bzero(v.data(), v.size());
       }
     } body_wipe{req};
     const auto st = parser.Next(&req);

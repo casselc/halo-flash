@@ -47,6 +47,9 @@ std::unique_ptr<FlashNextGpu> FlashNextGpu::Create(rt::Device& device, const mod
 }
 
 FlashNextGpu::~FlashNextGpu() {
+  // Poisoned: device work may still be queued against this engine's memory (a failed restore whose synchronize
+  // failed). Nothing goes back to the allocator for reuse; the process exit releases it with the device context.
+  if (poisoned_) return;
   (void)dev_.Synchronize(nullptr);
   for (auto& g : batch_graphs_) dev_.FreeGraph(g.graph);
   for (auto& sp : sessions_)
@@ -1108,6 +1111,7 @@ bool FlashNextGpu::AllocSeq(SeqState& s, std::string* error) {
 }
 
 void FlashNextGpu::FreeSeq(SeqState& s) noexcept {
+  if (poisoned_) return;  // quarantine: no allocation of a poisoned engine is released for reuse
   (void)dev_.Synchronize(nullptr);
   for (auto& g : s.graphs) dev_.FreeGraph(g);
   for (auto& g : s.post_graphs) dev_.FreeGraph(g);
@@ -1195,6 +1199,7 @@ bool FlashNextGpu::BindSession(SessionId id, std::string* error) {
 }
 
 bool FlashNextGpu::DropSession(SessionId id, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);  // quarantine: the session and its memory stay allocated
   if (!HasSession(id) || id == bound_) {
     if (error) *error = id == bound_ ? "cannot drop the bound session" : "no such session";
     return false;
@@ -1446,6 +1451,7 @@ bool FlashNextGpu::Save(Snapshot& snap, std::string* error) {
 }
 
 bool FlashNextGpu::Restore(const Snapshot& snap, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   if (!snap.valid_ || &snap.dev_ != &dev_) {
     if (error) *error = "snapshot is empty or from another device";
     return false;
@@ -1468,6 +1474,7 @@ bool FlashNextGpu::Restore(const Snapshot& snap, std::string* error) {
 }
 
 bool FlashNextGpu::ReleaseKvPages(std::string* error) {
+  if (poisoned_) return PoisonedFail(error);  // quarantine: pages stay mapped
   if (!dev_.Synchronize(error)) return false;  // queued work may still read them
   const std::size_t pb = dev_.PageBytes();
   for (auto& r : kv_) {

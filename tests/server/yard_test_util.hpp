@@ -9,6 +9,8 @@
 #include <openssl/evp.h>
 #include <openssl/rsa.h>
 
+#include <sys/stat.h>
+
 #include <array>
 #include <cstdint>
 #include <ctime>
@@ -21,7 +23,7 @@
 
 namespace yardtest {
 
-inline const std::string kInc = "0f0f";  // the test providers' incarnation
+inline const std::string kInc = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f";  // the test providers' incarnation
 inline std::string Entry(std::int64_t key, const std::string& inc = kInc) { return inc + "." + std::to_string(key); }
 
 inline std::string B64(const std::string& s) {
@@ -88,7 +90,7 @@ struct Claims {
   std::int64_t epoch = 1, iat = 0, exp = 0;  // 0: now, now + 300
   std::string key_sha256;                    // base64url SHA-256 of the key ("" = none)
   bool with_halo_spill = true;
-  std::string entry = "0f0f.1";  // halo_spill.entry (seal): "<incarnation>.<key>"; "": absent
+  std::string entry = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f.1";  // halo_spill.entry (seal): "<incarnation>.<key>"; "": absent
   std::int64_t through = 0;  // halo_spill.through (revoke); 0: absent
   std::string nbf;           // raw JSON for nbf ("" = iat)
   std::string aud_json;      // raw JSON for aud ("" = the string aud)
@@ -155,7 +157,10 @@ inline halo::server::YardSpillKeys::Answer RegisterRaw(halo::server::YardSpillKe
   return y.Register(sess, body, now);
 }
 
-inline void WriteFile(const std::string& path, const std::string& s) { std::ofstream(path) << s; }
+inline void WriteFile(const std::string& path, const std::string& s) {
+  { std::ofstream(path) << s; }
+  ::chmod(path.c_str(), 0600);  // the JWKS and state files must not be group-writable
+}
 
 }  // namespace yardtest
 

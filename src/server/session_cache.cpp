@@ -33,7 +33,7 @@ void CleanSpillDir(const std::string& dir) {
 SessionCache::SessionCache(Engine& engine, SessionCacheOptions options) : e_(engine), opt_(options) {
   if (opt_.align == 0) opt_.align = 1;
   if (opt_.incarnation.empty()) {  // entry ids must not repeat across processes: "<incarnation>.<key>"
-    std::array<std::uint8_t, 8> r{};
+    std::array<std::uint8_t, 16> r{};
     if (!core::crypt::RandomBytes(r)) std::abort();
     static const char* hex = "0123456789abcdef";
     for (auto b : r) opt_.incarnation += {hex[b >> 4], hex[b & 15]};

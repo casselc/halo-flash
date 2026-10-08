@@ -347,12 +347,19 @@ int main(int argc, char** argv) {
   if (!mtp_model.empty() && model.empty()) return std::fprintf(stderr, "--mtp-model needs --model (Flash-Next)\n"), 2;
   std::string error;
   // Spill encryption keys: loaded before the cache exists and destroyed after it (masters zeroed on exit).
-  // The spill directory holds the key state (master epoch, yard epochs): created 0700 here, before any key loads.
-  if (spill_key != "none" || !yard_opt.jwks_path.empty()) {
+  // The spill directory holds the spill files and the key state (master epoch, yard epochs): created 0700 here,
+  // and owned by this process for its lifetime (spill-dir.lock), before any key or the model loads: a second
+  // halo_serve on the same directory refuses to start, whatever its keys.
+  std::unique_ptr<server::StateDir> spill_state_dir;
+  std::unique_ptr<server::StateLock> spill_dir_lock;
+  {
     std::error_code ec;
     std::filesystem::create_directories(cache.spill_dir, ec);
     if (!ec) std::filesystem::permissions(cache.spill_dir, std::filesystem::perms::owner_all, ec);
     if (ec) return std::fprintf(stderr, "--spill-dir %s: %s\n", cache.spill_dir.c_str(), ec.message().c_str()), 1;
+    spill_state_dir = server::StateDir::Open(cache.spill_dir, &error);
+    if (spill_state_dir) spill_dir_lock = spill_state_dir->Lock("spill-dir", &error);
+    if (!spill_dir_lock) return std::fprintf(stderr, "--spill-dir: %s\n", error.c_str()), 1;
   }
   std::unique_ptr<server::MasterSpillKeys> spill_keys;
   if (!server::MakeSpillKeys(spill_key, cache.spill_dir, &spill_keys, &error))
