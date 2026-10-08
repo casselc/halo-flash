@@ -144,6 +144,7 @@ class ScheduledGenerator : public TextGenerator {
   void PublishFinished();
   void Sync();
   std::shared_ptr<Job> Find(Scheduler::Id id);
+  std::shared_ptr<Job> FindShared(Job& job);
   Result Wait(const std::shared_ptr<Job>& job, std::uint64_t gen, const Params& params,
               const std::function<bool(text::TokenId)>* on_token, const std::function<bool(std::string_view)>* on_text);
   std::int64_t NowMs() const;

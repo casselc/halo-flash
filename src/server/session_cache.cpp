@@ -344,13 +344,14 @@ bool SessionCache::PrefillSlice(LeaseId lease, std::uint32_t max_tokens, std::ui
   // would otherwise make every later state differ from a cold prefill).
   if (opt_.mode == SessionCacheOptions::Mode::kExact && max_tokens >= opt_.align)
     max_tokens = max_tokens / opt_.align * opt_.align;
-  const std::size_t stop = L.want_ck && L.at < L.ck ? L.ck : L.n;
-  const std::size_t to = std::min(stop, L.at + std::max<std::uint32_t>(1, max_tokens));
-  if (!RunTo(L, to, chunk_tokens, {}, nullptr, error)) return false;
-  if (L.want_ck && L.at == L.ck) {
-    if (!ParkCheckpoint(L, error)) return false;
+  const std::size_t to = std::min(L.n, L.at + std::max<std::uint32_t>(1, max_tokens));
+  // The checkpoint inside this slice is parked on the way (a second engine call from there; the split is aligned):
+  // a slice that stopped at it would take the turn a second unit, and its first token a second round of others'.
+  if (L.want_ck && L.at < L.ck && L.ck <= to) {
+    if (!RunTo(L, L.ck, chunk_tokens, {}, nullptr, error) || !ParkCheckpoint(L, error)) return false;
     L.want_ck = false;
   }
+  if (!RunTo(L, to, chunk_tokens, {}, nullptr, error)) return false;
   *ran = L.at - from;
   *done = L.at >= L.n;
   if (*done) L.e.canonical = L.e.canonical && L.reused % opt_.align == 0 && L.splits_aligned;

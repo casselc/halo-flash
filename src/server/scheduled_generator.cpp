@@ -72,6 +72,11 @@ ScheduledGenerator::~ScheduledGenerator() {
 
 std::int64_t ScheduledGenerator::NowMs() const { return static_cast<std::int64_t>(Ms(epoch_, Clock::now())); }
 
+std::shared_ptr<ScheduledGenerator::Job> ScheduledGenerator::FindShared(Job& job) {
+  auto j = Find(job.id);
+  return j ? j : std::shared_ptr<Job>(&job, [](Job*) {});
+}
+
 std::shared_ptr<ScheduledGenerator::Job> ScheduledGenerator::Find(Scheduler::Id id) {
   std::lock_guard<std::mutex> lk(mu_);
   auto it = jobs_.find(id);
@@ -390,6 +395,13 @@ void ScheduledGenerator::RunSlice(Job& job, std::uint32_t tokens, Scheduler::Pro
     if (job.spec) chooser_.Reset();
     job.run = std::make_unique<DecodeRun>(job.ids.back(), job.budget, job.spec ? &chooser_ : nullptr,
                                           job.spec ? &job.spec_stats : nullptr);
+    // The first token belongs to the prefill's unit (~40 ms): TTFT is then the request's own prefill and the slices
+    // fair queuing ordered before it, not every other request's prefill too.
+    std::vector<Scheduler::Progress> first;
+    RunDecodeUnit({FindShared(job)}, 1, &first);
+    p->decoded = first.empty() ? 0 : first[0].decoded;
+    p->finished = !first.empty() && first[0].finished;
+    p->completed = !first.empty() && first[0].completed;
   }
 }
 
