@@ -634,3 +634,9 @@ step's token plus up to k drafts and emit 1 + accepted tokens. What that changes
     `CLOCK_MONOTONIC` microseconds, the clock of the kernel log and of `AMD_LOG_LEVEL`), `HALO_DIAG_RANGE=free|pool|
     poison` (free is the default), `HALO_DIAG_MAP_DELAY_US`, and `halo_vmm_remap_probe` (tools/vmm_remap_probe.cpp:
     the runtime race in 80 lines of plain HIP, for an upstream report). Mutant `rt-poison-check-blind`.
+
+**Prior art (searched 2026-10-07).** The same class is public on gfx1201 (RDNA4): ROCm/rocm-systems#11693 (freshly
+mapped VM memory reads zeros; map returns before the mapping is visible to GPU work; ~2 ms host delay works around it;
+open) and ROCm/legacy-rocm-build#6692 (reusing a VA after hipMemUnmap corrupts live VMM buffers). Our gfx1151 data
+(writes land in the released page; ~60-100 us suffice) is drafted as a comment for #11693 in
+/data/halo-work/platform/upstream/rocm-vmm-remap-gfx1151.md, not posted.
