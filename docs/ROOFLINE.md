@@ -1485,7 +1485,26 @@ docs/MTP.md "Server integration". Pinned, chooser limit 4, 32K draft head; greed
 | Serving, W 128 | W 0 + 0-3% decode, +0.17 s TTFT cold | 1.26x / 1.23x / 1.24x (turn 2 1.35x); TTFT +0.13-0.18 s cold | yes (default) |
 | MTP serving with decode graphs off (fault workaround) | fault gone, speed unchanged | speed unchanged (+-1%) but faulted in 1 of 9 runs: not the cause | no |
 
-## 17. 2026-10-07 (stream SE, branch `stream/spill-crypt`): encrypted spill files (format v2)
+## 17. 2026-10-07 (stream RC, branch `stream/rt-rootcause`): root cause of the MTP-serving fault
+
+docs/SESSIONS.md section 11. Correctness, not speed: the rows record what each experiment predicted and found
+(bench = MS's bench.jsonl through halo_serve, MTP on; "fix off" = the runtime frees and reuses ranges).
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| Standalone repro: reserve / map / copy / free / re-reserve, 648K reuses (ana/vmm_repro) | faults if a generic reuse race | 0 faults | no (not reproduced) |
+| Fix off, W 128, graphs, address log + HIP LOG_MEM | >= 1 fault in 4 | 0 of 4 | - |
+| Fix off, W 0 (MS's high-rate config) | >= 2 of 4 | faulted run 1; timeline: fork copy into its fresh page | - |
+| DropSession frees batch (verify) graphs before the session's memory | 0 of 4 if a graph outliving its ranges is the trigger | 1 of 2 faulted | no (refuted, reverted) |
+| Poison quarantine (stale-write detector), W 0 | 0 faults, 0 hits under A | 0 of 3, 0 hits | diagnostic (env, off) |
+| Fix off, W 0, 2 ms sleep after every map | 0 of 4 if the write outruns the mapping | 0 of 4 | diagnostic (env, off) |
+| AR serving, fix off | 0 faults; ex-load-buffer fork pages < 25% of MTP's | 0 of 3; ~1 a run vs ~100 | - |
+| Minimal remap probe (ana/vmm_stale): write right after unmap + remap at the same VA | - | 100 of 100 writes land in the OLD page; >= 60 us later 0 of 100; no HIP sync helps | repro for upstream |
+| VMM settle (no GPU work until 1 ms after a map / unmap) + fork maps before copies, fix off, W 0 | 0 of 4; TTFT +1 ms a fork | 0 of 4; final defaults, no diagnostics (E10): 0 of 4; TTFT and decode within run-to-run noise (+-5%) | yes (default 1000 us) |
+| Range pool (6240e69) | - | removed the fault by keeping forks off freshly freed addresses, but kept every pooled range's high-water pages charged (4 GB probe: freed only with the range); 128K OOM on main (stream SE) | no (removed; `HALO_DIAG_RANGE=pool` for A/B) |
+| Ranges freed + VMM settle, 128K spill bench (SE's B0) | restores like SR4 (2.56 s) | restore 2571 ms, logits bit-identical | yes |
+
+## 18. 2026-10-07 (stream SE, branch `stream/spill-crypt`): encrypted spill files (format v2)
 
 Not a kernel change: the cost of AES-256-GCM on the SR4 spill path (docs/SESSIONS.md section 10). Real model,
 default KV, `halo_run --spill-bench --spill-format 12` (v1 and v2 from the same prefill, restores interleaved),

@@ -1247,61 +1247,45 @@ TEST(SessionCache, SpeculativeDecodeIsGreedyIdenticalAndReuseStaysExact) {
   EXPECT_GT(reused, 0u) << "the cache never reused a speculative session";
 }
 
-// rt::HipDevice keeps released ranges reserved and hands them out again (the runtime reusing a freed address made
-// a write to a freshly mapped page fault: docs/SESSIONS.md section 10). 32 ranges of 3 pages are used and released;
-// 96 ranges of 1 or 2 pages reserved meanwhile overlap none of them (they stay reserved; returned to the runtime,
-// their addresses are handed out again for other sizes); 32 new 3-page ranges are exactly the released ones. Every
-// range's fresh pages hold what was written through them.
-TEST(SessionCache, ReleasedRangesComeBackAndRemapCleanly) {
+// rt::HipDevice returns a released range to the runtime: the memory of the pages mapped into a range stays charged
+// until the range itself is freed (ROCm 7.2.3), so keeping released ranges (stream MS's range pool) grew memory with
+// every session and ran 128K contexts out of memory (docs/SESSIONS.md section 11). 24 ranges of different sizes, each
+// with 64 fresh pages (128 MB with 2 MB pages) written and read back, are used and released one after another:
+// device memory available afterwards is within 512 MB of before (3 GB would be gone if released ranges stayed
+// reserved: a kept range keeps every page slot it ever mapped charged; only a page mapped at the same slot of the
+// same range reuses that charge).
+// Mutant rt-range-kept-on-release (the pool as the default) fails it.
+TEST(SessionCache, ReleasedRangesGiveTheirMemoryBack) {
   std::string e;
   auto dev = rt::Device::Create(rt::Backend::kHip, &e);
   if (!dev) GTEST_SKIP() << "no GPU backend";
   const std::size_t pb = dev->PageBytes();
   if (pb == 0) GTEST_SKIP() << "no page mapping";
-  // Maps a fresh page at each page of `r`, fills it with `v`, reads it back, unmaps and releases the pages.
-  const auto use = [&](const rt::Buffer& r, std::uint8_t v) {
-    std::vector<void*> h(r.bytes / pb);
-    for (std::size_t j = 0; j < h.size(); ++j) {
+  const std::size_t before = dev->AvailableBytes();
+  if (before == SIZE_MAX) GTEST_SKIP() << "available memory unknown";
+  const std::size_t pages = std::max<std::size_t>(1, (std::size_t{128} << 20) / pb);
+  for (int round = 0; round < 24; ++round) {
+    rt::Buffer r = dev->ReserveRange((pages + round) * pb, &e);  // sizes differ, as sessions' ranges do
+    ASSERT_TRUE(r.device) << e;
+    std::vector<void*> h(pages);
+    for (std::size_t j = 0; j < pages; ++j) {
       h[j] = dev->CreatePage(&e);
       ASSERT_TRUE(h[j] && dev->MapPage(r, j * pb, h[j], &e)) << e;
     }
-    ASSERT_TRUE(dev->Fill(r, v, &e) && dev->Synchronize(&e)) << e;
-    std::vector<std::uint8_t> back(r.bytes);
-    ASSERT_TRUE(dev->Download(r, 0, back.data(), back.size(), &e)) << e;
-    ASSERT_TRUE(std::all_of(back.begin(), back.end(), [&](std::uint8_t b) { return b == v; })) << int(v);
-    for (std::size_t j = 0; j < h.size(); ++j) {
+    const auto v = static_cast<std::uint8_t>(round + 1);
+    ASSERT_TRUE(dev->Fill(rt::Buffer{r.device, pages * pb, nullptr}, v, &e) && dev->Synchronize(&e)) << e;
+    std::vector<std::uint8_t> back(pb);
+    ASSERT_TRUE(dev->Download(r, (pages - 1) * pb, back.data(), back.size(), &e)) << e;
+    ASSERT_TRUE(std::all_of(back.begin(), back.end(), [&](std::uint8_t x) { return x == v; })) << round;
+    for (std::size_t j = 0; j < pages; ++j) {
       ASSERT_TRUE(dev->UnmapPage(r, j * pb, &e)) << e;
       dev->ReleasePage(h[j]);
     }
-  };
-  std::vector<rt::Buffer> big(32), small(96);
-  std::set<void*> released;
-  for (auto& r : big) {
-    r = dev->ReserveRange(3 * pb, &e);
-    ASSERT_TRUE(r.device) << e;
-  }
-  for (auto& r : big) {
-    ASSERT_NO_FATAL_FAILURE(use(r, 1));
-    released.insert(r.device);
     dev->ReleaseRange(r);
   }
-  for (std::size_t i = 0; i < small.size(); ++i) {
-    small[i] = dev->ReserveRange((1 + i % 2) * pb, &e);
-    ASSERT_TRUE(small[i].device) << e;
-    const auto* p = static_cast<const char*>(small[i].device);
-    for (void* q : released)
-      ASSERT_TRUE(p + small[i].bytes <= static_cast<const char*>(q) || static_cast<const char*>(q) + 3 * pb <= p)
-          << "range " << i << " overlaps a released range that should still be reserved";
-    ASSERT_NO_FATAL_FAILURE(use(small[i], static_cast<std::uint8_t>(2 + i)));
-  }
-  for (auto& r : big) {
-    r = dev->ReserveRange(3 * pb, &e);
-    ASSERT_TRUE(r.device) << e;
-    ASSERT_EQ(released.erase(r.device), 1u) << "a 3-page range did not come from the released ones";
-    ASSERT_NO_FATAL_FAILURE(use(r, 200));
-  }
-  for (auto& r : big) dev->ReleaseRange(r);
-  for (auto& r : small) dev->ReleaseRange(r);
+  const std::size_t after = dev->AvailableBytes();
+  EXPECT_LT(before > after ? before - after : 0, std::size_t{512} << 20)
+      << "released ranges kept " << (before - after) / (1 << 20) << " MB";
 }
 
 namespace {
@@ -1452,3 +1436,96 @@ TEST(SessionCache, YardKeysAuthoriseResume) {
   });
   std::filesystem::remove_all(dir);
 }
+
+// rt::HipDevice holds GPU work back until the GPU has settled a mapping change (docs/SESSIONS.md section 11): on this
+// stack a write issued right after a page was unmapped and another mapped at the same address went to the OLD,
+// released page (stream RC's probe, ana/vmm_stale: 100 of 100 without the wait), and one right after a fresh
+// mapping faulted (the MTP-serving fork fault). A page is used, unmapped and released, another page (also mapped at a
+// second address to read it back) mapped in its place and written at once, 20 times: every write reaches the new
+// page. Mutant rt-vmm-settle-off (no wait) fails it.
+TEST(SessionCache, RemappedPageSeesTheNewPageAtOnce) {
+  std::string e;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &e);
+  if (!dev) GTEST_SKIP() << "no GPU backend";
+  const std::size_t pb = dev->PageBytes();
+  if (pb == 0) GTEST_SKIP() << "no page mapping";
+  void* s = dev->CreatePage(&e);
+  rt::Buffer view = dev->ReserveRange(pb, &e);
+  ASSERT_TRUE(s && view.device && dev->MapPage(view, 0, s, &e)) << e;
+  int misdirected = 0;
+  for (int rep = 0; rep < 20; ++rep) {
+    ASSERT_TRUE(dev->Fill(view, 0xA5, &e)) << e;
+    rt::Buffer r = dev->ReserveRange(2 * pb, &e);
+    ASSERT_TRUE(r.device) << e;
+    const rt::Buffer at{static_cast<char*>(r.device) + pb, pb, nullptr};
+    void* a = dev->CreatePage(&e);
+    ASSERT_TRUE(a && dev->MapPage(r, pb, a, &e) && dev->Fill(at, 0x11, &e) && dev->Synchronize(&e)) << e;
+    ASSERT_TRUE(dev->UnmapPage(r, pb, &e)) << e;
+    dev->ReleasePage(a);
+    ASSERT_TRUE(dev->MapPage(r, pb, s, &e)) << e;
+    ASSERT_TRUE(dev->Fill(rt::Buffer{static_cast<char*>(at.device) + 8192, 4096, nullptr}, 0x55, &e) &&
+                dev->Synchronize(&e))
+        << e;
+    std::uint32_t got = 0;
+    ASSERT_TRUE(dev->Download(view, 8192, &got, 4, &e)) << e;
+    if (got != 0x55555555u) ++misdirected;
+    ASSERT_TRUE(dev->UnmapPage(r, pb, &e)) << e;
+    dev->ReleaseRange(r);
+  }
+  EXPECT_EQ(misdirected, 0) << "writes right after a remap went to the old page";
+  ASSERT_TRUE(dev->UnmapPage(view, 0, &e)) << e;
+  dev->ReleasePage(s);
+  dev->ReleaseRange(view);
+}
+
+// HALO_DIAG_RANGE=poison (rt::HipDevice, docs/SESSIONS.md section 11): released ranges are never handed out again and
+// get a sentinel page wherever they held pages, checked at every ReserveRange. A write through a pointer kept past
+// ReleaseRange (the "stale device pointer" a fault could otherwise hide behind) is reported as POISON-HIT and does not
+// fault; a clean release / reserve cycle reports nothing. Positive control of the detector stream RC ran the
+// MTP serving bench under (0 hits in 3 runs).
+TEST(SessionCache, PoisonModeReportsAWriteIntoAReleasedRange) {
+  ::setenv("HALO_DIAG_RANGE", "poison", 1);
+  std::string e;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &e);
+  ::unsetenv("HALO_DIAG_RANGE");
+  if (!dev) GTEST_SKIP() << "no GPU backend";
+  const std::size_t pb = dev->PageBytes();
+  if (pb == 0) GTEST_SKIP() << "no page mapping";
+  // One session-like range: two pages mapped, written, unmapped and released; returns the stale range.
+  const auto use_and_release = [&]() {
+    rt::Buffer r = dev->ReserveRange(3 * pb, &e);
+    EXPECT_TRUE(r.device) << e;
+    void* h[2] = {dev->CreatePage(&e), dev->CreatePage(&e)};
+    for (int j = 0; j < 2; ++j) EXPECT_TRUE(h[j] && dev->MapPage(r, j * pb, h[j], &e)) << e;
+    for (int j = 0; j < 2; ++j) {
+      EXPECT_TRUE(dev->Fill(rt::Buffer{static_cast<char*>(r.device) + j * pb, pb, nullptr}, 7, &e)) << e;
+      EXPECT_TRUE(dev->UnmapPage(r, j * pb, &e)) << e;
+      dev->ReleasePage(h[j]);
+    }
+    const rt::Buffer stale = r;
+    dev->ReleaseRange(r);
+    return stale;
+  };
+  // Clean: nothing writes a released range.
+  testing::internal::CaptureStderr();
+  (void)use_and_release();
+  rt::Buffer probe = dev->ReserveRange(pb, &e);
+  std::string out = testing::internal::GetCapturedStderr();
+  ASSERT_TRUE(probe.device) << e;
+  EXPECT_EQ(out.find("POISON-HIT"), std::string::npos) << out;
+  // Stale: a kernel writes 4 KB into the second page of a released range, through the old pointer.
+  const rt::Buffer stale = use_and_release();
+  testing::internal::CaptureStderr();
+  ASSERT_TRUE(dev->Fill(rt::Buffer{static_cast<char*>(stale.device) + pb + 8192, 4096, nullptr}, 0x55, &e) &&
+              dev->Synchronize(&e))
+      << "the stale write faulted instead of landing in the sentinel: " << e;
+  rt::Buffer next = dev->ReserveRange(pb, &e);
+  out = testing::internal::GetCapturedStderr();
+  ASSERT_TRUE(next.device) << e;
+  EXPECT_NE(out.find("POISON-HIT (reserve): 1024 words changed, first at byte 8192"), std::string::npos) << out;
+  // Never handed out again.
+  EXPECT_NE(next.device, stale.device);
+  dev->ReleaseRange(probe);
+  dev->ReleaseRange(next);
+}
+

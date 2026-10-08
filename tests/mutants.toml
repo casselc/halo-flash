@@ -2444,11 +2444,31 @@ filter = "SessionCache.SpeculativeDecodeIsGreedyIdenticalAndReuseStaysExact"
 why = "a sampled request verified greedily returns the argmax text instead of a sample"
 
 [[mutant]]
-name = "rt-range-freed-on-release"
+name = "rt-range-kept-on-release"
 file = "src/rt/hip_device.cpp"
-find = 'range_pool_.emplace(b.bytes, b.device);'
-replace = '(void)hipMemAddressFree(b.device, b.bytes);'
+find = 'RangeMode range_mode_ = RangeMode::kFree;'
+replace = 'RangeMode range_mode_ = RangeMode::kPool;'
 suite = "gpu"
 binary = "gpu_tests"
-filter = "SessionCache.ReleasedRangesComeBackAndRemapCleanly"
-why = "a released range goes back to the runtime, whose reuse of the address made writes to a freshly mapped page fault"
+filter = "SessionCache.ReleasedRangesGiveTheirMemoryBack"
+why = "released ranges kept reserved (the old range pool): their unmapped pages stay charged and memory grows per session"
+
+[[mutant]]
+name = "rt-poison-check-blind"
+file = "src/rt/hip_device.cpp"
+find = 'if (n == 0) return true;'
+replace = 'if (n == 0 || true) return true;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.PoisonModeReportsAWriteIntoAReleasedRange"
+why = "the poison-mode check that a write reached a released range reports nothing: the stale-pointer detector is blind"
+
+[[mutant]]
+name = "rt-vmm-settle-off"
+file = "src/rt/hip_device.cpp"
+find = 'unsigned long settle_us_ = 1000;'
+replace = 'unsigned long settle_us_ = 0;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.RemappedPageSeesTheNewPageAtOnce"
+why = "GPU work right after a mapping change: a write to a remapped page lands in the old, released page (and a fresh mapping can fault)"
