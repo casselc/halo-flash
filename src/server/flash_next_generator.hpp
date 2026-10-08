@@ -55,6 +55,7 @@ class FlashNextGenerator : public TextGenerator {
                      SessionCacheOptions cache = {}, SpecOptions spec = {});
 
   Result Generate(const Params& params, const std::function<bool(std::string_view)>& on_text) override;
+  [[nodiscard]] std::optional<std::uint64_t> CountTokens(std::string_view prompt) const override;
 
   /// Token-level only (GenerateIds; Generate fails): no tokenizer, generation stops at `stops`.
   FlashNextGenerator(engine::FlashNextGpu& engine, std::vector<text::TokenId> stops, std::uint32_t max_context,

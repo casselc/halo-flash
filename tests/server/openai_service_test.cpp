@@ -32,6 +32,7 @@
 
 #include "core/json.hpp"
 #include "engine/mtp_depth.hpp"
+#include "server/anthropic_service.hpp"
 #include "server/decode_loop.hpp"
 #include "server/http.hpp"
 #include "server/openai_response.hpp"
@@ -689,6 +690,8 @@ struct ServingRig {
     o.now_s = [] { return std::int64_t{1700000000}; };
     service = std::make_unique<OpenAiService>(gen, o);
     service->Register(server);
+    anthropic = std::make_unique<AnthropicService>(gen, o);  // /v1/messages, same generator and observer
+    anthropic->Register(server);
     std::string err;
     if (!server.Start(&err)) throw std::runtime_error(err);
   }
@@ -698,6 +701,7 @@ struct ServingRig {
   Recording observed;
   HttpServer server;
   std::unique_ptr<OpenAiService> service;
+  std::unique_ptr<AnthropicService> anthropic;
 };
 
 /// One client connection ("Connection: close": the server closes after its reply).
@@ -714,7 +718,9 @@ struct Conn {
     a.sin_port = htons(static_cast<std::uint16_t>(port));
     ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
     if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0) throw std::runtime_error("connect");
-    const std::string req = "POST /v1/responses HTTP/1.1\r\nConnection: close\r\nContent-Length: " +
+    // An Anthropic Messages body goes to /v1/messages, any other to /v1/responses.
+    const char* path = body.find("\"messages\"") != std::string::npos ? "/v1/messages" : "/v1/responses";
+    const std::string req = "POST " + std::string(path) + " HTTP/1.1\r\nConnection: close\r\nContent-Length: " +
                             std::to_string(body.size()) + "\r\n\r\n" + body;
     ::send(fd, req.data(), req.size(), MSG_NOSIGNAL);
   }
@@ -771,6 +777,12 @@ Delivery Delivered(const Conn& c, bool stream) {
     const auto v = json::Parse(body, &err);
     if (!v) return d;
     d.full = true;
+    if (const Value* t = v->find("type"); t && t->str() == "message") {  // Anthropic: stop_reason as the status
+      d.status = v->find("stop_reason")->str();
+      for (const auto& b : v->find("content")->items())
+        if (b.find("type")->str() == "text") d.text += b.find("text")->str();
+      return d;
+    }
     d.status = v->find("status")->str();
     d.text = OutputText(*v);
     return d;
@@ -779,6 +791,10 @@ Delivery Delivered(const Conn& c, bool stream) {
   for (const auto& e : Events(body, &done)) {
     const std::string type = e.find("type")->str();
     if (type == "response.output_text.delta") d.text += e.find("delta")->str();
+    if (type == "content_block_delta" && e.find("delta")->find("type")->str() == "text_delta")
+      d.text += e.find("delta")->find("text")->str();
+    if (type == "message_delta") d.status = e.find("delta")->find("stop_reason")->str();
+    if (type == "message_stop") d.full = true;
     if (type == "response.completed" || type == "response.incomplete") {
       d.full = true;
       d.status = e.find("response")->find("status")->str();
@@ -796,6 +812,7 @@ struct Finished {
   std::shared_ptr<SteppedGenerator::Run> run;
   int work_at_leave = -1;  // the run's work when its client left (-1: it did not leave)
   bool store_failed = false;  // its store write failed (injected)
+  bool messages = false;      // an Anthropic /v1/messages request (nothing stored)
 };
 
 std::string RequestBody(const std::string& marker, bool stream, std::uint32_t max_tokens, const std::string& prev = "") {
@@ -803,6 +820,12 @@ std::string RequestBody(const std::string& marker, bool stream, std::uint32_t ma
                   R"(, "max_output_tokens": )" + std::to_string(max_tokens);
   if (!prev.empty()) b += R"(, "previous_response_id": ")" + prev + "\"";
   return b + "}";
+}
+
+/// The same request on the Anthropic route.
+std::string MessagesBody(const std::string& marker, bool stream, std::uint32_t max_tokens) {
+  return R"({"model": "claude-test", "max_tokens": )" + std::to_string(max_tokens) + R"(, "stream": )" +
+         (stream ? "true" : "false") + R"(, "messages": [{"role": "user", "content": ")" + marker + R"("}]})";
 }
 
 bool Await(const std::function<bool()>& f, int ms = 5000) {
@@ -824,6 +847,8 @@ bool Await(const std::function<bool()>& f, int ms = 5000) {
 //     chunk or step);
 //   - a stalled client delays another one by about the send timeout, not indefinitely;
 //   - continuing from a completed response sends its delivered text back to the generator; from a cancelled one, 400.
+// Requests go to /v1/responses or, drawn per request, to Anthropic's /v1/messages (no store: the same rules for
+// completion, cancellation and work after a departure; continuing and store failures are Responses-only).
 TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
   hegel::test([](hegel::TestCase& tc) {
     ServingRig rig;
@@ -870,6 +895,7 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
       }
       if (f.work_at_leave >= 0)
         ASSERT_LE(f.run->work.load(), f.work_at_leave) << f.marker << ": work after its client left";
+      if (f.messages) return;  // nothing stored
       if (!f.got.full && !f.stream) {
         // A non-streaming client that left never got the id: nothing is kept. (Every handler has returned once
         // the server holds no connection.)
@@ -894,6 +920,7 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
     };
     const auto complete = [&](const std::string& marker, const std::string& body, bool stream, int words) {
       Finished f{marker, body, 0, stream, {}, rig.gen.Plan(marker, -1, words)};
+      f.messages = body.find("\"messages\"") != std::string::npos;
       Conn c(port, body);
       c.ReadToEnd();
       f.got = Delivered(c, stream);
@@ -908,13 +935,18 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
       const bool stream = tc.draw(gs::booleans());
       const int words = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 8}));
       const auto max_tokens = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 12}));
+      const bool msg = tc.draw(gs::booleans());  // this step's requests go to /v1/messages
+      const auto body_of = [&](const std::string& m, bool s, std::uint32_t mt) {
+        return msg ? MessagesBody(m, s, mt) : RequestBody(m, s, mt);
+      };
       if (rule == "complete") {
         const auto m = fresh();
-        finish(complete(m, RequestBody(m, stream, max_tokens), stream, words));
+        finish(complete(m, body_of(m, stream, max_tokens), stream, words));
       } else if (rule == "leave-queued") {
         // A holder keeps the engine (held in decode) while the victim queues behind it and leaves.
         const auto hm = fresh(), vm = fresh();
-        Finished h{hm, RequestBody(hm, stream, 64), 0, stream, {}, rig.gen.Plan(hm, SteppedGenerator::kChunks + 1, words)};
+        Finished h{hm, body_of(hm, stream, 64), 0, stream, {}, rig.gen.Plan(hm, SteppedGenerator::kChunks + 1, words)};
+        h.messages = msg;
         Conn hc(port, h.body);
         std::thread reader([&] { hc.ReadToEnd(); });
         struct Join {  // also when an assertion returns early
@@ -926,8 +958,9 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
           }
         } join{reader, *h.run};
         ASSERT_TRUE(Await([&] { return h.run->held.load(); }));
-        Finished v{vm, RequestBody(vm, tc.draw(gs::booleans()), 64), 0, false, {}, rig.gen.Plan(vm, -1, words)};
+        Finished v{vm, body_of(vm, tc.draw(gs::booleans()), 64), 0, false, {}, rig.gen.Plan(vm, -1, words)};
         v.stream = v.body.find("\"stream\": true") != std::string::npos;
+        v.messages = msg;
         {
           Conn vc(port, v.body);
           ASSERT_TRUE(Await([&] { return v.run->phase.load() == SteppedGenerator::kQueued; }));
@@ -945,7 +978,8 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
         const int at = rule == "leave-prefill"
                            ? tc.draw(gs::integers<int>({.min_value = 1, .max_value = SteppedGenerator::kChunks - 1}))
                            : SteppedGenerator::kChunks + tc.draw(gs::integers<int>({.min_value = 1, .max_value = words}));
-        Finished f{m, RequestBody(m, stream, 64), 0, stream, {}, rig.gen.Plan(m, at, words)};
+        Finished f{m, body_of(m, stream, 64), 0, stream, {}, rig.gen.Plan(m, at, words)};
+        f.messages = msg;
         {
           Conn c(port, f.body);
           ASSERT_TRUE(Await([&] { return f.run->held.load(); }));
@@ -956,12 +990,13 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
         // A streaming client that never reads a reply far larger than the socket buffers; another client must get
         // the engine within about the send timeout (200 ms here).
         const auto sm = fresh();
-        Finished s{sm, RequestBody(sm, true, 64), 0, true, {}, rig.gen.Plan(sm, -1, 60, 256 * 1024)};
+        Finished s{sm, body_of(sm, true, 64), 0, true, {}, rig.gen.Plan(sm, -1, 60, 256 * 1024)};
+        s.messages = msg;
         Conn sc(port, s.body, 4096);
         ASSERT_TRUE(Await([&] { return s.run->phase.load() == SteppedGenerator::kDecode; }));
         const auto t0 = std::chrono::steady_clock::now();
         const auto m = fresh();
-        finish(complete(m, RequestBody(m, stream, max_tokens), stream, words));
+        finish(complete(m, body_of(m, stream, max_tokens), stream, words));
         EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(3)) << "a stalled client held the engine";
         ASSERT_TRUE(Await([&] { return s.run->phase.load() == SteppedGenerator::kDone; }));
         sc.Close();
@@ -998,6 +1033,7 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
         finish(complete(marker, body, s, words));
       } else if (rule == "continue" && !done.empty()) {
         const Finished prev = done[tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = done.size() - 1}))];
+        if (prev.messages) continue;  // nothing to continue from
         const auto rec = record_of(prev);
         ASSERT_TRUE(rec);
         const auto m = fresh();

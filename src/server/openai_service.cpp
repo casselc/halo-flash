@@ -47,11 +47,16 @@ std::string StopMatcher::Push(std::string_view text) {
   // the result does not depend on how the text was chunked.
   for (std::size_t end = old + 1; end <= pending_.size(); ++end) {
     std::size_t cut = std::string::npos;
+    const std::string* which = nullptr;
     for (const auto& s : stops_)
-      if (!s.empty() && s.size() <= end && pending_.compare(end - s.size(), s.size(), s) == 0)
-        cut = std::min(cut, end - s.size());
+      if (!s.empty() && s.size() <= end && pending_.compare(end - s.size(), s.size(), s) == 0 &&
+          end - s.size() < cut) {
+        cut = end - s.size();
+        which = &s;
+      }
     if (cut != std::string::npos) {
       stopped_ = true;
+      matched_ = *which;
       std::string out = pending_.substr(0, cut);
       pending_.clear();
       return out;

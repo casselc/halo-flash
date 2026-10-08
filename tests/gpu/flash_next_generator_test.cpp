@@ -164,3 +164,54 @@ TEST(FlashNextGenerator, CompleteUtf8PrefixHoldsBackCutSequences) {
   EXPECT_EQ(server::CompleteUtf8Prefix("\xff"), 1u);            // invalid bytes pass
   EXPECT_EQ(server::CompleteUtf8Prefix("\x80\x80"), 2u);        // stray continuations pass
 }
+
+// Anthropic usage (server/anthropic_service.hpp): cached_tokens are the prompt tokens whose state was reused,
+// cache_write_tokens the ones prefilled now that a retained state holds afterwards. Exact mode retains the
+// checkpoint at the generation prompt's start rounded down to the alignment; fast mode also keeps the finished
+// session, which holds the whole prompt. CountTokens is the prompt's token count.
+TEST(FlashNextGenerator, CacheUsageCountsWhatIsReusedAndWhatIsRetained) {
+  Tiny* t = Load();
+  if (!t) GTEST_SKIP() << "set HALO_TINY_HF_DIR";
+  std::string e;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &e);
+  if (!dev) GTEST_SKIP() << e;
+  constexpr std::uint32_t kCtx = 1024;
+  auto engine = engine::FlashNextGpu::Create(*dev, *t->weights, t->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(engine) << e;
+  std::string words;
+  for (int i = 0; i < 60; ++i) words += "word" + std::to_string(i) + " ";
+  const std::string p1 = "<|im_start|>user\n" + words + "<|im_end|>\n<|im_start|>assistant\n";
+  const text::TokenId im_start = t->tok->Encode("<|im_start|>", true)[0];
+  const auto stable_of = [&](const std::string& p) {
+    const auto ids = t->tok->Encode(p, true);
+    std::size_t s = 0;
+    for (std::size_t i = 0; i < ids.size(); ++i)
+      if (ids[i] == im_start) s = i;
+    return s;
+  };
+  {
+    server::FlashNextGenerator g(*engine, *t->tok, kCtx);  // exact, align 64
+    server::TextGenerator::Result r1, r2;
+    const std::string a1 = Collect(g, p1, 4, &r1);
+    ASSERT_TRUE(r1.error.empty()) << r1.error;
+    EXPECT_EQ(g.CountTokens(p1), std::optional<std::uint64_t>(r1.prompt_tokens));
+    const std::size_t ck1 = stable_of(p1) / 64 * 64;
+    ASSERT_GT(ck1, 0u) << "the prompt must reach the first aligned checkpoint";
+    EXPECT_EQ(r1.cached_tokens, 0u);
+    EXPECT_EQ(r1.cache_write_tokens, ck1);
+    const std::string p2 = p1 + a1 + "<|im_end|>\n<|im_start|>user\n" + words + "<|im_end|>\n<|im_start|>assistant\n";
+    (void)Collect(g, p2, 4, &r2);
+    const std::size_t ck2 = stable_of(p2) / 64 * 64;
+    EXPECT_EQ(r2.cached_tokens, ck1);
+    EXPECT_EQ(r2.cache_write_tokens, ck2 - ck1);
+    EXPECT_LE(r2.cached_tokens + r2.cache_write_tokens, r2.prompt_tokens);
+  }
+  {
+    ASSERT_TRUE(engine->Reset(&e)) << e;
+    server::FlashNextGenerator g(*engine, *t->tok, kCtx, {.mode = server::SessionCacheOptions::Mode::kFast});
+    server::TextGenerator::Result r;
+    (void)Collect(g, p1, 4, &r);
+    EXPECT_EQ(r.cached_tokens, 0u);
+    EXPECT_EQ(r.cache_write_tokens, r.prompt_tokens) << "the finished session holds the whole prompt";
+  }
+}

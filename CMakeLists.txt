@@ -53,6 +53,9 @@ add_library(halo_server STATIC
   src/server/openai_response.cpp
   src/server/http.cpp
   src/server/openai_service.cpp
+  src/server/anthropic_request.cpp
+  src/server/anthropic_response.cpp
+  src/server/anthropic_service.cpp
   src/server/systemone_service.cpp
   src/server/metrics.cpp
   src/server/kv_choice.cpp
@@ -225,6 +228,7 @@ if(HALO_BUILD_TESTS)
     tests/server/openai_response_test.cpp
     tests/server/http_test.cpp
     tests/server/openai_service_test.cpp
+    tests/server/anthropic_test.cpp
     tests/server/systemone_service_test.cpp
     tests/server/metrics_test.cpp
     tests/server/kv_choice_test.cpp

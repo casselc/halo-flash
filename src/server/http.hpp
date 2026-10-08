@@ -110,7 +110,7 @@ struct HttpServerOptions {
   /// stayed closed), so a stalled client is noticed about this long after its window closes, not only once the
   /// server's send buffer is full too.
   int send_timeout_ms = 30000;
-  std::string api_key;          // non-empty: require "Authorization: Bearer <key>"
+  std::string api_key;          // non-empty: require "Authorization: Bearer <key>" or "x-api-key: <key>"
 };
 
 class HttpServer {
@@ -125,6 +125,11 @@ class HttpServer {
   /// Paths starting with `prefix` that match no exact route (the longest
   /// matching prefix for the request's method wins).
   void RoutePrefix(std::string method, std::string prefix, HttpHandler handler);
+  /// The 401 body for paths starting with `prefix` (an API whose clients expect their own error shape); register
+  /// before Start(). Other paths get the OpenAI shape.
+  void AuthErrorBody(std::string prefix, std::string json_body) {
+    auth_errors_.emplace_back(std::move(prefix), std::move(json_body));
+  }
   /// Binds, listens and starts the accept thread.
   [[nodiscard]] bool Start(std::string* error);
   /// Stops accepting, closes connections (streams see their writer fail),
@@ -141,6 +146,7 @@ class HttpServer {
   HttpServerOptions opt_;
   std::map<std::pair<std::string, std::string>, HttpHandler> routes_;
   std::vector<std::pair<std::pair<std::string, std::string>, HttpHandler>> prefix_routes_;
+  std::vector<std::pair<std::string, std::string>> auth_errors_;  // path prefix, 401 body
   int listen_fd_ = -1;
   int port_ = 0;
   std::atomic<bool> stopping_{false};

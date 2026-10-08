@@ -91,6 +91,10 @@ class SessionCache {
   void Abandon();
 
   [[nodiscard]] std::size_t retained() const { return entries_.size(); }
+  /// The longest prefix of `prompt` a retained state (resident or spilled) holds whole: a checkpoint whose tokens
+  /// are a prefix of `prompt`, or a finished session (fast mode) that extends `prompt`. After Finish, minus the
+  /// request's reused tokens, it is what the request added to the cache (Anthropic's cache_creation_input_tokens).
+  [[nodiscard]] std::size_t RetainedPrefix(std::span<const std::int32_t> prompt) const;
   /// Device bytes the retained states hold (recurrent buffers and KV pages no other session shares).
   [[nodiscard]] std::size_t retained_bytes() const;
   /// Tokens the live session has run (or the last finished one's, until the next Prepare).

@@ -29,7 +29,12 @@
 // directory holds Qwen3.5-2B-Base-BF16.gguf and the strands-decider-*.gguf
 // files, as the decider tests expect).
 // Endpoints: GET /health, /metrics (Prometheus, vLLM names), /v1/models, /v1/responses/{id};
-//            POST /v1/completions, /v1/chat/completions, /v1/responses.
+//            POST /v1/completions, /v1/chat/completions, /v1/responses,
+//            POST /v1/messages, /v1/messages/count_tokens (Anthropic Messages API, docs/ANTHROPIC.md).
+// --anthropic-alias PATTERN=TARGET (repeatable; PATTERN a name or a prefix ending in '*', TARGET the model id,
+// "<model id>:<variant>", or empty for the model id): model names the Anthropic routes accept. Default
+// "claude-*=" (every claude-* name is the served model); given at least once, the list replaces the default.
+// --api-key also accepts "x-api-key: KEY" (Anthropic clients).
 // P10 variants: --qwen35-model GGUF --qwen35-tokenizer GGUF serves the OpenAI
 // routes from a Qwen3.5 dense model instead of Flash-Next (no --model);
 // --variant MANIFEST (repeatable) loads a variant of the Qwen3.5 base (the
@@ -58,6 +63,7 @@
 #include "model/ngram.hpp"
 #include "model/weights.hpp"
 #include "rt/device.hpp"
+#include "server/anthropic_service.hpp"
 #include "server/flash_next_generator.hpp"
 #include "server/http.hpp"
 #include "server/kv_choice.hpp"
@@ -147,6 +153,7 @@ int main(int argc, char** argv) {
                     decider_device = "hip", scope_dir, scope_project = "halo-flash", scope_capture = "digest",
                     scope_wal, scope_eval_endpoint, qwen35_model, qwen35_tokenizer;
   std::vector<std::string> variant_paths;
+  std::vector<server::ModelAlias> anthropic_aliases;
   int port = 8080;
   double send_timeout_s = 30;
   double sse_keepalive_s = 15;
@@ -178,7 +185,8 @@ int main(int argc, char** argv) {
           "                        MTP speculative decoding (off without --mtp-model)\n"
           "  --ngram-cache-gb G --moe-topk N --decider-dir DIR --decider-device hip|hrx|cpu --variant MANIFEST\n"
           "  --scope-dir DIR --scope-project NAME --scope-capture off|digest|full --scope-wal PATH\n"
-          "  --scope-eval-endpoint URL\n");
+          "  --scope-eval-endpoint URL\n"
+          "  --anthropic-alias PATTERN=TARGET  model names /v1/messages accepts (repeatable; default claude-*=)\n");
       return 0;
     }
   }
@@ -214,6 +222,11 @@ int main(int argc, char** argv) {
     else if (a == "--spill-dir") cache.spill_dir = v;
     else if (a == "--spill-evict") cache.spill_on_evict = v == "1";
     else if (a == "--model-id") model_id = v;
+    else if (a == "--anthropic-alias") {
+      const auto alias = server::ParseModelAliasSpec(v);
+      if (!alias) return std::fprintf(stderr, "--anthropic-alias must be PATTERN=TARGET ('*' only at the end)\n"), 2;
+      anthropic_aliases.push_back(*alias);
+    }
     else if (a == "--mtp-model") mtp_model = v;
     else if (a == "--mtp-vocab") mtp_vocab = v;
     else if (a == "--mtp-window") spec.window = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
@@ -401,11 +414,14 @@ int main(int argc, char** argv) {
   }
   if (q35_generator) so.variants = [q35_generator] { return q35_generator->Variants(); };
   server::OpenAiService service(*generator, so);
+  if (anthropic_aliases.empty()) anthropic_aliases.push_back({"claude-*", ""});
+  server::AnthropicService anthropic(*generator, so, anthropic_aliases);
   server::HttpServer http({.host = host,
                            .port = port,
                            .send_timeout_ms = static_cast<int>(std::min(send_timeout_s * 1000, 3.6e6)),
                            .api_key = api_key});
   service.Register(http);
+  anthropic.Register(http);
   metrics.Register(http);
   if (flash_generator) RegisterSpillRoutes(http, *flash_generator);
 #if HALO_WITH_SCOPE

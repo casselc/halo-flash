@@ -44,6 +44,11 @@ bool FlashNextGenerator::IsStop(text::TokenId t) const {
   return std::find(stops_.begin(), stops_.end(), t) != stops_.end();
 }
 
+std::optional<std::uint64_t> FlashNextGenerator::CountTokens(std::string_view prompt) const {
+  if (!tok_) return std::nullopt;
+  return tok_->Encode(prompt, true).size();
+}
+
 TextGenerator::Result FlashNextGenerator::Generate(const Params& params,
                                                    const std::function<bool(std::string_view)>& on_text) {
   Result r;
@@ -163,6 +168,8 @@ TextGenerator::Result FlashNextGenerator::GenerateIds(std::span<const std::int32
   // A sampled token that was neither a stop nor run is not in the session; its state is exactly what it ran.
   const auto t3 = Clock::now();
   cache_.Finish();
+  const std::size_t retained = cache_.RetainedPrefix(ids);
+  r.cache_write_tokens = retained > prep.reused ? retained - prep.reused : 0;
   if (trace) {
     const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     std::fprintf(stderr, "cache: prompt %zu reused %zu prefilled %zu ckpt %d | prepare %.1f ms, first step %.1f ms, "
