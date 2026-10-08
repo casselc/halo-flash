@@ -139,6 +139,7 @@ TextGenerator::Admission ScheduledGenerator::AdmitIds(std::span<const std::int32
       jobs_[adm.id] = job;
       backend_->Admitted(adm.id, job->ids);
       ticket->job = job;
+      kick_ = true;
       wake_.notify_all();
       break;
     case O::kAdopted: {
@@ -311,6 +312,7 @@ bool ScheduledGenerator::RunDecider(const std::function<void()>& work, std::stri
     job->id = adm.id;
     job->admitted_ms = NowMs();
     jobs_[adm.id] = job;
+    kick_ = true;
   }
   wake_.notify_all();
   std::unique_lock<std::mutex> lk(job->mu);
@@ -613,7 +615,10 @@ void ScheduledGenerator::Loop() {
     Sync();
     if (unit.kind == Scheduler::Kind::kNone) {
       std::unique_lock<std::mutex> lk(mu_);
-      wake_.wait_for(lk, std::chrono::milliseconds(20), [&] { return stop_.load() || !posts_.empty(); });
+      // An admission wakes the engine at once (without kick_ the predicate ignored it: up to 20 ms added to every
+      // request that found the engine idle, found by D2's deciders: 175 ms scheduled vs 153 ms concurrent).
+      wake_.wait_for(lk, std::chrono::milliseconds(20), [&] { return stop_.load() || !posts_.empty() || kick_; });
+      kick_ = false;
       continue;
     }
     if (opt_.before_unit) opt_.before_unit(unit);

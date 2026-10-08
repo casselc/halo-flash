@@ -29,7 +29,8 @@ Q1 = {"state": "Help! My payouts have been failing for 3 days and the support ch
 Q3 = {"state": Q1["state"],
       "questions": {"is_urgent": {"type": "noul", "instructions": "Does this convey urgency?"},
                     "topic": {"type": "choice", "instructions": "What is it about?",
-                              "criteria": ["payments", "account access", "shipping", "other"]},
+                              "criteria": {"payments": "Payments or payouts", "access": "Account access",
+                                           "shipping": "Shipping", "other": "Something else"}},
                     "anger": {"type": "score", "instructions": "How angry is the writer?",
                               "criteria": ["calm", "annoyed", "angry", "furious"]}}}
 
@@ -78,7 +79,9 @@ def main() -> int:
     a = ap.parse_args()
     cmd = a.command[1:] if a.command and a.command[0] == "--" else a.command
     texts = serve_ab.chunk_texts(a.text_dir, 4, 8192 * 4)
-    colds = serve_ab.chunk_texts(a.text_dir, 2, a.cold_tokens * 4)
+    # the cold texts lie past the decode phases' texts (chunk_texts slices one concatenation: overlapping texts
+    # would make the "cold" prefill partly a cache hit)
+    colds = serve_ab.chunk_texts(a.text_dir, 6, a.cold_tokens * 4)[4:6]
     ask = "\n\nThink step by step about the text above, then write a long, detailed analysis of it."
     res: dict = {}
     proc = serve_ab.start_server(cmd, a.port, a.out)
@@ -112,8 +115,12 @@ def main() -> int:
             if t:
                 t.join()
             res[phase] = {"ttft_s": r["ttft_s"], "prompt": (r.get("usage") or {}).get("prompt_tokens"),
+                          "cached": (r.get("usage") or {}).get("cached_tokens"),
                           "decider": stats(lat)}
             print(phase, res[phase], flush=True)
+        c = http.client.HTTPConnection("127.0.0.1", a.port, timeout=30)
+        c.request("GET", "/metrics")
+        res["metrics"] = c.getresponse().read().decode(errors="replace")
     finally:
         serve_ab.stop_server(proc)
         with open(a.out, "w") as f:

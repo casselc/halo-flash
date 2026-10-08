@@ -164,6 +164,7 @@ class ScheduledGenerator : public TextGenerator {
 
   std::mutex mu_;  // jobs_, posts_, replay_ (lock order: mu_, then a job's mu or the scheduler's)
   std::condition_variable wake_;
+  bool kick_ = false;  // an admission since the engine thread last looked (guarded by mu_)
   std::map<Scheduler::Id, std::shared_ptr<Job>> jobs_;
   std::deque<std::function<void()>> posts_;
   struct Stored {
