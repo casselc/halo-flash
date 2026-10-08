@@ -306,9 +306,12 @@ inside its range, W 0 TTFT equal to AR. Agent cold TTFT: predicted 8.5 s, AR its
 A sampled request's text depends on the window (different drafts consume the RNG differently): agent_t08 ran to 256
 tokens at W 128 (1.07x) and stopped at 65 at W 0.
 
-**Fault found and fixed** (docs/SESSIONS.md section 11): intermittent GPU write faults in MTP serving traced to the
-HIP runtime reusing freed virtual ranges; `HipDevice` now pools released ranges. 0 of 8 runs since (4 with no reuse
-at all, 4 with the pool), against 7 of 11 before.
+**Fault found and fixed** (docs/SESSIONS.md section 11): intermittent GPU write faults in MTP serving. Root cause
+(stream RC): the GPU's address translation lags `hipMemMap` / `hipMemUnmap` by tens of microseconds, and the fork's
+copy wrote its fresh page microseconds after mapping it; not a stale pointer (poison quarantine: no write into a
+released range). Fix: `HipDevice` holds GPU work until 1 ms after the last mapping change, and a fork maps all its
+pages before copying (0 of 4 runs even with the runtime reusing addresses). MS's range pool is removed: it kept
+released pages charged and ran 128K contexts out of memory.
 
 Still open: batched sessions (StepBatch) stay AR (the draft block follows one session, `mtp_owner_`); a batched draft
 prefill would make full history affordable (+0.17-0.25x on doc / code at 8K); the paper-style gate (1.5x) is not

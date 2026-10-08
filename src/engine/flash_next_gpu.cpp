@@ -1237,8 +1237,11 @@ bool FlashNextGpu::ForkSession(SessionId src, SessionId* id, std::string* error)
       ok = to->linear[l].conv && to->linear[l].state;
     }
   (void)D;
-  // KV: region by region, as the source's kind table lists them (AllocSeq's order).
+  // KV: region by region, as the source's kind table lists them (AllocSeq's order). Every page is mapped before any
+  // copy into one is launched: the device holds launches back until the GPU has settled the mappings
+  // (rt::HipDevice, docs/SESSIONS.md section 11), so one wait per fork instead of one per copied page.
   const std::size_t pb = dev_.PageBytes();
+  std::vector<std::pair<void*, void*>> copies;  // (fresh page in the fork, the source's page)
   for (std::size_t ri = 0; ok && ri < from.kv.size(); ++ri) {
     const KvRegion& fr = from.kv[ri];
     const auto& fa = from.attn[fr.layer];
@@ -1274,10 +1277,11 @@ bool FlashNextGpu::ForkSession(SessionId src, SessionId* id, std::string* error)
             ok = h != nullptr;
             if (!ok) break;
             auto page = std::make_shared<KvPage>(dev_, h);
-            ok = dev_.MapPage(tr.va, j * pb, h, error) &&
-                 CopyFloats(rt::Buffer{static_cast<char*>(tr.va.device) + j * pb, pb, nullptr},
-                            rt::Buffer{static_cast<char*>(fr.va.device) + j * pb, pb, nullptr}, pb / 4, error);
-            if (ok) tr.pages.push_back(std::move(page));
+            ok = dev_.MapPage(tr.va, j * pb, h, error);
+            if (ok) {
+              copies.push_back({static_cast<char*>(tr.va.device) + j * pb, static_cast<char*>(fr.va.device) + j * pb});
+              tr.pages.push_back(std::move(page));
+            }
           }
         }
       } else {
@@ -1291,6 +1295,8 @@ bool FlashNextGpu::ForkSession(SessionId src, SessionId* id, std::string* error)
       }
     }
   }
+  for (std::size_t i = 0; ok && i < copies.size(); ++i)
+    ok = CopyFloats(rt::Buffer{copies[i].first, pb, nullptr}, rt::Buffer{copies[i].second, pb, nullptr}, pb / 4, error);
   to->ngram_history = from.ngram_history;
   to->position = from.position;
   if (src_bound) SwapBound(from);
