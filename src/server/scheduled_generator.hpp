@@ -35,6 +35,7 @@
 #include "core/sampling.hpp"
 #include "engine/mtp_depth.hpp"
 #include "server/decode_loop.hpp"
+#include "server/metrics.hpp"
 #include "server/openai_service.hpp"
 #include "server/scheduler.hpp"
 #include "text/tokenizer.hpp"
@@ -128,6 +129,12 @@ class ScheduledGenerator : public TextGenerator {
     Post([task] { (*task)(); });
     return fut.get();
   }
+  /// G3 M4: runs `work` (a decider evaluation, on its own model) as a scheduler unit on the engine thread and
+  /// returns once it ran; false with `error` when it did not (the generator stopped). DeciderGate's kScheduled.
+  bool RunDecider(const std::function<void()>& work, std::string* error);
+  /// The scheduler's series for /metrics (Metrics::AddSection): halo:sched_* gauges (queued, prefilling, decoding,
+  /// ledger, decider credit), counters (Scheduler::Counters) and unit / queue-wait histograms.
+  void RenderMetrics(std::string& out, const std::string& labels) const;
   [[nodiscard]] ScheduledBackend& backend() { return *backend_; }
   [[nodiscard]] const Scheduler& scheduler() const { return sched_; }
 
@@ -172,6 +179,14 @@ class ScheduledGenerator : public TextGenerator {
   bool spec_active_ = false;                // a request decodes with MTP (engine thread)
   std::vector<Job*> unpublished_;           // finished, answered after the scheduler's Done (engine thread)
   std::vector<std::shared_ptr<Job>> held_;  // ... kept alive until then
+  struct UnitStats {
+    Metrics::Histogram slice{{0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0}, {}};
+    Metrics::Histogram batch{{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0}, {}};
+    Metrics::Histogram decide{{0.025, 0.05, 0.1, 0.2, 0.5, 1.0, 2.5}, {}};
+    Metrics::Histogram queue_wait{{0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0}, {}};
+  };
+  mutable std::mutex stats_mu_;
+  UnitStats stats_;  // guarded by stats_mu_
   std::atomic<bool> stop_{false};
   std::thread thread_;  // last: started once everything else is constructed
 };

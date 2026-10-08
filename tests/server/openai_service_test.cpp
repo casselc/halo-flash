@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cctype>
 #include <deque>
+#include <future>
 #include <map>
 #include <memory>
 #include <chrono>
@@ -1268,6 +1269,97 @@ TEST(OpenAiService, ScheduledSecondTurnOfASandboxIsRefused429) {
   Conn again(port, RequestBody("m904x", false, 16), 0, "X-Halo-Principal: sb\r\n");
   again.ReadToEnd();
   EXPECT_EQ(again.Status(), 200) << again.raw.substr(0, 300);
+}
+
+// G3 M4 (--decider-mode scheduled): a decider evaluation is a scheduler unit on the engine thread. Six arrive while
+// a request's first prefill slice runs: the four with credit (D4 burst 4, no refill here) run at the next unit
+// boundary, ahead of that request's remaining slices; the two without credit take the decider class's fair share;
+// every evaluation runs once, on the engine thread, and the request's answer is unchanged. /metrics counts them.
+TEST(ScheduledDecider, CreditedDecidersRunAtTheNextBoundaryOnTheEngineThread) {
+  SteppedGenerator gen;
+  auto plan = gen.Plan("m1x", -1, 3);
+  ScheduledOptions o;
+  o.sched.decider_burst = 4;
+  o.sched.decider_refill_per_s = 0;
+  std::mutex mu;
+  std::vector<Scheduler::Kind> kinds;
+  std::vector<std::future<bool>> deciders;
+  std::atomic<int> ran{0}, off_engine{0};
+  std::atomic<bool> launched{false};
+  ScheduledGenerator* self = nullptr;
+  const auto main_id = std::this_thread::get_id();
+  o.before_unit = [&](const Scheduler::Unit& u) {
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      kinds.push_back(u.kind);
+    }
+    if (u.kind != Scheduler::Kind::kSlice || launched.exchange(true)) return;
+    const auto engine_id = std::this_thread::get_id();
+    for (int i = 0; i < 6; ++i)
+      deciders.push_back(std::async(std::launch::async, [&, engine_id] {
+        std::string e;
+        return self->RunDecider(
+            [&, engine_id] {
+              if (std::this_thread::get_id() != engine_id || std::this_thread::get_id() == main_id) ++off_engine;
+              ++ran;
+            },
+            &e);
+      }));
+    // Wait (on the engine thread, between units) until all six are admitted.
+    for (int spin = 0; spin < 5000; ++spin) {
+      int n = 0;
+      for (const auto& v : self->scheduler().Requests()) n += v.decider ? 1 : 0;
+      if (n == 6) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  };
+  ScheduledGenerator sg(std::make_unique<FakeBackend>(gen), 1u << 20, {}, o);
+  self = &sg;
+  const std::string prompt = "a turn m1x";
+  std::vector<std::int32_t> ids(prompt.begin(), prompt.end());
+  TextGenerator::Params p;
+  p.max_tokens = 16;
+  std::vector<text::TokenId> got;
+  const auto r = sg.GenerateIds(ids, ids.size() - 1, p, [&](text::TokenId t) {
+    got.push_back(t);
+    return true;
+  });
+  for (auto& f : deciders) EXPECT_TRUE(f.get());
+  EXPECT_TRUE(r.error.empty()) << r.error;
+  EXPECT_FALSE(r.cancelled);
+  {  // the same request served alone
+    SteppedGenerator gen2;
+    gen2.Plan("m1x", -1, 3);
+    ScheduledGenerator alone(std::make_unique<FakeBackend>(gen2), 1u << 20);
+    std::vector<text::TokenId> want;
+    const auto r2 = alone.GenerateIds(ids, ids.size() - 1, p, [&](text::TokenId t) {
+      want.push_back(t);
+      return true;
+    });
+    EXPECT_TRUE(r2.error.empty());
+    EXPECT_FALSE(want.empty());
+    EXPECT_EQ(got, want);
+  }
+  EXPECT_EQ(ran.load(), 6);
+  EXPECT_EQ(off_engine.load(), 0);
+  std::vector<Scheduler::Kind> k;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    k = kinds;
+  }
+  ASSERT_GE(k.size(), 5u);
+  EXPECT_EQ(k[0], Scheduler::Kind::kSlice);
+  for (int i = 1; i <= 4; ++i) EXPECT_EQ(k[static_cast<std::size_t>(i)], Scheduler::Kind::kDecide) << "unit " << i;
+  EXPECT_EQ(std::count(k.begin(), k.end(), Scheduler::Kind::kDecide), 6);
+  const auto c = sg.scheduler().counters();
+  EXPECT_EQ(c.decides, 6u);
+  EXPECT_EQ(c.decider_out_of_credit, 2u);
+  std::string m;
+  sg.RenderMetrics(m, "model_name=\"t\"");
+  EXPECT_NE(m.find("halo:sched_decides_total{model_name=\"t\"} 6\n"), std::string::npos) << m;
+  EXPECT_NE(m.find("halo:sched_unit_seconds_count{model_name=\"t\",kind=\"decide\"} 6\n"), std::string::npos);
+  EXPECT_NE(m.find("halo:sched_queue_wait_seconds_count{model_name=\"t\"} 1\n"), std::string::npos);
+  EXPECT_EQ(m.find("# TYPE halo:sched_unit_seconds histogram"), m.rfind("# TYPE halo:sched_unit_seconds histogram"));
 }
 
 // Audit F7: a store write that fails is answered with an error, never a finished response whose id later 404s.

@@ -56,6 +56,7 @@ add_library(halo_server STATIC
   src/server/http.cpp
   src/server/openai_service.cpp
   src/server/systemone_service.cpp
+  src/server/decider_gate.cpp
   src/server/metrics.cpp
   src/server/kv_choice.cpp
 )

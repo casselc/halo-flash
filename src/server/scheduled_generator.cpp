@@ -20,6 +20,9 @@ struct ScheduledGenerator::Job {
   sampling::SamplingConfig sampling;
   std::uint32_t budget = 0;
   bool spec_ok = false;  // MTP would apply (enabled, no penalties) if it starts alone
+  std::function<void()> work;  // a decider evaluation (Scheduler kDecide): runs on the engine thread
+  std::int64_t admitted_ms = 0;
+  bool waited = false;  // its queue wait (admission to its first unit) was observed (engine thread)
   // engine thread only
   bool begun = false, spec = false, finished = false;
   std::unique_ptr<sampling::SamplerState> state;
@@ -132,6 +135,7 @@ TextGenerator::Admission ScheduledGenerator::AdmitIds(std::span<const std::int32
   switch (adm.outcome) {
     case O::kQueued:
       job->id = adm.id;
+      job->admitted_ms = NowMs();
       jobs_[adm.id] = job;
       backend_->Admitted(adm.id, job->ids);
       ticket->job = job;
@@ -295,6 +299,81 @@ TextGenerator::Result ScheduledGenerator::Wait(const std::shared_ptr<Job>& job, 
   }
 }
 
+bool ScheduledGenerator::RunDecider(const std::function<void()>& work, std::string* error) {
+  auto job = std::make_shared<Job>();
+  job->work = work;
+  {
+    Scheduler::Turn t;
+    t.decider = true;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (stop_) return *error = "the scheduler stopped", false;
+    const auto adm = sched_.Arrive(t, NowMs());
+    job->id = adm.id;
+    job->admitted_ms = NowMs();
+    jobs_[adm.id] = job;
+  }
+  wake_.notify_all();
+  std::unique_lock<std::mutex> lk(job->mu);
+  job->cv.wait(lk, [&] { return job->done; });
+  if (!job->result.error.empty() || job->result.cancelled)
+    return *error = job->result.error.empty() ? "the scheduler stopped" : job->result.error, false;
+  return true;
+}
+
+void ScheduledGenerator::RenderMetrics(std::string& out, const std::string& labels) const {
+  std::uint64_t queued = 0, prefilling = 0, decoding = 0, deciders = 0;
+  for (const auto& v : sched_.Requests()) {
+    if (v.decider) ++deciders;
+    else if (!v.started) ++queued;
+    else if (!v.prefill_done) ++prefilling;
+    else ++decoding;
+  }
+  const auto c = sched_.counters();
+  const auto l = sched_.ledger();
+  const auto gauge = [&](const char* name, const char* help, double v) {
+    out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " gauge\n";
+    out += std::string(name) + "{" + labels + "} " + std::to_string(v) + "\n";
+  };
+  const auto counter = [&](const char* name, const char* help, std::uint64_t v) {
+    out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " counter\n";
+    out += std::string(name) + "{" + labels + "} " + std::to_string(v) + "\n";
+  };
+  gauge("halo:sched_requests_queued", "Admitted agent requests not started.", static_cast<double>(queued));
+  gauge("halo:sched_requests_prefilling", "Started agent requests still prefilling.", static_cast<double>(prefilling));
+  gauge("halo:sched_requests_decoding", "Agent requests decoding.", static_cast<double>(decoding));
+  gauge("halo:sched_deciders_active", "Decider evaluations admitted and not finished.", static_cast<double>(deciders));
+  gauge("halo:sched_ledger_capacity_bytes", "Reservation ledger capacity.", static_cast<double>(l.capacity));
+  gauge("halo:sched_ledger_retained_bytes", "Ledger bytes held by retained prefixes.", static_cast<double>(l.retained));
+  gauge("halo:sched_ledger_reserved_bytes", "Ledger bytes reserved by admitted requests.", static_cast<double>(l.reserved));
+  gauge("halo:sched_decider_credit", "Decider evaluations banked (D4).", sched_.credit(NowMs()));
+  counter("halo:sched_admitted_total", "Requests admitted (deciders included).", c.admitted);
+  counter("halo:sched_replayed_total", "Idempotency keys replayed from a finished turn.", c.replayed);
+  counter("halo:sched_adopted_total", "Idempotency keys adopted while in flight.", c.adopted);
+  counter("halo:sched_duplicates_total", "Late duplicates of an in-flight key dropped.", c.duplicates);
+  counter("halo:sched_refused_limit_total", "429s: the principal's in-flight limit.", c.limit429);
+  counter("halo:sched_refused_memory_total", "429s: no ledger room.", c.memory429);
+  counter("halo:sched_evictions_total", "Retained prefixes evicted by admission.", c.evictions);
+  counter("halo:sched_fenced_total", "Requests fenced after their client left.", c.fenced);
+  counter("halo:sched_parked_total", "Fenced prefills whose progress was parked.", c.parked);
+  counter("halo:sched_units_total", "Scheduler units run.", c.units);
+  counter("halo:sched_slices_total", "Prefill slices.", c.slices);
+  counter("halo:sched_batches_total", "Decode units.", c.batches);
+  counter("halo:sched_batched_total", "Decode units with more than one request.", c.batched);
+  counter("halo:sched_decides_total", "Decider units.", c.decides);
+  counter("halo:sched_preemptions_total", "A started prefill's next slice yielded to another request.", c.preemptions);
+  counter("halo:sched_decider_out_of_credit_total", "Deciders admitted without credit.", c.decider_out_of_credit);
+  UnitStats s;
+  {
+    std::lock_guard<std::mutex> lk(stats_mu_);
+    s = stats_;
+  }
+  RenderHistogram(out, "halo:sched_unit_seconds", "Scheduler unit length, seconds.", labels + ",kind=\"slice\"", s.slice);
+  RenderHistogram(out, "halo:sched_unit_seconds", "Scheduler unit length, seconds.", labels + ",kind=\"batch\"", s.batch, false);
+  RenderHistogram(out, "halo:sched_unit_seconds", "Scheduler unit length, seconds.", labels + ",kind=\"decide\"", s.decide, false);
+  RenderHistogram(out, "halo:sched_queue_wait_seconds", "Admission to a request's first unit, seconds.", labels,
+                  s.queue_wait);
+}
+
 // ---------------------------------------------------------------- the engine thread
 
 void ScheduledGenerator::Publish(Job& job) {
@@ -327,7 +406,7 @@ void ScheduledGenerator::FinishJob(Job& job, const std::string& error) {
                    static_cast<unsigned long long>(job.id), job.tokens.size(), error.c_str(),
                    job.result.cancelled ? 1 : 0);
   }
-  if (completed) {
+  if (completed && !job.work) {
     Stored s;
     {
       std::lock_guard<std::mutex> jl(job.mu);
@@ -557,11 +636,26 @@ void ScheduledGenerator::Loop() {
       RunDecodeUnit(jobs, unit.steps, &ps);
     } else {
       for (const auto& j : jobs) {
-        FinishJob(*j, "decider units are not served by this generator");
-        ps.push_back({j->id, 0, 0, false, true, false});
+        if (j->work) j->work();
+        FinishJob(*j, j->work ? "" : "a decider unit without an evaluation");
+        ps.push_back({j->id, 0, 0, false, true, static_cast<bool>(j->work)});
       }
     }
     const auto elapsed = static_cast<std::int64_t>(Ms(t0, Clock::now()));
+    {
+      std::lock_guard<std::mutex> lk(stats_mu_);
+      const double sec = static_cast<double>(elapsed) * 1e-3;
+      (unit.kind == Scheduler::Kind::kSlice   ? stats_.slice
+       : unit.kind == Scheduler::Kind::kBatch ? stats_.batch
+                                              : stats_.decide)
+          .Observe(sec);
+      const auto start_ms = NowMs() - elapsed;
+      for (const auto& j : jobs)
+        if (!j->waited && !j->work) {
+          j->waited = true;
+          stats_.queue_wait.Observe(static_cast<double>(std::max<std::int64_t>(0, start_ms - j->admitted_ms)) * 1e-3);
+        }
+    }
     sched_.Done(unit, ps, NowMs(), std::max<std::int64_t>(1, elapsed));
     {
       std::lock_guard<std::mutex> lk(mu_);

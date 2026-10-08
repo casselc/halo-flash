@@ -42,9 +42,11 @@ std::string Num(double v) {
   return s;
 }
 
-void Hist(std::string& out, const char* name, const char* help, const std::string& labels,
-          const Metrics::Histogram& h) {
-  out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " histogram\n";
+}  // namespace
+
+void RenderHistogram(std::string& out, const char* name, const char* help, const std::string& labels,
+                     const Metrics::Histogram& h, bool header) {
+  if (header) out += std::string("# HELP ") + name + " " + help + "\n# TYPE " + name + " histogram\n";
   std::uint64_t cum = 0;
   for (std::size_t i = 0; i < h.bounds.size(); ++i) {
     cum += i < h.counts.size() ? h.counts[i] : 0;
@@ -54,8 +56,6 @@ void Hist(std::string& out, const char* name, const char* help, const std::strin
   out += std::string(name) + "_sum{" + labels + "} " + Num(h.sum) + "\n";
   out += std::string(name) + "_count{" + labels + "} " + std::to_string(h.count) + "\n";
 }
-
-}  // namespace
 
 std::string Metrics::Render() const {
   const std::string labels = "model_name=\"" + model_ + "\"";
@@ -92,9 +92,10 @@ std::string Metrics::Render() const {
            std::to_string(spec_.depth[i]) + "\n";
   counter("halo:mtp_catchup_tokens_total", "Prompt positions the MTP draft block caught up on.",
           spec_.catchup_tokens);
-  Hist(out, "vllm:time_to_first_token_seconds", "Time to first output text, seconds.", labels, ttft_);
-  Hist(out, "vllm:time_per_output_token_seconds", "Time between output pieces, seconds.", labels, tpot_);
-  Hist(out, "vllm:e2e_request_latency_seconds", "Request latency, seconds.", labels, e2e_);
+  RenderHistogram(out, "vllm:time_to_first_token_seconds", "Time to first output text, seconds.", labels, ttft_);
+  RenderHistogram(out, "vllm:time_per_output_token_seconds", "Time between output pieces, seconds.", labels, tpot_);
+  RenderHistogram(out, "vllm:e2e_request_latency_seconds", "Request latency, seconds.", labels, e2e_);
+  for (const auto& section : sections_) section(out, labels);
   return out;
 }
 

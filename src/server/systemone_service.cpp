@@ -17,9 +17,10 @@ HttpResponse Detail(int status, const std::string& message) {
 
 }  // namespace
 
-void RegisterSystemOne(HttpServer& server, DecisionEngine& engine) {
-  auto mu = std::make_shared<std::mutex>();
-  server.Route("POST", "/v1/systemone", [&engine, mu](const HttpRequest& req) {
+void RegisterSystemOne(HttpServer& server, DecisionEngine& engine, DeciderGate* gate) {
+  auto own = gate ? nullptr : std::make_shared<DeciderGate>();
+  DeciderGate* g = gate ? gate : own.get();
+  server.Route("POST", "/v1/systemone", [&engine, g, own](const HttpRequest& req) {
     std::string error;
     const auto body = json::Parse(req.body, &error);
     if (!body) return Detail(422, "the request body is not valid JSON: " + error);
@@ -27,10 +28,9 @@ void RegisterSystemOne(HttpServer& server, DecisionEngine& engine) {
     if (!request) return Detail(422, error);
     const auto start = std::chrono::steady_clock::now();
     std::optional<json::Value> answer;
-    {
-      std::lock_guard<std::mutex> lk(*mu);
-      answer = engine.Evaluate(*request, &error);
-    }
+    std::string gate_error;
+    if (!g->Run([&] { answer = engine.Evaluate(*request, &error); }, &gate_error))
+      return Detail(503, "the decider could not run: " + gate_error);
     if (!answer) return Detail(422, error);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     answer->set("latency_ms", json::Value::Float(std::round(ms * 100.0) / 100.0));

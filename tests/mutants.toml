@@ -1829,3 +1829,43 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "OpenAiService.ScheduledSecondTurnOfASandboxIsRefused429"
 why = "G3: the principal comes from the broker's X-Halo-Principal header (else every caller is the anonymous principal)"
+
+[[mutant]]
+name = "sg-decider-work-skipped"
+file = "src/server/scheduled_generator.cpp"
+find = '        if (j->work) j->work();'
+replace = '        (void)0;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ScheduledDecider.*"
+why = "G3 M4: a scheduled decider unit must run its evaluation (on the engine thread) before the decider is answered"
+
+[[mutant]]
+name = "sg-queue-wait-counts-deciders"
+file = "src/server/scheduled_generator.cpp"
+find = '        if (!j->waited && !j->work) {'
+replace = '        if (!j->waited) {'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ScheduledDecider.*"
+why = "G3 M4: halo:sched_queue_wait_seconds is agent requests' admission-to-first-unit; deciders have their own (halo:decider_wait_seconds)"
+
+[[mutant]]
+name = "gate-scheduled-falls-back"
+file = "src/server/decider_gate.cpp"
+find = '    : mode_(scheduled ? mode : Mode::kConcurrent), scheduled_(std::move(scheduled)) {}'
+replace = '    : mode_(Mode::kConcurrent), scheduled_(std::move(scheduled)) {}'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SystemOneService.*"
+why = "G3 M4: --decider-mode scheduled routes every evaluation through the scheduler's runner, not the gate's mutex"
+
+[[mutant]]
+name = "gate-runner-failure-answered"
+file = "src/server/systemone_service.cpp"
+find = '      return Detail(503, "the decider could not run: " + gate_error);'
+replace = '      return Detail(422, error);'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SystemOneService.*"
+why = "G3 M4: an evaluation the scheduler could not run is a 503 (retryable), not a validation 422"

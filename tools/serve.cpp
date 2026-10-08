@@ -33,7 +33,9 @@
 // --scope-eval-endpoint URL points them elsewhere.
 // --decider-dir serves POST /v1/systemone with strands-decider-2B (the
 // directory holds Qwen3.5-2B-Base-BF16.gguf and the strands-decider-*.gguf
-// files, as the decider tests expect).
+// files, as the decider tests expect). --decider-mode concurrent|scheduled (G3 M4, D2; default concurrent):
+// evaluations run one at a time beside Flash-Next's work, or as scheduler units on the engine thread (credited:
+// at the next unit boundary; needs --scheduler on). /metrics adds halo:decider_* and, scheduled, halo:sched_*.
 // Endpoints: GET /health, /metrics (Prometheus, vLLM names), /v1/models, /v1/responses/{id};
 //            POST /v1/completions, /v1/chat/completions, /v1/responses.
 // P10 variants: --qwen35-model GGUF --qwen35-tokenizer GGUF serves the OpenAI
@@ -179,6 +181,7 @@ int main(int argc, char** argv) {
   bool scheduled = true;              // --scheduler on|off (G3, docs/SCHEDULER.md)
   server::ScheduledOptions sched;     // --sched-*
   double sched_capacity_gb = -1;      // ledger capacity (-1: what the device has left after loading, less margins)
+  bool decider_scheduled = false;     // --decider-mode (G3 M4, D2)
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--help" || a == "-h") {
@@ -203,6 +206,7 @@ int main(int argc, char** argv) {
           "                        admission, Idempotency-Key replay / adopt. off: one request at a time (FIFO)\n"
           "  --sched-slice N (2048) --sched-slice-alone N (8192) --sched-plimit N (1) --sched-capacity-gb G\n"
           "  --sched-decider-burst N (4) --sched-decider-refill R (2/s)\n"
+          "  --decider-mode concurrent|scheduled  decider evaluations beside Flash-Next (default) or as scheduler units\n"
           "  --ngram-cache-gb G --moe-topk N --decider-dir DIR --decider-device hip|hrx|cpu --variant MANIFEST\n"
           "  --scope-dir DIR --scope-project NAME --scope-capture off|digest|full --scope-wal PATH\n"
           "  --scope-eval-endpoint URL\n");
@@ -260,6 +264,11 @@ int main(int argc, char** argv) {
     else if (a == "--sched-decider-refill") sched.sched.decider_refill_per_s = std::atof(v.c_str());
     else if (a == "--decider-dir") decider_dir = v;
     else if (a == "--decider-device") decider_device = v;
+    else if (a == "--decider-mode") {
+      if (v != "concurrent" && v != "scheduled")
+        return std::fprintf(stderr, "--decider-mode must be concurrent or scheduled\n"), 2;
+      decider_scheduled = v == "scheduled";
+    }
     else if (a == "--scope-dir") scope_dir = v;
     else if (a == "--scope-project") scope_project = v;
     else if (a == "--scope-capture") scope_capture = v;
@@ -460,6 +469,10 @@ int main(int argc, char** argv) {
                            .send_timeout_ms = static_cast<int>(std::min(send_timeout_s * 1000, 3.6e6)),
                            .api_key = api_key});
   service.Register(http);
+  if (sched_generator)
+    metrics.AddSection([sched_generator](std::string& out, const std::string& labels) {
+      sched_generator->RenderMetrics(out, labels);
+    });
   metrics.Register(http);
   if (flash_generator) RegisterSpillRoutes(http, *flash_generator);
   // Scheduled: the admin routes run on the engine thread between units.
@@ -477,6 +490,7 @@ int main(int argc, char** argv) {
   }
 #endif
   std::unique_ptr<StrandsEngine> decider;
+  std::unique_ptr<server::DeciderGate> decider_gate;
   if (!decider_dir.empty()) {
     const std::string& d = decider_dir;
     auto sd = decide::StrandsDecider::Open({d + "/Qwen3.5-2B-Base-BF16.gguf", d + "/strands-decider-lora-f32.gguf",
@@ -501,7 +515,16 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "decider variant %s loaded\n", v->manifest.name.c_str());
     }
     decider = std::make_unique<StrandsEngine>(std::move(sd));
-    server::RegisterSystemOne(http, *decider);
+    if (decider_scheduled && !sched_generator) std::fprintf(stderr, "decider: --decider-mode scheduled needs --scheduler on; concurrent\n");
+    server::DeciderGate::Runner run;
+    if (decider_scheduled && sched_generator)
+      run = [sched_generator](const std::function<void()>& work, std::string* err) {
+        return sched_generator->RunDecider(work, err);
+      };
+    decider_gate = std::make_unique<server::DeciderGate>(server::DeciderGate::Mode::kScheduled, std::move(run));
+    std::fprintf(stderr, "decider: %s\n", server::DeciderGate::Name(decider_gate->mode()));
+    metrics.AddSection([g = decider_gate.get()](std::string& out, const std::string& labels) { g->Render(out, labels); });
+    server::RegisterSystemOne(http, *decider, decider_gate.get());
   }
   if (!http.Start(&error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
   std::fprintf(stderr, "serving %s on http://%s:%d\n", model_id.c_str(), host.c_str(), http.port());

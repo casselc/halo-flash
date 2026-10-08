@@ -14,11 +14,13 @@
 //   vllm:spec_decode_num_drafts_total, vllm:spec_decode_num_draft_tokens_total,
 //   vllm:spec_decode_num_accepted_tokens_total, vllm:spec_decode_num_accepted_tokens_per_pos_total{position}
 // plus halo:mtp_decode_steps_total{depth} (decode steps by drafts run; 0: an ordinary step of a speculative
-// request) and halo:mtp_catchup_tokens_total (prompt positions the draft block caught up on). Every series
+// request) and halo:mtp_catchup_tokens_total (prompt positions the draft block caught up on). Sections added with
+// AddSection (G3: the scheduler's halo:sched_* series, the decider gate's halo:decider_*) follow. Every series
 // carries model_name.
 
 #include <array>
 #include <atomic>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -38,6 +40,9 @@ class Metrics : public GenerationObserver {
   void Finished() noexcept { running_.fetch_sub(1); }
   [[nodiscard]] std::string Render() const;
   void Register(HttpServer& server);
+  /// Appends more series to every Render (`labels`: the model_name label); before the server starts.
+  using Section = std::function<void(std::string& out, const std::string& labels)>;
+  void AddSection(Section s) { sections_.push_back(std::move(s)); }
 
   struct Histogram {
     std::vector<double> bounds;  // upper bounds, seconds
@@ -49,6 +54,7 @@ class Metrics : public GenerationObserver {
 
  private:
   const std::string model_;
+  std::vector<Section> sections_;
   std::atomic<std::int64_t> running_{0};
   mutable std::mutex mu_;
   std::uint64_t prompt_tokens_ = 0, generation_tokens_ = 0, cached_tokens_ = 0;  // guarded by mu_
@@ -64,6 +70,11 @@ class Metrics : public GenerationObserver {
                   960.0, 1920.0, 7680.0},
                  {}};
 };
+
+/// Appends `h` in the Prometheus histogram format (cumulative buckets, +Inf, sum, count); `header`: with the HELP
+/// and TYPE lines (false for a further label set of a series already introduced).
+void RenderHistogram(std::string& out, const char* name, const char* help, const std::string& labels,
+                     const Metrics::Histogram& h, bool header = true);
 
 /// Forwards each record to several observers.
 class FanOut : public GenerationObserver {
