@@ -6,7 +6,9 @@
 #include <openssl/evp.h>
 #include <openssl/param_build.h>
 #include <openssl/rsa.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -176,7 +178,10 @@ bool Jwks::Parse(std::string_view text, std::string* error) {
   for (const auto& k : keys->items()) {
     const std::string kid = StrOr(k.find("kid"));
     if (!kid.empty()) {
-      dup = dup || std::find(kids.begin(), kids.end(), kid) != kids.end();
+      if (std::find(kids.begin(), kids.end(), kid) != kids.end()) {
+        dup = true;  // the document is refused below; no second key object is built for this kid
+        continue;
+      }
       kids.push_back(kid);
     }
     if (StrOr(k.find("kty")) != "RSA") continue;
@@ -204,11 +209,25 @@ bool Jwks::Parse(std::string_view text, std::string* error) {
 }
 
 bool Jwks::Load(const std::string& path, std::string* error) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f) return *error = "jwks: cannot read " + path, false;
-  std::stringstream ss;
-  ss << f.rdbuf();
-  return Parse(ss.str(), error);
+  // Bounded before anything is allocated: the size is checked on the opened descriptor, then read exactly.
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return *error = "jwks: cannot read " + path, false;
+  struct stat st {};
+  std::string text;
+  bool ok = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 && st.st_size <= (1 << 20);
+  if (ok) {
+    text.resize(static_cast<std::size_t>(st.st_size));
+    std::size_t got = 0;
+    while (ok && got < text.size()) {
+      const ssize_t r = ::read(fd, text.data() + got, text.size() - got);
+      if (r < 0 && errno == EINTR) continue;
+      ok = r > 0;
+      if (ok) got += static_cast<std::size_t>(r);
+    }
+  }
+  ::close(fd);
+  if (!ok) return *error = "jwks: " + path + " is not a regular file of at most 1 MB, or a read failed", false;
+  return Parse(text, error);
 }
 
 const void* Jwks::Find(std::string_view kid) const {
@@ -291,7 +310,7 @@ std::optional<json::Value> VerifyJwt(std::string_view token, const Jwks& keys, c
 }
 
 // ---- the provider ----
-YardSpillKeys::YardSpillKeys(Options o) : o_(std::move(o)) {}
+YardSpillKeys::YardSpillKeys(Options o) : o_(std::move(o)), jwks_(std::make_shared<Jwks>()) {}
 
 std::unique_ptr<YardSpillKeys> YardSpillKeys::Create(Options o, std::string* error) {
   if (o.jwks_path.empty()) return *error = "yard keys: --yard-jwks is required", nullptr;
@@ -299,10 +318,24 @@ std::unique_ptr<YardSpillKeys> YardSpillKeys::Create(Options o, std::string* err
   if (o.audience.empty()) return *error = "yard keys: --yard-audience must not be empty", nullptr;
   if (o.key_ttl_s < 1 || o.key_ttl_s > 3600) return *error = "yard keys: --yard-key-ttl must be 1..3600 s", nullptr;
   if (o.jwks_refresh_s < 1 || o.jwks_refresh_s > 3600) return *error = "yard keys: JWKS refresh must be 1..3600 s", nullptr;
+  if (o.jwks_forced_gap_ms < 0) return *error = "yard keys: JWKS forced-refresh gap must be >= 0", nullptr;
+  if (o.incarnation.empty()) {
+    std::array<std::uint8_t, 8> r{};
+    if (!crypt::RandomBytes(r)) return *error = "yard keys: no randomness for the incarnation id", nullptr;
+    static const char* hex = "0123456789abcdef";
+    for (auto b : r) o.incarnation += {hex[b >> 4], hex[b & 15]};
+  }
+  for (char c : o.incarnation)
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return *error = "yard keys: incarnation must be hex", nullptr;
   std::unique_ptr<YardSpillKeys> y(new YardSpillKeys(std::move(o)));
+  if (!y->o_.state_path.empty()) {
+    y->lock_ = StateLock::Acquire(y->o_.state_path, error);
+    if (!y->lock_) return nullptr;
+  }
   if (!y->LoadState(error)) return nullptr;
   y->RefreshJwks(true);
-  if (y->jwks_.size() == 0) return *error = "yard keys: the JWKS " + y->o_.jwks_path + " has no usable RS256 key", nullptr;
+  if (y->Keys()->size() == 0)
+    return *error = "yard keys: the JWKS " + y->o_.jwks_path + " has no usable RS256 key", nullptr;
   if (y->o_.sweeper)
     y->sweeper_ = std::thread([p = y.get()] {
       std::unique_lock<std::mutex> lk(p->mu_);
@@ -331,49 +364,101 @@ bool YardSpillKeys::ValidSession(std::string_view s) {
   return true;
 }
 
-// State file: one line per session: "<session> <high> <fence|-> <last_seal|-> <last_spill> <last_restore>".
+bool YardSpillKeys::stopped() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return stopped_;
+}
+
+// State file: one line per session, "<session> <high> <fence|-> <last_seal|-> <last_spill> <last_restore>\n", each
+// field separated by one space; no duplicate sessions; fence, last seal and last spill <= high; last restore <= high.
 bool YardSpillKeys::LoadState(std::string* error) {
   if (o_.state_path.empty()) return true;
-  struct stat st {};
-  if (::lstat(o_.state_path.c_str(), &st) != 0) {
-    if (errno == ENOENT) return true;
-    return *error = "yard keys: cannot stat " + o_.state_path, false;
-  }
-  if (!S_ISREG(st.st_mode)) return *error = "yard keys: " + o_.state_path + " is not a regular file", false;
-  std::ifstream f(o_.state_path);
-  if (!f) return *error = "yard keys: cannot read " + o_.state_path, false;
-  if ((st.st_mode & 077) != 0)
-    return *error = "yard keys: " + o_.state_path + " is readable by group/others (chmod 600)", false;
-  std::string line;
-  while (std::getline(f, line)) {
-    std::istringstream ls(line);
-    std::string sess, fence, seal, high, spill, restore, extra;
-    if (!(ls >> sess >> high >> fence >> seal >> spill >> restore) || (ls >> extra) || !ValidSession(sess))
-      return *error = "yard keys: " + o_.state_path + " is malformed (refusing to start)", false;
-    Session s;
+  std::string text, e;
+  const StateRead r = ReadStateFile(o_.state_path, 1u << 20, &text, &e);
+  const auto bad = [&](const std::string& why) {
+    *error = "yard keys: " + o_.state_path + ": " + why + " (refusing to start)";
+    return false;
+  };
+  if (r == StateRead::kError) return bad(e);
+  if (r == StateRead::kFresh) return InitStateFile(o_.state_path, "", error);
+  std::size_t at = 0;
+  while (at < text.size()) {
+    const auto nl = text.find('\n', at);
+    if (nl == std::string::npos) return bad("the last line is not terminated");
+    const std::string_view line(text.data() + at, nl - at);
+    at = nl + 1;
+    std::vector<std::string_view> f;
+    for (std::size_t p = 0;;) {
+      const auto sp = line.find(' ', p);
+      f.push_back(line.substr(p, sp == std::string_view::npos ? std::string_view::npos : sp - p));
+      if (sp == std::string_view::npos) break;
+      p = sp + 1;
+    }
+    if (f.size() != 6 || !ValidSession(f[0])) return bad("malformed line");
+    if (sessions_.contains(f[0])) return bad("duplicate session " + std::string(f[0]));
+    const auto num = [](std::string_view t, std::uint64_t* out) { return ParseU64(t, std::uint64_t{1} << 62, out); };
+    Epochs ep;
+    if (!num(f[1], &ep.high) || !num(f[4], &ep.last_spill) || !num(f[5], &ep.last_restore)) return bad("malformed number");
     std::uint64_t v = 0;
-    const auto num = [&](const std::string& t, std::uint64_t* out) { return ParseU64(t, std::uint64_t{1} << 62, out); };
-    bool ok = num(high, &s.high) && num(spill, &s.last_spill) && num(restore, &s.last_restore);
-    if (fence != "-") ok = ok && num(fence, &v), s.fence = v;
-    if (seal != "-") ok = ok && num(seal, &v), s.last_seal = v;
-    if (!ok) return *error = "yard keys: " + o_.state_path + " is malformed (refusing to start)", false;
-    sessions_[sess] = std::move(s);
+    if (f[2] != "-") {
+      if (!num(f[2], &v)) return bad("malformed fence");
+      ep.fence = v;
+    }
+    if (f[3] != "-") {
+      if (!num(f[3], &v)) return bad("malformed last seal");
+      ep.last_seal = v;
+    }
+    if (ep.fence.value_or(0) > ep.high || ep.last_seal.value_or(0) > ep.high || ep.last_spill > ep.high ||
+        ep.last_restore > ep.high)
+      return bad("inconsistent epochs for " + std::string(f[0]));
+    if (sessions_.size() >= o_.max_sessions) return bad("more sessions than --yard-max-sessions");
+    sessions_[std::string(f[0])].e = ep;
   }
   return true;
 }
 
-bool YardSpillKeys::SaveState(std::string* error) {
-  if (o_.state_path.empty()) return true;
+Persist YardSpillKeys::Commit(std::string_view name, const Epochs& cand, std::string* why) {
+  const auto apply = [&] {
+    auto it = sessions_.find(name);
+    if (it == sessions_.end()) it = sessions_.emplace(std::string(name), Session{}).first;
+    it->second.e = cand;
+  };
+  if (o_.state_path.empty()) {
+    apply();
+    return Persist::kDurable;
+  }
   std::string out;
-  for (const auto& [name, s] : sessions_)
-    out += name + " " + std::to_string(s.high) + " " + (s.fence ? std::to_string(*s.fence) : "-") + " " +
-           (s.last_seal ? std::to_string(*s.last_seal) : "-") + " " + std::to_string(s.last_spill) + " " +
-           std::to_string(s.last_restore) + "\n";
-  return WriteFileDurable(o_.state_path, out, error);
+  const auto line = [&](std::string_view n, const Epochs& e) {
+    out += std::string(n) + " " + std::to_string(e.high) + " " + (e.fence ? std::to_string(*e.fence) : "-") + " " +
+           (e.last_seal ? std::to_string(*e.last_seal) : "-") + " " + std::to_string(e.last_spill) + " " +
+           std::to_string(e.last_restore) + "\n";
+  };
+  bool written = false;
+  for (const auto& [n, s] : sessions_) {
+    const bool me = n == name;
+    line(n, me ? cand : s.e);
+    written = written || me;
+  }
+  if (!written) line(name, cand);
+  const Persist p = WriteStateFile(o_.state_path, out, why);
+  if (p != Persist::kUnpublished) apply();
+  if (p == Persist::kUncertain) Stop("state " + std::string(PersistName(p)) + ": " + *why);
+  return p;
+}
+
+void YardSpillKeys::Stop(const std::string& why) {
+  // Fail-stop: the disk may hold a state memory cannot vouch for. Every key goes; nothing is authorized until a
+  // restart reloads the state from disk.
+  if (!stopped_) std::fprintf(stderr, "yard keys: STOPPED: %s (restart halo_serve to reload the state)\n", why.c_str());
+  stopped_ = true;
+  for (auto& [n, s] : sessions_) {
+    ZeroSlot(s, s.seal, OpState::kExpired);
+    ZeroSlot(s, s.open, OpState::kExpired);
+  }
 }
 
 void YardSpillKeys::Record(Session& s, Use use, std::uint64_t epoch, const std::array<std::uint8_t, 32>& h,
-                           std::uint64_t entry, OpState st) {
+                           const std::string& entry, OpState st) {
   for (auto& r : s.ops)
     if (r.use == use && r.epoch == epoch && crypt::Equal(r.key_hash, h)) {
       r.state = st;
@@ -414,9 +499,16 @@ std::size_t YardSpillKeys::Sweep() {
   return SweepLocked(Clock::now());
 }
 
+std::shared_ptr<const Jwks> YardSpillKeys::Keys() const {
+  std::lock_guard<std::mutex> lk(jwks_mu_);
+  return jwks_;
+}
+
 void YardSpillKeys::RefreshJwks(bool force) {
-  // Under mu_ or before the provider is shared. A changed file (inode, size, mtime) or the refresh interval re-reads
-  // it; an unreadable or invalid file empties the key set (fail closed: nothing verifies until it is fixed).
+  // Never under mu_: loading (file read, JSON, RSA key construction) cannot hold up leases or the sweeper. A changed
+  // file (inode, size, mtime) or the interval re-reads it; an unknown kid forces a re-read at most once per gap. An
+  // unreadable or invalid file empties the key set (fail closed: nothing verifies until it is fixed).
+  std::lock_guard<std::mutex> rl(refresh_mu_);
   struct stat st {};
   const bool have = ::stat(o_.jwks_path.c_str(), &st) == 0;
   const std::uint64_t sig[3] = {have ? st.st_ino : 0, have ? static_cast<std::uint64_t>(st.st_size) : 0,
@@ -424,13 +516,22 @@ void YardSpillKeys::RefreshJwks(bool force) {
                                            static_cast<std::uint64_t>(st.st_mtim.tv_nsec)
                                      : 0};
   const auto now = Clock::now();
-  if (!force && std::equal(sig, sig + 3, jwks_sig_) && now - jwks_loaded_ < std::chrono::seconds(o_.jwks_refresh_s))
-    return;
+  const bool changed = !std::equal(sig, sig + 3, jwks_sig_);
+  const bool stale = now - jwks_loaded_ >= std::chrono::seconds(o_.jwks_refresh_s);
+  const bool forced_ok = force && now - jwks_forced_ >= std::chrono::milliseconds(o_.jwks_forced_gap_ms);
+  if (!changed && !stale && !forced_ok) return;
+  if (forced_ok) jwks_forced_ = now;
+  auto next = std::make_shared<Jwks>();
   std::string e;
-  if (!have || !jwks_.Load(o_.jwks_path, &e)) {
-    jwks_.Clear();
+  if (!have || !next->Load(o_.jwks_path, &e)) {
+    next->Clear();
     std::fprintf(stderr, "yard keys: JWKS %s unusable (%s): no token verifies until it is fixed\n", o_.jwks_path.c_str(),
                  have ? e.c_str() : "missing");
+  }
+  ++jwks_loads_;
+  {
+    std::lock_guard<std::mutex> lk(jwks_mu_);
+    jwks_ = std::move(next);
   }
   std::copy(sig, sig + 3, jwks_sig_);
   jwks_loaded_ = now;
@@ -470,17 +571,15 @@ YardSpillKeys::Answer YardSpillKeys::Register(std::string_view session, std::str
       return answer(400, "key must be 32 bytes, base64url without padding");
     if (!crypt::Sha256(key.span(), key_hash)) return answer(500, "SHA-256 failed");
   }
-  std::lock_guard<std::mutex> lk(mu_);
-  const auto tnow = Clock::now();
-  (void)SweepLocked(tnow);
+  // The token, outside the provider lock (the JWKS snapshot is immutable). Every refusal looks the same to the
+  // client; the reason goes to the log (never the token).
   RefreshJwks(false);
-  // The token. Every refusal looks the same to the client; the reason goes to the log (never the token).
   JwtCheck check{.issuer = o_.issuer, .audience = o_.audience, .now = now};
   JwtError je = JwtError::kOk;
-  auto claims = VerifyJwt(*token, jwks_, check, &je);
-  if (!claims && je == JwtError::kUnknownKid) {  // yard may have just rotated its key: re-read once
+  auto claims = VerifyJwt(*token, *Keys(), check, &je);
+  if (!claims && je == JwtError::kUnknownKid) {  // yard may have just rotated its key: re-read (rate-limited)
     RefreshJwks(true);
-    claims = VerifyJwt(*token, jwks_, check, &je);
+    claims = VerifyJwt(*token, *Keys(), check, &je);
   }
   const auto refuse = [&](const char* why) {
     std::fprintf(stderr, "yard keys: %.*s: token refused: %s\n", static_cast<int>(session.size()), session.data(), why);
@@ -502,153 +601,173 @@ YardSpillKeys::Answer YardSpillKeys::Register(std::string_view session, std::str
     if (!Base64UrlDecodeExact(StrOr(hs->find("key_sha256")), want) || !crypt::Equal(want, key_hash))
       return refuse("bound to another key");
   }
-  std::uint64_t entry = 0;
+  std::string entry;
   if (use == "seal") {
-    const auto en = Int(hs->find("entry"), &bad);
-    if (bad || !en || *en < 1) return refuse("seal without an entry");
-    entry = static_cast<std::uint64_t>(*en);
-    const auto* body_entry = req->find("entry");
-    if (body_entry && Int(body_entry, &bad) != en) return answer(400, "entry differs from the token's");
+    const std::string* en = Str(hs->find("entry"));
+    if (!en || en->empty() || en->size() > 64) return refuse("seal without an entry");
+    entry = *en;
+    if (const auto* body_entry = req->find("entry"); body_entry && StrOr(body_entry) != entry)
+      return answer(400, "entry differs from the token's");
   }
   const auto E = static_cast<std::uint64_t>(*epoch);
-  std::uint64_t through = E;
+  std::optional<std::uint64_t> through;
   if (use == "revoke") {
     const auto th = Int(hs->find("through"), &bad);
     if (bad) return refuse("through");
     if (th) through = static_cast<std::uint64_t>(*th);
-    if (through > E) return refuse("revoke through a later epoch than the token's");
+    if (through && *through > E) return refuse("revoke through a later epoch than the token's");
   }
-  // Single use (in memory: after a restart the persisted epochs refuse what was used).
   const std::int64_t t = now ? now : Now();
+  const std::int64_t exp = Int(claims->find("exp"), &bad).value_or(t);
+
+  std::lock_guard<std::mutex> lk(mu_);
+  if (stopped_) return answer(503, "key provider stopped (state durability uncertain): restart halo_serve");
+  const auto tnow = Clock::now();
+  (void)SweepLocked(tnow);
   for (auto it = seen_jti_.begin(); it != seen_jti_.end();) it = it->second < t ? seen_jti_.erase(it) : std::next(it);
   if (seen_jti_.contains(jti)) return answer(409, "token replayed (jti already used)");
-  const std::int64_t exp = Int(claims->find("exp"), &bad).value_or(t);
-  Session& s = sessions_[std::string(session)];
-  const auto persist_and = [&](Answer a) {
-    std::string pe;
-    if (!SaveState(&pe)) {
-      std::fprintf(stderr, "yard keys: cannot persist state: %s\n", pe.c_str());
-      return answer(500, "cannot persist the registration (not done)");
-    }
-    seen_jti_[jti] = exp;
-    return a;
+  // A seal for an entry of another server incarnation (a token minted before a restart): its numeric id may name a
+  // different conversation now.
+  if (use == "seal") {
+    const std::string pre = o_.incarnation + ".";
+    std::uint64_t k = 0;
+    if (entry.rfind(pre, 0) != 0 || !ParseU64(std::string_view(entry).substr(pre.size()), ~0ull, &k))
+      return answer(409, "entry " + entry + " is not of this server incarnation (" + o_.incarnation +
+                             "): read GET /admin/sessions again");
+  }
+  auto sit = sessions_.find(session);
+  if (sit == sessions_.end() && sessions_.size() >= o_.max_sessions)
+    return answer(409, "too many yard sessions (" + std::to_string(o_.max_sessions) + ")");
+  Session empty;
+  Session& s = sit == sessions_.end() ? empty : sit->second;  // a new session exists only once its state is durable
+  const auto settle = [&](Persist p) -> std::optional<Answer> {
+    if (p == Persist::kDurable) return std::nullopt;
+    if (p == Persist::kUncertain) return answer(503, "state durability uncertain: key provider stopped (not done)");
+    return answer(500, "cannot persist the registration (not done)");
   };
-  const auto ok_body = [&](bool dup, const char* state, std::uint64_t file_epoch, const std::string& name) {
-    const std::string kid = name.empty() ? "" : "yard:" + name + ":e" + std::to_string(file_epoch) + ":" + std::string(session);
+
+  if (use == "revoke") {
+    // R: the claim, else the last spilled epoch (a revoke fences checkpoints that were written; none: no fence, but
+    // every key of the session goes). Fail-closed first: keys at or below the fence are zeroed before the state is
+    // persisted (stricter is safe whatever the outcome).
+    const std::optional<std::uint64_t> R = through ? through : (s.e.last_spill ? std::optional(s.e.last_spill) : std::nullopt);
+    Epochs cand = s.e;
+    if (R) cand.fence = std::max(cand.fence.value_or(0), *R);
+    cand.high = std::max(cand.high, E);
+    if (cand.last_seal && cand.fence && *cand.last_seal <= *cand.fence) cand.last_seal.reset();
+    bool zeroed = false;
+    if (sit != sessions_.end()) {
+      const auto fenced = [&](std::uint64_t file_epoch) { return !R || file_epoch <= *cand.fence; };
+      if (s.seal && fenced(s.seal->epoch)) zeroed = true, ZeroSlot(s, s.seal, OpState::kRevoked);
+      if (s.open && fenced(s.open->epoch - 1)) zeroed = true, ZeroSlot(s, s.open, OpState::kRevoked);
+      for (auto& r : s.ops)
+        if (r.state == OpState::kRegistered && (!R || (r.use == Use::kSeal ? r.epoch : r.epoch - 1) <= *cand.fence))
+          r.state = OpState::kRevoked;
+    }
+    const bool dup = !zeroed && cand.fence == s.e.fence && cand.high == s.e.high;
+    std::string pe;
+    if (auto a = settle(Commit(session, cand, &pe))) return *a;
+    seen_jti_[jti] = exp;
+    Answer a = answer(200, "{\"ok\":true,\"session\":\"" + Esc(session) + "\",\"use\":\"revoke\",\"epoch\":" +
+                               std::to_string(E) + ",\"through\":" + (cand.fence ? std::to_string(*cand.fence) : "null") +
+                               ",\"duplicate\":" + (dup ? "true" : "false") + "}");
+    a.revoked_session = std::string(session);
+    a.revoked_through = cand.fence.value_or(0);
+    return a;
+  }
+
+  std::string name;
+  if (!crypt::KeyName(key.span(), &name)) return answer(500, "cannot name the key");
+  const auto ttl = std::chrono::seconds(o_.key_ttl_s);
+  const auto deadline = tnow + std::min<Clock::duration>(ttl, std::chrono::seconds(std::max<std::int64_t>(exp - t, 0)));
+  const Use u = use == "seal" ? Use::kSeal : Use::kOpen;
+  const std::uint64_t file_epoch = u == Use::kSeal ? E : E - 1;
+  const auto ok_body = [&](bool dup, const char* state) {
+    const std::string kid = "yard:" + name + ":e" + std::to_string(file_epoch) + ":" + std::string(session);
     return answer(200, "{\"ok\":true,\"session\":\"" + Esc(session) + "\",\"use\":\"" + use + "\",\"epoch\":" +
                            std::to_string(E) + ",\"key_id\":\"" + Esc(kid) + "\",\"state\":\"" + state +
                            "\",\"duplicate\":" + (dup ? "true" : "false") + "}");
   };
-  if (use == "revoke") {
-    // Never stale: a fence only gets stricter. Keys at file epochs <= the fence are zeroed now.
-    const std::uint64_t old_high = s.high;
-    const auto old_fence = s.fence, old_seal = s.last_seal;
-    const bool dup = s.fence && *s.fence >= through;
-    s.fence = std::max(s.fence.value_or(0), through);
-    s.high = std::max(s.high, E);
-    if (s.seal && s.seal->epoch <= *s.fence) ZeroSlot(s, s.seal, OpState::kRevoked);
-    if (s.open && s.open->epoch - 1 <= *s.fence) ZeroSlot(s, s.open, OpState::kRevoked);
-    if (s.last_seal && *s.last_seal <= *s.fence) s.last_seal.reset();
-    for (auto& r : s.ops)
-      if ((r.use == Use::kSeal ? r.epoch : r.epoch - 1) <= *s.fence && r.state == OpState::kRegistered)
-        r.state = OpState::kRevoked;
-    std::string pe;
-    if (!SaveState(&pe)) {  // not done: put the fence back (the zeroed keys stay zeroed: stricter is safe)
-      s.high = old_high;
-      s.fence = old_fence;
-      s.last_seal = old_seal;
-      return answer(500, "cannot persist the revocation (not done)");
-    }
-    seen_jti_[jti] = exp;
-    Answer a = answer(200, "{\"ok\":true,\"session\":\"" + Esc(session) + "\",\"use\":\"revoke\",\"epoch\":" +
-                               std::to_string(E) + ",\"through\":" + std::to_string(*s.fence) +
-                               ",\"duplicate\":" + (dup ? "true" : "false") + "}");
-    a.revoked_session = std::string(session);
-    a.revoked_through = *s.fence;
-    return a;
-  }
-  std::string name;
-  if (!crypt::KeyName(key.span(), &name)) return answer(500, "cannot name the key");
-  const auto deadline = tnow + std::min(std::chrono::seconds(o_.key_ttl_s), std::chrono::seconds(std::max<std::int64_t>(exp - t, 0)));
-  const Use u = use == "seal" ? Use::kSeal : Use::kOpen;
-  const std::uint64_t file_epoch = u == Use::kSeal ? E : E - 1;
-  if (s.fence && file_epoch <= *s.fence) return answer(409, "revoked: epoch " + std::to_string(file_epoch) + " is fenced");
-  if (E < s.high) return answer(409, "stale epoch " + std::to_string(E) + " (session at " + std::to_string(s.high) + ")");
-  // One-shot: the same registration again reports what happened to it (a consumed key is never re-armed); a used
-  // epoch never takes a key again.
+  if (s.e.fence && file_epoch <= *s.e.fence) return answer(409, "revoked: epoch " + std::to_string(file_epoch) + " is fenced");
+  if (E < s.e.high) return answer(409, "stale epoch " + std::to_string(E) + " (session at " + std::to_string(s.e.high) + ")");
+  // One-shot: the same registration again reports what happened to it (a consumed key is never re-armed).
   if (const OpRecord* r = FindOp(s, u, E, key_hash); r && r->state == OpState::kConsumed && (u == Use::kOpen || r->entry == entry)) {
     seen_jti_[jti] = exp;
-    return ok_body(true, "consumed", file_epoch, name);
+    return ok_body(true, "consumed");
   }
   std::optional<Slot>& slot = u == Use::kSeal ? s.seal : s.open;
-  // The live slot of this very operation (constant-time comparison of the whole key, not its name).
-  if (slot && slot->epoch == E && crypt::Equal(slot->key.span(), key.span()) && slot->entry == entry) {
-    slot->deadline = std::max(slot->deadline, deadline);  // a retry with a newer token: same key, same op
-    return persist_and(ok_body(true, slot->reserved ? "in use" : "registered", file_epoch, name));
+  std::optional<Slot>& other = u == Use::kSeal ? s.open : s.seal;
+  const bool used = u == Use::kSeal ? E <= s.e.last_spill : E <= s.e.last_restore;
+  // The live slot of this very operation (constant-time comparison of the whole key, not its name). A used epoch
+  // only answers "in use" while its own lease runs; otherwise the used check below refuses it.
+  if (slot && slot->epoch == E && crypt::Equal(slot->key.span(), key.span()) && slot->entry == entry &&
+      (!used || slot->reserved)) {
+    // A retry with a newer token: never past the first registration + TTL.
+    slot->deadline = std::min(std::max(slot->deadline, deadline), slot->cap);
+    seen_jti_[jti] = exp;
+    return ok_body(true, slot->reserved ? "in use" : "registered");
   }
-  const bool used = u == Use::kSeal ? E <= s.last_spill : E <= s.last_restore;
   if (used) return answer(409, std::string(use) + " at epoch " + std::to_string(E) + " was already used");
-  if (u == Use::kOpen && (!s.last_seal || E != *s.last_seal + 1))
+  if (u == Use::kOpen && (!s.e.last_seal || E != *s.e.last_seal + 1))
     return answer(409, "open at epoch " + std::to_string(E) + " is not right after a seal here");
-  if (slot && slot->reserved) return answer(409, "a spill or restore holds the current key; retry");
+  // Every slot this transition invalidates must be free: the same use's (replaced) and the other use's (a new seal
+  // ends the old checkpoint's open; an open ends the seal).
+  if ((slot && slot->reserved) || (other && other->reserved))
+    return answer(409, "a spill or restore holds a key this registration would replace; retry");
   if (u == Use::kSeal) {
-    // An entry is sealed for one yard session only.
-    for (auto& [other, os] : sessions_)
-      if (other != session && os.seal && os.seal->entry == entry)
-        return answer(409, "entry " + std::to_string(entry) + " has a seal registration of another session");
+    for (auto& [n, os] : sessions_)
+      if (n != session && os.seal && os.seal->entry == entry)
+        return answer(409, "entry " + entry + " has a seal registration of another session");
   }
-  ZeroSlot(s, slot, OpState::kExpired);  // replaced before use (a new key for the same op)
-  slot = Slot{E, std::move(key), key_hash, name, entry, deadline, ++gen_, false};
-  Record(s, u, E, key_hash, entry, OpState::kRegistered);
-  const auto prev_high = s.high;
-  const auto prev_seal = s.last_seal;
-  s.high = E;
-  if (u == Use::kSeal) {
-    s.last_seal = E;
-    ZeroSlot(s, s.open, OpState::kExpired);  // a new checkpoint: an older open key has nothing left to open
-  } else {
-    ZeroSlot(s, s.seal, OpState::kExpired);
-  }
-  Answer a = persist_and(ok_body(false, "registered", file_epoch, name));
-  if (a.status != 200) {  // not acknowledged: not installed
-    ZeroSlot(s, slot, OpState::kExpired);
-    s.high = prev_high;
-    s.last_seal = prev_seal;
-  }
-  return a;
+  // Staged: the new epochs are persisted first; only a durable publish changes the slots.
+  Epochs cand = s.e;
+  cand.high = E;
+  if (u == Use::kSeal) cand.last_seal = E;
+  std::string pe;
+  if (auto a = settle(Commit(session, cand, &pe))) return *a;
+  Session& live = sessions_.find(session)->second;
+  std::optional<Slot>& lslot = u == Use::kSeal ? live.seal : live.open;
+  std::optional<Slot>& lother = u == Use::kSeal ? live.open : live.seal;
+  ZeroSlot(live, lslot, OpState::kExpired);  // replaced before use (a new key for the same op)
+  ZeroSlot(live, lother, OpState::kExpired);  // a new checkpoint ends the old open; an open ends the seal
+  lslot = Slot{E, std::move(key), key_hash, name, entry, deadline, tnow + ttl, ++gen_, false};
+  Record(live, u, E, key_hash, entry, OpState::kRegistered);
+  seen_jti_[jti] = exp;
+  return ok_body(false, "registered");
 }
 
 std::string YardSpillKeys::ListJson() {
   std::lock_guard<std::mutex> lk(mu_);
   (void)SweepLocked(Clock::now());
-  std::string o = "{\"sessions\":[";
+  std::string o = "{\"incarnation\":\"" + o_.incarnation + "\",\"stopped\":" + (stopped_ ? "true" : "false") +
+                  ",\"sessions\":[";
   bool first = true;
   for (const auto& [name, s] : sessions_) {
     const auto slot = [&](const std::optional<Slot>& x) {
-      return x ? "{\"epoch\":" + std::to_string(x->epoch) + ",\"key_name\":\"" + x->name + "\",\"entry\":" +
-                     std::to_string(x->entry) + ",\"in_use\":" + (x->reserved ? "true" : "false") + "}"
+      return x ? "{\"epoch\":" + std::to_string(x->epoch) + ",\"key_name\":\"" + x->name + "\",\"entry\":\"" +
+                     Esc(x->entry) + "\",\"in_use\":" + (x->reserved ? "true" : "false") + "}"
                : std::string("null");
     };
-    o += std::string(first ? "" : ",") + "{\"session\":\"" + Esc(name) + "\",\"high_epoch\":" + std::to_string(s.high) +
-         ",\"revoked_through\":" + (s.fence ? std::to_string(*s.fence) : "null") +
-         ",\"sealed_epoch\":" + (s.last_seal ? std::to_string(*s.last_seal) : "null") +
-         ",\"spilled_epoch\":" + std::to_string(s.last_spill) + ",\"restored_epoch\":" + std::to_string(s.last_restore) +
-         ",\"seal\":" + slot(s.seal) + ",\"open\":" + slot(s.open) + "}";
+    o += std::string(first ? "" : ",") + "{\"session\":\"" + Esc(name) + "\",\"high_epoch\":" + std::to_string(s.e.high) +
+         ",\"revoked_through\":" + (s.e.fence ? std::to_string(*s.e.fence) : "null") +
+         ",\"sealed_epoch\":" + (s.e.last_seal ? std::to_string(*s.e.last_seal) : "null") +
+         ",\"spilled_epoch\":" + std::to_string(s.e.last_spill) + ",\"restored_epoch\":" +
+         std::to_string(s.e.last_restore) + ",\"seal\":" + slot(s.seal) + ",\"open\":" + slot(s.open) + "}";
     first = false;
   }
   return o + "]}";
 }
 
 std::string YardSpillKeys::Describe() const {
-  std::lock_guard<std::mutex> lk(mu_);
-  return "yard (" + std::to_string(jwks_.size()) + " JWKS keys, aud " + o_.audience + ", fallback " +
-         (o_.fallback ? o_.fallback->Describe() : std::string("refuse")) + ")";
+  return "yard (" + std::to_string(Keys()->size()) + " JWKS keys, aud " + o_.audience + ", incarnation " +
+         o_.incarnation + ", fallback " + (o_.fallback ? o_.fallback->Describe() : std::string("refuse")) + ")";
 }
 
-bool YardSpillKeys::SealLease(std::uint64_t entry, std::string_view label, bool yard_bound, SpillLease* out,
+bool YardSpillKeys::SealLease(std::string_view entry, std::string_view label, bool yard_bound, SpillLease* out,
                               std::string* why) {
   {
     std::lock_guard<std::mutex> lk(mu_);
+    if (stopped_) return *why = "key provider stopped (state durability uncertain)", false;
     (void)SweepLocked(Clock::now());
     for (auto& [name, s] : sessions_) {
       if (!s.seal || s.seal->entry != entry) continue;
@@ -656,28 +775,35 @@ bool YardSpillKeys::SealLease(std::uint64_t entry, std::string_view label, bool 
       if (sl.reserved) return *why = "the seal key is in use", false;
       if (yard_bound && label != name)
         return *why = "entry is bound to yard session " + std::string(label) + ", the registration is for " + name, false;
+      // Eligible only while its epoch is unused and unfenced (a failed rollback leaves the fence; never bypass it).
+      if (sl.epoch <= s.e.last_spill || (s.e.fence && sl.epoch <= *s.e.fence))
+        return *why = "the seal registration's epoch was already used or is fenced", false;
       if (!crypt::DeriveKek(sl.key.span(), name, sl.epoch, "yard:" + sl.name, &out->kek, why)) return false;
-      // The used-epoch fence is persisted before the key is used (a crash after the spill cannot let the seal
-      // token of this epoch register again); a failed spill puts it back (Finish).
-      out->prev_fence = s.last_spill;
-      s.last_spill = std::max(s.last_spill, sl.epoch);
-      if (!SaveState(why)) {
-        s.last_spill = out->prev_fence;
+      // The used-epoch fence is persisted before the key is used (a crash after the spill cannot let the seal token
+      // of this epoch register again); a seal that published nothing puts it back (Finish).
+      Epochs cand = s.e;
+      cand.last_spill = sl.epoch;
+      const std::uint64_t prev = s.e.last_spill;
+      const std::string n = name;
+      const Persist p = Commit(n, cand, why);
+      if (p != Persist::kDurable) {
         out->kek = {};
         return false;
       }
-      out->session = name;
-      out->epoch = sl.epoch;
-      out->gen = sl.gen;
+      Slot& live = *sessions_.find(n)->second.seal;
+      out->prev_fence = prev;
+      out->session = n;
+      out->epoch = live.epoch;
+      out->gen = live.gen;
       out->yard = true;
-      sl.reserved = true;
+      live.reserved = true;
       return true;
     }
   }
   // No registration for this entry. A yard-bound entry needs one (no custody downgrade); others may fall back.
   if (yard_bound) return *why = "yard-bound entry: a fresh seal registration is needed", false;
   if (o_.fallback) return o_.fallback->SealLease(entry, label, false, out, why);
-  return *why = "no yard seal registration for entry " + std::to_string(entry), false;
+  return *why = "no yard seal registration for entry " + std::string(entry), false;
 }
 
 bool YardSpillKeys::OpenLease(std::string_view label, std::string_view file_key_id, SpillLease* out, std::string* why) {
@@ -686,36 +812,41 @@ bool YardSpillKeys::OpenLease(std::string_view label, std::string_view file_key_
     return *why = "file not sealed by yard and no fallback provider", false;
   }
   std::lock_guard<std::mutex> lk(mu_);
+  if (stopped_) return *why = "key provider stopped (state durability uncertain)", false;
   (void)SweepLocked(Clock::now());
   const auto it = sessions_.find(label);
   if (it == sessions_.end() || !it->second.open) return *why = "no yard open key registered for " + std::string(label), false;
-  Slot& sl = *it->second.open;
+  Session& s = it->second;
+  Slot& sl = *s.open;
   if (sl.reserved) return *why = "the open key is in use", false;
+  if (sl.epoch <= s.e.last_restore || (s.e.fence && sl.epoch - 1 <= *s.e.fence))
+    return *why = "the open registration's epoch was already used or is fenced", false;
   if (!crypt::DeriveKek(sl.key.span(), label, sl.epoch - 1, "yard:" + sl.name, &out->kek, why)) return false;
   if (out->kek.id != file_key_id) {
     out->kek = {};
     return *why = "the registered open key is not this file's (key or epoch)", false;
   }
   // Persisted before the key is used: the open token of this epoch never registers again, even after a crash.
-  Session& s = it->second;
-  out->prev_fence = s.last_restore;
-  s.last_restore = std::max(s.last_restore, sl.epoch);
-  if (!SaveState(why)) {
-    s.last_restore = out->prev_fence;
+  Epochs cand = s.e;
+  cand.last_restore = sl.epoch;
+  const std::uint64_t prev = s.e.last_restore;
+  if (Commit(label, cand, why) != Persist::kDurable) {
     out->kek = {};
     return false;
   }
+  Slot& live = *sessions_.find(label)->second.open;
+  out->prev_fence = prev;
   out->session = std::string(label);
-  out->epoch = sl.epoch - 1;
-  out->gen = sl.gen;
+  out->epoch = live.epoch - 1;
+  out->gen = live.gen;
   out->yard = true;
-  sl.reserved = true;
+  live.reserved = true;
   return true;
 }
 
-void YardSpillKeys::Finish(const SpillLease& lease, Use use, bool ok) {
+void YardSpillKeys::Finish(const SpillLease& lease, Use use, Outcome outcome) {
   if (!lease.yard) {
-    if (o_.fallback) o_.fallback->Finish(lease, use, ok);
+    if (o_.fallback) o_.fallback->Finish(lease, use, outcome);
     return;
   }
   std::lock_guard<std::mutex> lk(mu_);
@@ -723,22 +854,28 @@ void YardSpillKeys::Finish(const SpillLease& lease, Use use, bool ok) {
   if (it == sessions_.end()) return;
   Session& s = it->second;
   std::optional<Slot>& slot = use == Use::kSeal ? s.seal : s.open;
-  if (!slot || slot->gen != lease.gen) return;  // replaced or revoked meanwhile: nothing of ours to finish
-  if (!ok && use == Use::kSeal) {
-    // Nothing was written (SpillSession leaves the path as it was): the key may seal a retry; the used fence the
-    // lease raised goes back (if persisting that fails, the stricter fence stays: safe, the retry is refused).
-    slot->reserved = false;
-    if (s.last_spill == slot->epoch && lease.prev_fence < s.last_spill) {
-      const auto raised = s.last_spill;
-      s.last_spill = lease.prev_fence;
+  const bool mine = slot && slot->gen == lease.gen;  // else replaced or revoked meanwhile
+  if (use == Use::kSeal && outcome == Outcome::kNotDone) {
+    // Nothing was published: the used fence the lease raised goes back, also when the slot was revoked meanwhile
+    // (the revoke's own fence still holds). If that cannot be made durable, the stricter fence stays and the key is
+    // disabled: it can never seal under a fence it is not allowed past.
+    if (mine) slot->reserved = false;
+    if (s.e.last_spill == lease.epoch && lease.prev_fence < lease.epoch && !stopped_) {
+      Epochs cand = s.e;
+      cand.last_spill = lease.prev_fence;
       std::string e;
-      if (!SaveState(&e)) s.last_spill = raised;
+      if (Commit(lease.session, cand, &e) != Persist::kDurable) {
+        std::fprintf(stderr, "yard keys: seal rollback not durable (%s): the key is disabled\n", e.c_str());
+        Session& live = sessions_.find(lease.session)->second;
+        std::optional<Slot>& ls = live.seal;
+        if (ls && ls->gen == lease.gen) ZeroSlot(live, ls, OpState::kExpired);
+      }
     }
     return;
   }
-  // A restore consumes its key whatever the outcome: on failure the cache erases the entry and its file, so the key
-  // has nothing left to open. The used fence was persisted by OpenLease.
-  ZeroSlot(s, slot, OpState::kConsumed);  // one-shot: zeroed now, its record says consumed
+  // Done, or published with uncertain durability (the used fence stays): one-shot, zeroed now. A restore consumes its
+  // key whatever the outcome (on failure the cache erases the entry and its file).
+  if (mine) ZeroSlot(s, slot, OpState::kConsumed);
 }
 
 bool YardSpillKeys::MayOpen(std::string_view label, std::string_view file_key_id) {
@@ -753,7 +890,7 @@ bool YardSpillKeys::MayOpen(std::string_view label, std::string_view file_key_id
   const auto it = sessions_.find(label);
   if (it == sessions_.end()) return true;
   const Session& s = it->second;
-  return !(s.fence && fe <= *s.fence) && fe >= s.last_restore;  // fenced, or already restored: never again
+  return !(s.e.fence && fe <= *s.e.fence) && fe >= s.e.last_restore;  // fenced, or already restored: never again
 }
 
 }  // namespace halo::server

@@ -34,6 +34,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -539,7 +540,9 @@ void FlashNextGpu::SpillCleanTemps(const std::string& dir) {
 
 bool FlashNextGpu::SpillSession(const std::string& path, const SpillProtection& prot,
                                 std::span<const std::uint8_t> blob, SpillInfo* info, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   const auto t0 = std::chrono::steady_clock::now();
+  if (info) info->published = false;
   const auto& c = w_.config;
   const std::size_t kPiece = std::max(kAlign, spill_piece_bytes_ / kAlign * kAlign);
   const bool v2 = prot.kek != nullptr;
@@ -688,7 +691,9 @@ bool FlashNextGpu::SpillSession(const std::string& path, const SpillProtection& 
     ::unlink(tmp.c_str());
     return Fail(error, why);
   }
-  if (!SyncDir(path)) return Fail(error, "spill: fsync of the directory failed (the file may not be durable)");
+  if (info) info->published = true;
+  if (spill_fault_ == 3 || !SyncDir(path))
+    return Fail(error, "spill: fsync of the directory failed (published; the file may not be durable)");
   if (info) {
     info->file_bytes = end;
     info->position = position_;
@@ -733,6 +738,7 @@ bool FlashNextGpu::SpillPeek(const std::string& path, const SpillProtection& pro
 
 bool FlashNextGpu::RestoreSession(const std::string& path, const SpillProtection& prot,
                                   std::vector<std::uint8_t>* blob, SpillInfo* info, std::string* error, bool* reset) {
+  if (poisoned_) return PoisonedFail(error);
   const auto t0 = std::chrono::steady_clock::now();
   if (reset) *reset = false;
   const auto& c = w_.config;
@@ -781,8 +787,15 @@ bool FlashNextGpu::RestoreSession(const std::string& path, const SpillProtection
   const auto fail_reset = [&](std::string why) {
     std::string e2;
     // Every worker has joined (RunPool); the device finishes what they queued before the state is reset, so no
-    // write of this restore lands after it returns.
-    (void)dev_.Synchronize(&e2);
+    // write of this restore lands after it returns. If that cannot be established (the synchronize fails), queued
+    // writes may still land in storage a reset would reuse: the engine poisons itself and refuses all further use.
+    if (restore_sync_fault_ || !dev_.Synchronize(&e2)) {
+      poisoned_ = true;
+      std::fprintf(stderr, "engine: POISONED: device synchronize failed while cleaning up a failed restore (%s)\n",
+                   e2.c_str());
+      if (reset) *reset = false;
+      return Fail(error, std::move(why) + "; device synchronize failed: engine poisoned");
+    }
     (void)Reset(&e2);
     if (reset) *reset = true;
     return Fail(error, std::move(why));

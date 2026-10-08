@@ -81,6 +81,7 @@ struct Statics {
   std::size_t piece = E::spill_piece_bytes_;
   unsigned threads = E::spill_threads_;
   int fault = E::spill_fault_, identity = E::spill_test_identity_;
+  bool sync_fault = E::restore_sync_fault_;
   ~Statics() {
     E::kv_f16_only_ = kv16;
     E::prefill_shexp_w8a8_ = w8a8;
@@ -88,6 +89,7 @@ struct Statics {
     E::spill_threads_ = threads;
     E::spill_fault_ = fault;
     E::spill_test_identity_ = identity;
+    E::restore_sync_fault_ = sync_fault;
   }
 };
 
@@ -942,4 +944,44 @@ TEST(Spill, CheckpointIdentityDowngradeAndNoLateWrites) {
   EXPECT_EQ(gpu->Position(), 0u);
   ASSERT_TRUE(gpu->Prefill(b, {}, &error)) << error;  // the reset session works
   for (const auto* f : {&fa, &fb, &f1, &fbad}) std::filesystem::remove(*f);
+}
+
+// A failed restore whose cleanup cannot synchronize the device (injected) poisons the engine: queued writes might
+// still land in storage a reset would reuse, so every later call is refused instead.
+TEST(Spill, FailedSyncInRestoreCleanupPoisonsTheEngine) {
+  Small* s = LoadSmall();
+  if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  std::string error;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &error);
+  if (!dev) GTEST_SKIP() << "no HIP device";
+  Statics guard;
+  E::spill_piece_bytes_ = 64u << 10;
+  const std::size_t V = s->weights->config.vocab_size;
+  const std::string good = SpillDir() + "/poison.spill", bad = SpillDir() + "/poison_bad.spill";
+  auto gpu = E::Create(*dev, *s->weights, s->ngram.get(), nullptr, 512, &error);
+  ASSERT_TRUE(gpu) << error;
+  std::vector<std::int32_t> a(200);
+  for (std::size_t i = 0; i < a.size(); ++i) a[i] = static_cast<std::int32_t>((i * 7919) % V);
+  ASSERT_TRUE(gpu->Prefill(a, {}, &error)) << error;
+  ASSERT_TRUE(gpu->SpillSession(good, Prot(), {}, nullptr, &error)) << error;
+  auto bytes = ReadFile(good);
+  for (std::size_t at = bytes.size() * 3 / 4; at < bytes.size(); at += 4096) bytes[at] ^= 0x55;
+  WriteFile(bad, bytes);
+  E::restore_sync_fault_ = true;
+  bool reset = true;
+  EXPECT_FALSE(gpu->RestoreSession(bad, Prot(), nullptr, nullptr, &error, &reset));
+  E::restore_sync_fault_ = false;
+  EXPECT_NE(error.find("poisoned"), std::string::npos) << error;
+  EXPECT_FALSE(reset) << "the state was reset (and would be reused) although the device was not quiescent";
+  EXPECT_TRUE(gpu->poisoned());
+  std::vector<float> logits(V);
+  E::SessionId id = 0;
+  EXPECT_FALSE(gpu->Step(5, logits, &error)) << "a poisoned engine stepped";
+  EXPECT_FALSE(gpu->Prefill(a, {}, &error)) << "a poisoned engine prefilled";
+  EXPECT_FALSE(gpu->NewSession(&id, &error));
+  EXPECT_FALSE(gpu->Reset(&error));
+  EXPECT_FALSE(gpu->RestoreSession(good, Prot(), nullptr, nullptr, &error));
+  EXPECT_FALSE(gpu->SpillSession(bad, Prot(), {}, nullptr, &error));
+  std::filesystem::remove(good);
+  std::filesystem::remove(bad);
 }

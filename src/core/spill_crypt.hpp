@@ -81,6 +81,8 @@ class Gcm {
   Gcm(const Gcm&) = delete;
   Gcm& operator=(const Gcm&) = delete;
   [[nodiscard]] bool ok() const noexcept { return ctx_ != nullptr; }
+  /// Test seam: true when the context holds no cipher (and so no key schedule): every call resets it.
+  [[nodiscard]] bool IdleForTest() const noexcept;
   /// Encrypts `n` bytes of `src` into `dst` (they may be the same buffer).
   [[nodiscard]] bool Seal(std::span<const std::uint8_t> key, std::span<const std::uint8_t, kNonceBytes> nonce,
                           std::span<const std::uint8_t> aad, const std::uint8_t* src, std::uint8_t* dst, std::size_t n,
@@ -116,6 +118,8 @@ constexpr std::size_t kKeyIdBytes = 128;
 /// A short public name of a key, for ids and display only (never an equality test between keys): hex of the first
 /// 8 bytes of HMAC-SHA256(key, "halo-spill-master-id"). False if the HMAC fails.
 [[nodiscard]] bool KeyName(std::span<const std::uint8_t> key, std::string* out);
+/// Test seam: every key gets the same name (a forced 64-bit name collision: names must never decide key equality).
+void KeyNameCollideForTest(bool on) noexcept;
 
 // ---- the v2 header's envelope (the engine owns the rest of the header) ----
 constexpr std::size_t kHeaderBytes = 512;  ///< v2 header, fixed size

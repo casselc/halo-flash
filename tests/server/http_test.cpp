@@ -20,6 +20,7 @@
 
 #include <hegel/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <chrono>
@@ -471,5 +472,76 @@ TEST(Http, UnixSocketIsPrivate) {
   HttpServer loose(o);
   std::string err;
   EXPECT_FALSE(loose.Start(&err)) << "a socket in a group-readable directory";
+  std::filesystem::remove_all(dir);
+}
+
+// Secret request bytes never stay behind: consuming a pipelined request zeroes the tail the move vacated, growing
+// zeroes the old storage before freeing it, and dropping the parser (a client gone mid-body) zeroes everything.
+TEST(Http, SecretBufferLeavesNoCopies) {
+  static std::vector<std::string> freed;
+  freed.clear();
+  SecretBuffer::on_free_for_test = [](std::string_view block) { freed.emplace_back(block); };
+  const auto clean_tail = [](const SecretBuffer& b) {
+    const auto st = b.storage_for_test();
+    return std::all_of(st.begin() + static_cast<std::ptrdiff_t>(b.size()), st.end(), [](char c) { return c == 0; });
+  };
+  {
+    HttpParser p;
+    const std::string a = "POST /a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+    const std::string b = "POST /admin/keys/s HTTP/1.1\r\nContent-Length: 12\r\n\r\nSECRETKEY123";
+    p.Feed(a + b + "POST /c HTTP/1.1\r\nContent-Length: 20\r\n\r\nPARTIALSECR");  // a third, cut off mid-body
+    HttpRequest r;
+    ASSERT_EQ(p.Next(&r), HttpParser::Status::kRequest);
+    ASSERT_EQ(p.Next(&r), HttpParser::Status::kRequest);
+    EXPECT_EQ(r.body, "SECRETKEY123");
+    EXPECT_EQ(p.Next(&r), HttpParser::Status::kNeedMore);
+    std::string big(20000, 'Z');  // grows the storage: the old block must be freed zeroed
+    SecretBuffer s;
+    s.Append("SECRETKEY123");
+    s.Append(big);
+    s.Consume(12);
+    EXPECT_TRUE(clean_tail(s)) << "a consumed prefix left a copy in the spare storage";
+  }
+  SecretBuffer::on_free_for_test = nullptr;
+  ASSERT_FALSE(freed.empty());
+  for (const auto& block : freed)
+    EXPECT_TRUE(std::all_of(block.begin(), block.end(), [](char c) { return c == 0; })) << "a block was freed unwiped";
+}
+
+// The admin socket is never taken from a live server, a stale one is replaced, and a server only unlinks its own.
+TEST(Http, UnixSocketOwnership) {
+  const std::string dir = (std::filesystem::temp_directory_path() / ("halo-http-own-" + std::to_string(::getpid()))).string();
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
+  HttpServerOptions o;
+  o.unix_path = dir + "/admin.sock";
+  std::string err;
+  auto a = std::make_unique<HttpServer>(o);
+  ASSERT_TRUE(a->Start(&err)) << err;
+  HttpServer b(o);
+  EXPECT_FALSE(b.Start(&err)) << "a second server took a live socket";
+  EXPECT_NE(err.find("live"), std::string::npos) << err;
+  // A successor at the path (the first one's file removed): the first's Stop must not unlink it.
+  std::filesystem::remove(o.unix_path);
+  HttpServer c(o);
+  ASSERT_TRUE(c.Start(&err)) << err;
+  a->Stop();
+  a.reset();
+  EXPECT_TRUE(std::filesystem::exists(o.unix_path)) << "a server unlinked its successor's socket";
+  c.Stop();
+  EXPECT_FALSE(std::filesystem::exists(o.unix_path));
+  // A stale socket (nobody listening) is replaced.
+  {
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un sa{};
+    sa.sun_family = AF_UNIX;
+    std::memcpy(sa.sun_path, o.unix_path.c_str(), o.unix_path.size() + 1);
+    ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof sa), 0);
+    ::close(fd);
+  }
+  HttpServer d(o);
+  EXPECT_TRUE(d.Start(&err)) << "a stale socket was not replaced: " << err;
+  d.Stop();
   std::filesystem::remove_all(dir);
 }

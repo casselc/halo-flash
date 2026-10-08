@@ -240,3 +240,19 @@ TEST(SpillCrypt, Sha256Vector) {
   EXPECT_EQ(std::vector<std::uint8_t>(d.begin(), d.end()),
             Hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
 }
+
+// No key schedule outlives a call: the context is idle (no cipher) after every Seal and Open, failed ones included.
+TEST(SpillCrypt, GcmContextIsResetAfterEveryCall) {
+  std::vector<std::uint8_t> key(32, 5), buf(100, 1), aad(8, 2);
+  std::array<std::uint8_t, 12> nonce{};
+  std::array<std::uint8_t, 16> tag{};
+  sc::Gcm g;
+  ASSERT_TRUE(g.IdleForTest());
+  ASSERT_TRUE(g.Seal(key, nonce, aad, buf.data(), buf.size(), tag));
+  EXPECT_TRUE(g.IdleForTest()) << "a seal left its key schedule in the context";
+  ASSERT_TRUE(g.Open(key, nonce, aad, buf.data(), buf.size(), tag));
+  EXPECT_TRUE(g.IdleForTest()) << "an open left its key schedule in the context";
+  tag[3] ^= 1;
+  ASSERT_FALSE(g.Open(key, nonce, aad, buf.data(), buf.size(), tag));
+  EXPECT_TRUE(g.IdleForTest()) << "a failed open left its key schedule in the context";
+}

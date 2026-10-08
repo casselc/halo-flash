@@ -1247,6 +1247,7 @@ bool FlashNextGpu::SharedExpertChunk(const model::LayerWeights& l, std::uint32_t
 bool FlashNextGpu::PrefillChunk(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error,
                                 const std::vector<float>* pre_emb,
                                 const std::function<void(const model::NgramHistory&)>& after_prep) {
+  if (poisoned_) return PoisonedFail(error);
   const auto& c = w_.config;
   const auto T = static_cast<std::uint32_t>(tokens.size());
   if (T == 0) return true;

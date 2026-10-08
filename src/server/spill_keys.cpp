@@ -15,50 +15,6 @@ namespace halo::server {
 
 namespace crypt = core::crypt;
 
-bool ParseU64(std::string_view s, std::uint64_t max, std::uint64_t* out) {
-  if (s.empty() || s.size() > 20) return false;
-  std::uint64_t v = 0;
-  for (char c : s) {
-    if (c < '0' || c > '9') return false;
-    const std::uint64_t d = static_cast<std::uint64_t>(c - '0');
-    if (v > (max - d) / 10) return false;
-    v = v * 10 + d;
-  }
-  *out = v;
-  return true;
-}
-
-bool WriteFileDurable(const std::string& path, std::string_view bytes, std::string* error) {
-  const std::string tmp = path + ".tmp." + std::to_string(::getpid());
-  ::unlink(tmp.c_str());
-  const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-  if (fd < 0) return *error = "cannot create " + tmp + ": " + std::strerror(errno), false;
-  std::size_t done = 0;
-  while (done < bytes.size()) {
-    const ssize_t w = ::write(fd, bytes.data() + done, bytes.size() - done);
-    if (w < 0 && errno == EINTR) continue;
-    if (w <= 0) {
-      ::close(fd);
-      ::unlink(tmp.c_str());
-      return *error = "write " + tmp + " failed", false;
-    }
-    done += static_cast<std::size_t>(w);
-  }
-  const bool synced = ::fsync(fd) == 0;
-  ::close(fd);
-  if (!synced || ::rename(tmp.c_str(), path.c_str()) != 0) {
-    ::unlink(tmp.c_str());
-    return *error = "cannot publish " + path + ": " + std::strerror(errno), false;
-  }
-  const auto slash = path.rfind('/');
-  const std::string dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : path.substr(0, slash));
-  const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  const bool dir_ok = dfd >= 0 && ::fsync(dfd) == 0;
-  if (dfd >= 0) ::close(dfd);
-  if (!dir_ok) return *error = "fsync of " + dir + " failed", false;
-  return true;
-}
-
 std::unique_ptr<MasterSpillKeys> MasterSpillKeys::Create(std::string provider, crypt::SecretBytes master,
                                                          const std::string& epoch_file, std::string* error) {
   if (!master.ok() || master.size() < crypt::kKeyBytes) return *error = "spill key: no master", nullptr;
@@ -70,22 +26,22 @@ std::unique_ptr<MasterSpillKeys> MasterSpillKeys::Create(std::string provider, c
   k->master_ = std::move(master);
   k->epoch_file_ = epoch_file;
   if (!epoch_file.empty()) {
+    // One owner: a second halo_serve on these files is refused (it would overwrite fences with a stale epoch).
+    k->lock_ = StateLock::Acquire(epoch_file, error);
+    if (!k->lock_) return nullptr;
     // The epoch never goes back: a restart continues from the persisted one (an older epoch's files stay fenced).
-    const int fd = ::open(epoch_file.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd >= 0) {
-      char buf[32] = {};
-      const ssize_t r = ::read(fd, buf, sizeof(buf) - 1);
-      ::close(fd);
-      std::string_view v(buf, r > 0 ? static_cast<std::size_t>(r) : 0);
-      while (!v.empty() && (v.back() == '\n' || v.back() == ' ')) v.remove_suffix(1);
+    std::string text, e2;
+    const StateRead r = ReadStateFile(epoch_file, 64, &text, &e2);
+    if (r == StateRead::kError) return *error = "spill key: epoch file: " + e2 + " (refusing to start)", nullptr;
+    if (r == StateRead::kFresh) {
+      if (!InitStateFile(epoch_file, "1\n", error)) return nullptr;
+    } else {
+      // Exactly "<digits>\n": no prefix-plus-junk, no sign, no zero.
       std::uint64_t e = 0;
-      if (!ParseU64(v, std::uint64_t{1} << 62, &e) || e == 0)
+      if (text.size() < 2 || text.back() != '\n' ||
+          !ParseU64(std::string_view(text).substr(0, text.size() - 1), std::uint64_t{1} << 62, &e) || e == 0)
         return *error = "spill key: epoch file " + epoch_file + " is malformed (refusing to start)", nullptr;
       k->epoch_.store(e);
-    } else if (errno != ENOENT) {
-      return *error = "spill key: cannot read epoch file " + epoch_file + ": " + std::strerror(errno), nullptr;
-    } else if (!WriteFileDurable(epoch_file, "1\n", error)) {
-      return nullptr;
     }
   }
   return k;
@@ -109,7 +65,7 @@ bool MasterSpillKeys::Derive(std::string_view label, SpillLease* out, std::strin
   return true;
 }
 
-bool MasterSpillKeys::SealLease(std::uint64_t, std::string_view label, bool yard_bound, SpillLease* out,
+bool MasterSpillKeys::SealLease(std::string_view, std::string_view label, bool yard_bound, SpillLease* out,
                                 std::string* why) {
   if (yard_bound) return *why = "a yard-bound entry is never sealed under the master key", false;
   return Derive(label, out, why);
@@ -130,7 +86,16 @@ bool MasterSpillKeys::FenceEpoch(std::string* why) {
   std::lock_guard<std::mutex> lk(mu_);
   const std::uint64_t next = epoch_.load() + 1;
   // Persisted before it takes effect: a crash cannot bring an older epoch back.
-  if (!epoch_file_.empty() && !WriteFileDurable(epoch_file_, std::to_string(next) + "\n", why)) return false;
+  if (!epoch_file_.empty()) {
+    const Persist p = WriteStateFile(epoch_file_, std::to_string(next) + "\n", why);
+    if (p == Persist::kUnpublished) return false;
+    if (p == Persist::kUncertain) {
+      // The disk shows the new epoch (maybe not after a crash): take it, the stricter fence. Reported as a failure.
+      epoch_.store(next);
+      *why = "epoch " + std::to_string(next) + " taken, but its durability is uncertain: " + *why;
+      return false;
+    }
+  }
   epoch_.store(next);
   return true;
 }

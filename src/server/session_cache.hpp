@@ -63,6 +63,9 @@ struct SessionCacheOptions {
   SpillKeys* spill_keys = nullptr;
   bool spill_plaintext_ok = false;
   bool spill_accept_v1 = false;
+  /// This server incarnation's id: entry ids are "<incarnation>.<key>" (yard's seal claim names one), so an id
+  /// never names another conversation after a restart. Empty: 16 random hex digits (halo_serve passes yard's).
+  std::string incarnation;
 };
 
 class SessionCache {
@@ -117,6 +120,7 @@ class SessionCache {
     std::string session;           ///< the spill key's session label (a yard session, or "s<pid>-<key>")
     std::string key_id;            ///< spilled: the id of the key that seals the file ("" plaintext)
     bool yard_bound = false;       ///< sealed under a yard key once: never under a master key again
+    std::string entry_id;          ///< "<incarnation>.<key>": what a yard seal registration names
   };
   [[nodiscard]] std::vector<EntryInfo> List() const;
   /// Writes a resident entry's state to the spill directory and frees its device memory. Outcomes: true = done
@@ -161,6 +165,7 @@ class SessionCache {
   };
   enum class Restored : std::uint8_t { kDone, kRefused, kNoKey };
   std::string Label(const Entry& en) const;
+  std::string EntryId(const Entry& en) const;
   bool Drop(Engine::SessionId id, std::string* error);
   void Evict();  // down to max_retained and budget_bytes
   bool EvictOne();  // the least recently used resident entry: spilled (spill_on_evict) or dropped

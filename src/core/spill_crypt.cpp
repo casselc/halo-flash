@@ -153,6 +153,10 @@ namespace {
 constexpr std::size_t kChunk = std::size_t{1} << 30;
 }  // namespace
 
+bool Gcm::IdleForTest() const noexcept {
+  return !ctx_ || EVP_CIPHER_CTX_get0_cipher(static_cast<const EVP_CIPHER_CTX*>(ctx_)) == nullptr;
+}
+
 bool Gcm::Seal(std::span<const std::uint8_t> key, std::span<const std::uint8_t, kNonceBytes> nonce,
                std::span<const std::uint8_t> aad, const std::uint8_t* src, std::uint8_t* dst, std::size_t n,
                std::span<std::uint8_t, kTagBytes> tag) {
@@ -226,7 +230,13 @@ bool DeriveKek(std::span<const std::uint8_t> ikm, std::string_view session, std:
   return true;
 }
 
+namespace {
+std::atomic<bool> g_name_collide{false};
+}  // namespace
+void KeyNameCollideForTest(bool on) noexcept { g_name_collide.store(on); }
+
 bool KeyName(std::span<const std::uint8_t> key, std::string* out) {
+  if (g_name_collide.load()) return *out = "0000000000000000", true;
   std::array<std::uint8_t, 32> h{};
   const std::string_view label = "halo-spill-master-id";
   if (!HmacSha256(key, {reinterpret_cast<const std::uint8_t*>(label.data()), label.size()}, h)) return false;

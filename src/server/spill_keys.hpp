@@ -25,6 +25,7 @@
 #include <string_view>
 
 #include "core/spill_crypt.hpp"
+#include "server/state_file.hpp"
 
 namespace halo::server {
 
@@ -42,23 +43,26 @@ struct SpillLease {
 class SpillKeys {
  public:
   enum class Use : std::uint8_t { kSeal, kOpen };
+  /// How a spill or restore under a lease ended. kNotDone: nothing was published (the spill file at its path is what
+  /// it was). kUncertain: the file was published but its durability is not known (the directory fsync failed).
+  enum class Outcome : std::uint8_t { kDone, kNotDone, kUncertain };
   virtual ~SpillKeys() = default;
   /// Provider and key name, for logs and GET /admin/sessions (never key bytes).
   [[nodiscard]] virtual std::string Describe() const = 0;
-  /// A lease to seal a new file of cache entry `entry` (label `label`). `yard_bound`: the entry is or was sealed
-  /// under a yard key; such an entry is never sealed under a master key again (no custody downgrade). False: no
-  /// key; the caller refuses (never a plaintext fallback).
-  [[nodiscard]] virtual bool SealLease(std::uint64_t entry, std::string_view label, bool yard_bound, SpillLease* out,
+  /// A lease to seal a new file of cache entry `entry` (its incarnation-safe id, "<incarnation>.<key>"; label
+  /// `label`). `yard_bound`: the entry is or was sealed under a yard key; such an entry is never sealed under a master
+  /// key again (no custody downgrade). False: no key; the caller refuses (never a plaintext fallback).
+  [[nodiscard]] virtual bool SealLease(std::string_view entry, std::string_view label, bool yard_bound, SpillLease* out,
                                        std::string* why) = 0;
   /// A lease to open the file of `label` whose header names `file_key_id`. False: no key now (the entry waits).
   [[nodiscard]] virtual bool OpenLease(std::string_view label, std::string_view file_key_id, SpillLease* out,
                                        std::string* why) = 0;
-  /// The spill / restore under `lease` is done (`ok`): one-shot providers consume exactly that registration; on
-  /// !ok the registration stays as it was (a retry may use it).
-  virtual void Finish(const SpillLease& lease, Use use, bool ok) {
+  /// The spill / restore under `lease` ended with `outcome`: one-shot providers consume exactly that registration;
+  /// only a seal that published nothing (kNotDone) may leave its registration for a retry.
+  virtual void Finish(const SpillLease& lease, Use use, Outcome outcome) {
     (void)lease;
     (void)use;
-    (void)ok;
+    (void)outcome;
   }
   /// Could `file_key_id` still open? False for a file the provider can never open again (an older master epoch, a
   /// fenced yard epoch); true when it may (including "not registered yet").
@@ -74,16 +78,19 @@ class SpillKeys {
 /// "tpm" / "file": one master key and a persisted epoch.
 class MasterSpillKeys final : public SpillKeys {
  public:
-  /// `epoch_file`: where the epoch is kept (0600; created at 1 if absent; a malformed file refuses the start).
-  /// Empty: in memory only (tests).
+  /// `epoch_file`: where the epoch is kept (0600; created at 1 on the first start, with an init marker; a malformed,
+  /// unsafe or missing-after-init file refuses the start; held exclusively through "<epoch_file>.lock" for the
+  /// provider's lifetime). Empty: in memory only (tests).
   static std::unique_ptr<MasterSpillKeys> Create(std::string provider, core::crypt::SecretBytes master,
                                                  const std::string& epoch_file, std::string* error);
   [[nodiscard]] std::string Describe() const override;
-  [[nodiscard]] bool SealLease(std::uint64_t entry, std::string_view label, bool yard_bound, SpillLease* out,
+  [[nodiscard]] bool SealLease(std::string_view entry, std::string_view label, bool yard_bound, SpillLease* out,
                                std::string* why) override;
   [[nodiscard]] bool OpenLease(std::string_view label, std::string_view file_key_id, SpillLease* out,
                                std::string* why) override;
   [[nodiscard]] bool MayOpen(std::string_view label, std::string_view file_key_id) override;
+  /// Persisted first. Unpublished: nothing changes (false). Uncertain (published, directory fsync failed): the new
+  /// epoch is taken anyway, so memory matches what the disk shows and the stricter fence holds (false, with why).
   [[nodiscard]] bool FenceEpoch(std::string* why) override;
   [[nodiscard]] std::uint64_t epoch() const { return epoch_.load(); }
   /// The prefix of every key id: "<provider>:<master name>".
@@ -95,6 +102,7 @@ class MasterSpillKeys final : public SpillKeys {
   MasterSpillKeys() = default;
   bool Derive(std::string_view label, SpillLease* out, std::string* why);
   std::string provider_, prefix_, epoch_file_;
+  std::unique_ptr<StateLock> lock_;
   core::crypt::SecretBytes master_;
   std::atomic<std::uint64_t> epoch_{1};
   std::mutex mu_;
@@ -118,10 +126,6 @@ constexpr const char* kSystemdCreds = "/usr/bin/systemd-creds";
 [[nodiscard]] bool MakeSpillKeys(const std::string& spec, const std::string& state_dir,
                                  std::unique_ptr<MasterSpillKeys>* out, std::string* error);
 
-/// Atomic small-file write: temp (0600, O_EXCL) + fsync + rename + fsync of the directory.
-[[nodiscard]] bool WriteFileDurable(const std::string& path, std::string_view bytes, std::string* error);
-/// Parses a decimal unsigned integer exactly (no sign, no junk, no overflow, <= max).
-[[nodiscard]] bool ParseU64(std::string_view s, std::uint64_t max, std::uint64_t* out);
 
 }  // namespace halo::server
 

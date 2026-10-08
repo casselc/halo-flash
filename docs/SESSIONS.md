@@ -477,11 +477,17 @@ format halo_serve writes unless the operator asks for plaintext**.
 - **Partial restores.** A restore goes into a fresh session that the cache drops on any failure; inside the engine
   every restore worker joins (`RunPool`) and the device is synchronized before the state is reset, so no write of a
   failed restore lands after `RestoreSession` returns (`Spill.CheckpointIdentityDowngradeAndNoLateWrites`). So a
-  partial restore is never exposed or used; it may physically exist in a session that is then discarded.
+  partial restore is never exposed or used; it may physically exist in a session that is then discarded. If that
+  synchronize itself fails, quiescence is not established: the engine **poisons** itself (no reset; every session,
+  step, prefill, spill and restore call is refused until restart; `Spill.FailedSyncInRestoreCleanupPoisonsTheEngine`).
+- **Spill outcomes.** `SpillInfo::published` tells "nothing published" (the path is what it was) from "published but
+  the directory fsync failed" (durability unknown). The cache reports the latter to the key provider as
+  `Outcome::kUncertain`: the key counts as used (never handed back for another file), and the file is removed.
 - **v1** (plaintext, CRC32C) is still written when there is no provider and `--spill-plaintext-ok 1`, and read only
   with `--spill-accept-v1 1`, and then only for an entry this process recorded as v1: an entry recorded as v2 never
-  takes a v1 file (`expect_version`), whatever the flag. Each v1 restore logs a warning. The flag is a migration aid
-  for files written before SE; it goes with format v1 (sunset: when v1 writing is removed).
+  takes a v1 file (`expect_version`), whatever the flag. Each v1 restore logs a warning. The flag only covers v1
+  files this same process wrote (with `--spill-plaintext-ok 1`); it does not import files from before SE or from
+  another process (the cache index is in memory). It goes with format v1 (sunset: when v1 writing is removed).
 - Crypto: OpenSSL 3.6.3 libcrypto from the pinned nixpkgs (`pkgs.openssl` in flake.nix; no new fetch: the store path
   was already in the closure), EVP AES-256-GCM. On this CPU (Zen 5, `vaes vpclmulqdq avx512*`) it takes the
   VAES/AVX-512 path: 14.3 GB/s a core for 16 MB buffers; with VAES/VPCLMULQDQ or AVX-512F masked
@@ -539,30 +545,44 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
 
 - **Transport.** The route is served on the **admin Unix socket** (`--admin-socket`, default
   `$XDG_RUNTIME_DIR/halo-flash/admin.sock`: its directory must be ours and 0700, the socket is 0600, and every
-  connection's peer uid (`SO_PEERCRED`) must be ours or one given by `--admin-socket-peer-uid`, e.g. yard-ctl's). That
-  is the same-host default. The key is in the body and halo_serve has no TLS: `--yard-keys-tcp 1` also serves it on
+  connection's peer uid (`SO_PEERCRED`) must be halo_serve's own). **Same uid only** (round 3): the cross-uid option
+  `--admin-socket-peer-uid` was removed (a 0700 directory and a 0600 socket deny another uid before `SO_PEERCRED` is
+  even read, so it never worked) and is refused. A yard-ctl of another uid uses the encrypted-transport route below.
+  A live socket at the path (a connect succeeds) refuses the start instead of being taken over; a stale one is
+  replaced; `Stop()` unlinks the path only while it is still this server's socket (same inode). That is the same-host
+  default. The key is in the body and halo_serve has no TLS: `--yard-keys-tcp 1` also serves it on
   `--host:--port`, which is allowed only behind an authenticated, encrypted transport (the tailnet's WireGuard to
   that host, nothing in between); a signed token does not keep K confidential.
 - `POST /admin/keys/{sess}` body `{"token","use":"seal|open|revoke","key":"<base64url 32 bytes>"}`. The token: RS256
   only, explicitly PKCS#1 v1.5 + SHA-256 (yard's issuer signs RS256: internal/sts/jwt.go); `kid` in the JWKS file;
   `aud` halo_serve (a string, or an array containing it), `iss`; integer `iat`, `exp` (and `nbf` if present: any other
   type is refused), `0 < exp - iat <= 300`, no post-`exp` leeway (iat / nbf may be 30 s ahead for clock skew); `jti`;
-  `yard_sess` = `{sess}`; `yard_epoch`; `halo_spill: {use, key_sha256, entry (seal: the cache entry key), through
-  (revoke, optional)}`. A JSON document with a repeated member is refused; JWT segments are strict base64url. Every
+  `yard_sess` = `{sess}`; `yard_epoch`; `halo_spill: {use, key_sha256, entry (seal: the entry id
+  "<incarnation>.<key>" from `GET /admin/sessions`), through (revoke, optional)}`. A JSON document with a repeated member is refused; JWT segments are strict base64url. Every
   token refusal is the same `401 {"ok":false,"error":"token refused"}`; the reason goes to the log only. 409s (stale,
   fenced, used, replay) are answered only to a verified token. Errors never echo the key or the token; the request
-  body is overwritten after the call (the parsed copies too; the HTTP layer zeroes consumed request bytes).
+  body is overwritten after the call (the parsed copies too). The HTTP layer keeps request bytes in a `SecretBuffer`:
+  consuming a request moves the rest down and zeroes the vacated tail, growth zeroes the old storage before freeing
+  it, and dropping the connection (a client gone mid-body, a parse error) zeroes everything; every request's body
+  string is zeroed after its dispatch, whatever the path (an API-key refusal included).
 - **JWKS.** A key is used only if `kty` RSA, `alg` absent or RS256, `use` absent or `sig`, `key_ops` absent or
   containing `verify`, a canonical modulus of 2048..16384 bits (`BN_num_bits`, not encoded bytes) and `e` = 65537. A
   duplicate `kid` makes the whole document invalid (the loaded set is kept). The file is re-read when it changes
-  (inode, size, mtime) and at least every 60 s, and once on an unknown kid: a removed signing key stops verifying at
-  the next registration; a missing, unreadable, malformed or empty document denies everything until fixed. Startup
+  (inode, size, mtime) and at least every 60 s; an unknown kid forces a re-read at most once per 5 s (a flood cannot
+  keep halo loading keys). The file's size is checked on the opened descriptor (<= 1 MB) before it is read. Loading
+  and validating a new set happens outside the provider lock and the result is swapped in (an immutable snapshot),
+  so leases and the expiry sweeper never wait for it. A removed signing key stops verifying at the next registration;
+  keys already registered under it keep their (short) deadline. A missing, unreadable, malformed or empty document
+  denies everything until fixed. Startup
   refuses an empty issuer or audience, a TTL outside 1..3600 s, and a JWKS with no usable key.
-- `GET /admin/keys`: per session the highest epoch, the revoke fence (`revoked_through`), the last seal, spilled and
+- `GET /admin/keys`: the server `incarnation` and whether the provider is `stopped`; per session the highest epoch, the revoke fence (`revoked_through`), the last seal, spilled and
   restored epochs, and the live slots (epoch, key name, entry, in use; never the key). An expired key is gone, not
   hidden.
 - `POST /admin/sessions/{key}/spill` (no query: `?session=` was removed). The **seal registration names the entry**
-  (`halo_spill.entry`): only a seal registration for that entry seals it, under its own session's label, so an admin
+  (`halo_spill.entry` = its `entry_id`, `"<incarnation>.<key>"`, shown by `GET /admin/sessions`; the incarnation is
+  16 random hex digits drawn at every start, round 3): a numeric key is reused by the next process for another
+  conversation, so a seal for an entry of another incarnation (a token minted before a restart) is refused (409).
+  Only a seal registration for that entry seals it, under its own session's label, so an admin
   caller can neither relabel an entry nor spend another session's registration. From its first yard seal an entry is
   **yard-bound** for good: it is never sealed under the master again, fallback or not (no custody downgrade); a
   re-spill needs a fresh seal registration. `restore` needs the open key: until it is registered the restore answers
@@ -571,30 +591,49 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
   - seal at E: `E > fence`, `E >= highest`, `E > last spill`; for exactly one entry;
   - open at E: `E - 1 > fence`, `E >= highest`, `E == last seal + 1`, `E > last restore`; opens exactly the file of
     `E - 1`;
-  - revoke at token epoch T, `through` R <= T (default T): `fence = max(fence, R)`; every key at a file epoch <= fence
-    is zeroed, the last seal is forgotten if fenced, and the route then erases that session's entries (spilled or
-    resident) whose key epoch is <= fence (`DropRevoked`; a newer checkpoint survives a late cleanup). A revoke is
-    never stale (fences only get stricter) and repeating it is a no-op 200 (`"duplicate":true`). yard-ctl sends
-    `through` = the epoch of the last checkpoint it wants gone (the token epoch is the default).
+  - revoke at token epoch T, `through` R <= T; **default R = the session's last spilled epoch, none if nothing was
+    spilled** (round 3; GLM NL3: a token-epoch default fenced an abort before any checkpoint and refused the next seal
+    at that epoch). With R: `fence = max(fence, R)`, keys at file epochs <= fence are zeroed (newer ones stay), the
+    last seal is forgotten if fenced. Without R: no fence, but every key of the session is zeroed. The route then
+    erases that session's entries (spilled or resident) whose key epoch is <= fence (`DropRevoked`; a newer
+    checkpoint survives a late cleanup). A revoke is never stale and repeating it is a no-op 200
+    (`"duplicate":true`). yard-ctl sends `through` = the epoch of the last checkpoint it wants gone when it knows it.
   - a registration below the highest epoch is stale (409); a seen jti is a replay (409).
 - **One-shot, really.** halo keeps a non-secret record per operation (use, epoch, key hash, entry; registered /
   consumed / expired / revoked). The same registration again (fresh token, same use, epoch, key and entry) is a no-op
   200: `"state":"registered"` while the key is live, `"state":"consumed"` after its spill or restore, and then the key
   is **not** re-armed. Another key at a used epoch is refused (409).
 - **Expiry is erasure.** A key's authorization ends at `min(token exp, registration + TTL)` (steady clock for the
-  TTL); a sweeper thread zeroes and unmaps expired keys once a second (a key reserved by a running spill or restore is
+  TTL); a retry with a fresh token may extend it to that token's exp, but never past the first registration + TTL; a sweeper thread zeroes and unmaps expired keys once a second (a key reserved by a running spill or restore is
   zeroed when that finishes).
 - **Leases and races.** A spill or restore takes a lease on the exact registration (its generation) under the
   provider's lock; finishing consumes that registration and no newer one; a registration cannot replace a slot a
-  lease holds (409, retry). Lock order: the cache's generation lock, then the provider's lock; never the reverse
+  lease holds, the other use's slot included (a new seal would end a reserved open, an open a reserved seal: 409,
+  retry). A lease is granted only while its epoch is unused and unfenced. A seal that published nothing gives its used
+  fence back (also when its slot was revoked meanwhile); if that rollback cannot be made durable, the stricter fence
+  stays and the key is zeroed. A seal published with uncertain durability keeps the fence and consumes the key.
+  Lock order: the cache's generation lock, then the provider's lock; never the reverse
   (a registration runs outside the generation lock; only its revoke cleanup enters it afterwards). **In-flight restore
   at a revoke:** the revoke zeroes the slot at once; a restore that already holds its lease finishes with its own copy
   of the KEK; the revoke's cleanup then runs under the generation lock, after it, and erases the restored entry. So a
   revoke takes effect for every operation that starts after it, and erases the results of the ones in flight.
 - **Restart (incarnation).** Per session the highest epoch, revoke fence, last seal, last spilled and last restored
-  epochs are kept in `--yard-state` (default `<spill dir>/yard-state`, 0600, written durably). A registration is
-  acknowledged only after they are on disk; a spill or restore raises its used fence on disk **before** the key is
-  used (a failed spill puts it back). Keys, leases and seen jtis are memory only: a restart forgets every key (yard
+  epochs are kept in `--yard-state` (default `<spill dir>/yard-state`, 0600, written durably; at most 4096 sessions,
+  rewritten whole under the lock). A registration is acknowledged only after they are on disk; a spill or restore
+  raises its used fence on disk **before** the key is used (a failed spill puts it back).
+- **State files (round 3; `src/server/state_file.*`).** Both state files (yard's and the master's epoch) are owned
+  exclusively: an flock on `<file>.lock`, taken before the file is read and held for the provider's lifetime; a
+  second halo_serve on the same spill directory refuses to start (before it loads the model). Publication is typed:
+  *unpublished* (nothing changed), *durable*, or *uncertain* (renamed into place, directory fsync failed). A
+  transition is staged: memory takes the new epochs only after a durable publish, and no live key is destroyed before
+  that (except a revoke's keys: fail-closed, documented). On *uncertain* the yard provider **stops** (every key zeroed,
+  every registration 503 and every lease refused until a restart reloads what the disk holds); the master takes the
+  new epoch (what the disk shows, the stricter fence) and reports the failure. Loading opens the directory and then
+  the file relative to it with `O_NOFOLLOW`, requires a regular file owned by us with no group/other bits, reads it
+  to EOF bounded by its size, and refuses junk, unterminated lines, duplicate sessions and inconsistent epochs.
+  `<file>.init` marks a state that was initialized: a missing state with its marker refuses the start ("recovery
+  required"; delete the marker to reset deliberately). Restoring an older copy of both from a backup is out of scope
+  (no external monotonic anchor). Keys, leases and seen jtis are memory only: a restart forgets every key (yard
   re-registers after verifying `GET /admin/keys`); a replayed token after a restart is either refused by the
   persisted fences or re-registers the same, unused operation (harmless). Cache entries are memory only too, so after
   a restart old spill files are not restored at all (they are re-prefilled).
@@ -628,7 +667,8 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
 | A process running as chuck, or root, while halo_serve runs | **not protected**: it can run `systemd-creds decrypt --user` itself, or read halo_serve's memory (ptrace as the same uid) | a process as chuck cannot mint yard tokens, so it cannot make halo open a yard-sealed file; but it can read keys halo holds at that moment, and plaintext state in device memory | memory and GPU memory of the live process; swap is not involved (key memory is mlocked or refused; the 16 MB staging buffers are pinned) |
 | A stolen admin API key | can spill / restore phase-A entries (halo opens them itself) | cannot open yard-sealed files without a fresh yard token bound to the key; cannot relabel an entry or move it to the master (custody) | - |
 | The key in transit | - | the Unix socket (0600, peer uid) or an authenticated encrypted transport only (above) | a misconfigured `--yard-keys-tcp 1` on a plain network |
-| Residual copies of K in halo_serve | - | the body, its parsed JSON strings, the HTTP layer's consumed bytes and receive buffer are overwritten; K is decoded straight into `SecretBytes` after a length check | copies a library made internally (the JSON parser's reallocation of strings it was growing, the kernel's socket buffers) |
+| Residual copies of K in halo_serve | - | the body, its parsed JSON strings, the HTTP layer's buffer (consumed, grown, dropped) and receive buffer are overwritten; K is decoded straight into `SecretBytes` after a length check | copies a library made internally (the JSON parser's reallocation of strings it was growing, the kernel's socket buffers) |
+| Two halo_serve processes on one spill directory | the second refuses to start (state lock) | same | - |
 
 ### I/O path
 
@@ -772,6 +812,21 @@ killed; SR4's eight small-model mutants re-run, killed (`m3g_c.txt`). Not mutate
 `EVP_CIPHER_CTX_reset` after each call, the non-in-place DEK wrap on the success path, the full-key (not key-name)
 duplicate comparison short of a 64-bit name collision, and `RunPool` joining (the mutant, detaching, is undefined
 behaviour). 12K restore after the fix round: v2 median 266.6 ms (v1 268.7; P1 267.1).
+
+Round 3 (second-pass reviews, `streams/SE/reviews/*round2.md`): `YardKeys.SealEntriesAreIncarnationBound`,
+`StateHasOneOwner`, `PersistenceOutcomesAreTyped` (injected failure before the rename and at the directory fsync, for
+a registration, a new session, a lease, a revoke and the master's fence), `FailedSealRollback` (rollback not durable:
+the key disabled, neither a lease nor a fresh-token duplicate uses it; uncertain publish consumes; the revoked-slot
+case), `OppositeReservedSlotsSurvive` (both orders), `RevokeDefaultFencesWhatWasSpilled`,
+`StateLoadingRefusesUnsafeOrPartialState`, `UnknownKidFloodIsRateLimited`, `RetriesNeverPassTheFirstTtl`,
+`KeyNamesNeverDecideEquality` (a forced 64-bit name collision, `KeyNameCollideForTest`);
+`SpillCrypt.GcmContextIsResetAfterEveryCall` (`Gcm::IdleForTest`); `Http.SecretBufferLeavesNoCopies` (pipelined key
+request, growth, a request cut off mid-body), `Http.UnixSocketOwnership` (live socket refused, successor not
+unlinked, stale replaced); GPU `Spill.FailedSyncInRestoreCleanupPoisonsTheEngine`, and the yard resume test gains an
+uncertain spill (`spill_fault_ = 3`) and incarnation entry ids. Mutants: 23 new CPU and 2 new GPU (`r3-*`), 13 earlier
+ones re-targeted; all killed (`streams/SE/m4_cpu.txt`, `m4b_cpu.txt`, `m4g_a.txt`, `m4g_b.txt`). Still not mutated:
+the lease eligibility check and the duplicate branch's used guard (each masked by the rollback's key disabling: defense
+in depth), and the out-of-place DEK wrap on the success path. 12K restore: v2 271.3 ms median (v1 268.8; b3.txt).
 
 SR4:
 

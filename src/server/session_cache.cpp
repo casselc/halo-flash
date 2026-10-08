@@ -5,6 +5,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -30,6 +32,12 @@ void CleanSpillDir(const std::string& dir) {
 
 SessionCache::SessionCache(Engine& engine, SessionCacheOptions options) : e_(engine), opt_(options) {
   if (opt_.align == 0) opt_.align = 1;
+  if (opt_.incarnation.empty()) {  // entry ids must not repeat across processes: "<incarnation>.<key>"
+    std::array<std::uint8_t, 8> r{};
+    if (!core::crypt::RandomBytes(r)) std::abort();
+    static const char* hex = "0123456789abcdef";
+    for (auto b : r) opt_.incarnation += {hex[b >> 4], hex[b & 15]};
+  }
   if (!opt_.spill_dir.empty()) {
     std::error_code ec;
     std::filesystem::create_directories(opt_.spill_dir, ec);
@@ -61,6 +69,8 @@ void SessionCache::EraseEntry(std::size_t i) {
   entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
 }
 
+std::string SessionCache::EntryId(const Entry& en) const { return opt_.incarnation + "." + std::to_string(en.key); }
+
 std::string SessionCache::Label(const Entry& en) const {
   return en.session.empty() ? "s" + std::to_string(::getpid()) + "-" + std::to_string(en.key) : en.session;
 }
@@ -74,7 +84,7 @@ bool SessionCache::SpillEntry(Entry& en, std::string* error) {
   SpillLease lease;
   if (opt_.spill_keys) {
     prot.kek = &lease.kek;
-    if (!opt_.spill_keys->SealLease(en.key, Label(en), en.yard_bound, &lease, error)) {  // no key, no spill: never plaintext
+    if (!opt_.spill_keys->SealLease(EntryId(en), Label(en), en.yard_bound, &lease, error)) {  // no key, no spill: never plaintext
       ++counters_.spill_failed;
       ++counters_.no_key;
       return false;
@@ -86,7 +96,7 @@ bool SessionCache::SpillEntry(Entry& en, std::string* error) {
   const std::string path = opt_.spill_dir + "/s" + std::to_string(::getpid()) + "-" + std::to_string(en.key) + ".spill";
   const auto prev = e_.BoundSession();
   if (!e_.BindSession(en.id, error)) {
-    if (opt_.spill_keys) opt_.spill_keys->Finish(lease, SpillKeys::Use::kSeal, false);
+    if (opt_.spill_keys) opt_.spill_keys->Finish(lease, SpillKeys::Use::kSeal, SpillKeys::Outcome::kNotDone);
     return false;
   }
   std::vector<std::uint8_t> blob(en.tokens.size() * 4);
@@ -95,8 +105,14 @@ bool SessionCache::SpillEntry(Entry& en, std::string* error) {
   const bool ok = e_.SpillSession(path, prot, blob, &info, error);
   std::string e2;
   (void)e_.BindSession(prev == en.id ? 0 : prev, &e2);
-  if (opt_.spill_keys) opt_.spill_keys->Finish(lease, SpillKeys::Use::kSeal, ok);
-  if (!ok) {  // not done: the entry stays resident and unchanged
+  // Published but not durable (the directory fsync failed) is not "not done": the key counts as used. The entry stays
+  // resident and the (maybe not durable) file is removed.
+  if (opt_.spill_keys)
+    opt_.spill_keys->Finish(lease, SpillKeys::Use::kSeal,
+                            ok ? SpillKeys::Outcome::kDone
+                               : (info.published ? SpillKeys::Outcome::kUncertain : SpillKeys::Outcome::kNotDone));
+  if (!ok) {  // the entry stays resident and unchanged
+    if (info.published) ::unlink(path.c_str());
     ++counters_.spill_failed;
     return false;
   }
@@ -142,7 +158,8 @@ SessionCache::Restored SessionCache::RestoreEntry(Entry& en, std::string* error)
     prot.kek = &lease.kek;
   }
   const auto finish = [&](bool ok) {
-    if (keyed) opt_.spill_keys->Finish(lease, SpillKeys::Use::kOpen, ok);
+    if (keyed)
+      opt_.spill_keys->Finish(lease, SpillKeys::Use::kOpen, ok ? SpillKeys::Outcome::kDone : SpillKeys::Outcome::kNotDone);
   };
   const auto prev = e_.BoundSession();
   Engine::SessionId id;
@@ -204,7 +221,7 @@ std::vector<SessionCache::EntryInfo> SessionCache::List() const {
   std::vector<EntryInfo> out;
   for (const auto& en : entries_)
     out.push_back({en.key, en.tokens.size(), en.checkpoint, en.canonical, en.spilled, en.spilled ? 0 : Bytes(en),
-                   en.file_bytes, en.used, Label(en), en.key_id, en.yard_bound});
+                   en.file_bytes, en.used, Label(en), en.key_id, en.yard_bound, EntryId(en)});
   return out;
 }
 

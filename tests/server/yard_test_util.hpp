@@ -21,6 +21,9 @@
 
 namespace yardtest {
 
+inline const std::string kInc = "0f0f";  // the test providers' incarnation
+inline std::string Entry(std::int64_t key, const std::string& inc = kInc) { return inc + "." + std::to_string(key); }
+
 inline std::string B64(const std::string& s) {
   return halo::server::Base64UrlEncode({reinterpret_cast<const std::uint8_t*>(s.data()), s.size()});
 }
@@ -85,7 +88,7 @@ struct Claims {
   std::int64_t epoch = 1, iat = 0, exp = 0;  // 0: now, now + 300
   std::string key_sha256;                    // base64url SHA-256 of the key ("" = none)
   bool with_halo_spill = true;
-  std::int64_t entry = 1;    // halo_spill.entry (seal); 0: absent
+  std::string entry = "0f0f.1";  // halo_spill.entry (seal): "<incarnation>.<key>"; "": absent
   std::int64_t through = 0;  // halo_spill.through (revoke); 0: absent
   std::string nbf;           // raw JSON for nbf ("" = iat)
   std::string aud_json;      // raw JSON for aud ("" = the string aud)
@@ -117,7 +120,7 @@ inline std::string Token(const Signer& s, Claims c, const std::string& alg = "RS
                      "\",\"yard_epoch\":" + std::to_string(c.epoch);
   if (c.with_halo_spill) {
     body += ",\"halo_spill\":{\"use\":\"" + c.use + "\",\"key_sha256\":\"" + c.key_sha256 + "\"";
-    if (c.use == "seal" && c.entry) body += ",\"entry\":" + std::to_string(c.entry);
+    if (c.use == "seal" && !c.entry.empty()) body += ",\"entry\":\"" + c.entry + "\"";
     if (c.through) body += ",\"through\":" + std::to_string(c.through);
     body += "}";
   }
@@ -141,7 +144,7 @@ inline halo::server::YardSpillKeys::Answer Register(halo::server::YardSpillKeys&
   c.sess = sess;
   c.use = use;
   c.epoch = epoch;
-  c.entry = entry;
+  c.entry = entry ? Entry(entry) : "";
   c.through = through;
   c.key_sha256 = key.empty() ? "" : KeyHash(key);
   std::string body = Body(Token(s, c), use, key);

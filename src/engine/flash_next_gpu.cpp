@@ -871,6 +871,7 @@ bool FlashNextGpu::Step(std::int32_t token, std::span<float> logits, std::string
 
 bool FlashNextGpu::StepSample(std::int32_t token, const SampleRequest& request, SampleResult* result,
                               std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   const auto fail = [&](const char* what) {
     if (error) *error = what;
     return false;
@@ -889,6 +890,7 @@ bool FlashNextGpu::StepSample(std::int32_t token, const SampleRequest& request, 
 
 bool FlashNextGpu::Run(std::int32_t token, Head head, const SampleRequest* request, std::span<float> logits,
                        SampleResult* result, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   const auto& c = w_.config;
   if (position_ >= max_context_ || token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size) {
     if (error) *error = position_ >= max_context_ ? "context is full" : "token out of range";
@@ -1168,6 +1170,7 @@ std::uint32_t FlashNextGpu::SessionPositionOf(SessionId id) const {
 }
 
 bool FlashNextGpu::NewSession(SessionId* id, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   auto s = std::make_unique<SeqState>();
   if (!AllocSeq(*s, error)) {
     FreeSeq(*s);
@@ -1179,6 +1182,7 @@ bool FlashNextGpu::NewSession(SessionId* id, std::string* error) {
 }
 
 bool FlashNextGpu::BindSession(SessionId id, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   if (!HasSession(id)) {
     if (error) *error = "no such session";
     return false;
@@ -1209,6 +1213,7 @@ bool FlashNextGpu::DropSession(SessionId id, std::string* error) {
 }
 
 bool FlashNextGpu::ForkSession(SessionId src, SessionId* id, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   if (!HasSession(src)) {
     if (error) *error = "no such session";
     return false;
@@ -1475,6 +1480,7 @@ bool FlashNextGpu::ReleaseKvPages(std::string* error) {
 }
 
 bool FlashNextGpu::Reset(std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   const auto& c = w_.config;
   // The bound session's shared KV pages go: a fork holds them, and the rewritten positions must not reach it
   // (sessions only append, so shared pages are otherwise never written). EnsureKv maps fresh ones as needed;

@@ -340,6 +340,9 @@ class FlashNextGpu {
   [[nodiscard]] bool DropSession(SessionId id, std::string* error);
   [[nodiscard]] SessionId BoundSession() const noexcept { return bound_; }
   [[nodiscard]] bool HasSession(SessionId id) const noexcept;
+  /// True after a failure that left the device in a state the engine cannot vouch for (a failed restore whose
+  /// cleanup synchronize failed): every session, step, prefill, spill and restore call is refused from then on.
+  [[nodiscard]] bool poisoned() const noexcept { return poisoned_; }
   [[nodiscard]] std::uint32_t SessionPositionOf(SessionId id) const;
   /// Device bytes of physical memory the session's state holds, counting shared KV pages once per holder
   /// (`exclusive`: pages only this session references) - for the memory tables.
@@ -370,6 +373,9 @@ class FlashNextGpu {
     std::uint32_t version = 0;  ///< file format: 1 plaintext, 2 encrypted
     std::string key_id;         ///< v2: the id of the KEK that wraps the file's data key
     std::array<std::uint8_t, 16> checkpoint{};  ///< v2: random per file, authenticated (keep it to restore)
+    /// Spill: the file was renamed into place (set even when SpillSession then fails: a failed directory fsync
+    /// leaves a published file of uncertain durability; false = nothing was published).
+    bool published = false;
   };
   /// How a spill file is protected (docs/SESSIONS.md section 10). Spill: `kek` set writes format v2 under it; null
   /// writes plaintext v1 (only for a caller that chose plaintext). Restore / peek: a v2 file opens only with the KEK
@@ -406,12 +412,14 @@ class FlashNextGpu {
   static void SpillCleanTemps(const std::string& dir);
   [[nodiscard]] std::uint64_t ModelFingerprint() const noexcept { return model_fp_; }
   /// Test hooks (crash simulation): 1 = stop after half the payload (temp file left, no rename); 2 = stop after
-  /// the fsync, before the rename.
+  /// the fsync, before the rename; 3 = the directory fsync after the rename fails (published, not durable).
   static inline int spill_fault_ = 0;
   /// Test hook: write an authentic file of another identity (1 model fingerprint, 2 options, 3 KV kind,
   /// 4 position + 1), to show the identity checks run behind the authentication.
   static inline int spill_test_identity_ = 0;
   static inline unsigned spill_threads_ = 4;  ///< I/O threads (each: one pinned staging buffer of a piece)
+  /// Test hook: the device synchronize in a failed restore's cleanup fails (the engine must poison itself).
+  static inline bool restore_sync_fault_ = false;
   /// Test probe: restore pieces uploaded to the device so far (a failed restore must not add any after it returns).
   static inline std::atomic<std::uint64_t> spill_uploads_{0};
   static inline std::size_t spill_piece_bytes_ = 16u << 20;  ///< I/O and checksum unit, a multiple of 4096
@@ -507,6 +515,11 @@ class FlashNextGpu {
   [[nodiscard]] bool RouteTrace(std::vector<std::uint32_t>* ids, std::string* error);
 
  private:
+  bool poisoned_ = false;
+  static bool PoisonedFail(std::string* error) {
+    if (error) *error = "engine poisoned (an earlier device failure left its state unverifiable): restart";
+    return false;
+  }
   struct DevTensor {
     rt::Buffer buf;
     rt::KernelId matvec = -1, embed = -1, expert = -1, embed_rows = -1;

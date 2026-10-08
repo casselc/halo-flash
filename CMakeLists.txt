@@ -60,6 +60,7 @@ add_library(halo_server STATIC
   src/server/systemone_service.cpp
   src/server/metrics.cpp
   src/server/kv_choice.cpp
+  src/server/state_file.cpp
   src/server/spill_keys.cpp
   src/server/yard_keys.cpp
 )

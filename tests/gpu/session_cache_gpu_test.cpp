@@ -446,7 +446,7 @@ struct GateKeys final : server::SpillKeys {
   server::MasterSpillKeys& inner;
   bool seal = true, open = true;
   std::string Describe() const override { return "gate:" + inner.Describe(); }
-  bool SealLease(std::uint64_t entry, std::string_view label, bool bound, server::SpillLease* out,
+  bool SealLease(std::string_view entry, std::string_view label, bool bound, server::SpillLease* out,
                  std::string* why) override {
     if (!seal) return *why = "key withheld", false;
     return inner.SealLease(entry, label, bound, out, why);
@@ -1314,7 +1314,7 @@ struct RevokeDuringRestore final : server::SpillKeys {
   server::YardSpillKeys::Answer revoke;
   RevokeDuringRestore(server::YardSpillKeys& yard, const yardtest::Signer& s) : y(yard), signer(s) {}
   std::string Describe() const override { return y.Describe(); }
-  bool SealLease(std::uint64_t entry, std::string_view label, bool bound, server::SpillLease* out,
+  bool SealLease(std::string_view entry, std::string_view label, bool bound, server::SpillLease* out,
                  std::string* why) override {
     return y.SealLease(entry, label, bound, out, why);
   }
@@ -1326,7 +1326,7 @@ struct RevokeDuringRestore final : server::SpillKeys {
     }
     return ok;
   }
-  void Finish(const server::SpillLease& lease, Use use, bool ok) override { y.Finish(lease, use, ok); }
+  void Finish(const server::SpillLease& lease, Use use, Outcome outcome) override { y.Finish(lease, use, outcome); }
   bool MayOpen(std::string_view label, std::string_view id) override { return y.MayOpen(label, id); }
 };
 }  // namespace
@@ -1356,6 +1356,7 @@ TEST(SessionCache, YardKeysAuthoriseResume) {
   yo.issuer = "https://id.example.org/yard";
   yo.fallback = master.get();  // --spill-yard-fallback master: still never for a yard-bound entry
   yo.state_path = dir + "/yard-state";
+  yo.incarnation = yardtest::kInc;
   auto yard = server::YardSpillKeys::Create(yo, &e);
   ASSERT_TRUE(yard) << e;
   RevokeDuringRestore keys(*yard, signer);
@@ -1376,6 +1377,7 @@ TEST(SessionCache, YardKeysAuthoriseResume) {
   server::SessionCacheOptions o{.mode = server::SessionCacheOptions::Mode::kExact, .align = 64, .max_retained = 4};
   o.spill_dir = dir + "/spill";
   o.spill_keys = &keys;
+  o.incarnation = yardtest::kInc;  // halo_serve passes the provider's
   server::FlashNextGenerator g(*ea, std::vector<text::TokenId>{}, kCtx, o);
   std::vector<std::int32_t> got;
   ASSERT_TRUE(g.GenerateIds(prompt, 190, p, collect(&got)).error.empty());
@@ -1396,6 +1398,7 @@ TEST(SessionCache, YardKeysAuthoriseResume) {
     EXPECT_EQ(c.List().front().key_id.rfind("yard:", 0), 0u) << c.List().front().key_id;
     EXPECT_EQ(c.List().front().session, "sess-1");
     EXPECT_TRUE(c.List().front().yard_bound);
+    EXPECT_EQ(c.List().front().entry_id, yardtest::Entry(entry));
     EXPECT_FALSE(c.Restore(key, &why, &kept));
     EXPECT_TRUE(kept) << "an entry waiting for yard's open key was dropped: " << why;
     EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "open", 4, k1).status, 409) << "open before the commit";
@@ -1404,15 +1407,25 @@ TEST(SessionCache, YardKeysAuthoriseResume) {
     // Custody: no seal registration now; the master fallback must not take a yard-bound entry.
     EXPECT_FALSE(c.Spill(key, &why)) << "a yard-bound entry was sealed under the master (custody downgrade)";
     EXPECT_EQ(FilesIn(o.spill_dir), 0u);
+    // A spill published but not durable (the directory fsync fails): not "not done": the key counts as used, the
+    // file is removed and the entry stays resident.
     EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "seal", 5, k2, entry).status, 200);
+    engine::FlashNextGpu::spill_fault_ = 3;
+    EXPECT_FALSE(c.Spill(key, &why));
+    engine::FlashNextGpu::spill_fault_ = 0;
+    EXPECT_FALSE(c.List().front().spilled);
+    EXPECT_EQ(FilesIn(o.spill_dir), 0u);
+    EXPECT_NE(yardtest::Register(*yard, signer, "sess-1", "seal", 5, k2, entry).body.find("consumed"), std::string::npos)
+        << "an uncertain spill left its key for another file";
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "seal", 6, k2, entry).status, 200);
     EXPECT_TRUE(c.Spill(key, &why)) << why;
     // A restore in flight when a revoke (through 5) lands: it completes with the key it holds; the revoke's
     // cleanup, which the route runs under the generation lock after it, erases the restored entry.
-    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "open", 6, k2).status, 200);
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "open", 7, k2).status, 200);
     keys.armed = true;
     EXPECT_TRUE(c.Restore(key, &why, &kept)) << why;
     EXPECT_EQ(keys.revoke.status, 200) << keys.revoke.body;
-    EXPECT_EQ(keys.revoke.revoked_through, 9u);
+    EXPECT_EQ(keys.revoke.revoked_through, 6u) << "the revoke's default fence is the last spilled epoch";
     EXPECT_EQ(c.DropRevoked(keys.revoke.revoked_session, keys.revoke.revoked_through), 1u);
     EXPECT_EQ(c.List().size(), 0u);
     EXPECT_EQ(FilesIn(o.spill_dir), 0u);

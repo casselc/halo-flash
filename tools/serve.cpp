@@ -129,11 +129,12 @@ static void RegisterSpillRoutes(halo::server::HttpServer& http, halo::server::Fl
         char b[700];  // labels and key ids are printable ASCII without quotes (spill_crypt.cpp, yard session ids)
         std::snprintf(b, sizeof(b),
                       "%s{\"key\":%llu,\"tokens\":%zu,\"checkpoint\":%s,\"canonical\":%s,\"spilled\":%s,"
-                      "\"device_bytes\":%zu,\"file_bytes\":%llu,\"session\":\"%s\",\"key_id\":\"%s\",\"yard_bound\":%s}",
+                      "\"device_bytes\":%zu,\"file_bytes\":%llu,\"session\":\"%s\",\"key_id\":\"%s\",\"yard_bound\":%s,"
+                      "\"entry_id\":\"%s\"}",
                       first ? "" : ",", static_cast<unsigned long long>(e.key), e.tokens, e.checkpoint ? "true" : "false",
                       e.canonical ? "true" : "false", e.spilled ? "true" : "false", e.device_bytes,
                       static_cast<unsigned long long>(e.file_bytes), JsonSafe(e.session).c_str(),
-                      JsonSafe(e.key_id).c_str(), e.yard_bound ? "true" : "false");
+                      JsonSafe(e.key_id).c_str(), e.yard_bound ? "true" : "false", JsonSafe(e.entry_id).c_str());
         body += b;
         first = false;
       }
@@ -210,7 +211,6 @@ int main(int argc, char** argv) {
   server::SpecOptions spec;           // --mtp-window / --mtp-depth
   std::string spill_key = "none";     // --spill-key (server/spill_keys.hpp)
   std::string admin_socket;           // --admin-socket (default $XDG_RUNTIME_DIR/halo-flash/admin.sock)
-  std::vector<long> admin_peer_uids;  // --admin-socket-peer-uid
   bool yard_keys_tcp = false;         // --yard-keys-tcp
   server::YardSpillKeys::Options yard_opt;  // --yard-* (phase B)
   bool yard_fallback_master = false;  // --spill-yard-fallback
@@ -249,7 +249,7 @@ int main(int argc, char** argv) {
           "                        registration is not spilled; master: sealed under --spill-key unless yard-bound)\n"
           "  --admin-socket PATH   admin routes on a Unix socket (dir 0700, socket 0600, peer uid checked); the yard\n"
           "                        key route is served only there (default $XDG_RUNTIME_DIR/halo-flash/admin.sock)\n"
-          "  --admin-socket-peer-uid UID  another uid allowed on the admin socket (e.g. yard-ctl's; repeatable)\n"
+          "                        Same uid only: a caller of another uid (yard-ctl) uses the tailnet route\n"
           "  --yard-keys-tcp 0|1   also serve the key route on --host:--port (only behind an authenticated, encrypted\n"
           "                        transport such as the tailnet's WireGuard: the key is in the body; default 0)\n"
           "  --mtp-model SIDECAR [--mtp-vocab IDS] [--mtp-window W (128)] [--mtp-depth N (4)]\n"
@@ -310,9 +310,8 @@ int main(int argc, char** argv) {
       yard_opt.key_ttl_s = static_cast<std::int64_t>(t);
     } else if (a == "--admin-socket") admin_socket = v;
     else if (a == "--admin-socket-peer-uid") {
-      std::uint64_t u = 0;
-      if (!server::ParseU64(v, 0xfffffffeu, &u)) return std::fprintf(stderr, "--admin-socket-peer-uid: a uid\n"), 2;
-      admin_peer_uids.push_back(static_cast<long>(u));
+      return std::fprintf(stderr, "--admin-socket-peer-uid was removed: the admin socket (0700 dir, 0600 socket) only "
+                                  "admits halo_serve's own uid; see IDENTITY.md \"Transport\"\n"), 2;
     } else if (a == "--yard-keys-tcp") {
       if (v != "0" && v != "1") return std::fprintf(stderr, "--yard-keys-tcp must be 0 or 1\n"), 2;
       yard_keys_tcp = v == "1";
@@ -368,6 +367,7 @@ int main(int argc, char** argv) {
     yard_keys = server::YardSpillKeys::Create(yard_opt, &error);  // refuses an empty issuer / audience, bad TTLs
     if (!yard_keys) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
     cache.spill_keys = yard_keys.get();
+    cache.incarnation = yard_keys->incarnation();  // entry ids "<incarnation>.<key>" (the seal claim names one)
     std::fprintf(stderr, "spill: encrypted (v2), keys %s\n", yard_keys->Describe().c_str());
   } else if (spill_keys) std::fprintf(stderr, "spill: encrypted (v2), key %s\n", spill_keys->Describe().c_str());
   else if (cache.spill_plaintext_ok) std::fprintf(stderr, "spill: PLAINTEXT v1 files (--spill-plaintext-ok 1)\n");
@@ -557,7 +557,6 @@ int main(int argc, char** argv) {
     ao.max_connections = 4;
     ao.api_key = api_key;
     ao.unix_path = admin_socket;
-    ao.unix_peer_uids = admin_peer_uids;
     admin = std::make_unique<server::HttpServer>(ao);
     RegisterSpillRoutes(*admin, *flash_generator, spill_keys.get(), yard_keys.get(), true);
     if (!admin->Start(&error)) return std::fprintf(stderr, "--admin-socket: %s\n", error.c_str()), 1;

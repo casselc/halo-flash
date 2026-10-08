@@ -14,12 +14,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <thread>
 
+#include "server/state_file.hpp"
 #include "server/yard_keys.hpp"
 #include "yard_test_util.hpp"
 
@@ -54,6 +56,7 @@ struct Fixture {
     o.fallback = fallback;
     o.key_ttl_s = ttl;
     o.sweeper = false;
+    o.incarnation = kInc;
     if (persist) o.state_path = dir + "/yard-state";
     Restart();
   }
@@ -71,9 +74,9 @@ struct Fixture {
                             const std::string& sess = "sess-1", std::int64_t through = 0) {
     return Register(*y, signer, sess, use, epoch, key, entry, through);
   }
-  bool Seal(std::uint64_t entry, const std::string& label, bool bound, SpillLease* l, std::string* why = nullptr) {
+  bool Seal(std::int64_t entry, const std::string& label, bool bound, SpillLease* l, std::string* why = nullptr) {
     std::string w;
-    return y->SealLease(entry, label, bound, l, why ? why : &w);
+    return y->SealLease(Entry(entry), label, bound, l, why ? why : &w);
   }
   bool Open(const std::string& label, const std::string& id, SpillLease* l, std::string* why = nullptr) {
     std::string w;
@@ -141,7 +144,7 @@ TEST(YardKeys, TokenRefusals) {
       {"use not authorised", with([](Claims& c) { c.use = "open"; }), "use not authorised"},
       {"bound to another key", with([&](Claims& c) { c.key_sha256 = KeyHash(Key32(2)); }), "another key"},
       {"no epoch", with([](Claims& c) { c.epoch = 0; }), "yard_epoch"},
-      {"seal without an entry", with([](Claims& c) { c.entry = 0; }), "entry"},
+      {"seal without an entry", with([](Claims& c) { c.entry = ""; }), "entry"},
       {"revoke through a later epoch", with([](Claims& c) { c.use = "revoke"; c.through = 5; c.epoch = 3; }), "through"},
       {"duplicate claim (aud twice)", with([](Claims& c) { c.aud = "scope"; c.extra = ",\"aud\":\"halo_serve\""; }),
        "malformed"},
@@ -270,7 +273,7 @@ TEST(YardKeys, EpochRulesReplayDuplicatesAndShredding) {
   const std::string k1 = Key32(1), k2 = Key32(2);
   Claims c;
   c.epoch = 3;
-  c.entry = 7;
+  c.entry = Entry(7);
   c.key_sha256 = KeyHash(k1);
   const std::string t = Token(f.signer, c);
   std::string body = Body(t, "seal", k1);
@@ -293,7 +296,7 @@ TEST(YardKeys, EpochRulesReplayDuplicatesAndShredding) {
   EXPECT_FALSE(f.Seal(7, "sess-1", true, &l)) << "a reserved key leased twice";
   EXPECT_NE(f.y->ListJson().find("\"sealed_epoch\":3"), std::string::npos) << f.y->ListJson();
   EXPECT_EQ(f.y->ListJson().find(KeyB64(k1)), std::string::npos);
-  f.y->Finish(seal, SpillKeys::Use::kSeal, true);  // the spill is done: one-shot
+  f.y->Finish(seal, SpillKeys::Use::kSeal, SpillKeys::Outcome::kDone);  // the spill is done: one-shot
   EXPECT_FALSE(f.Seal(7, "sess-1", true, &l)) << "a used seal key is still held";
   // The file waits for yard: no open key yet.
   EXPECT_FALSE(f.Open("sess-1", seal.kek.id, &l));
@@ -310,7 +313,7 @@ TEST(YardKeys, EpochRulesReplayDuplicatesAndShredding) {
   ASSERT_TRUE(f.Open("sess-1", seal.kek.id, &open));
   EXPECT_EQ(open.kek.id, seal.kek.id);
   EXPECT_TRUE(sc::Equal(open.kek.key.span(), seal.kek.key.span()));
-  f.y->Finish(open, SpillKeys::Use::kOpen, true);
+  f.y->Finish(open, SpillKeys::Use::kOpen, SpillKeys::Outcome::kDone);
   EXPECT_FALSE(f.y->MayOpen("sess-1", seal.kek.id)) << "a restored file may open again";
   // A skipped epoch: an open at 5 is not right after the seal (3).
   EXPECT_EQ(f.Reg("open", 5, k1).status, 409);
@@ -330,7 +333,7 @@ TEST(YardKeys, RevokeFencesTheSession) {
   ASSERT_EQ(f.Reg("seal", 4, k).status, 200);
   SpillLease seal;
   ASSERT_TRUE(f.Seal(1, "x", false, &seal));
-  f.y->Finish(seal, SpillKeys::Use::kSeal, true);
+  f.y->Finish(seal, SpillKeys::Use::kSeal, SpillKeys::Outcome::kDone);
   // A delayed open token: minted (for E + 1 = 5) before the revoke, delivered after it.
   Claims late;
   late.use = "open";
@@ -364,7 +367,7 @@ TEST(YardKeys, RevokeFencesTheSession) {
   Fixture g;
   ASSERT_EQ(g.Reg("seal", 2, k).status, 200);
   ASSERT_TRUE(g.Seal(1, "x", false, &seal));
-  g.y->Finish(seal, SpillKeys::Use::kSeal, true);
+  g.y->Finish(seal, SpillKeys::Use::kSeal, SpillKeys::Outcome::kDone);
   ASSERT_EQ(g.Reg("revoke", 2, "").status, 200);
   EXPECT_EQ(g.Reg("open", 3, k).status, 409);
   EXPECT_FALSE(g.Open("sess-1", seal.kek.id, &l));
@@ -378,7 +381,7 @@ TEST(YardKeys, ConsumedKeysAreNeverRearmed) {
   ASSERT_EQ(f.Reg("seal", 2, k).status, 200);
   SpillLease s, l;
   ASSERT_TRUE(f.Seal(1, "x", false, &s));
-  f.y->Finish(s, SpillKeys::Use::kSeal, true);
+  f.y->Finish(s, SpillKeys::Use::kSeal, SpillKeys::Outcome::kDone);
   auto a = f.Reg("seal", 2, k);
   ASSERT_EQ(a.status, 200);
   EXPECT_TRUE(Has(a, "\"state\":\"consumed\"")) << a.body;
@@ -386,7 +389,7 @@ TEST(YardKeys, ConsumedKeysAreNeverRearmed) {
   EXPECT_EQ(f.Reg("seal", 2, k2).status, 409) << "a second key at a used seal epoch";
   ASSERT_EQ(f.Reg("open", 3, k).status, 200);
   ASSERT_TRUE(f.Open("sess-1", s.kek.id, &l));
-  f.y->Finish(l, SpillKeys::Use::kOpen, true);
+  f.y->Finish(l, SpillKeys::Use::kOpen, SpillKeys::Outcome::kDone);
   a = f.Reg("open", 3, k);
   ASSERT_EQ(a.status, 200);
   EXPECT_TRUE(Has(a, "\"state\":\"consumed\""));
@@ -394,7 +397,7 @@ TEST(YardKeys, ConsumedKeysAreNeverRearmed) {
   // A failed spill does not consume: the same key seals the retry.
   ASSERT_EQ(f.Reg("seal", 5, k2, 2).status, 200);
   ASSERT_TRUE(f.Seal(2, "x", false, &s));
-  f.y->Finish(s, SpillKeys::Use::kSeal, false);
+  f.y->Finish(s, SpillKeys::Use::kSeal, SpillKeys::Outcome::kNotDone);
   ASSERT_TRUE(f.Seal(2, "x", false, &l)) << "a failed spill consumed its key";
 }
 
@@ -447,9 +450,9 @@ TEST(YardKeys, EpochsSurviveARestart) {
   ASSERT_EQ(f.y->Register("sess-1", body).status, 200);
   SpillLease s, l;
   ASSERT_TRUE(f.Seal(1, "x", false, &s));
-  f.y->Finish(s, SpillKeys::Use::kSeal, true);
+  f.y->Finish(s, SpillKeys::Use::kSeal, SpillKeys::Outcome::kDone);
   ASSERT_EQ(f.Reg("seal", 1, k, 1, "sess-2").status, 200);
-  ASSERT_EQ(f.Reg("revoke", 1, "", 1, "sess-2").status, 200);
+  ASSERT_EQ(f.Reg("revoke", 1, "", 1, "sess-2", 1).status, 200);  // through 1: nothing was spilled there
   struct stat st {};
   ASSERT_EQ(::stat(f.o.state_path.c_str(), &st), 0);
   EXPECT_EQ(st.st_mode & 0777, 0600u);
@@ -488,10 +491,10 @@ TEST(YardKeys, LeasesAreGenerationBound) {
   EXPECT_EQ(f.Reg("seal", 2, k2).status, 409) << "a reserved key was replaced";
   ASSERT_EQ(f.Reg("revoke", 2, "").status, 200);  // zeroes the reserved slot
   ASSERT_EQ(f.Reg("seal", 3, k2).status, 200);
-  f.y->Finish(a, SpillKeys::Use::kSeal, true);  // the old lease completes late
+  f.y->Finish(a, SpillKeys::Use::kSeal, SpillKeys::Outcome::kDone);  // the old lease completes late
   ASSERT_TRUE(f.Seal(1, "x", false, &b)) << "a stale lease consumed the newer registration";
   EXPECT_NE(b.gen, a.gen);
-  f.y->Finish(b, SpillKeys::Use::kSeal, true);
+  f.y->Finish(b, SpillKeys::Use::kSeal, SpillKeys::Outcome::kDone);
   // In-flight restore at a revoke.
   ASSERT_EQ(f.Reg("open", 4, k2).status, 200);
   SpillLease o;
@@ -500,7 +503,7 @@ TEST(YardKeys, LeasesAreGenerationBound) {
   ASSERT_EQ(r.status, 200);
   EXPECT_EQ(r.revoked_through, 3u);
   EXPECT_TRUE(o.kek.key.ok()) << "the lease's key copy must survive until the restore finishes";
-  f.y->Finish(o, SpillKeys::Use::kOpen, true);  // no slot of its generation left: nothing happens
+  f.y->Finish(o, SpillKeys::Use::kOpen, SpillKeys::Outcome::kDone);  // no slot of its generation left: nothing happens
   EXPECT_FALSE(f.y->MayOpen("sess-1", b.kek.id));
 }
 
@@ -524,8 +527,271 @@ TEST(YardKeys, NoCustodyDowngrade) {
   EXPECT_FALSE(fb.Open("s1", "yard:0011223344556677:e3:s1", &l2)) << "a yard file fell back";
   EXPECT_FALSE(fb.Seal(1, "sess-1", true, &l, &why)) << "a yard-bound entry was sealed under the master";
   EXPECT_NE(why.find("yard-bound"), std::string::npos) << why;
-  EXPECT_FALSE(master->SealLease(1, "sess-1", true, &l, &why)) << "the master sealed a yard-bound entry";
+  EXPECT_FALSE(master->SealLease("x.1", "sess-1", true, &l, &why)) << "the master sealed a yard-bound entry";
   // A yard-bound entry of sess-1 is not sealed by sess-2's registration.
   ASSERT_EQ(fb.Reg("seal", 1, Key32(1), 5, "sess-2").status, 200);
   EXPECT_FALSE(fb.Seal(5, "sess-1", true, &l, &why));
+}
+
+// ---- round 3 ----
+
+// A seal authorization names an entry of one server incarnation: after a restart (a new incarnation) the same
+// numeric entry key may name another conversation, so a token minted before the restart is refused.
+TEST(YardKeys, SealEntriesAreIncarnationBound) {
+  Fixture f(nullptr, true);
+  const std::string k = Key32(21);
+  Claims c;
+  c.epoch = 2;
+  c.entry = Entry(1);
+  c.key_sha256 = KeyHash(k);
+  const std::string token = Token(f.signer, c);
+  std::string body = Body(token, "seal", k);
+  ASSERT_EQ(f.y->Register("sess-1", body).status, 200);
+  f.o.incarnation = "0e0e";  // the next process
+  f.Restart();
+  body = Body(token, "seal", k);  // the same, unused authorization, delivered again after the restart
+  const auto a = f.y->Register("sess-1", body);
+  EXPECT_EQ(a.status, 409) << "a pre-restart seal authorization was accepted: " << a.body;
+  EXPECT_TRUE(Has(a, "incarnation")) << a.body;
+  SpillLease l;
+  std::string why;
+  EXPECT_FALSE(f.y->SealLease(Entry(1, "0e0e"), "x", false, &l, &why)) << "entry 1 of the new process got the old key";
+  EXPECT_EQ(f.Reg("seal", 2, k, 1).status, 409) << "an entry of the old incarnation (fresh token) was accepted";
+  ASSERT_EQ(Register(*f.y, f.signer, "sess-1", "seal", 2, k, 0).status, 401);  // no entry at all
+  Claims ok;
+  ok.epoch = 2;
+  ok.entry = Entry(1, "0e0e");
+  ok.key_sha256 = KeyHash(k);
+  body = Body(Token(f.signer, ok), "seal", k);
+  EXPECT_EQ(f.y->Register("sess-1", body).status, 200);
+  EXPECT_TRUE(f.y->SealLease(Entry(1, "0e0e"), "x", false, &l, &why)) << why;
+}
+
+// One owner per state file: a second provider (another halo_serve on the same spill directory) is refused.
+TEST(YardKeys, StateHasOneOwner) {
+  Fixture f(nullptr, true);
+  std::string e;
+  EXPECT_FALSE(YardSpillKeys::Create(f.o, &e)) << "two providers own one state file";
+  EXPECT_NE(e.find("held"), std::string::npos) << e;
+  sc::SecretBytes m1(32), m2(32);
+  ASSERT_TRUE(sc::RandomBytes({m1.data(), 32}));
+  std::memcpy(m2.data(), m1.data(), 32);
+  auto a = halo::server::MasterSpillKeys::Create("file", std::move(m1), f.dir + "/m.epoch", &e);
+  ASSERT_TRUE(a) << e;
+  EXPECT_FALSE(halo::server::MasterSpillKeys::Create("file", std::move(m2), f.dir + "/m.epoch", &e));
+  EXPECT_NE(e.find("held"), std::string::npos) << e;
+}
+
+// Typed persistence. Unpublished: nothing changes (no session, no slot, old slots intact). Uncertain (published, the
+// directory fsync failed): the provider stops (keys zeroed, everything refused) and a restart sees the disk's state.
+TEST(YardKeys, PersistenceOutcomesAreTyped) {
+  Fixture f(nullptr, true);
+  const std::string k = Key32(22), k2 = Key32(23);
+  ASSERT_EQ(f.Reg("seal", 2, k).status, 200);
+  halo::server::g_state_write_fault = 1;
+  auto a = f.Reg("seal", 3, k2);
+  EXPECT_EQ(a.status, 500) << a.body;
+  SpillLease l;
+  ASSERT_TRUE(f.Seal(1, "x", false, &l)) << "an unpublished registration destroyed the live slot";
+  EXPECT_EQ(l.epoch, 2u);
+  f.y->Finish(l, SpillKeys::Use::kSeal, SpillKeys::Outcome::kNotDone);
+  halo::server::g_state_write_fault = 1;
+  EXPECT_EQ(f.Reg("seal", 1, k, 9, "sess-new").status, 500);
+  EXPECT_EQ(f.y->ListJson().find("sess-new"), std::string::npos) << "an unpublished session exists";
+  // A lease whose fence cannot be published is refused, and the slot stays usable.
+  halo::server::g_state_write_fault = 1;
+  EXPECT_FALSE(f.Seal(1, "x", false, &l));
+  EXPECT_TRUE(f.Seal(1, "x", false, &l));
+  f.y->Finish(l, SpillKeys::Use::kSeal, SpillKeys::Outcome::kNotDone);
+  // Uncertain: stop.
+  halo::server::g_state_write_fault = 2;
+  a = f.Reg("seal", 3, k2);
+  EXPECT_EQ(a.status, 503) << a.body;
+  EXPECT_TRUE(f.y->stopped());
+  EXPECT_FALSE(f.Seal(1, "x", false, &l)) << "a stopped provider leased a key";
+  EXPECT_EQ(f.Reg("seal", 4, k2).status, 503);
+  f.Restart();  // the disk shows epoch 3 (published): the stricter state
+  EXPECT_FALSE(f.y->stopped());
+  EXPECT_NE(f.y->ListJson().find("\"high_epoch\":3"), std::string::npos) << f.y->ListJson();
+  EXPECT_EQ(f.Reg("seal", 2, k).status, 409) << "the restart lost the published epoch";
+  // A revoke that cannot be published still zeroed the keys (fail-closed) and answers "not done".
+  ASSERT_EQ(f.Reg("seal", 3, k2).status, 200);
+  halo::server::g_state_write_fault = 1;
+  EXPECT_EQ(f.Reg("revoke", 3, "").status, 500);
+  EXPECT_FALSE(f.Seal(1, "x", false, &l)) << "a failed revoke left the key usable";
+  // Master: unpublished keeps the epoch; uncertain takes the new one (what the disk shows).
+  sc::SecretBytes m(32);
+  ASSERT_TRUE(sc::RandomBytes({m.data(), 32}));
+  std::string e;
+  auto mk = halo::server::MasterSpillKeys::Create("file", std::move(m), f.dir + "/m.epoch", &e);
+  ASSERT_TRUE(mk) << e;
+  halo::server::g_state_write_fault = 1;
+  EXPECT_FALSE(mk->FenceEpoch(&e));
+  EXPECT_EQ(mk->epoch(), 1u);
+  halo::server::g_state_write_fault = 2;
+  EXPECT_FALSE(mk->FenceEpoch(&e));
+  EXPECT_EQ(mk->epoch(), 2u) << "memory disagrees with the published epoch";
+  EXPECT_NE(e.find("uncertain"), std::string::npos) << e;
+}
+
+// A failed seal whose rollback cannot be published keeps the used fence and disables the key: neither a direct
+// lease nor a fresh-token duplicate registration uses it again. A rollback after the slot was revoked meanwhile
+// still puts the used fence back (GLM NN1).
+TEST(YardKeys, FailedSealRollback) {
+  Fixture f(nullptr, true);
+  const std::string k = Key32(24);
+  ASSERT_EQ(f.Reg("seal", 2, k).status, 200);
+  SpillLease l;
+  ASSERT_TRUE(f.Seal(1, "x", false, &l));
+  halo::server::g_state_write_fault = 1;
+  f.y->Finish(l, SpillKeys::Use::kSeal, SpillKeys::Outcome::kNotDone);
+  EXPECT_NE(f.y->ListJson().find("\"seal\":null"), std::string::npos) << "the key was not disabled: " << f.y->ListJson();
+  EXPECT_FALSE(f.Seal(1, "x", false, &l)) << "a key whose rollback failed was leased again";
+  const auto a = f.Reg("seal", 2, k);
+  EXPECT_EQ(a.status, 409) << "a fresh-token duplicate re-armed it: " << a.body;
+  // Published but not durable: the key counts as used.
+  ASSERT_EQ(f.Reg("seal", 3, Key32(25), 2).status, 200);
+  ASSERT_TRUE(f.Seal(2, "x", false, &l));
+  f.y->Finish(l, SpillKeys::Use::kSeal, SpillKeys::Outcome::kUncertain);
+  EXPECT_FALSE(f.Seal(2, "x", false, &l));
+  EXPECT_TRUE(Has(f.Reg("seal", 3, Key32(25), 2), "\"state\":\"consumed\""));
+  // A failed spill whose slot survived: the used fence goes back and the key seals the retry.
+  ASSERT_EQ(f.Reg("seal", 5, Key32(26), 3).status, 200);
+  ASSERT_TRUE(f.Seal(3, "x", false, &l));
+  ASSERT_EQ(f.Reg("revoke", 5, "", 1, "sess-1", 4).status, 200);  // fences 4, not 5: the slot at 5 survives
+  ASSERT_TRUE(f.y->ListJson().find("\"spilled_epoch\":5") != std::string::npos) << f.y->ListJson();
+  f.y->Finish(l, SpillKeys::Use::kSeal, SpillKeys::Outcome::kNotDone);
+  EXPECT_NE(f.y->ListJson().find("\"spilled_epoch\":3"), std::string::npos) << f.y->ListJson();
+  SpillLease l2;
+  EXPECT_TRUE(f.Seal(3, "x", false, &l2)) << "the failed spill's key was not left for a retry";
+  f.y->Finish(l2, SpillKeys::Use::kSeal, SpillKeys::Outcome::kDone);
+  // NN1: the slot revoked during the lease, then the spill failed: the used fence still goes back (the revoke's own
+  // fence holds the epoch).
+  ASSERT_EQ(f.Reg("seal", 7, Key32(27), 4).status, 200);
+  ASSERT_TRUE(f.Seal(4, "x", false, &l));
+  ASSERT_EQ(f.Reg("revoke", 7, "", 1, "sess-1", 7).status, 200);  // zeroes the reserved slot
+  f.y->Finish(l, SpillKeys::Use::kSeal, SpillKeys::Outcome::kNotDone);
+  EXPECT_NE(f.y->ListJson().find("\"spilled_epoch\":5"), std::string::npos) << f.y->ListJson();
+  EXPECT_NE(f.y->ListJson().find("\"revoked_through\":7"), std::string::npos) << f.y->ListJson();
+}
+
+// A registration never destroys a slot a lease holds, the other use's included; both orders.
+TEST(YardKeys, OppositeReservedSlotsSurvive) {
+  Fixture f;
+  const std::string k = Key32(27), k2 = Key32(28);
+  ASSERT_EQ(f.Reg("seal", 2, k).status, 200);
+  SpillLease s, o;
+  ASSERT_TRUE(f.Seal(1, "x", false, &s));
+  EXPECT_EQ(f.Reg("open", 3, k).status, 409) << "an open registration destroyed a reserved seal slot";
+  f.y->Finish(s, SpillKeys::Use::kSeal, SpillKeys::Outcome::kDone);
+  ASSERT_EQ(f.Reg("open", 3, k).status, 200);
+  ASSERT_TRUE(f.Open("sess-1", s.kek.id, &o));
+  EXPECT_EQ(f.Reg("seal", 4, k2).status, 409) << "a seal registration destroyed a reserved open slot";
+  f.y->Finish(o, SpillKeys::Use::kOpen, SpillKeys::Outcome::kDone);
+  EXPECT_EQ(f.Reg("seal", 4, k2).status, 200);
+}
+
+// The revoke default fences what was spilled, not the token epoch: an abort before any spill at E forgets the keys
+// but leaves E sealable (GLM NL3); after a spill at E the default fences E.
+TEST(YardKeys, RevokeDefaultFencesWhatWasSpilled) {
+  Fixture f;
+  const std::string k = Key32(29);
+  ASSERT_EQ(f.Reg("seal", 3, k).status, 200);
+  auto a = f.Reg("revoke", 3, "");
+  ASSERT_EQ(a.status, 200);
+  EXPECT_TRUE(Has(a, "\"through\":null")) << a.body;
+  SpillLease l;
+  EXPECT_FALSE(f.Seal(1, "x", false, &l)) << "a revoke kept the key";
+  ASSERT_EQ(f.Reg("seal", 3, Key32(30)).status, 200) << "an abort before any spill poisoned the epoch";
+  ASSERT_TRUE(f.Seal(1, "x", false, &l));
+  f.y->Finish(l, SpillKeys::Use::kSeal, SpillKeys::Outcome::kDone);
+  a = f.Reg("revoke", 3, "");
+  ASSERT_EQ(a.status, 200);
+  EXPECT_EQ(a.revoked_through, 3u);
+  EXPECT_EQ(f.Reg("open", 4, Key32(30)).status, 409);
+}
+
+// State files are loaded only whole, safe and consistent; a state that was initialized and then vanished refuses.
+TEST(YardKeys, StateLoadingRefusesUnsafeOrPartialState) {
+  Fixture f(nullptr, true);
+  ASSERT_EQ(f.Reg("seal", 2, Key32(31)).status, 200);
+  f.y.reset();
+  std::string e;
+  const auto refuses = [&](const std::string& text, mode_t mode = 0600) {
+    std::filesystem::remove(f.o.state_path);
+    WriteFile(f.o.state_path, text);
+    ::chmod(f.o.state_path.c_str(), mode);
+    auto y = YardSpillKeys::Create(f.o, &e);
+    return !y;
+  };
+  EXPECT_FALSE(refuses("sess-1 2 - 2 0 0\n")) << e;
+  EXPECT_TRUE(refuses("sess-1 2 - 2 0 0\nsess-1 3 - 3 0 0\n")) << "duplicate session records";
+  EXPECT_TRUE(refuses("sess-1 2 - 2 0 0\njunk")) << "a valid prefix plus junk";
+  EXPECT_TRUE(refuses("sess-1 2 - 2 0 0")) << "an unterminated last line";
+  EXPECT_TRUE(refuses("sess-1  2 - 2 0 0\n")) << "a double space";
+  EXPECT_TRUE(refuses("sess-1 2 5 2 0 0\n")) << "a fence above the highest epoch";
+  EXPECT_TRUE(refuses("sess-1 2 - 2 0 0\n", 0640)) << "group-readable";
+  std::filesystem::remove(f.o.state_path);
+  WriteFile(f.dir + "/other", "sess-1 2 - 2 0 0\n");
+  ::chmod((f.dir + "/other").c_str(), 0600);
+  std::filesystem::create_symlink(f.dir + "/other", f.o.state_path);
+  EXPECT_FALSE(YardSpillKeys::Create(f.o, &e)) << "a symlinked state file";
+  std::filesystem::remove(f.o.state_path);
+  EXPECT_FALSE(YardSpillKeys::Create(f.o, &e)) << "an initialized state vanished and was silently reset";
+  EXPECT_NE(e.find("recovery required"), std::string::npos) << e;
+  std::filesystem::remove(f.o.state_path + ".init");
+  EXPECT_TRUE(YardSpillKeys::Create(f.o, &e)) << "a deliberate reset (marker removed) must start: " << e;
+  // The master's epoch file: exactly "<digits>\n".
+  sc::SecretBytes m(32);
+  ASSERT_TRUE(sc::RandomBytes({m.data(), 32}));
+  const std::string ef = f.dir + "/m.epoch";
+  WriteFile(ef, "2\njunk");
+  ::chmod(ef.c_str(), 0600);
+  WriteFile(ef + ".init", "initialized\n");
+  EXPECT_FALSE(halo::server::MasterSpillKeys::Create("file", std::move(m), ef, &e)) << "epoch prefix plus junk";
+}
+
+// An unknown kid forces a JWKS re-read at most once per gap (a flood cannot keep the provider loading keys), and the
+// loading never holds the provider lock (leases and the sweeper proceed).
+TEST(YardKeys, UnknownKidFloodIsRateLimited) {
+  Fixture f;
+  f.o.jwks_forced_gap_ms = 60000;
+  f.Restart();
+  const auto before = f.y->jwks_loads();
+  ASSERT_EQ(f.Reg("seal", 1, Key32(32)).status, 200);
+  for (int i = 0; i < 50; ++i) EXPECT_EQ(Register(*f.y, f.other, "sess-1", "seal", 2, Key32(33), 2).status, 401);
+  EXPECT_LE(f.y->jwks_loads() - before, 1u) << "unknown kids forced unbounded JWKS reloads";
+  SpillLease l;
+  EXPECT_TRUE(f.Seal(1, "x", false, &l));
+  EXPECT_EQ(f.y->Sweep(), 0u);
+}
+
+// A retry with a fresh token never extends a key past its first registration + TTL.
+TEST(YardKeys, RetriesNeverPassTheFirstTtl) {
+  Fixture f(nullptr, false, 2);
+  const std::string k = Key32(34);
+  ASSERT_EQ(f.Reg("seal", 1, k).status, 200);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  ASSERT_TRUE(Has(f.Reg("seal", 1, k), "\"duplicate\":true"));
+  std::this_thread::sleep_for(std::chrono::milliseconds(700));
+  SpillLease l;
+  EXPECT_FALSE(f.Seal(1, "x", false, &l)) << "a retry extended the key past registration + TTL";
+}
+
+// Duplicates are decided by the whole key: two keys whose (display) names collide are different registrations.
+TEST(YardKeys, KeyNamesNeverDecideEquality) {
+  Fixture f;
+  sc::KeyNameCollideForTest(true);
+  ASSERT_EQ(f.Reg("seal", 1, Key32(35)).status, 200);
+  const auto a = f.Reg("seal", 1, Key32(36));
+  sc::KeyNameCollideForTest(false);
+  ASSERT_EQ(a.status, 200);
+  EXPECT_TRUE(Has(a, "\"duplicate\":false")) << "a different key with the same name was taken for a duplicate";
+  SpillLease l;
+  ASSERT_TRUE(f.Seal(1, "x", false, &l));
+  sc::Kek want;
+  std::string e;
+  const std::string k2 = Key32(36);
+  ASSERT_TRUE(sc::DeriveKek({reinterpret_cast<const std::uint8_t*>(k2.data()), 32}, "sess-1", 1, "yard:x", &want, &e));
+  EXPECT_TRUE(sc::Equal(l.kek.key.span(), want.key.span())) << "the lease holds the first key";
 }
