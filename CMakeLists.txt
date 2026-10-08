@@ -265,6 +265,8 @@ if(HALO_BUILD_TESTS)
     target_link_libraries(halo_graph_bench PRIVATE halo_gpu)
     add_executable(halo_gemv_bench tools/gemv_bench.cpp)
     target_link_libraries(halo_gemv_bench PRIVATE halo_gpu)
+    add_executable(halo_vmm_remap_probe tools/vmm_remap_probe.cpp)
+    target_link_libraries(halo_vmm_remap_probe PRIVATE halo_gpu)
   endif()
   halo_test(model_tests
     tests/model/reference_hf_test.cpp

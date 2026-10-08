@@ -50,6 +50,10 @@ changed and every result is byte-identical by construction (decode and prefill l
 - **Fallback.** A backend without page mapping (HRX today; or `HALO_NO_PAGING=1`) allocates each region whole
   at `max_context` and a fork copies the written rows.
 - `HALO_PAGE_BYTES` overrides the page size (tests use 64 KB so short sequences span several pages).
+- **Mapping changes settle before use.** On this stack the GPU sees a page mapping tens of microseconds after
+  `hipMemMap` / `hipMemSetAccess` / `hipMemUnmap` return (a write right after a remap reached the old page; right
+  after a fresh map it faulted: section 11). `rt::HipDevice` holds the next launch, fill or copy back until 1 ms
+  after the last map or unmap (`HALO_VMM_SETTLE_US`); callers batch their maps before their writes.
 
 **Measured** (VMM probe, `streams/M/probe/vmm.hip`): granule 4 KB; a 2 MB page costs 84 us to create and
 46 us to map the first time, 7.3 us to map again (sharing); reads through a shared mapping run at 217.6 GB/s
@@ -576,14 +580,57 @@ step's token plus up to k drafts and emit 1 + accepted tokens. What that changes
   machine `ServingModelUnderDeparturesStallsAndRetries` runs with and without speculative cycles.
 - **The draft block follows one session** (`mtp_owner_`): each request re-anchors it with `MtpTrackFrom` before its
   prefill, at max(reused, prompt - W); batched sessions (StepBatch) stay AR.
-- **A fault this exposed, fixed in rt**: MTP serving hit an intermittent GPU write fault (amdgpu permission fault,
-  then a sticky `hipErrorIllegalAddress` that failed every later request) in 7 of 11 fresh bench runs (W 0 and 128,
-  decode graphs on and off), always in the next request's `ForkSession` of a cached prefix: the copy kernel faulted
-  on the first 4 KB pages of a page mapped just before it. Address forensics (a reserve / map / release log matched
-  against the kernel's fault addresses, three faulting runs): every faulting address lay in a range the runtime
-  had freed (`hipMemAddressFree`) for an earlier session and handed out again (`hipMemAddressReserve`). With no address ever
-  reused it did not reproduce (0 of 4 runs), nor with the fix: `HipDevice::ReleaseRange` keeps released ranges
-  reserved in a size-keyed pool that `ReserveRange` hands out again (0 of 4 runs at the shipped defaults; remapping
-  pages inside a kept reservation is what `EnsureKv` / `Reset` already did). Not explained: why AR serving, which
-  frees and reserves the same way, never faulted (MTP changes the request's page count and timing; the fault may
-  need both). Test `SessionCache.ReleasedRangesComeBackAndRemapCleanly`, mutant `rt-range-freed-on-release`.
+- **A fault this exposed: the GPU's address translation lags the HIP mapping calls** (root cause: stream RC,
+  2026-10-07; working files `/data/halo-work/streams/RC/`, experiments and predicted vs actual in its PREDICTIONS.md).
+  MTP serving hit an intermittent GPU write fault (amdgpu permission fault, then a sticky `hipErrorIllegalAddress`
+  that failed every later request) in the next request's `ForkSession`: the copy kernel, writing a fresh page it had
+  mapped microseconds before, through the correct address. Stream MS's fix (6240e69: `ReleaseRange` keeps ranges
+  reserved and reuses them, no `hipMemAddressFree`) removed it, by correlation. What RC established:
+  - **Not a stale pointer** (the feared alternative, which the pool would have turned into silent corruption): in
+    all 5 logged faults the faulting page is the fork's freshly mapped copy target and the writer the copy kernel
+    (address log with monotonic timestamps against the kernel's fault addresses). With released ranges quarantined
+    and a sentinel page mapped wherever they had pages (`HALO_DIAG_RANGE=poison`, checked at every reserve), 3 bench
+    runs at the faulting configuration gave no fault and no write into any released range; MS's never-free run
+    (released ranges left unmapped, so a stale write would fault) gave 0 of 4. The detector is positive-controlled
+    by `SessionCache.PoisonModeReportsAWriteIntoAReleasedRange`. (Stale reads are not covered.)
+  - **A runtime / driver race (A).** A 2 ms wait after every page mapping removed the fault with the runtime still
+    freeing and reusing addresses (0 of 4 runs, against 2 of 3 without at W 0). A minimal program
+    (`streams/RC/ana/vmm_stale.cpp`, plain HIP, no engine) shows the same race deterministically: map page A at an
+    address, write it, unmap it, release it, map page S at the same address, and write at once (a kernel with a raw
+    pointer, or `hipMemsetAsync`): 100 of 100 writes land in the old, released page A, and reads through the address
+    return them; S is untouched. `hipStreamSynchronize(0)`, `hipDeviceSynchronize`, a blocking stream or a yield do
+    not help; time does (>= 60 us between unmap and remap, or >= 100 us after the remap: 0 of 100; a 50 us spin 1 of
+    100). ROCm 7.2.3 (nix), kernel 7.0, gfx1151. Not narrowed below the HIP API (ROCr `hsa_amd_vmem_*`, KFD and the
+    amdgpu TLB flush are candidates); worth an upstream report with that program. Stream C's not-kept handle pool
+    (section 7: released handles remapped at another address, GPU faults at 2 MB pages in 2 of 3 swarm runs) was
+    probably the same lag.
+  - **Fix (rt::HipDevice, "VMM settle")**: no GPU work (launch, graph launch, fill, upload, download) is submitted
+    until `HALO_VMM_SETTLE_US` (default 1000) after the last page map or unmap; `ForkSession` maps all its pages
+    before launching its copies, so a fork waits once. With the settle and the runtime freeing and reusing ranges
+    (the pool off): 0 of 4 runs at W 0 (and the fork's TTFT unchanged within run-to-run noise: greedy TTFT sums
+    14.6-17.0 s vs 17.4 s). Test `SessionCache.RemappedPageSeesTheNewPageAtOnce` (20 of 20 misdirected with
+    `HALO_VMM_SETTLE_US=0`), mutant `rt-vmm-settle-off`.
+  - **The range pool is gone** (released ranges go back to the runtime again). It removed the fault by keeping
+    forks off freshly freed addresses, but it leaked: the memory of every page slot a range ever mapped stays
+    charged until the range is freed (ROCm 7.2.3, `streams/RC/ana/vmm_gtt.cpp`: 4 GB of unmapped, released pages in
+    a kept range stayed in GTT; a page mapped at the same slot of the same range reuses the charge, any other slot
+    adds to it), so pooled ranges held their high-water pages and 128K contexts ran out of memory in `hipMemCreate`
+    on main (stream SE). With ranges freed and the settle: the 128K spill bench restores 6.76 GB in 2571 ms with
+    bit-identical next-step logits (SR4 before the pool: 2.56 s), and MTP serving at W 0 shows no fault (stream RC
+    E8: 0 of 4; E10, the final defaults with no diagnostics: 0 of 4, greedy TTFT unchanged). Test
+    `SessionCache.ReleasedRangesGiveTheirMemoryBack` (24 ranges of different sizes, 128 MB each: within 512 MB; the
+    pool keeps 3072 MB), mutant `rt-range-kept-on-release`. The pool survives only
+    as `HALO_DIAG_RANGE=pool` for A/B.
+  - **Why only under MTP, and mostly at W 0 with graphs.** Every fault was on an address last backed by one of the
+    850 MB raw expert copies freed after repacking, then only by reserved-and-freed ranges that never mapped it. MTP
+    serving repacks the draft block's experts and frees three such buffers just before serving, so serving-time KV
+    ranges land there: ~100 fork copy pages a run in that class (all 5 faults were in it, while it is ~7% of fork
+    copy pages); AR serving, whose raw copies are freed earlier and whose addresses are taken by long-lived
+    allocations, has ~1 a run (RC: 0 of 3 AR runs with the runtime freeing ranges). Why that address history makes
+    the lag show as a fault (an invalid translation) rather than a misdirected write is not established. The rate
+    was higher at W 0 with graphs (MS 5 of 6, RC 2 of 3) than at W 128 (RC 0 of 4, logging heavily) or eager (1 of 8):
+    timing.
+  - Diagnostics kept, off by default: `HALO_DIAG_VA=1` (every allocation, range, page and graph event on stderr with
+    `CLOCK_MONOTONIC` microseconds, the clock of the kernel log and of `AMD_LOG_LEVEL`), `HALO_DIAG_RANGE=free|pool|
+    poison` (free is the default), `HALO_DIAG_MAP_DELAY_US`, and `halo_vmm_remap_probe` (tools/vmm_remap_probe.cpp:
+    the runtime race in 80 lines of plain HIP, for an upstream report). Mutant `rt-poison-check-blind`.
