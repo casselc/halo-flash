@@ -6,7 +6,7 @@ module schedRules {
   pure val DESIGN: Rules = {
     preempt: true, deciderPrio: true, deciderBudget: true, fenceDeparture: true, deadPeerProbe: true,
     heartbeat: true, parkOnCancel: true, bindAtStart: true, reserveLedger: true, evictSeesFreed: true,
-    pinPlanned: true, atomic429: true, idempotency: true,
+    pinPlanned: true, atomic429: true, idempotency: true, twoLevel: true,
   }
 }
 module design { import schedRules.*  import scheduler(RULES = DESIGN).* from "./scheduler" }
@@ -28,3 +28,6 @@ module evictPlanned { import schedRules.*  import scheduler(RULES = { ...DESIGN,
 module queued429 { import schedRules.*  import scheduler(RULES = { ...DESIGN, atomic429: false }).* from "./scheduler" }
 // keyless clients: also the instance on which the keyless paths (limit 429, a prefix bound later) are witnessed
 module noIdempotency { import schedRules.*  import scheduler(RULES = { ...DESIGN, idempotency: false }).* from "./scheduler" }
+// one-level fair queuing over sandbox principals (G3 as first designed): a chain that fans out to several sandboxes
+// takes several shares
+module oneLevelSfq { import schedRules.*  import scheduler(RULES = { ...DESIGN, twoLevel: false }).* from "./scheduler" }
