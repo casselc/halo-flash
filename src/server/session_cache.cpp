@@ -40,7 +40,8 @@ SessionCache::SessionCache(Engine& engine, SessionCacheOptions options) : e_(eng
 SessionCache::~SessionCache() {
   std::string error;
   if (e_.BoundSession() != 0) (void)e_.BindSession(0, &error);
-  if (has_live_ && live_.id != 0) (void)e_.DropSession(live_.id, &error);
+  for (auto& [lease, lv] : lives_)
+    if (lv.e.id != 0) (void)e_.DropSession(lv.e.id, &error);
   for (const auto& en : entries_) {
     std::error_code ec;
     if (en.spilled) std::filesystem::remove(en.path, ec);
@@ -58,6 +59,7 @@ void SessionCache::EraseEntry(std::size_t i) {
     (void)Drop(entries_[i].id, &error);
   }
   entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
+  ++generation_;
 }
 
 bool SessionCache::SpillEntry(Entry& en, std::string* error) {
@@ -84,6 +86,7 @@ bool SessionCache::SpillEntry(Entry& en, std::string* error) {
   en.path = path;
   en.file_bytes = info.file_bytes;
   ++counters_.spilled;
+  ++generation_;
   return true;
 }
 
@@ -121,6 +124,7 @@ bool SessionCache::RestoreEntry(Entry& en, std::string* error) {
   en.path.clear();
   en.file_bytes = 0;
   ++counters_.restored;
+  ++generation_;
   return true;
 }
 
@@ -189,10 +193,11 @@ std::size_t SessionCache::retained_bytes() const {
 }
 
 bool SessionCache::EvictOne() {
-  // The least recently used resident entry.
+  // The least recently used resident entry that no scheduled request is about to reuse (pinned).
   std::ptrdiff_t lru = -1;
   for (std::size_t i = 0; i < entries_.size(); ++i)
-    if (!entries_[i].spilled && (lru < 0 || entries_[i].used < entries_[static_cast<std::size_t>(lru)].used))
+    if (!entries_[i].spilled && !pins_.count(entries_[i].key) &&
+        (lru < 0 || entries_[i].used < entries_[static_cast<std::size_t>(lru)].used))
       lru = static_cast<std::ptrdiff_t>(i);
   if (lru < 0) return false;
   std::string error;
@@ -217,13 +222,11 @@ void SessionCache::Evict() {
   }
 }
 
-bool SessionCache::Prepare(std::span<const std::int32_t> prompt, std::size_t stable, std::uint32_t positions,
-                           Prepared* out, std::string* error, const std::function<bool()>& cancelled,
-                           const std::function<bool(std::size_t, std::string*)>& before_prefill) {
+bool SessionCache::Begin(LeaseId lease, std::span<const std::int32_t> prompt, std::size_t stable,
+                         std::uint32_t positions, Prepared* out, std::string* error,
+                         const std::function<bool(std::size_t, std::string*)>& before_prefill) {
   *out = {};
-  if (has_live_) Abandon();  // a Prepare without Finish: the previous state is not trusted
-  const auto stop = [&] { return out->cancelled = out->cancelled || (cancelled && cancelled()); };
-  if (stop()) return *error = "cancelled", false;
+  if (lives_.count(lease)) Abandon(lease);  // a Begin without Finish: the previous state is not trusted
   const std::size_t n = prompt.empty() ? 0 : prompt.size() - 1;
   const bool exact = opt_.mode == SessionCacheOptions::Mode::kExact;
 
@@ -251,111 +254,238 @@ bool SessionCache::Prepare(std::span<const std::int32_t> prompt, std::size_t sta
   }
 
   // The live session: a fork of a checkpoint, a finished live session taken over, or a fresh one.
-  live_ = {};
-  const bool extends_live = best && !best->checkpoint;
+  Live lv;
+  lv.prompt.assign(prompt.begin(), prompt.end());
+  lv.n = n;
+  lv.extends = best && !best->checkpoint;
   if (best && best->checkpoint) {
-    if (!e_.ForkSession(best->id, &live_.id, error)) return false;
+    if (!e_.ForkSession(best->id, &lv.e.id, error)) return false;
     best->used = ++clock_;
-    live_.tokens = best->tokens;
-    live_.canonical = best->canonical;
+    lv.e.tokens = best->tokens;
+    lv.e.canonical = best->canonical;
+    lv.bound_key = best->key;
   } else if (best) {
-    live_ = std::move(*best);
+    lv.e = std::move(*best);
     entries_.erase(entries_.begin() + (best - entries_.data()));
+    ++generation_;
   } else {
-    if (!e_.NewSession(&live_.id, error)) return false;
-    live_.canonical = true;  // an empty sequence
+    if (!e_.NewSession(&lv.e.id, error)) return false;
+    lv.e.canonical = true;  // an empty sequence
   }
-  has_live_ = true;
-  if (!e_.BindSession(live_.id, error)) return Abandon(), false;
-  out->reused = live_.tokens.size();
+  Live& L = lives_[lease] = std::move(lv);
+  if (!e_.BindSession(L.e.id, error)) return Abandon(lease), false;
+  out->reused = L.reused = L.at = L.e.tokens.size();
 
-  // Room for the prompt and its generation, evicting retained states (least recently used first) until the
-  // device can hold it.
+  // Room for the prompt and its generation, evicting retained states (least recently used first, never a pinned
+  // one) until the device can hold it.
   for (;;) {
     std::string why;
     if (e_.KvRoomFor(positions, static_cast<std::uint32_t>(n - out->reused), &why)) break;
     if (!EvictOne()) {
-      Abandon();
+      Abandon(lease);
       return *error = why, false;
     }
   }
 
-  if (before_prefill && !before_prefill(out->reused, error)) return Abandon(), false;
+  if (before_prefill && !before_prefill(out->reused, error)) return Abandon(lease), false;
 
   // Checkpoint position: where the generation prompt starts (exact: rounded down to the alignment).
   std::size_t ck = std::min(stable, n);
   if (exact) ck = ck / opt_.align * opt_.align;
-  // A checkpoint costs a second prefill call (~140 ms fixed per call on the real model, stream H c1) and a fork.
-  // Fast mode skips it when this request extends a finished session: that client echoes its history, so the
-  // next request will most likely extend this one again (opencode, pi); a client that re-renders (Hermes) never
-  // extends, so it always gets one.
-  const bool want_ck = opt_.mode != SessionCacheOptions::Mode::kOff && ck > out->reused && !extends_live &&
-                       !(exact && !live_.canonical) &&
-                       std::none_of(entries_.begin(), entries_.end(), [&](const Entry& en) {
-                         return en.tokens.size() == ck && std::equal(en.tokens.begin(), en.tokens.end(), prompt.begin());
-                       });
-  std::size_t at = out->reused;
-  const auto run = [&](std::size_t to) {
-    if (to <= at) return true;
-    if (!e_.Prefill(prompt.subspan(at, to - at), {}, error, stop)) return false;
-    live_.tokens.insert(live_.tokens.end(), prompt.begin() + static_cast<std::ptrdiff_t>(at),
-                        prompt.begin() + static_cast<std::ptrdiff_t>(to));
-    out->prefilled += to - at;
-    at = to;
-    return true;
-  };
-  if (want_ck) {
-    if (!run(ck)) return Abandon(), false;
-    Entry park;
-    if (!e_.ForkSession(live_.id, &park.id, error)) return Abandon(), false;
-    park.tokens = live_.tokens;
-    park.checkpoint = true;
-    // Byte-identical to a cold prefill when every split of its prefill sat on the alignment.
-    park.canonical = live_.canonical && out->reused % opt_.align == 0 && ck % opt_.align == 0;
-    park.used = ++clock_;
-    park.key = next_key_++;
-    entries_.push_back(std::move(park));
-    out->checkpointed = true;
-    if (!e_.BindSession(live_.id, error)) return Abandon(), false;
-  }
-  if (!run(n)) return Abandon(), false;
-  // Its splits sat on the alignment (the end of a prefill need not).
-  live_.canonical = live_.canonical && out->reused % opt_.align == 0 && (!want_ck || ck % opt_.align == 0);
-  last_live_tokens_ = live_.tokens.size();
+  // A checkpoint costs a split of the prefill and a fork (~10-20 ms). Fast mode skips it when this request extends
+  // a finished session: that client echoes its history, so the next request will most likely extend this one
+  // again (opencode, pi); a client that re-renders (Hermes) never extends, so it always gets one.
+  L.ck = ck;
+  L.want_ck = opt_.mode != SessionCacheOptions::Mode::kOff && ck > out->reused && !L.extends &&
+              !(exact && !L.e.canonical) &&
+              std::none_of(entries_.begin(), entries_.end(), [&](const Entry& en) {
+                return en.tokens.size() == ck && std::equal(en.tokens.begin(), en.tokens.end(), prompt.begin());
+              });
+  if (lease == 0) last_live_tokens_ = L.e.tokens.size();
   return true;
 }
 
-void SessionCache::Ran(std::int32_t token) {
-  if (!has_live_) return;
-  live_.tokens.push_back(token);
-  live_.canonical = false;  // a decode step's arithmetic differs from a prefill's
-  last_live_tokens_ = live_.tokens.size();
+bool SessionCache::RunTo(Live& L, std::size_t to, std::uint32_t chunk, const std::function<bool()>& cancelled,
+                         Prepared* out, std::string* error) {
+  if (to <= L.at) return true;
+  if (e_.BoundSession() != L.e.id && !e_.BindSession(L.e.id, error)) return false;
+  if (!e_.Prefill(std::span<const std::int32_t>(L.prompt).subspan(L.at, to - L.at), {}, error, cancelled, chunk))
+    return false;
+  L.e.tokens.insert(L.e.tokens.end(), L.prompt.begin() + static_cast<std::ptrdiff_t>(L.at),
+                    L.prompt.begin() + static_cast<std::ptrdiff_t>(to));
+  if (out) out->prefilled += to - L.at;
+  // A split inside the prompt (more prefill follows) must sit on the alignment for the state to stay canonical.
+  if (to < L.n) L.splits_aligned = L.splits_aligned && to % opt_.align == 0;
+  L.at = to;
+  return true;
 }
 
-void SessionCache::Finish() {
-  if (!has_live_) return;
-  has_live_ = false;
-  std::string error;
-  if (opt_.mode == SessionCacheOptions::Mode::kFast && !live_.tokens.empty()) {
-    live_.checkpoint = false;
-    live_.used = ++clock_;
-    if (live_.key == 0) live_.key = next_key_++;
-    (void)e_.BindSession(0, &error);
-    entries_.push_back(std::move(live_));
-  } else {
-    (void)Drop(live_.id, &error);
+bool SessionCache::ParkCheckpoint(Live& L, std::string* error) {
+  Entry park;
+  if (!e_.ForkSession(L.e.id, &park.id, error)) return false;
+  park.tokens = L.e.tokens;
+  park.checkpoint = true;
+  // Byte-identical to a cold prefill when every split of its prefill sat on the alignment.
+  park.canonical = L.e.canonical && L.reused % opt_.align == 0 && L.splits_aligned && L.at % opt_.align == 0;
+  park.used = ++clock_;
+  park.key = next_key_++;
+  entries_.push_back(std::move(park));
+  ++generation_;
+  return e_.BindSession(L.e.id, error);
+}
+
+bool SessionCache::PrefillSlice(LeaseId lease, std::uint32_t max_tokens, std::uint32_t chunk_tokens, std::size_t* ran,
+                                bool* done, std::string* error) {
+  auto it = lives_.find(lease);
+  if (it == lives_.end()) return *error = "no such lease", false;
+  Live& L = it->second;
+  const std::size_t from = L.at;
+  // Exact mode: a slice is a multiple of the alignment, so every split sits on it (a caller's 2000-token slice
+  // would otherwise make every later state differ from a cold prefill).
+  if (opt_.mode == SessionCacheOptions::Mode::kExact && max_tokens >= opt_.align)
+    max_tokens = max_tokens / opt_.align * opt_.align;
+  const std::size_t stop = L.want_ck && L.at < L.ck ? L.ck : L.n;
+  const std::size_t to = std::min(stop, L.at + std::max<std::uint32_t>(1, max_tokens));
+  if (!RunTo(L, to, chunk_tokens, {}, nullptr, error)) return false;
+  if (L.want_ck && L.at == L.ck) {
+    if (!ParkCheckpoint(L, error)) return false;
+    L.want_ck = false;
   }
-  live_ = {};
+  *ran = L.at - from;
+  *done = L.at >= L.n;
+  if (*done) L.e.canonical = L.e.canonical && L.reused % opt_.align == 0 && L.splits_aligned;
+  if (lease == 0) last_live_tokens_ = L.e.tokens.size();
+  return true;
+}
+
+bool SessionCache::Prepare(std::span<const std::int32_t> prompt, std::size_t stable, std::uint32_t positions,
+                           Prepared* out, std::string* error, const std::function<bool()>& cancelled,
+                           const std::function<bool(std::size_t, std::string*)>& before_prefill) {
+  *out = {};
+  if (lives_.count(0)) Abandon(0);  // a Prepare without Finish: the previous state is not trusted
+  const auto stop = [&] { return out->cancelled = out->cancelled || (cancelled && cancelled()); };
+  if (stop()) return *error = "cancelled", false;
+  if (!Begin(0, prompt, stable, positions, out, error, before_prefill)) return false;
+  Live& L = lives_.at(0);
+  if (L.want_ck) {
+    if (!RunTo(L, L.ck, 0, stop, out, error)) return Abandon(0), false;
+    if (!ParkCheckpoint(L, error)) return Abandon(0), false;
+    out->checkpointed = true;
+    L.want_ck = false;
+  }
+  if (!RunTo(L, L.n, 0, stop, out, error)) return Abandon(0), false;
+  // Its splits sat on the alignment (the end of a prefill need not).
+  L.e.canonical = L.e.canonical && L.reused % opt_.align == 0 && L.splits_aligned;
+  last_live_tokens_ = L.e.tokens.size();
+  return true;
+}
+
+void SessionCache::Ran(LeaseId lease, std::int32_t token) {
+  auto it = lives_.find(lease);
+  if (it == lives_.end()) return;
+  it->second.e.tokens.push_back(token);
+  it->second.e.canonical = false;  // a decode step's arithmetic differs from a prefill's
+  if (lease == 0) last_live_tokens_ = it->second.e.tokens.size();
+}
+
+void SessionCache::Finish(LeaseId lease) {
+  auto it = lives_.find(lease);
+  if (it == lives_.end()) return;
+  Entry live = std::move(it->second.e);
+  lives_.erase(it);
+  std::string error;
+  if (opt_.mode == SessionCacheOptions::Mode::kFast && !live.tokens.empty()) {
+    live.checkpoint = false;
+    live.used = ++clock_;
+    if (live.key == 0) live.key = next_key_++;
+    if (e_.BoundSession() == live.id) (void)e_.BindSession(0, &error);
+    entries_.push_back(std::move(live));
+    ++generation_;
+  } else {
+    (void)Drop(live.id, &error);
+  }
   Evict();
 }
 
-void SessionCache::Abandon() {
-  if (!has_live_) return;
-  has_live_ = false;
+void SessionCache::Abandon(LeaseId lease) {
+  auto it = lives_.find(lease);
+  if (it == lives_.end()) return;
   std::string error;
-  (void)Drop(live_.id, &error);
-  live_ = {};
-  last_live_tokens_ = 0;
+  (void)Drop(it->second.e.id, &error);
+  lives_.erase(it);
+  if (lease == 0) last_live_tokens_ = 0;
+}
+
+std::uint64_t SessionCache::Park(LeaseId lease) {
+  auto it = lives_.find(lease);
+  if (it == lives_.end()) return 0;
+  Live& L = it->second;
+  std::uint64_t key = 0;
+  // Exact: only a state equal to a cold prefill of its tokens is worth keeping (a prefill stopped between slices,
+  // every split aligned, no decode step run); fast mode keeps whatever ran, as Finish does.
+  if (opt_.mode == SessionCacheOptions::Mode::kFast) {
+    const std::size_t before = entries_.size();
+    Finish(lease);
+    for (std::size_t i = before; i < entries_.size(); ++i) key = entries_[i].key;
+    return key;
+  }
+  const bool canonical = opt_.mode == SessionCacheOptions::Mode::kExact && L.e.canonical &&
+                         L.reused % opt_.align == 0 && L.splits_aligned && L.at % opt_.align == 0 &&
+                         L.e.tokens.size() == L.at && L.at > L.reused &&
+                         std::none_of(entries_.begin(), entries_.end(), [&](const Entry& en) {
+                           return en.tokens.size() == L.at && en.tokens == L.e.tokens;
+                         });
+  std::string error;
+  if (canonical && ParkCheckpoint(L, &error)) key = entries_.back().key;
+  Abandon(lease);
+  Evict();
+  return key;
+}
+
+SessionCache::Engine::SessionId SessionCache::LeaseSession(LeaseId lease) const {
+  auto it = lives_.find(lease);
+  return it == lives_.end() ? 0 : it->second.e.id;
+}
+
+std::size_t SessionCache::LeasePosition(LeaseId lease) const {
+  auto it = lives_.find(lease);
+  return it == lives_.end() ? 0 : it->second.e.tokens.size();
+}
+
+std::uint64_t SessionCache::LeaseBoundKey(LeaseId lease) const {
+  auto it = lives_.find(lease);
+  return it == lives_.end() ? 0 : it->second.bound_key;
+}
+
+void SessionCache::Unpin(std::uint64_t key) {
+  auto it = pins_.find(key);
+  if (it != pins_.end() && --it->second <= 0) pins_.erase(it);
+}
+
+bool SessionCache::EvictKey(std::uint64_t key) {
+  for (std::size_t i = 0; i < entries_.size(); ++i) {
+    if (entries_[i].key != key || entries_[i].spilled) continue;
+    std::string error;
+    if (opt_.spill_on_evict && SpillEntry(entries_[i], &error)) {
+      TrimSpilled();
+      return true;
+    }
+    EraseEntry(i);
+    return true;
+  }
+  return false;
+}
+
+std::vector<SessionCache::Resident> SessionCache::Residents() const {
+  std::vector<Resident> out;
+  const bool exact = opt_.mode == SessionCacheOptions::Mode::kExact;
+  for (const auto& en : entries_) {
+    if (en.spilled) continue;
+    const auto b = e_.SessionMemory(en.id);
+    out.push_back({en.key, std::make_shared<const std::vector<std::int32_t>>(en.tokens), b.recurrent + b.kv_mapped,
+                   opt_.mode != SessionCacheOptions::Mode::kOff && (!exact || en.canonical)});
+  }
+  return out;
 }
 
 }  // namespace halo::server

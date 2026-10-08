@@ -188,6 +188,7 @@ const char* ReasonPhrase(int status) {
     case 413: return "Content Too Large";
     case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
+    case 429: return "Too Many Requests";
     case 503: return "Service Unavailable";
     case 505: return "HTTP Version Not Supported";
     default: return "Unknown";

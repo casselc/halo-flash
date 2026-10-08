@@ -50,6 +50,7 @@ target_link_libraries(halo_text PUBLIC halo_core)
 add_library(halo_server STATIC
   src/server/decode_loop.cpp
   src/server/scheduler.cpp
+  src/server/scheduled_generator.cpp
   src/server/openai_request.cpp
   src/server/openai_response.cpp
   src/server/http.cpp
@@ -248,7 +249,8 @@ if(HALO_BUILD_TESTS)
     target_link_libraries(halo_step_stats PRIVATE halo_gpu)
     add_executable(halo_sample_bench tools/sample_bench.cpp)
     target_link_libraries(halo_sample_bench PRIVATE halo_gpu)
-    add_library(halo_server_engine STATIC src/server/flash_next_generator.cpp src/server/session_cache.cpp)
+    add_library(halo_server_engine STATIC src/server/flash_next_generator.cpp src/server/session_cache.cpp
+                src/server/flash_next_backend.cpp)
     target_link_libraries(halo_server_engine PUBLIC halo_server halo_gpu)
     add_executable(halo_gemm_bench tools/gemm_bench.cpp)
     target_link_libraries(halo_gemm_bench PRIVATE halo_gpu)

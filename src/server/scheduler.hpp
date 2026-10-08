@@ -44,6 +44,9 @@ class Scheduler {
     std::uint32_t slice_contended = 2048;  ///< prefill slice while anyone else is runnable (D1)
     std::uint32_t slice_alone = 8192;      ///< ... and when the prefill is alone
     std::uint32_t plimit = 1;              ///< active agent requests per principal (D3)
+    /// ... for callers with no principal (not through the broker: one shared principal). Above 1 so that an
+    /// un-brokered harness's concurrent requests (a title request beside the turn) queue as they did before G3.
+    std::uint32_t anonymous_plimit = 8;
     std::uint32_t max_batch = 8;           ///< decode unit: at most this many requests (StepBatch)
     std::uint32_t decode_steps = 8;        ///< decode unit: steps per unit at B = 1 (fewer at larger B, >= 2)
     std::int64_t decode_unit_target = 0;   ///< decode unit length to aim for (0: decode_steps x step cost at B=1)

@@ -9,6 +9,7 @@
 #include <random>
 #include <utility>
 
+#include "core/sha256.hpp"
 #include "server/openai_response.hpp"
 #include "text/tool_call_parser.hpp"
 
@@ -132,6 +133,9 @@ void SetContext(const HttpRequest& http, GenerationRequest& req) {
     if (at != std::string::npos) req.prompt_version = static_cast<std::uint32_t>(std::strtoul(p->c_str() + at + 1, nullptr, 10));
   }
   if (const std::string* v = http.Header("x-halo-variant-id")) req.variant_id = *v;
+  if (const std::string* v = http.Header("x-halo-principal")) req.principal = *v;
+  if (const std::string* v = http.Header("x-halo-chain-id")) req.chain_root = *v;
+  if (const std::string* v = http.Header("idempotency-key")) req.idempotency_key = *v;
 }
 
 std::int64_t NowNs() {
@@ -254,6 +258,34 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
   }
   const char* prefix = api == Api::kChat ? "chatcmpl-" : api == Api::kResponses ? "resp_" : "cmpl-";
   const std::string id = prefix + opt_.new_id();
+  // D5: a turn's default idempotency key is a digest of (principal, previous_response_id, input): a client's retry
+  // of the same turn carries the same key, so it replays or adopts instead of generating again. Only for requests a
+  // broker stamped with a principal (anonymous callers repeating a prompt mean it).
+  if (req.idempotency_key.empty() && !req.principal.empty()) {
+    const std::string material = req.principal + '\n' + req.previous_response_id + '\n' +
+                                 (api == Api::kCompletions ? prompt : CompactJson(req.messages)) + '\n' +
+                                 std::to_string(static_cast<int>(api));
+    req.idempotency_key = "d5:" + core::Sha256Hex(material);
+  }
+  const auto gone0 = [connected] { return connected && !connected(); };
+  TextGenerator::Params admit_params{prompt, req.variant, req.sampling, req.max_tokens, gone0,
+                                     req.principal, req.chain_root, req.idempotency_key, nullptr};
+  const auto admission = gen_.Admit(admit_params);
+  if (admission.refused) {
+    // Not done, and never will be: the scheduler took it off the queue as it answered (docs/SCHEDULER.md 4).
+    Value inner = Value::MakeObject();
+    inner.set("message", Value::String("the server is busy (" + admission.why + "); retry after " +
+                                       std::to_string(admission.retry_after_s) + " s with the same Idempotency-Key"));
+    inner.set("type", Value::String("rate_limit_exceeded"));
+    inner.set("param", Value::Null());
+    inner.set("code", Value::String(admission.why == "memory" ? "insufficient_memory" : "too_many_requests"));
+    Value e = Value::MakeObject();
+    e.set("error", std::move(inner));
+    HttpResponse r = HttpResponse::Json(429, CompactJson(e));
+    r.headers.emplace_back("Retry-After", std::to_string(std::max<std::int64_t>(1, admission.retry_after_s)));
+    if (opt_.on_refused) opt_.on_refused(admission.why);
+    return r;
+  }
 
   struct Executed {
     std::string error;  // the request failed (generation, or the store write): answered with it
@@ -271,8 +303,9 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
   // The client closed its end (or the server is stopping): nobody will receive the rest.
   const auto gone = [connected] { return connected && !connected(); };
   // `poll`: Params::cancelled (gone, plus the stream's keepalive).
-  const auto execute = [this, api, id, run, gone](std::vector<Value>* events, const std::function<bool()>& flush,
-                                                  const std::function<bool()>& poll) {
+  const auto ticket = admission.ticket;
+  const auto execute = [this, api, id, run, gone, ticket](std::vector<Value>* events, const std::function<bool()>& flush,
+                                                          const std::function<bool()>& poll) {
     OutputBuilder builder(run->req, id, opt_.now_s(), opt_.new_id);
     text::ToolCallStreamParser parser(run->popt);
     StopMatcher stops(run->req.stop);
@@ -287,7 +320,8 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
         builder.Add(parsed, events);
       }
     };
-    TextGenerator::Params params{run->prompt, run->req.variant, run->req.sampling, run->req.max_tokens, poll};
+    TextGenerator::Params params{run->prompt, run->req.variant, run->req.sampling, run->req.max_tokens, poll,
+                                 run->req.principal, run->req.chain_root, run->req.idempotency_key, ticket};
     if (opt_.on_activity) opt_.on_activity(true);
     struct Done {
       const std::function<void(bool)>& f;

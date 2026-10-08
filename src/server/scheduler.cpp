@@ -189,7 +189,7 @@ Scheduler::Admission Scheduler::Arrive(const Turn& turn, std::int64_t now, bool 
       ++mine;
       longest = std::max(longest, RemainingEstimate(x));
     }
-  if (mine >= opt_.plimit) {
+  if (mine >= (r.principal == kAnonymous ? opt_.anonymous_plimit : opt_.plimit)) {
     ++counters_.limit429;
     a.outcome = Outcome::kLimit;
     a.retry_after_s = std::clamp<std::int64_t>((longest + opt_.per_second - 1) / opt_.per_second, 1, opt_.retry_after_cap_s);

@@ -1611,16 +1611,6 @@ binary = "gpu_tests"
 filter = "SessionCache.ReleasedRangesComeBackAndRemapCleanly"
 why = "a released range goes back to the runtime, whose reuse of the address made writes to a freshly mapped page fault"
 
-[[mutant]]
-name = "fn-slice-chunk-unaligned"
-file = "src/engine/flash_next_gpu.cpp"
-find = '      chunk_tokens > 0 ? chunk_tokens'
-replace = '      chunk_tokens > 0 ? chunk_tokens + 8'
-suite = "gpu-small"
-binary = "gpu_tests"
-filter = "Sessions.InterleavedSlicesMatchAlone"
-why = "G3 M1: a scheduler slice's chunks must split the prompt at multiples of 16 positions (the DeltaNet scan's piece) to stay byte-identical to an unsplit prefill"
-
 # ---- G3 scheduler (src/server/scheduler.cpp): one mutant per policy rule; the Hegel machine against the model's
 # properties (SchedulerModel) or a directed check (Scheduler.*) kills each. spec/scheduler/schedTest.qnt has the
 # model's mutant of the same rule. ----------------------------------------------
@@ -1751,7 +1741,7 @@ why = "SFQ join rule: a root back from idle keeps its old tag and monopolizes th
 [[mutant]]
 name = "sched-no-principal-limit"
 file = "src/server/scheduler.cpp"
-find = 'if (mine >= opt_.plimit) {'
+find = 'if (mine >= (r.principal == kAnonymous ? opt_.anonymous_plimit : opt_.plimit)) {'
 replace = 'if (false) {'
 suite = "cpu-asan"
 binary = "server_tests"
@@ -1777,3 +1767,65 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "Scheduler.SliceIsShortOnlyWhenContended"
 why = "D1: 2048-token slices under contention (an 8192 slice is a 5-8 s preemption bound)"
+
+[[mutant]]
+name = "fn-slice-chunk-unaligned"
+file = "src/engine/flash_next_gpu.cpp"
+find = '      chunk_tokens > 0 ? chunk_tokens'
+replace = '      chunk_tokens > 0 ? chunk_tokens + 8'
+suite = "gpu-small"
+binary = "gpu_tests"
+filter = "Sessions.InterleavedSlicesMatchAlone"
+why = "G3 M1: a scheduler slice's chunks must split the prompt at multiples of 16 positions (the DeltaNet scan's piece) to stay byte-identical to an unsplit prefill"
+
+# ---- G3 M3: the scheduled generator (src/server/scheduled_generator.cpp), its service path and the cache leases ----
+
+[[mutant]]
+name = "sg-answer-before-done"
+file = "src/server/scheduled_generator.cpp"
+find = '  unpublished_.push_back(&job);'
+replace = '  Publish(job);'
+suite = "gpu-small"
+binary = "gpu_tests"
+filter = "ScheduledGenerator.ConcurrentRequestsEqualEachServedAlone"
+why = "G3 M3: a request is answered only after Scheduler::Done let it go, else the sandbox's next turn finds its previous one in flight and gets a limit 429 (found while building)"
+
+[[mutant]]
+name = "sg-batch-token-mixup"
+file = "src/server/scheduled_generator.cpp"
+find = '        items[i] = {live[i]->id, live[i]->run->token(), &live[i]->sampling, live[i]->state.get(), 0};'
+replace = '        items[i] = {live[i]->id, live[0]->run->token(), &live[i]->sampling, live[i]->state.get(), 0};'
+suite = "gpu-small"
+binary = "gpu_tests"
+filter = "ScheduledGenerator.ConcurrentRequestsEqualEachServedAlone"
+why = "G3 M3: a batched decode unit steps each request with its own next token (StepBatch entries are byte-identical to stepping alone only then)"
+
+[[mutant]]
+name = "cache-lease-slice-not-rounded"
+file = "src/server/session_cache.cpp"
+find = '    max_tokens = max_tokens / opt_.align * opt_.align;'
+replace = '    max_tokens = max_tokens;'
+suite = "gpu-small"
+binary = "gpu_tests"
+filter = "SessionCache.LeaseSlicesSplitOnTheAlignment"
+why = "G3 M3: exact mode rounds a lease's slice to the alignment, so a scheduler slice of any size keeps every split aligned"
+
+[[mutant]]
+name = "svc-429-ignored"
+file = "src/server/openai_service.cpp"
+find = '  if (admission.refused) {'
+replace = '  if (false) {'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.ScheduledSecondTurnOfASandboxIsRefused429"
+why = "G3: a refused admission is answered 429 + Retry-After before the stream starts (never a 200 with nothing in it)"
+
+[[mutant]]
+name = "svc-no-principal-header"
+file = "src/server/openai_service.cpp"
+find = '  if (const std::string* v = http.Header("x-halo-principal")) req.principal = *v;'
+replace = '  if (const std::string* v = http.Header("x-halo-principal-unused")) req.principal = *v;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.ScheduledSecondTurnOfASandboxIsRefused429"
+why = "G3: the principal comes from the broker's X-Halo-Principal header (else every caller is the anonymous principal)"

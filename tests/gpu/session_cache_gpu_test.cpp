@@ -34,6 +34,7 @@
 #include "model/weights.hpp"
 #include "rt/device.hpp"
 #include "server/flash_next_generator.hpp"
+#include "server/flash_next_backend.hpp"
 #include "text/tokenizer.hpp"
 
 namespace gs = hegel::generators;
@@ -396,6 +397,182 @@ TEST(SessionCache, ReuseIsByteIdenticalToColdPrefill) {
   std::printf("exact: %zu requests, %zu of %zu prompt tokens reused; fast: %zu reused, %zu requests differ from cold\n",
               requests, reused, prompt_tokens, fast_reused, fast_differs);
   EXPECT_GT(reused, prompt_tokens / 10) << "the cache hardly reused anything: the comparison is close to vacuous";
+}
+
+// G3 M3: a lease prefilled in slices of any size (a scheduler's --sched-slice) splits its prompt only at multiples
+// of the alignment in exact mode, and the state is then a cold prefill's: its logits after the prompt equal one
+// Prefill's, and the checkpoint parked at `stable` is canonical (reused by the next request).
+TEST(SessionCache, LeaseSlicesSplitOnTheAlignment) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  std::string e;
+  auto engine = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, 1024, &e);
+  auto cold = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, 1024, &e);
+  ASSERT_TRUE(engine && cold) << e;
+  const std::size_t V = m->weights->config.vocab_size;
+  std::vector<std::int32_t> prompt(700);
+  std::uint32_t seed = 99;
+  for (auto& t : prompt) t = static_cast<std::int32_t>(((seed = seed * 1664525u + 1013904223u) >> 8) % V);
+  for (const std::uint32_t slice : {100u, 64u, 150u, 300u}) {
+    server::SessionCache cache(*engine, {.mode = server::SessionCacheOptions::Mode::kExact, .align = kAlign});
+    server::SessionCache::Prepared prep;
+    ASSERT_TRUE(cache.Begin(7, prompt, 500, 800, &prep, &e)) << e;
+    for (bool done = false; !done;) {
+      std::size_t ran = 0;
+      ASSERT_TRUE(cache.PrefillSlice(7, slice, slice, &ran, &done, &e)) << e;
+      if (!done) EXPECT_EQ(cache.LeasePosition(7) % kAlign, 0u) << "slice " << slice << ": a split off the alignment";
+    }
+    std::vector<float> got(V), want(V);
+    ASSERT_TRUE(engine->BindSession(cache.LeaseSession(7), &e) && engine->Step(prompt.back(), got, &e)) << e;
+    ASSERT_TRUE(cold->Reset(&e) && cold->Prefill(std::span<const std::int32_t>(prompt).first(prompt.size() - 1), {}, &e) &&
+                cold->Step(prompt.back(), want, &e)) << e;
+    EXPECT_TRUE(SameBits(got, want)) << "slice " << slice << ": not a cold prefill's state";
+    cache.Abandon(7);
+    bool canonical_ck = false;
+    for (const auto& en : cache.List()) canonical_ck = canonical_ck || (en.checkpoint && en.canonical && en.tokens == 448);
+    EXPECT_TRUE(canonical_ck) << "slice " << slice << ": no canonical checkpoint at 448 (stable 500, aligned down)";
+  }
+}
+
+// G3 M3 (docs/SCHEDULER.md): requests of 2-4 sandboxes served concurrently through the fair scheduler (prefill
+// slices of 64-128 tokens that alternate between requests, decode units batched with StepBatch, the exact cache's
+// leases) produce exactly the tokens each produces served alone by a cache-off engine (greedy or seeded sampling).
+// Some clients leave mid-request (the scheduler fences them, parking a prefill's slice-aligned progress) and retry
+// the same turn: the retry's tokens are the same too. Non-vacuous: requests overlapped, decode units batched,
+// prompts were reused.
+TEST(ScheduledGenerator, ConcurrentRequestsEqualEachServedAlone) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  constexpr std::uint32_t kCtx = 2048;
+  std::string e;
+  auto ea = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  auto eb = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(ea && eb) << e;
+  const auto V = static_cast<std::int32_t>(m->weights->config.vocab_size);
+  std::size_t requests = 0, reused = 0, batched = 0, preempted = 0, departed = 0, parked = 0;
+  hegel::test([&](hegel::TestCase& tc) {
+    server::ScheduledOptions so;
+    so.sched.slice_contended = kAlign;
+    so.sched.slice_alone = 2 * kAlign;
+    so.sched.decode_steps = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 4}));
+    auto ag = server::MakeScheduledFlashNext(*ea, nullptr, {}, kCtx,
+                                             {.mode = server::SessionCacheOptions::Mode::kExact, .align = kAlign}, {}, so);
+    server::ScheduledGenerator& a = *ag;
+    server::FlashNextGenerator b(*eb, std::vector<text::TokenId>{}, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
+    const auto tokens = [&](std::uint32_t lo, std::uint32_t hi) {
+      std::vector<std::int32_t> v(tc.draw(gs::integers<std::uint32_t>({.min_value = lo, .max_value = hi})));
+      for (auto& t : v) t = tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = V - 1}));
+      return v;
+    };
+    const std::vector<std::int32_t> gen_prompt = {7, 11, 13};
+    struct Turn {
+      std::vector<std::int32_t> prompt;
+      std::size_t stable = 0;
+      server::TextGenerator::Params p;
+      int leave_after_ms = -1;  // the client leaves this long after sending (then retries with the same key)
+      std::vector<std::int32_t> got;
+      server::TextGenerator::Result r;
+    };
+    // Each sandbox's turns: a conversation whose next prompt extends the previous one (so the cache reuses).
+    const int sandboxes = tc.draw(gs::integers<int>({.min_value = 2, .max_value = 4}));
+    std::vector<std::vector<Turn>> conv(static_cast<std::size_t>(sandboxes));
+    for (int s = 0; s < sandboxes; ++s) {
+      std::vector<std::int32_t> prompt = tokens(20, 400);
+      const int turns = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 3}));
+      for (int t = 0; t < turns; ++t) {
+        Turn tu;
+        tu.stable = prompt.size();
+        tu.prompt = prompt;
+        tu.prompt.insert(tu.prompt.end(), gen_prompt.begin(), gen_prompt.end());
+        tu.p.max_tokens = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 16}));
+        if (tc.draw(gs::booleans())) {
+          tu.p.sampling.temperature = 1.0F;
+          tu.p.sampling.top_k = 0;
+          tu.p.sampling.top_p = 1.0F;
+          tu.p.sampling.seed = tc.draw(gs::integers<std::int64_t>({.min_value = 0, .max_value = 1 << 20}));
+        }
+        tu.p.principal = "sandbox-" + std::to_string(s);
+        tu.p.chain_root = tc.draw(gs::booleans()) ? "chain-x" : "";
+        tu.p.idempotency_key = tu.p.principal + ":" + std::to_string(t);
+        if (tc.draw(gs::integers<int>({.min_value = 0, .max_value = 3})) == 0)
+          tu.leave_after_ms = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 30}));
+        conv[static_cast<std::size_t>(s)].push_back(std::move(tu));
+        const auto more = tokens(1, 120);  // the next turn: this prompt, a reply, a tool result
+        prompt.insert(prompt.end(), gen_prompt.begin(), gen_prompt.end());
+        prompt.insert(prompt.end(), more.begin(), more.end());
+        if (prompt.size() + 40 >= kCtx) break;
+      }
+    }
+    std::vector<std::thread> threads;
+    std::atomic<int> left{0};
+    for (auto& turns : conv)
+      threads.emplace_back([&a, &turns, &left] {
+        for (auto& tu : turns) {
+          const auto collect = [&tu](text::TokenId t) { return tu.got.push_back(static_cast<std::int32_t>(t)), true; };
+          if (tu.leave_after_ms >= 0) {
+            // The client leaves after a while; its retry carries the same key (it adopts, or reuses what was parked).
+            const auto t0 = std::chrono::steady_clock::now();
+            auto p = tu.p;
+            p.cancelled = [t0, ms = tu.leave_after_ms] {
+              return std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(ms);
+            };
+            std::vector<std::int32_t> dropped;
+            const auto r = a.GenerateIds(tu.prompt, tu.stable, p, [&dropped](text::TokenId t) {
+              return dropped.push_back(static_cast<std::int32_t>(t)), true;
+            });
+            if (r.cancelled) ++left;
+            else {  // it finished before the client left: that is its answer
+              tu.got = dropped;
+              tu.r = r;
+              continue;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+          }
+          tu.r = a.GenerateIds(tu.prompt, tu.stable, tu.p, collect);
+        }
+      });
+    for (auto& t : threads) t.join();
+    for (std::size_t s = 0; s < conv.size(); ++s)
+      for (std::size_t t = 0; t < conv[s].size(); ++t) {
+        auto& tu = conv[s][t];
+        // (printed as well: a failure inside threads replays differently, and Hegel then reports only "flaky")
+        if (!tu.r.error.empty() || tu.r.cancelled || tu.r.refused)
+          std::fprintf(stderr, "FAIL sandbox %zu turn %zu: error '%s' cancelled %d refused %d (%s) leave %d\n", s, t,
+                       tu.r.error.c_str(), tu.r.cancelled ? 1 : 0, tu.r.refused ? 1 : 0, tu.r.refused_why.c_str(),
+                       tu.leave_after_ms);
+        ASSERT_TRUE(tu.r.error.empty()) << tu.r.error;
+        ASSERT_FALSE(tu.r.refused) << "a sandbox's turn refused (" << tu.r.refused_why << ") with nothing else in flight";
+        ASSERT_FALSE(tu.r.cancelled) << "sandbox " << s << " turn " << t;
+        std::vector<std::int32_t> want;
+        const auto rb = b.GenerateIds(tu.prompt, tu.stable, tu.p, [&want](text::TokenId x) {
+          return want.push_back(static_cast<std::int32_t>(x)), true;
+        });
+        ASSERT_TRUE(rb.error.empty()) << rb.error;
+        if (tu.got != want) {
+          std::fprintf(stderr, "FAIL sandbox %zu turn %zu: prompt %zu, reused %llu, replayed %d, leave %d, got %zu want %zu "
+                       "tokens, first diff at", s, t, tu.prompt.size(), static_cast<unsigned long long>(tu.r.cached_tokens),
+                       tu.r.replayed ? 1 : 0, tu.leave_after_ms, tu.got.size(), want.size());
+          std::size_t i = 0;
+          while (i < tu.got.size() && i < want.size() && tu.got[i] == want[i]) ++i;
+          std::fprintf(stderr, " %zu (temperature %.1f)\n", i, tu.p.sampling.temperature);
+        }
+        ASSERT_EQ(tu.got, want) << "sandbox " << s << " turn " << t << ", prompt " << tu.prompt.size() << ", reused "
+                                << tu.r.cached_tokens << (tu.r.replayed ? ", replayed" : "");
+        ++requests;
+        reused += tu.r.cached_tokens;
+      }
+    const auto c = a.scheduler().counters();
+    batched += c.batched;
+    preempted += c.preemptions;
+    departed += static_cast<std::size_t>(left.load());
+    parked += c.parked;
+  }, {.test_cases = 40});
+  std::printf("scheduled: %zu requests, %zu prompt tokens reused, %zu batched decode units, %zu preemptions, %zu "
+              "departures (%zu parked)\n", requests, reused, batched, preempted, departed, parked);
+  EXPECT_GT(batched, 0u) << "no decode unit batched two requests";
+  EXPECT_GT(preempted, 0u) << "no prefill was preempted by another request's slice";
+  EXPECT_GT(reused, 0u) << "no prompt was reused";
+  EXPECT_GT(departed, 0u) << "no client left mid-request";
 }
 
 // SR4: the exact cache with a disk tier. Eviction spills (max_retained 1-2), and between turns an admin spills
