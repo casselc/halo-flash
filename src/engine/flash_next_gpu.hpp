@@ -280,8 +280,13 @@ class FlashNextGpu {
   /// chunks (each chunk ends synchronized, so at most one chunk runs after
   /// it turns true); then the call fails with error "cancelled" and the
   /// bound session's state is partly advanced (drop or reset it).
+  /// `chunk_tokens` (G3, docs/SCHEDULER.md M1): the chunk size of this call (0: prefill_long_chunk_ for a prompt
+  /// longer than prefill_chunk_, else prefill_chunk_). A scheduler's prefill slice is one call of at most
+  /// `chunk_tokens` tokens on whichever session is bound: one chunk, nothing else per call (binding is host-side
+  /// only, the chunk buffers are the engine's), so sessions can alternate slices. A split at a multiple of 16
+  /// positions leaves the state byte-identical to an unsplit prefill (Sessions.InterleavedSlicesMatchAlone).
   [[nodiscard]] bool Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error,
-                             const std::function<bool()>& cancelled = {});
+                             const std::function<bool()>& cancelled = {}, std::uint32_t chunk_tokens = 0);
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
   /// Graph replay (default) or eager launches; both run the same sequence.
   void SetUseGraphs(bool on) noexcept { use_graphs_ = on; }

@@ -17,6 +17,11 @@ env = ["HALO_TINY_HF_DIR", "HALO_TINY_QWEN35_DIR", "HALO_SMALL_QUANT_DIR", "HALO
 [suite.cpu]
 build_dir = "build/cpu-debug"
 
+# The small quantized model only (session / slice exactness; take the GPU lock).
+[suite.gpu-small]
+build_dir = "build/gpu"
+env = ["HALO_SMALL_QUANT_DIR"]
+
 # The real model and its MTP sidecar (one model instance: take the GPU lock).
 [suite.gpu-real]
 build_dir = "build/gpu"
@@ -1605,3 +1610,13 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "SessionCache.ReleasedRangesComeBackAndRemapCleanly"
 why = "a released range goes back to the runtime, whose reuse of the address made writes to a freshly mapped page fault"
+
+[[mutant]]
+name = "fn-slice-chunk-unaligned"
+file = "src/engine/flash_next_gpu.cpp"
+find = '      chunk_tokens > 0 ? chunk_tokens'
+replace = '      chunk_tokens > 0 ? chunk_tokens + 8'
+suite = "gpu-small"
+binary = "gpu_tests"
+filter = "Sessions.InterleavedSlicesMatchAlone"
+why = "G3 M1: a scheduler slice's chunks must split the prompt at multiples of 16 positions (the DeltaNet scan's piece) to stay byte-identical to an unsplit prefill"

@@ -263,6 +263,76 @@ TEST(Sessions, SwarmMatchesFreshReplay) {
 // Directed: a fork shares the parent's KV pages below the fork point; both then diverge for long enough to
 // write past the shared region, and both must still equal their own replays. With a long context the
 // shared pages are real (several positions per page).
+// G3 M1 (docs/SCHEDULER.md section 3): the scheduler prefills a prompt in slices, one engine call each, and
+// alternates the slices of several sessions (whichever is bound runs its next slice). Each session's state after
+// its last slice is byte-identical to one Prefill of its whole prompt on a fresh engine: logits of the last
+// prompt position and of one more step. Slices are multiples of 64 positions (the session cache's alignment; the
+// real model is exact at any multiple of 16); a call may hold more than one chunk (`chunk_tokens`), and a session
+// whose prefill is the only one left runs its rest in one call with the default chunking (D1: 8192 alone).
+TEST(Sessions, InterleavedSlicesMatchAlone) {
+  Small* s = LoadSmall();
+  if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  auto devices = Devices();
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  const std::size_t V = s->weights->config.vocab_size;
+  constexpr std::uint32_t kMaxContext = 1024;
+  constexpr std::uint32_t kAlign = 64;
+  hegel::test([&](hegel::TestCase& tc) {
+    auto& dev = *devices[tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = devices.size() - 1}))];
+    std::string error;
+    auto gpu = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+    ASSERT_TRUE(gpu) << error;
+    auto oracle = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+    ASSERT_TRUE(oracle) << error;
+    gpu->SetUseGraphs(tc.draw(gs::booleans()));
+    struct Sess {
+      engine::FlashNextGpu::SessionId id = 0;
+      std::vector<std::int32_t> prompt;
+      std::size_t at = 0;
+    };
+    const auto n = tc.draw(gs::integers<int>({.min_value = 2, .max_value = 3}));
+    std::vector<Sess> ss(static_cast<std::size_t>(n));
+    for (auto& x : ss) {
+      ASSERT_TRUE(gpu->NewSession(&x.id, &error)) << error;
+      x.prompt.resize(tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 600})));
+      for (auto& t : x.prompt)
+        t = tc.draw(gs::integers<std::int32_t>({.min_value = 0, .max_value = static_cast<std::int32_t>(V - 1)}));
+    }
+    std::vector<float> got(V), want(V), got2(V), want2(V);
+    for (;;) {
+      std::vector<std::size_t> left;
+      for (std::size_t i = 0; i < ss.size(); ++i)
+        if (ss[i].at < ss[i].prompt.size()) left.push_back(i);
+      if (left.empty()) break;
+      auto& x = ss[left[tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = left.size() - 1}))]];
+      ASSERT_TRUE(gpu->BindSession(x.id, &error)) << error;
+      const std::size_t rest = x.prompt.size() - x.at;
+      std::size_t take = rest;
+      std::uint32_t chunk = 0;
+      if (left.size() > 1) {  // contended: a slice of 1-3 aligned chunks of one size, in one call
+        chunk = kAlign * tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 3}));
+        take = std::min<std::size_t>(rest, chunk * tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 2})));
+      }
+      const bool last = take == rest;
+      ASSERT_TRUE(gpu->Prefill(std::span<const std::int32_t>(x.prompt).subspan(x.at, take),
+                               last ? std::span<float>(got) : std::span<float>{}, &error, {}, chunk))
+          << error;
+      x.at += take;
+      if (!last) continue;
+      // The session is prefilled: its logits and one more step equal one Prefill of its prompt, alone.
+      ASSERT_TRUE(oracle->Reset(&error)) << error;
+      ASSERT_TRUE(oracle->Prefill(x.prompt, want, &error)) << error;
+      ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0)
+          << "session " << x.id << ": " << x.prompt.size() << " tokens in interleaved slices";
+      const std::int32_t t = x.prompt.back();
+      ASSERT_TRUE(gpu->Step(t, got2, &error)) << error;
+      ASSERT_TRUE(oracle->Step(t, want2, &error)) << error;
+      ASSERT_EQ(std::memcmp(got2.data(), want2.data(), V * 4), 0) << "session " << x.id << ": the step after";
+    }
+    ASSERT_TRUE(gpu->BindSession(0, &error)) << error;
+  });
+}
+
 TEST(Sessions, ForkedSessionsDivergeIndependently) {
   Small* s = LoadSmall();
   if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";

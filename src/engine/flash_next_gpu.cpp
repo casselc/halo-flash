@@ -1494,7 +1494,7 @@ bool FlashNextGpu::Reset(std::string* error) {
 }
 
 bool FlashNextGpu::Prefill(std::span<const std::int32_t> tokens, std::span<float> logits, std::string* error,
-                           const std::function<bool()>& cancelled) {
+                           const std::function<bool()>& cancelled, std::uint32_t chunk_tokens) {
   const auto stop = [&] {
     if (!cancelled || !cancelled()) return false;
     if (error) *error = "cancelled";
@@ -1508,7 +1508,8 @@ bool FlashNextGpu::Prefill(std::span<const std::int32_t> tokens, std::span<float
     return true;
   }
   const std::uint32_t want =
-      prefill_long_chunk_ > prefill_chunk_ && tokens.size() > prefill_chunk_ ? prefill_long_chunk_ : prefill_chunk_;
+      chunk_tokens > 0 ? chunk_tokens
+      : prefill_long_chunk_ > prefill_chunk_ && tokens.size() > prefill_chunk_ ? prefill_long_chunk_ : prefill_chunk_;
   if (!AllocChunk(want, error)) return false;
   const std::size_t chunk = std::max<std::uint32_t>(1, std::min(want, ck_.cap));
   // The next chunk's n-gram rows are read on a host thread while this chunk

@@ -165,6 +165,98 @@ TEST(SessionCache, RealModelSplitProbe) {
   }
 }
 
+// G3 M1 probe (not a gate; minutes, alone under the GPU lock): the cost of prefilling in scheduler slices. Two
+// sessions of HALO_SLICE_PROBE_N (8192) tokens each: one Prefill call per session (2048-token chunks inside), the
+// same in one call per 2048-token slice, the two sessions' slices alternating, and one call with 8192-token chunks
+// (the D1 "alone" slice). Prints the median of 3 per variant and the per-slice switch cost; asserts that the
+// interleaved slices leave each session byte-identical to its one-call prefill.
+TEST(SessionCache, RealModelSliceSwitchCost) {
+  const char* path = std::getenv("HALO_FLASH_NEXT_GGUF");
+  const char* text_path = std::getenv("HALO_PREFIX_PROBE_TEXT");
+  if (!path || !text_path) GTEST_SKIP() << "set HALO_FLASH_NEXT_GGUF and HALO_PREFIX_PROBE_TEXT";
+  auto m = Open(path, true);
+  ASSERT_TRUE(m);
+  std::ifstream in(text_path);
+  std::stringstream ss;
+  ss << in.rdbuf();
+  const auto ids = m->tok->Encode(ss.str(), false);
+  const std::size_t n = std::getenv("HALO_SLICE_PROBE_N") ? std::atoi(std::getenv("HALO_SLICE_PROBE_N")) : 8192;
+  ASSERT_GE(ids.size(), 2 * n + 1);
+  std::vector<std::int32_t> a(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(n)),
+      b(ids.begin() + static_cast<std::ptrdiff_t>(n), ids.begin() + static_cast<std::ptrdiff_t>(2 * n));
+  std::string e;
+  std::vector<rt::FileSource> sources;
+  for (const auto& r : m->reader->GetMappedRegions()) sources.push_back({r.data, r.size, r.file_descriptor});
+  auto engine = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, 16384, &e, sources);
+  ASSERT_TRUE(engine) << e;
+  const std::size_t V = m->weights->config.vocab_size;
+  constexpr std::uint32_t kSlice = 2048;
+  using Clock = std::chrono::steady_clock;
+  engine::FlashNextGpu::SessionId sa = 0, sb = 0;
+  ASSERT_TRUE(engine->NewSession(&sa, &e)) << e;
+  ASSERT_TRUE(engine->NewSession(&sb, &e)) << e;
+  const auto reset = [&] {
+    for (auto id : {sa, sb}) {
+      ASSERT_TRUE(engine->BindSession(id, &e)) << e;
+      ASSERT_TRUE(engine->Reset(&e)) << e;
+    }
+  };
+  std::vector<float> la(V), lb(V), ia(V), ib(V);
+  // one call per session, 2048-token chunks (chunk_tokens forces them; the default would be 8192 chunks)
+  const auto one_call = [&](std::uint32_t chunk) {
+    reset();
+    const auto t0 = Clock::now();
+    EXPECT_TRUE(engine->BindSession(sa, &e) && engine->Prefill(a, la, &e, {}, chunk)) << e;
+    EXPECT_TRUE(engine->BindSession(sb, &e) && engine->Prefill(b, lb, &e, {}, chunk)) << e;
+    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+  };
+  // one call per slice; `alternate`: the two sessions' slices interleave (a scheduler under contention)
+  const auto sliced = [&](bool alternate) {
+    reset();
+    const auto t0 = Clock::now();
+    std::size_t at_a = 0, at_b = 0;
+    const auto slice = [&](engine::FlashNextGpu::SessionId id, const std::vector<std::int32_t>& t, std::size_t* at,
+                           std::vector<float>& out) {
+      const std::size_t k = std::min<std::size_t>(kSlice, t.size() - *at);
+      const bool last = *at + k == t.size();
+      EXPECT_TRUE(engine->BindSession(id, &e) &&
+                  engine->Prefill(std::span<const std::int32_t>(t).subspan(*at, k), last ? std::span<float>(out) : std::span<float>{},
+                                  &e, {}, kSlice)) << e;
+      *at += k;
+    };
+    if (alternate) {
+      while (at_a < n || at_b < n) {
+        if (at_a < n) slice(sa, a, &at_a, ia);
+        if (at_b < n) slice(sb, b, &at_b, ib);
+      }
+    } else {
+      while (at_a < n) slice(sa, a, &at_a, ia);
+      while (at_b < n) slice(sb, b, &at_b, ib);
+    }
+    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+  };
+  const auto median3 = [](auto f) {
+    std::vector<double> v{f(), f(), f()};
+    std::sort(v.begin(), v.end());
+    return v[1];
+  };
+  (void)one_call(kSlice);  // warm-up (chunk buffers, page cache)
+  const double t_one = median3([&] { return one_call(kSlice); });
+  const double t_long = median3([&] { return one_call(8192); });
+  const double t_calls = median3([&] { return sliced(false); });
+  const double t_inter = median3([&] { return sliced(true); });
+  EXPECT_TRUE(SameBits(ia, la)) << "session A: interleaved slices differ from one call";
+  EXPECT_TRUE(SameBits(ib, lb)) << "session B: interleaved slices differ from one call";
+  (void)one_call(8192);
+  EXPECT_TRUE(SameBits(ia, la)) << "session A: 8192-token chunks differ from 2048";
+  const double slices = 2.0 * static_cast<double>((n + kSlice - 1) / kSlice);
+  std::printf("slice probe, 2 sessions x %zu tokens (ms, median of 3): one call 2048-chunks %.0f, one call "
+              "8192-chunks %.0f, a call per slice %.0f, alternating slices %.0f; per slice: separate calls %+.1f ms, "
+              "alternating %+.1f ms\n",
+              n, t_one, t_long, t_calls, t_inter, (t_calls - t_one) / slices, (t_inter - t_one) / slices);
+  ASSERT_TRUE(engine->BindSession(0, &e)) << e;
+}
+
 namespace {
 
 // The alignment the server's exact mode uses on the small model (SessionCacheOptions::align).
