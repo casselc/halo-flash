@@ -232,8 +232,11 @@ if(HALO_BUILD_TESTS)
     tests/server/metrics_test.cpp
     tests/server/kv_choice_test.cpp
     tests/server/decode_loop_test.cpp
-    tests/server/scheduler_test.cpp)
+    tests/server/scheduler_test.cpp
+    tests/server/scheduler_replay_test.cpp)
   target_link_libraries(server_tests PRIVATE halo_server)
+  target_compile_definitions(server_tests PRIVATE
+    HALO_SERVER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/server/data")
   halo_test(decide_tests
     tests/decide/systemone_test.cpp
     tests/decide/decider_test.cpp)

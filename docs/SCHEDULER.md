@@ -299,6 +299,16 @@ fair-queuing join rule above. With two levels: the first `chainFair` bound (one 
 a decoding root rides batches another root starts while catching up; and the first two `WAIT_CHAIN` derivations (18,
 then 20) undercounted the root-mate's tag ties and rides (found at 36 and 48 ticks).
 
+**Found by the M5 trace replay** (the code against the model's own traces, below), each a place where the model
+knew more or less than the server can, fixed in the model (the code was right): FIFO within a principal was by the
+order clients *sent* requests (model ids), but the server sees only arrival order (now `seq`, the admission order);
+admission decided "late duplicate" vs "adopt" on the client's true connection state, but the server knows only what
+it saw (FIN, or a failed probe): a peer that vanished a moment ago looks connected, so its retry adopts the
+in-flight attempt, which then lives or dies with that connection; fences were one request a step, but the code
+fences every departed request at a boundary in one critical section (an arrival cannot land between two fences);
+ties in virtual time were a nondeterministic choice, now the root (then principal) holding the request admitted
+first, as the code breaks them.
+
 **Rules** (`Rules` record; the design sets all; each mutant in `schedTest.qnt` turns one off): preempt,
 deciderPrio, deciderBudget, fenceDeparture, deadPeerProbe, heartbeat, parkOnCancel, bindAtStart, reserveLedger,
 evictSeesFreed, pinPlanned, atomic429, idempotency, twoLevel.
@@ -330,11 +340,11 @@ evictSeesFreed, pinPlanned, atomic429, idempotency, twoLevel.
 | `noIdempotency` | `generatedOnce` / `noSelfInflicted429` | VIOLATED | VIOLATED / VIOLATED | a lost answer regenerated; a retry refused by its own attempt |
 | `oneLevelSfq` | `chainFair` | VIOLATED | VIOLATED | a chain fanned out to two sandboxes takes two shares (A2A-MCP D9) |
 
-Witnesses (design, 20000 traces): preempted 100%, batched 99.3%, decider between slices 99.97%, decider out of
-credit served fairly 100%, parked on cancel 11.2%, evicted 91.7%, memory 429 96.6%, retry after 429 88.7%, client
-timeout 52.4%, fenced after FIN 26.8% / after a vanished peer 8.3%, late arrival 53.9%, replayed 4 traces, adopted
-42.1%, second turn done 34.1%, chain fan-out (a root with two backlogged sandboxes beside another root) 36.4%;
-keyless instance (5000): limit 429 38.5%, prefix bound later 7.1%. A run takes ~10 min per 20000 traces.
+Witnesses (design, 20000 traces, after M5's corrections): preempted 100%, batched 98.4%, decider between slices
+99.96%, decider out of credit served fairly 100%, parked on cancel 17.6%, evicted 88.5%, memory 429 94.4%, retry
+after 429 87.0%, client timeout 55.7%, fenced after FIN 35.3% / after a vanished peer 12.9%, late arrival 54.5%,
+replayed 8 traces, adopted 30.5%, second turn done 33.3%, chain fan-out (a root with two backlogged sandboxes beside
+another root) 35.2%; keyless instance (5000): limit 429 40.3%, prefix bound later 3.8%. A run takes ~10 min per 20000 traces.
 
 **Limits of the model.** Three principals and one conversation each, one chain (X) besides the lone roots, a
 conversation's chain fixed for the run; an admission that needs room evicts every evictable prefix at once (the
@@ -355,9 +365,55 @@ chain root then sandbox (section 4; model re-checked, section 10).
 - **D2 the 2B decider**: keep it concurrent on the GPU (today: no wait for a slice, unmeasured contention) or move
   it into the scheduler as units (bounded wait <= one slice + one decider, ~1.3-2.3 s). Recommended: measure
   contention first (HARNESS D1) in M4; flash-pointer deciders (P9, forks of Flash-Next sessions) must be units.
+  **Measured (section 12): keep it concurrent** (`--decider-mode concurrent`, the default): p90 421 ms beside a
+  prefill against 1.9 s as a unit with 2048-token slices (8.7 s with 8192 alone); its price at 2 deciders/s is
+  Flash-Next decode -20% and prefill ~1.5x. `--decider-mode scheduled` exists for flash-pointer deciders.
 - **D3 PLIMIT**: one in-flight turn per sandbox principal (recommended) or more (sub-agents in one sandbox would
   then share its fair share, not multiply it).
 - **D4 decider budget**: burst and refill rate (recommended: burst 4, refill 2/s, per the SYSTEMONE hot-path uses).
 - **D5 idempotency default key** when the client sends none: digest of (principal, previous_response_id, input)
   (recommended) or none (retries of keyless clients regenerate).
 - **D6 heartbeats default on** in halo_serve (recommended; the A2 branch has them opt-in).
+
+## 12. Implementation and measurements (stream G3, 2026-10-07)
+
+| # | Commit | What | Tests |
+|---|---|---|---|
+| model | a63f49e, M5 commit | two-level SFQ (chain root, then sandbox), `chainFair`, `oneLevelSfq`; M5's corrections (section 10) | `run.sh`: failures 0 |
+| M1 | 35406cd | `Prefill(..., chunk_tokens)`: a slice is one engine call on the bound session | `Sessions.InterleavedSlicesMatchAlone` (bitwise); mutant |
+| M2 | 123a3bc | `Scheduler` (host-only policy) | Hegel machine `SchedulerModel.PropertiesHoldUnderTheModelsActions` (12 properties) + 8 directed; 15 `sched-*` mutants |
+| M3 | ade4858, 18d3405 | `ScheduledGenerator` (engine thread, leases, StepBatch decode units, MTP only at B = 1), headers, 429 + Retry-After, D5 key; a completing slice runs the first decode step, a checkpoint inside a slice is parked on the way | `ScheduledGenerator.ConcurrentRequestsEqualEachServedAlone` (small model, tokens equal each request served alone), `OpenAiService.ServingModelUnderDeparturesStallsAndRetries` on the scheduler with 3 clients; 5 mutants |
+| M4 | 83f5899, 0fdb6a4 | `DeciderGate` (`--decider-mode concurrent|scheduled`), `RunDecider` units, `halo:sched_*` / `halo:decider_*` metrics; the idle engine wakes on an admission | `ScheduledDecider.*`, `SystemOneService.EvaluationsGoThroughTheDeciderGate`; 4 mutants |
+| M5 | M5 commit | `spec/scheduler/replay.sh` + `itf_events.py`: `quint run --mbt --out-itf` traces as server events; `SchedulerReplay.ModelTracesMatchTheCodeStepByStep` replays them against `Scheduler` (admission outcomes, fences, picks, every virtual time), `Scheduler::Boundary` | 24 checked-in traces (1143 compared steps), 300 more on 6 seeds all match; kills 12 of the 15 `sched-*` mutants alone, and 2 of its own |
+
+**Serving, real model** (unpinned clocks: `tools/gpu_clock.sh` cannot pin on this host; turns of 600-1100 new
+tokens on 12-15K contexts, 300 output tokens; `tools/serve_ab.py conc`):
+
+| Sandboxes | Today (`--scheduler off`) TTFT median / worst | G3 TTFT median / worst | G3 per-session tok/s | Aggregate tok/s today / G3 |
+|---:|---|---|---:|---|
+| 1 | 1.17 / 1.28 s | 1.21 / 1.30 s | 25.5 | 23.4 / 23.2 |
+| 2 | 7.2 / 14.9 s | 1.42 / 2.72 s | 17.0 | 22.3 / 30.7 |
+| 4 | 20.9 / 51.4 s | 2.89 / 5.22 s | 10.4 | 22.5 / 37.1 |
+
+B's P2 assumed 0.45 s turns; these turns take 1.0-1.3 s alone, and TTFT scales with them. Two fixes came out of the
+first runs: under GPU-time fairness the request whose prefill had just finished waited a round of everyone's slices
+for its first token (the first step now belongs to the completing slice), and a turn's prefill stopped at its
+exact-mode checkpoint, costing it a second round (the checkpoint is now parked inside the slice).
+
+**A cold 130K prompt beside a decoding sandbox**: the decoder ran 23.3 tok/s before, 11.9 tok/s while both were
+backlogged, and finished 1500 tokens in 120 s; the cold prompt's first token came at 170 s (alone ~97 s; +7% for
+2048-token slices; + the decoder's ~60 s of GPU). No allocation failure at this size on this branch.
+
+**D2** (2B decider at 2 calls/s, fresh 23-24K prefills):
+
+| | concurrent | scheduled, 8192 alone | scheduled, 2048 alone |
+|---|---|---|---|
+| decider beside a decode: median / p90 | 218 / 224 ms | 419 / 475 ms | 419 / 476 ms |
+| Flash-Next decode beside deciders | -20% | -30% | -33% |
+| decider beside a prefill: median / p90 | 380 / 421 ms | 5.6 / 8.7 s | 1.8 / 1.9 s |
+| prefill time per token beside deciders | +53% | +25% | +9% (and +10% alone, for 2048 slices) |
+
+A scheduled decider waits for the slice in progress, whole (the next call arrives just after a slice starts), so
+its latency is the slice length; concurrent, the two models share the GPU at kernel granularity with little real
+overlap. Decision rule fixed before measuring: concurrent, since its p90 beside a prefill (421 ms) is below a
+unit's wait.

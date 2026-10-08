@@ -1869,3 +1869,25 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "SystemOneService.*"
 why = "G3 M4: an evaluation the scheduler could not run is a 503 (retryable), not a validation 422"
+
+[[mutant]]
+name = "sched-tie-newest-root"
+file = "src/server/scheduler.cpp"
+find = 'if (root.empty() || std::make_pair(vroot_[q], first) < std::make_pair(vroot_[root], root_first[root])) root = q;'
+replace = 'if (root.empty() || std::make_pair(vroot_[q], -static_cast<std::int64_t>(first)) < std::make_pair(vroot_[root], -static_cast<std::int64_t>(root_first[root]))) root = q;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SchedulerReplay.*"
+why = "G3 M5: among roots with equal virtual time the one holding the request admitted first goes (the model's order since M5); the trace replay sees the other order"
+
+[[mutant]]
+name = "sched-boundary-fences-nothing"
+file = "src/server/scheduler.cpp"
+find = '''  Unit u;
+  FenceAndEvict(now, &u);
+  return u.fenced;'''
+replace = '''  return {};'''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SchedulerReplay.*"
+why = "G3 M5: Boundary() fences as Next() does (the replay's fence steps); without it a retry adopts a request the model already fenced"

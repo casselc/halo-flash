@@ -140,6 +140,9 @@ class Scheduler {
   void Depart(Id id);
   /// Engine thread: fence, evict, pick. kNone: nothing runnable (wait for an arrival).
   Unit Next(std::int64_t now);
+  /// A boundary with no pick: fences and evictions as Next() does them; returns the requests fenced. (The trace
+  /// replay calls it where the model fences between units; the engine thread needs only Next().)
+  std::vector<Id> Boundary(std::int64_t now);
   /// Engine thread, at the start of a request's first unit: its live state was bound from retained prefix
   /// `bound` (0: none) holding `reused` prompt tokens (bind at start: a departed predecessor may have parked a
   /// longer prefix since admission). The reservation shrinks to what is left; the planned prefix's pin goes.
@@ -214,6 +217,7 @@ class Scheduler {
   void Refill(std::int64_t now);
   void Finish(Req& r, bool completed, std::int64_t now);
   void Fence(std::int64_t now, Unit* unit);
+  void FenceAndEvict(std::int64_t now, Unit* unit);
   std::int64_t RemainingEstimate(const Req& r) const;
   std::int64_t SliceCost(std::uint32_t tokens) const;
   std::int64_t BatchStepCost(std::size_t b) const;

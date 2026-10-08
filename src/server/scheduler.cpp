@@ -270,15 +270,26 @@ void Scheduler::Fence(std::int64_t now, Unit* unit) {
   (void)now;
 }
 
-Scheduler::Unit Scheduler::Next(std::int64_t now) {
-  std::lock_guard<std::mutex> lk(mu_);
+void Scheduler::FenceAndEvict(std::int64_t now, Unit* u) {
   Refill(now);
-  Unit u;
-  Fence(now, &u);
+  Fence(now, u);
   for (Key k : evicting_)
     if (hooks_.evict) (void)hooks_.evict(k);
   evicting_.clear();
   evicting_bytes_ = 0;
+}
+
+std::vector<Scheduler::Id> Scheduler::Boundary(std::int64_t now) {
+  std::lock_guard<std::mutex> lk(mu_);
+  Unit u;
+  FenceAndEvict(now, &u);
+  return u.fenced;
+}
+
+Scheduler::Unit Scheduler::Next(std::int64_t now) {
+  std::lock_guard<std::mutex> lk(mu_);
+  Unit u;
+  FenceAndEvict(now, &u);
 
   std::vector<Req*> run;
   for (auto& [id, r] : reqs_)

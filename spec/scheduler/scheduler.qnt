@@ -85,14 +85,15 @@ module scheduler {
     reused: int, done: int, decoded: int, inherited: int, need: int,
     ph: Phase, conn: bool, fin: bool, leftAt: int, heard: int, admittedAt: int, lastServed: int,
     started: bool, goneWork: int, ans: Ans, prio: bool, served: bool, spurious: bool,
-    root: str, chained: bool,
+    root: str, chained: bool, seq: int,
   }
   type Client = { turn: int, busy: bool, attempts: int, retryAt: int, lastAns: Ans, root: str }
   type Engine = { kind: Kind, until: int, rs: Set[int] }
   // vtime/vnow: virtual time per chain root and the root-level system virtual time; pvt/pvnow: virtual time per
   // principal and each root's own system virtual time (the second level)
+  // seq: admissions so far (the server orders requests by arrival: it cannot know the order they were sent in)
   type Srv = { held: int -> int, charged: int, vtime: str -> int, vnow: int, pvt: str -> int, pvnow: str -> int,
-               credit: int }
+               credit: int, seq: int }
   // svc: GPU ticks started for each agent chain root; co: the ordered pairs of agent roots both backlogged at the
   // last pick; base: their service difference when they became backlogged together
   type Ghost = { computed: int -> int, maxPrompt: int -> int, evicted: int -> int, falseRefusals: int, faults: int, selfLimit: int,
@@ -122,6 +123,9 @@ module scheduler {
   val runSet: Set[Req] = actives.filter(r => runnable(r))
   val fencePending: bool = RULES.fenceDeparture and actives.exists(r => knownGone(r))
   pure def minId(s: Set[Req]): int = s.fold(1000000, (a, r) => if (r.id < a) r.id else a)
+  // the id of the request admitted first (FIFO is by arrival at the server, not by when the client sent it)
+  pure def firstIn(s: Set[Req]): int =
+    s.fold((1000000, 0), (a, r) => if (r.seq < a._1) (r.seq, r.id) else a)._2
   pure def sumHeld(h: int -> int): int = CONVS.fold(0, (a, c) => a + h.get(c))
   // pages actually mapped: retained prefixes plus each active request's own pages
   // the page a unit in progress writes is mapped when the unit starts (EnsureKv before the chunk or step)
@@ -154,7 +158,7 @@ module scheduler {
       decSent' = 0,
       eng' = { kind: Idle, until: 0, rs: Set() },
       srv' = { held: CONVS.mapBy(c => 0), charged: 0, vtime: ROOTS.mapBy(q => 0), vnow: 0,
-               pvt: PRINCIPALS.mapBy(q => 0), pvnow: ROOTS.mapBy(q => 0), credit: DEC_BURST },
+               pvt: PRINCIPALS.mapBy(q => 0), pvnow: ROOTS.mapBy(q => 0), credit: DEC_BURST, seq: 0 },
       gh' = { computed: CONVS.mapBy(c => 0), maxPrompt: CONVS.mapBy(c => 0), evicted: CONVS.mapBy(c => 0),
               falseRefusals: 0, faults: 0, selfLimit: 0, events: Set(),
               svc: AGENT_ROOTS.mapBy(q => 0), co: Set(), base: tuples(AGENT_ROOTS, AGENT_ROOTS).mapBy(q => 0) },
@@ -166,7 +170,7 @@ module scheduler {
     reused: 0, done: 0, decoded: 0, inherited: 0, need: 0,
     ph: Waiting, conn: true, fin: true, leftAt: 0, heard: t, admittedAt: 0, lastServed: 0,
     started: false, goneWork: 0, ans: NoAns, prio: false, served: false, spurious: false,
-    root: root, chained: false,
+    root: root, chained: false, seq: 0,
   }
   def ev(e: str): Ghost = { ...gh, events: gh.events.union(Set(e)) }
   // a client-side fault (lost request, abort, vanished peer, lost answer): at most MAXFAULTS a run, so that runs
@@ -281,8 +285,9 @@ module scheduler {
   action admitDecider(r: Req): bool = {
     val prio = not(RULES.deciderBudget) or srv.credit > 0
     all {
-      reqs' = reqs.set(r.id, { ...r, ph: Queued, admittedAt: time, lastServed: time, prio: prio }),
-      srv' = { ...joinVtime(r), credit: if (RULES.deciderBudget and prio) srv.credit - 1 else srv.credit },
+      reqs' = reqs.set(r.id, { ...r, ph: Queued, admittedAt: time, lastServed: time, prio: prio, seq: srv.seq }),
+      srv' = { ...joinVtime(r), credit: if (RULES.deciderBudget and prio) srv.credit - 1 else srv.credit,
+               seq: srv.seq + 1 },
       nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, time' = time,
       gh' = if (prio) gh else ev("deciderOutOfCredit"),
     }
@@ -306,22 +311,27 @@ module scheduler {
     val prior = allReqs.filter(x => sameKey(x, r))
     val stored = prior.filter(x => x.ph == Finished and x.served)
     val inflight = prior.filter(x => isActive(x))
-    val orphaned = inflight.filter(x => not(x.conn))
+    // What the server knows of the arriving connection: gone only once it saw FIN or the probe failed (a peer that
+    // vanished a moment ago still looks connected). The code decides duplicate vs adopt on this, never on the
+    // client's true state (M5's trace replay found the model had used the latter).
+    val arrivesGone = knownGone(r)
     if (RULES.idempotency and stored.size() > 0) all {
       // replay: the stored answer (the Responses store holds it), no engine work
       reqs' = reqs.set(r.id, { ...r, ph: Finished, ans: Pending, admittedAt: time }),
       nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, srv' = srv, time' = time,
       gh' = ev("replayed"),
-    } else if (RULES.idempotency and inflight.size() > 0 and not(r.conn)) all {
+    } else if (RULES.idempotency and inflight.size() > 0 and arrivesGone) all {
       // a late duplicate of a key already in flight: dropped (no answer is owed: its client left)
       reqs' = reqs.set(r.id, { ...r, ph: Merged }),
       nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, srv' = srv, time' = time,
       gh' = ev("lateDuplicateDropped"),
-    } else if (RULES.idempotency and orphaned.size() > 0) {
-      // adopt: the retry's connection takes over the in-flight attempt (its stream resumes); no new work
-      val x = reqs.get(minId(orphaned))
+    } else if (RULES.idempotency and inflight.size() > 0) {
+      // adopt: the retry's connection takes over the in-flight attempt (its stream resumes); no new work. The
+      // attempt now lives or dies with the adopting connection (which may itself be a peer that vanished).
+      val x = reqs.get(minId(inflight))
       all {
-        reqs' = reqs.set(x.id, { ...x, conn: true, fin: true, heard: time }).set(r.id, { ...r, ph: Merged, conn: false }),
+        reqs' = reqs.set(x.id, { ...x, conn: r.conn, fin: r.fin, leftAt: r.leftAt, heard: time })
+                    .set(r.id, { ...r, ph: Merged, conn: false }),
         nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, srv' = srv, time' = time,
         gh' = ev("adopted"),
       }
@@ -331,7 +341,8 @@ module scheduler {
     val mine = actives.filter(x => x.p == r.p and not(x.dec) and not(knownGone(x)))
     val reuse0 = reuseOf(srv.held, r.conv, r.prompt)
     val need = r.prompt - reuse0 + r.maxTok
-    val rq = { ...r, ph: Queued, admittedAt: time, lastServed: time, reused: reuse0, done: reuse0, need: need }
+    val rq = { ...r, ph: Queued, admittedAt: time, lastServed: time, reused: reuse0, done: reuse0, need: need,
+               seq: srv.seq }
     // r is still Waiting, so neither the ledger nor the reading counts it yet
     val free0 = freeOf(srv.held, allReqs, srv.charged, physical)
     // the other conversations' unpinned prefixes are the eviction candidates; when one is needed, all go (the
@@ -370,13 +381,13 @@ module scheduler {
     }
     else if (need <= free0) all {
       reqs' = markChained(reqs.set(r.id, rq)),
-      srv' = joinVtime(r),
+      srv' = { ...joinVtime(r), seq: srv.seq + 1 },
       nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, time' = time,
       gh' = { ...g1, events: gh.events.union(if (r.ans == NoAns and not(r.conn)) Set("lateArrival") else Set()) },
     }
     else if (canEvict and need <= free2) all {
       reqs' = markChained(reqs2.set(r.id, rq)),
-      srv' = { ...joinVtime(r), held: h2, charged: charged2 },
+      srv' = { ...joinVtime(r), held: h2, charged: charged2, seq: srv.seq + 1 },
       nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, time' = time,
       gh' = gEvict,
     }
@@ -392,16 +403,22 @@ module scheduler {
   }
 
   // ---------------------------------------------------------------- the engine thread
-  // fence: a departed request leaves at a unit boundary; its slice-aligned progress is parked (design)
-  action fence(id: int): bool = {
-    val r = reqs.get(id)
-    val park = RULES.parkOnCancel and not(r.dec) and r.started and r.done > srv.held.get(r.conv)
+  // fence: every departed request the server knows of leaves at a unit boundary, all at once (the code fences in
+  // one critical section: an arrival cannot land between two fences); a started prefill's slice-aligned progress
+  // is parked as its conversation's retained prefix (design)
+  def parks(r: Req): bool = RULES.parkOnCancel and not(r.dec) and r.started and r.done > srv.held.get(r.conv)
+  action fence: bool = {
+    val gone = actives.filter(r => knownGone(r))
+    val parked = gone.filter(r => parks(r))
     all {
-      eng.kind == Idle, RULES.fenceDeparture, isActive(r), knownGone(r),
-      reqs' = reqs.set(id, { ...r, ph: Cancelled }),
-      srv' = if (park) { ...srv, held: srv.held.set(r.conv, r.done) } else srv,
+      eng.kind == Idle, RULES.fenceDeparture, gone.size() > 0,
+      reqs' = reqs.keys().mapBy(i => if (gone.exists(r => r.id == i)) { ...reqs.get(i), ph: Cancelled } else reqs.get(i)),
+      srv' = { ...srv, held: CONVS.mapBy(c => parked.filter(r => r.conv == c).fold(srv.held.get(c), (a, r) => max(a, r.done))) },
       nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, time' = time,
-      gh' = if (park) ev("parkedOnCancel") else if (r.fin) ev("fencedFin") else ev("fencedVanished"),
+      gh' = { ...gh, events: gh.events
+        .union(if (parked.size() > 0) Set("parkedOnCancel") else Set())
+        .union(if (gone.exists(r => not(parks(r)) and r.fin)) Set("fencedFin") else Set())
+        .union(if (gone.exists(r => not(parks(r)) and not(r.fin))) Set("fencedVanished") else Set()) },
     }
   }
 
@@ -480,12 +497,12 @@ module scheduler {
     all {
       eng.kind == Idle, not(fencePending), rset.size() > 0,
       if (RULES.deciderPrio and prioDec.size() > 0) {
-        val i = minId(prioDec)
+        val i = firstIn(prioDec)
         startUnit(Decide, Set(i), DEC_COST, ev("deciderPrio"))
       } else if (not(RULES.preempt)) {
         // today: one request at a time, to the end (the generator mutex); no batching
         val cur = rset.filter(r => r.started)
-        val i = if (cur.size() > 0) minId(cur) else minId(rset)
+        val i = if (cur.size() > 0) firstIn(cur) else firstIn(rset)
         val r = reqs.get(i)
         if (r.dec) startUnit(Decide, Set(i), DEC_COST, gh)
         else if (prefillLeft(r)) startUnit(Slice, Set(i), SLICE, gh)
@@ -493,14 +510,18 @@ module scheduler {
       } else {
         // two-level start-time fair queuing by GPU time: the chain root with the least tag, then the principal
         // with the least tag within that root, then FIFO within the principal
+        // Ties go to the root (then the principal) holding the request admitted first, as the code breaks them
+        // (the M5 trace replay compares the code's picks with these).
         val rts = rset.map(r => rootOf(r))
         val mv = rts.fold(1000000, (a, q) => if (v.get(q) < a) v.get(q) else a)
-        nondet R = rts.filter(q => v.get(q) == mv).oneOf()
+        val tiedR = rts.filter(q => v.get(q) == mv)
+        val R = rootOf(reqs.get(firstIn(rset.filter(r => tiedR.contains(rootOf(r))))))
         val inR = rset.filter(r => rootOf(r) == R)
         val ps = inR.map(r => r.p)
         val mp = ps.fold(1000000, (a, q) => if (pv.get(q) < a) pv.get(q) else a)
-        nondet p = ps.filter(q => pv.get(q) == mp).oneOf()
-        val i = minId(inR.filter(r => r.p == p))
+        val tiedP = ps.filter(q => pv.get(q) == mp)
+        val p = reqs.get(firstIn(inR.filter(r => tiedP.contains(r.p)))).p
+        val i = firstIn(inR.filter(r => r.p == p))
         val r = reqs.get(i)
         if (r.dec) startUnit(Decide, Set(i), DEC_COST, if (r.prio) gh else ev("deciderFair"))
         else if (prefillLeft(r)) startUnit(Slice, Set(i), SLICE, gh)
@@ -566,9 +587,9 @@ module scheduler {
     all {
       reqs.keys().size() > 0,
       nondet i = reqs.keys().oneOf()
-      any { loseRequest(i), arrive(i), clientTimeout(i), clientAbort(i), peerVanishes(i), deliver(i), loseAnswer(i),
-            fence(i) },
+      any { loseRequest(i), arrive(i), clientTimeout(i), clientAbort(i), peerVanishes(i), deliver(i), loseAnswer(i) },
     },
+    fence,
     pick,
     unitEnd,
     tick,
