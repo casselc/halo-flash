@@ -11,7 +11,12 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
+
+#include <cstring>
+#include <filesystem>
 
 #include <hegel/gtest.h>
 
@@ -426,4 +431,45 @@ TEST(Http, ASlowStalledReaderIsCutOffToo) {
   EXPECT_LT(waited, std::chrono::seconds(3));
   for (int i = 0; i < 500 && !t.trickle_stopped.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
   EXPECT_TRUE(t.trickle_stopped.load());
+}
+
+// The admin Unix socket: served in a 0700 directory of ours as a 0600 socket; a directory others can enter is
+// refused; the socket file goes with Stop().
+TEST(Http, UnixSocketIsPrivate) {
+  const std::string dir = "/tmp/halo-http-unix-" + std::to_string(::getpid());
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
+  HttpServerOptions o;
+  o.unix_path = dir + "/admin.sock";
+  {
+    HttpServer s(o);
+    s.Route("GET", "/x", [](const HttpRequest&) { return HttpResponse::Json(200, "{\"ok\":true}"); });
+    std::string err;
+    ASSERT_TRUE(s.Start(&err)) << err;
+    struct stat st {};
+    ASSERT_EQ(::stat(o.unix_path.c_str(), &st), 0);
+    EXPECT_TRUE(S_ISSOCK(st.st_mode));
+    EXPECT_EQ(st.st_mode & 0777, 0600u);
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un a{};
+    a.sun_family = AF_UNIX;
+    std::memcpy(a.sun_path, o.unix_path.c_str(), o.unix_path.size() + 1);
+    ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a), 0);
+    const std::string req = "GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    ASSERT_EQ(::send(fd, req.data(), req.size(), 0), static_cast<ssize_t>(req.size()));
+    std::string extra;
+    Reply r;
+    ASSERT_TRUE(ReadReply(fd, extra, &r));
+    EXPECT_EQ(r.status, 200);
+    ::close(fd);
+    s.Stop();
+    EXPECT_FALSE(std::filesystem::exists(o.unix_path)) << "the socket file stayed";
+  }
+  std::filesystem::permissions(dir, std::filesystem::perms::owner_all | std::filesystem::perms::group_read |
+                                        std::filesystem::perms::group_exec);
+  HttpServer loose(o);
+  std::string err;
+  EXPECT_FALSE(loose.Start(&err)) << "a socket in a group-readable directory";
+  std::filesystem::remove_all(dir);
 }

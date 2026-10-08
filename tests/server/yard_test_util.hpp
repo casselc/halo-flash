@@ -29,6 +29,18 @@ struct Signer {
   EVP_PKEY* key = nullptr;
   std::string kid;
   explicit Signer(std::string k) : key(EVP_RSA_gen(2048)), kid(std::move(k)) {}
+  // A key of another size or public exponent (weak keys the JWKS loader must refuse).
+  Signer(std::string k, unsigned bits, unsigned long exponent) : kid(std::move(k)) {
+    EVP_PKEY_CTX* c = EVP_PKEY_CTX_new_from_name(nullptr, "RSA", nullptr);
+    BIGNUM* e = BN_new();
+    BN_set_word(e, exponent);
+    EVP_PKEY_keygen_init(c);
+    EVP_PKEY_CTX_set_rsa_keygen_bits(c, static_cast<int>(bits));
+    EVP_PKEY_CTX_set1_rsa_keygen_pubexp(c, e);
+    EVP_PKEY_generate(c, &key);
+    BN_free(e);
+    EVP_PKEY_CTX_free(c);
+  }
   ~Signer() { EVP_PKEY_free(key); }
   Signer(const Signer&) = delete;
   Signer& operator=(const Signer&) = delete;
@@ -41,9 +53,12 @@ struct Signer {
     BN_bn2bin(e, eb.data());
     BN_free(n);
     BN_free(e);
-    return "{\"kty\":\"RSA\",\"kid\":\"" + kid + "\",\"use\":\"sig\",\"alg\":\"RS256\",\"n\":\"" +
+    if (pad_n) nb.insert(nb.begin(), 0);  // a non-canonical modulus encoding (leading zero octet)
+    return "{\"kty\":\"RSA\",\"kid\":\"" + kid + "\"" + extra + ",\"alg\":\"RS256\",\"n\":\"" +
            halo::server::Base64UrlEncode(nb) + "\",\"e\":\"" + halo::server::Base64UrlEncode(eb) + "\"}";
   }
+  bool pad_n = false;
+  std::string extra = ",\"use\":\"sig\"";  // raw JWK members after the kid
   std::string Sign(const std::string& header_json, const std::string& claims_json) const {
     const std::string signing = B64(header_json) + "." + B64(claims_json);
     EVP_MD_CTX* md = EVP_MD_CTX_new();
@@ -70,6 +85,11 @@ struct Claims {
   std::int64_t epoch = 1, iat = 0, exp = 0;  // 0: now, now + 300
   std::string key_sha256;                    // base64url SHA-256 of the key ("" = none)
   bool with_halo_spill = true;
+  std::int64_t entry = 1;    // halo_spill.entry (seal); 0: absent
+  std::int64_t through = 0;  // halo_spill.through (revoke); 0: absent
+  std::string nbf;           // raw JSON for nbf ("" = iat)
+  std::string aud_json;      // raw JSON for aud ("" = the string aud)
+  std::string extra;         // raw JSON members appended to the claims (",\"x\":1")
 };
 
 inline std::string Key32(std::uint8_t seed) {
@@ -79,7 +99,8 @@ inline std::string Key32(std::uint8_t seed) {
 }
 inline std::string KeyB64(const std::string& k) { return B64(k); }
 inline std::string KeyHash(const std::string& k) {
-  const auto h = halo::core::crypt::Sha256({reinterpret_cast<const std::uint8_t*>(k.data()), k.size()});
+  std::array<std::uint8_t, 32> h{};
+  if (!halo::core::crypt::Sha256({reinterpret_cast<const std::uint8_t*>(k.data()), k.size()}, h)) return "";
   return halo::server::Base64UrlEncode(h);
 }
 
@@ -89,13 +110,18 @@ inline std::string Token(const Signer& s, Claims c, const std::string& alg = "RS
   if (!c.iat) c.iat = now;
   if (!c.exp) c.exp = c.iat + 300;
   if (c.jti.empty()) c.jti = "jti-" + std::to_string(++counter) + "-" + std::to_string(now);
-  std::string body = "{\"iss\":\"" + c.iss + "\",\"aud\":\"" + c.aud + "\",\"sub\":\"chuck\",\"iat\":" +
-                     std::to_string(c.iat) + ",\"nbf\":" + std::to_string(c.iat) + ",\"exp\":" + std::to_string(c.exp) +
+  std::string body = "{\"iss\":\"" + c.iss + "\",\"aud\":" + (c.aud_json.empty() ? "\"" + c.aud + "\"" : c.aud_json) +
+                     ",\"sub\":\"chuck\",\"iat\":" + std::to_string(c.iat) + ",\"nbf\":" +
+                     (c.nbf.empty() ? std::to_string(c.iat) : c.nbf) + ",\"exp\":" + std::to_string(c.exp) +
                      ",\"jti\":\"" + c.jti + "\",\"yard_kind\":\"internal\",\"yard_sess\":\"" + c.sess +
                      "\",\"yard_epoch\":" + std::to_string(c.epoch);
-  if (c.with_halo_spill)
-    body += ",\"halo_spill\":{\"use\":\"" + c.use + "\",\"key_sha256\":\"" + c.key_sha256 + "\"}";
-  body += "}";
+  if (c.with_halo_spill) {
+    body += ",\"halo_spill\":{\"use\":\"" + c.use + "\",\"key_sha256\":\"" + c.key_sha256 + "\"";
+    if (c.use == "seal" && c.entry) body += ",\"entry\":" + std::to_string(c.entry);
+    if (c.through) body += ",\"through\":" + std::to_string(c.through);
+    body += "}";
+  }
+  body += c.extra + "}";
   return s.Sign("{\"alg\":\"" + alg + "\",\"typ\":\"JWT\",\"kid\":\"" + s.kid + "\"}", body);
 }
 
@@ -106,16 +132,24 @@ inline std::string Body(const std::string& token, const std::string& use, const 
   return b + "}";
 }
 
-// One-call registration with a fresh, correct token.
+// One-call registration with a fresh, correct token (seal: for cache entry `entry`; revoke: through `through`).
 inline halo::server::YardSpillKeys::Answer Register(halo::server::YardSpillKeys& y, const Signer& s,
                                                     const std::string& sess, const std::string& use,
-                                                    std::int64_t epoch, const std::string& key) {
+                                                    std::int64_t epoch, const std::string& key,
+                                                    std::int64_t entry = 1, std::int64_t through = 0) {
   Claims c;
   c.sess = sess;
   c.use = use;
   c.epoch = epoch;
+  c.entry = entry;
+  c.through = through;
   c.key_sha256 = key.empty() ? "" : KeyHash(key);
-  return y.Register(sess, Body(Token(s, c), use, key));
+  std::string body = Body(Token(s, c), use, key);
+  return y.Register(sess, body);
+}
+inline halo::server::YardSpillKeys::Answer RegisterRaw(halo::server::YardSpillKeys& y, const std::string& sess,
+                                                       std::string body, std::int64_t now = 0) {
+  return y.Register(sess, body, now);
 }
 
 inline void WriteFile(const std::string& path, const std::string& s) { std::ofstream(path) << s; }

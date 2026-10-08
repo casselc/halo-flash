@@ -26,6 +26,7 @@
 // checkpoints (main's behaviour before the cache, for the extension case): fewer tokens prefilled, results equal
 // to a cold run only up to the prefill-vs-decode rounding.
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <span>
@@ -56,8 +57,9 @@ struct SessionCacheOptions {
   std::size_t max_spilled = 64;             ///< spilled entries kept (oldest file deleted beyond)
   std::size_t spill_budget_bytes = 64ull << 30;  ///< disk bytes they may hold
   /// Spill encryption (format v2). `spill_keys` (not owned; must outlive the cache) seals every file; when it has
-  /// no key for a session the spill is refused, never written in plaintext. Null: spills are refused unless
-  /// `spill_plaintext_ok` (then plaintext v1 files). `spill_accept_v1`: restore plaintext v1 files.
+  /// no key for an entry the spill is refused, never written in plaintext. Null: spills are refused unless
+  /// `spill_plaintext_ok` (then plaintext v1 files). `spill_accept_v1`: restore the plaintext v1 files this process
+  /// wrote (an entry recorded as v2 never accepts a v1 file).
   SpillKeys* spill_keys = nullptr;
   bool spill_plaintext_ok = false;
   bool spill_accept_v1 = false;
@@ -114,24 +116,25 @@ class SessionCache {
     std::uint64_t used = 0;        ///< LRU clock
     std::string session;           ///< the spill key's session label (a yard session, or "s<pid>-<key>")
     std::string key_id;            ///< spilled: the id of the key that seals the file ("" plaintext)
+    bool yard_bound = false;       ///< sealed under a yard key once: never under a master key again
   };
   [[nodiscard]] std::vector<EntryInfo> List() const;
   /// Writes a resident entry's state to the spill directory and frees its device memory. Outcomes: true = done
   /// (file complete and durable, device state dropped); false with the entry still resident = not done (nothing
   /// changed but a removed temp file); the entry is never half-spilled.
-  /// `session` (optional): the yard session the entry belongs to; it becomes the entry's key label (its file is
-  /// sealed and opened with that session's key). Empty: the entry keeps its label (default "s<pid>-<key>").
-  [[nodiscard]] bool Spill(std::uint64_t key, std::string* error, std::string_view session = {});
+  /// The key: the provider's seal lease for this entry (yard: a seal registration naming this entry, which also
+  /// binds the entry to that yard session for good).
+  [[nodiscard]] bool Spill(std::uint64_t key, std::string* error);
   /// Brings a spilled entry back onto the device (a resume ahead of its request). On false the entry is gone (its
   /// file refused or damaged, or no memory): its next request re-prefills, which is exactly a cold prefill; except
   /// when the key provider has no key for it yet (`*kept` true): then the entry and its file stay, untouched.
   [[nodiscard]] bool Restore(std::uint64_t key, std::string* error, bool* kept = nullptr);
-  /// Erases spilled entries whose file the provider can no longer open (its key id is not the provider's current
-  /// one: after Rotate, or a revoked yard key). Returns how many. Their files are deleted (and unreadable anyway).
+  /// Erases spilled entries whose file the provider can never open again (an older master epoch after
+  /// FenceEpoch, a revoked yard epoch). Returns how many. Their files are deleted.
   std::size_t DropUnreadable();
-  /// Erases the spilled entries of yard session `session` (its keys were revoked: crypto-shredded) and deletes
-  /// their files. Returns how many.
-  std::size_t DropSpilledOf(std::string_view session);
+  /// A yard revocation of `session` through file epoch `through`: erases that session's entries (spilled or
+  /// resident) whose key epoch is <= `through`, and deletes their files; newer ones stay. Returns how many.
+  std::size_t DropRevoked(std::string_view session, std::uint64_t through);
   /// Counters since construction (tests, metrics).
   struct SpillCounters {
     std::size_t spilled = 0, spill_failed = 0, restored = 0, restore_failed = 0, files_deleted = 0, no_key = 0;
@@ -151,6 +154,10 @@ class SessionCache {
     std::uint64_t file_bytes = 0;
     std::string session;               // spill key label (see EntryInfo::session); "" = the default
     std::string key_id;                // spilled: the file's key id ("" plaintext v1)
+    bool yard_bound = false;           // sealed under a yard key once (sticky)
+    std::uint64_t key_epoch = 0;       // the file epoch of its last yard seal (revocation fences by it)
+    std::uint32_t version = 0;         // spilled: the format written (1 / 2): a v2 entry never takes a v1 file
+    std::array<std::uint8_t, 16> checkpoint_id{};  // spilled (v2): the file's random checkpoint id
   };
   enum class Restored : std::uint8_t { kDone, kRefused, kNoKey };
   std::string Label(const Entry& en) const;

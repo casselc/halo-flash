@@ -64,6 +64,7 @@ class Value {
 struct ParseLimits {
   std::size_t max_depth = 128;
   std::size_t max_bytes = 64u << 20;
+  bool reject_duplicate_keys = false;  ///< an object with a repeated key is an error (security tokens, JWKS)
 };
 
 /// Strict RFC 8259 parser plus Python's NaN/Infinity/-Infinity literals.

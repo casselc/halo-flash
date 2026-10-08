@@ -135,8 +135,11 @@ TEST(SpillCrypt, KekSeparatesSessionsEpochsAndMasters) {
   for (const auto* k : {&c, &d, &f, &g}) EXPECT_FALSE(sc::Equal(a.key.span(), k->key.span()));
   EXPECT_NE(a.id, c.id);
   EXPECT_NE(a.id, d.id);
-  EXPECT_NE(sc::KeyName(m1.span()), sc::KeyName(m2.span()));
-  EXPECT_EQ(sc::KeyName(m1.span()).size(), 16u);
+  std::string n1, n2;
+  ASSERT_TRUE(sc::KeyName(m1.span(), &n1));
+  ASSERT_TRUE(sc::KeyName(m2.span(), &n2));
+  EXPECT_NE(n1, n2);
+  EXPECT_EQ(n1.size(), 16u);
   EXPECT_FALSE(sc::DeriveKek(m1.span(), std::string(300, 'a'), 1, "tpm:x", &g, &e));
   EXPECT_FALSE(sc::DeriveKek(m1.span(), "has space", 1, "tpm:x", &g, &e));
   EXPECT_FALSE(sc::DeriveKek(std::span<const std::uint8_t>(m1.data(), 16), "s", 1, "tpm:x", &g, &e));
@@ -172,4 +175,68 @@ TEST(SpillCrypt, DekWrapAuthenticatesTheHeaderAndHidesTheKey) {
     h2[at] ^= static_cast<std::uint8_t>(1u << tc.draw(gs::integers<int>({.min_value = 0, .max_value = 7})));
     ASSERT_EQ(sc::UnwrapDek(kek, h2, &back), at >= sc::kMetaTagOff) << "byte " << at;
   }, {.test_cases = 300});
+}
+
+// Secure memory fails closed: when mlock / madvise fail (here: injected) the allocation is empty and every user
+// refuses; nothing is handed out unlocked. Live() counts what is really still mapped (keys are really freed).
+TEST(SpillCrypt, SecretBytesFailClosed) {
+  const long live = sc::SecretBytes::Live();
+  {
+    sc::SecretBytes a(32);
+    ASSERT_TRUE(a.ok() && a.locked());
+    EXPECT_EQ(sc::SecretBytes::Live(), live + 1);
+    sc::SecretBytes::FailNextForTest(1);
+    sc::SecretBytes b(32);
+    EXPECT_FALSE(b.ok()) << "an unlockable allocation was handed out";
+    EXPECT_EQ(sc::SecretBytes::Live(), live + 1);
+    sc::SecretBytes c(32);
+    EXPECT_TRUE(c.ok()) << "the injected failure leaked into the next allocation";
+    // A key derivation into memory that cannot be locked refuses.
+    sc::SecretBytes::FailNextForTest(1);
+    sc::Kek k;
+    std::string e;
+    EXPECT_FALSE(sc::DeriveKek(a.span(), "s", 1, "file:x", &k, &e));
+  }
+  EXPECT_EQ(sc::SecretBytes::Live(), live) << "SecretBytes not unmapped on destruction";
+}
+
+// A failed open never leaves unauthenticated plaintext behind: the buffer is zeroed (a bad tag on authentic
+// ciphertext would otherwise leave the real plaintext there). A non-in-place seal leaves the source intact and a
+// failed seal leaves no half-encrypted output.
+TEST(SpillCrypt, FailedOpenWipesAndSealCanWriteElsewhere) {
+  std::vector<std::uint8_t> key(32, 7), pt(1000), ct(1000), aad(20, 3);
+  for (std::size_t i = 0; i < pt.size(); ++i) pt[i] = static_cast<std::uint8_t>(i * 13 + 1);
+  std::array<std::uint8_t, 12> nonce{};
+  std::array<std::uint8_t, 16> tag{};
+  sc::Gcm g;
+  ASSERT_TRUE(g.Seal(key, nonce, aad, pt.data(), ct.data(), ct.size(), tag));
+  EXPECT_NE(ct, pt);
+  EXPECT_EQ(pt[5], static_cast<std::uint8_t>(5 * 13 + 1)) << "the source was changed";
+  auto buf = ct;
+  ASSERT_TRUE(g.Open(key, nonce, aad, buf.data(), buf.size(), tag));
+  EXPECT_EQ(buf, pt);
+  buf = ct;
+  tag[0] ^= 1;
+  EXPECT_FALSE(g.Open(key, nonce, aad, buf.data(), buf.size(), tag));
+  EXPECT_TRUE(std::all_of(buf.begin(), buf.end(), [](std::uint8_t b) { return b == 0; }))
+      << "plaintext of a failed open is still in the buffer";
+  // The context is reset after each call: the same object keeps working under other keys.
+  std::vector<std::uint8_t> key2(32, 9);
+  std::array<std::uint8_t, 16> tag2{};
+  buf = pt;
+  ASSERT_TRUE(g.Seal(key2, nonce, aad, buf.data(), buf.size(), tag2));
+  ASSERT_TRUE(g.Open(key2, nonce, aad, buf.data(), buf.size(), tag2));
+  EXPECT_EQ(buf, pt);
+  // A seal with a bad key length fails and writes nothing usable.
+  std::vector<std::uint8_t> out(pt.size(), 0xaa);
+  EXPECT_FALSE(g.Seal(std::span<const std::uint8_t>(key.data(), 16), nonce, aad, pt.data(), out.data(), out.size(), tag2));
+}
+
+// Sha256 reports success and fills exactly 32 bytes (the FIPS 180-2 "abc" vector).
+TEST(SpillCrypt, Sha256Vector) {
+  std::array<std::uint8_t, 32> d{};
+  const std::string abc = "abc";
+  ASSERT_TRUE(sc::Sha256({reinterpret_cast<const std::uint8_t*>(abc.data()), abc.size()}, d));
+  EXPECT_EQ(std::vector<std::uint8_t>(d.begin(), d.end()),
+            Hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
 }

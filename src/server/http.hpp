@@ -111,6 +111,10 @@ struct HttpServerOptions {
   /// server's send buffer is full too.
   int send_timeout_ms = 30000;
   std::string api_key;          // non-empty: require "Authorization: Bearer <key>"
+  /// Non-empty: listen on this Unix socket instead of host:port. Its directory must exist, be ours and be 0700; the
+  /// socket is 0600 and a peer whose uid (SO_PEERCRED) is neither ours nor in `unix_peer_uids` is closed at once.
+  std::string unix_path;
+  std::vector<long> unix_peer_uids;
 };
 
 class HttpServer {
@@ -134,6 +138,8 @@ class HttpServer {
   [[nodiscard]] std::size_t active_connections() const { return active_.load(); }
 
  private:
+  bool StartUnix(std::string* error);
+  [[nodiscard]] bool PeerAllowed(int fd) const;
   void AcceptLoop();
   void Serve(int fd);
   HttpResponse Dispatch(const HttpRequest& req);
@@ -143,6 +149,7 @@ class HttpServer {
   std::vector<std::pair<std::pair<std::string, std::string>, HttpHandler>> prefix_routes_;
   int listen_fd_ = -1;
   int port_ = 0;
+  bool unix_ = false;
   std::atomic<bool> stopping_{false};
   std::atomic<std::size_t> active_{0};
   std::thread acceptor_;

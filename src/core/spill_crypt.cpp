@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -16,28 +17,47 @@
 namespace halo::core::crypt {
 
 // ---- SecretBytes ----
+namespace {
+std::atomic<long> g_live{0};
+std::atomic<int> g_fail_next{0};
+}  // namespace
+
+long SecretBytes::Live() noexcept { return g_live.load(); }
+void SecretBytes::FailNextForTest(int n) noexcept { g_fail_next.store(n); }
+
 SecretBytes::SecretBytes(std::size_t n) {
   if (n == 0) return;
   const std::size_t page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
   const std::size_t m = (n + page - 1) / page * page;
   void* p = ::mmap(nullptr, m, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (p == MAP_FAILED) return;
-  (void)::madvise(p, m, MADV_DONTDUMP);
-  (void)::madvise(p, m, MADV_WIPEONFORK);  // a forked child (systemd-creds, a helper) never sees it
-  locked_ = ::mlock(p, m) == 0;
+  // Fail closed: a key that could be swapped, dumped or inherited is not handed out.
+  int injected = g_fail_next.load();
+  while (injected > 0 && !g_fail_next.compare_exchange_weak(injected, injected - 1)) {
+  }
+  const bool ok = injected <= 0 && ::madvise(p, m, MADV_DONTDUMP) == 0 && ::madvise(p, m, MADV_WIPEONFORK) == 0 &&
+                  ::mlock(p, m) == 0;
+  if (!ok) {
+    (void)::munlock(p, m);
+    (void)::munmap(p, m);
+    return;
+  }
+  locked_ = true;
   p_ = static_cast<std::uint8_t*>(p);
   n_ = n;
   mapped_ = m;
+  ++g_live;
 }
 
 void SecretBytes::Clear() noexcept {
   if (!p_) return;
   OPENSSL_cleanse(p_, mapped_);
-  if (locked_) (void)::munlock(p_, mapped_);
+  (void)::munlock(p_, mapped_);
   (void)::munmap(p_, mapped_);
   p_ = nullptr;
   n_ = mapped_ = 0;
   locked_ = false;
+  --g_live;
 }
 
 SecretBytes::~SecretBytes() { Clear(); }
@@ -105,11 +125,11 @@ bool HmacSha256(std::span<const std::uint8_t> key, std::span<const std::uint8_t>
   return ok;
 }
 
-std::array<std::uint8_t, 32> Sha256(std::span<const std::uint8_t> data) {
-  std::array<std::uint8_t, 32> d{};
+bool Sha256(std::span<const std::uint8_t> data, std::span<std::uint8_t, 32> out) {
   unsigned n = 0;
-  (void)EVP_Digest(data.data(), data.size(), d.data(), &n, EVP_sha256(), nullptr);
-  return d;
+  if (EVP_Digest(data.data(), data.size(), out.data(), &n, EVP_sha256(), nullptr) == 1 && n == 32) return true;
+  OPENSSL_cleanse(out.data(), 32);
+  return false;
 }
 
 std::array<std::uint8_t, kNonceBytes> PieceNonce(std::span<const std::uint8_t, kSaltBytes> salt, std::uint32_t index) {
@@ -134,36 +154,48 @@ constexpr std::size_t kChunk = std::size_t{1} << 30;
 }  // namespace
 
 bool Gcm::Seal(std::span<const std::uint8_t> key, std::span<const std::uint8_t, kNonceBytes> nonce,
-               std::span<const std::uint8_t> aad, std::uint8_t* buf, std::size_t n,
+               std::span<const std::uint8_t> aad, const std::uint8_t* src, std::uint8_t* dst, std::size_t n,
                std::span<std::uint8_t, kTagBytes> tag) {
   auto* c = static_cast<EVP_CIPHER_CTX*>(ctx_);
   if (!c || key.size() != kKeyBytes) return false;
   int len = 0;
-  if (EVP_EncryptInit_ex(c, EVP_aes_256_gcm(), nullptr, key.data(), nonce.data()) != 1) return false;
-  if (!aad.empty() && EVP_EncryptUpdate(c, nullptr, &len, aad.data(), static_cast<int>(aad.size())) != 1) return false;
-  for (std::size_t at = 0; at < n; at += kChunk) {
+  bool ok = EVP_EncryptInit_ex(c, EVP_aes_256_gcm(), nullptr, key.data(), nonce.data()) == 1 &&
+            (aad.empty() || EVP_EncryptUpdate(c, nullptr, &len, aad.data(), static_cast<int>(aad.size())) == 1);
+  for (std::size_t at = 0; ok && at < n; at += kChunk) {
     const int m = static_cast<int>(std::min(kChunk, n - at));
-    if (EVP_EncryptUpdate(c, buf + at, &len, buf + at, m) != 1 || len != m) return false;
+    ok = EVP_EncryptUpdate(c, dst + at, &len, src + at, m) == 1 && len == m;
   }
-  if (EVP_EncryptFinal_ex(c, nullptr, &len) != 1) return false;
-  return EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_GET_TAG, static_cast<int>(kTagBytes), tag.data()) == 1;
+  ok = ok && EVP_EncryptFinal_ex(c, nullptr, &len) == 1 &&
+       EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_GET_TAG, static_cast<int>(kTagBytes), tag.data()) == 1;
+  (void)EVP_CIPHER_CTX_reset(c);  // no key schedule outlives the call
+  if (!ok) {
+    if (n) OPENSSL_cleanse(dst, n);  // never half-encrypted output
+    OPENSSL_cleanse(tag.data(), kTagBytes);
+  }
+  return ok;
 }
 
 bool Gcm::Open(std::span<const std::uint8_t> key, std::span<const std::uint8_t, kNonceBytes> nonce,
                std::span<const std::uint8_t> aad, std::uint8_t* buf, std::size_t n,
                std::span<const std::uint8_t, kTagBytes> tag) {
   auto* c = static_cast<EVP_CIPHER_CTX*>(ctx_);
-  if (!c || key.size() != kKeyBytes) return false;
-  int len = 0;
-  if (EVP_DecryptInit_ex(c, EVP_aes_256_gcm(), nullptr, key.data(), nonce.data()) != 1) return false;
-  if (!aad.empty() && EVP_DecryptUpdate(c, nullptr, &len, aad.data(), static_cast<int>(aad.size())) != 1) return false;
-  for (std::size_t at = 0; at < n; at += kChunk) {
-    const int m = static_cast<int>(std::min(kChunk, n - at));
-    if (EVP_DecryptUpdate(c, buf + at, &len, buf + at, m) != 1 || len != m) return false;
-  }
-  if (EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_TAG, static_cast<int>(kTagBytes), const_cast<std::uint8_t*>(tag.data())) != 1)
+  if (!c || key.size() != kKeyBytes) {
+    if (n) OPENSSL_cleanse(buf, n);
     return false;
-  return EVP_DecryptFinal_ex(c, nullptr, &len) == 1;
+  }
+  int len = 0;
+  bool ok = EVP_DecryptInit_ex(c, EVP_aes_256_gcm(), nullptr, key.data(), nonce.data()) == 1 &&
+            (aad.empty() || EVP_DecryptUpdate(c, nullptr, &len, aad.data(), static_cast<int>(aad.size())) == 1);
+  for (std::size_t at = 0; ok && at < n; at += kChunk) {
+    const int m = static_cast<int>(std::min(kChunk, n - at));
+    ok = EVP_DecryptUpdate(c, buf + at, &len, buf + at, m) == 1 && len == m;
+  }
+  ok = ok &&
+       EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_TAG, static_cast<int>(kTagBytes), const_cast<std::uint8_t*>(tag.data())) == 1;
+  ok = ok && EVP_DecryptFinal_ex(c, nullptr, &len) == 1;
+  (void)EVP_CIPHER_CTX_reset(c);
+  if (!ok && n) OPENSSL_cleanse(buf, n);  // unauthenticated plaintext never survives a failed open
+  return ok;
 }
 
 // ---- KEK ----
@@ -194,17 +226,18 @@ bool DeriveKek(std::span<const std::uint8_t> ikm, std::string_view session, std:
   return true;
 }
 
-std::string KeyName(std::span<const std::uint8_t> master) {
+bool KeyName(std::span<const std::uint8_t> key, std::string* out) {
   std::array<std::uint8_t, 32> h{};
   const std::string_view label = "halo-spill-master-id";
-  if (!HmacSha256(master, {reinterpret_cast<const std::uint8_t*>(label.data()), label.size()}, h)) return "?";
+  if (!HmacSha256(key, {reinterpret_cast<const std::uint8_t*>(label.data()), label.size()}, h)) return false;
   static const char* hex = "0123456789abcdef";
   std::string s;
   for (int i = 0; i < 8; ++i) {
     s += hex[h[i] >> 4];
     s += hex[h[i] & 15];
   }
-  return s;
+  *out = std::move(s);
+  return true;
 }
 
 // ---- DEK wrap ----
@@ -213,10 +246,13 @@ bool WrapDek(const Kek& kek, std::span<std::uint8_t, kHeaderBytes> header, std::
   std::span<std::uint8_t, kNonceBytes> nonce(header.data() + kWrapNonceOff, kNonceBytes);
   if (!RandomBytes(nonce)) return false;
   std::uint8_t* wrapped = header.data() + kWrappedDekOff;
-  std::memcpy(wrapped, dek.data(), kKeyBytes);
   Gcm g;
-  return g.Seal(kek.key.span(), nonce, HeaderAad(header), wrapped, kKeyBytes,
-                std::span<std::uint8_t, kTagBytes>(header.data() + kWrapTagOff, kTagBytes));
+  // Not in place: the DEK goes from its SecretBytes through the cipher; only ciphertext reaches the header.
+  if (g.Seal(kek.key.span(), nonce, HeaderAad(header), dek.data(), wrapped, kKeyBytes,
+             std::span<std::uint8_t, kTagBytes>(header.data() + kWrapTagOff, kTagBytes)))
+    return true;
+  OPENSSL_cleanse(wrapped, kKeyBytes + kTagBytes);
+  return false;
 }
 
 bool UnwrapDek(const Kek& kek, std::span<const std::uint8_t, kHeaderBytes> header, SecretBytes* dek) {

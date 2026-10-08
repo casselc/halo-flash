@@ -9,6 +9,8 @@
 // reference's tie rules (equal scores keep the lower index), so a step
 // needs no host round trip except the n-gram rows and the final logits.
 
+#include <array>
+#include <atomic>
 #include <functional>
 #include <chrono>
 #include <cstdint>
@@ -367,6 +369,7 @@ class FlashNextGpu {
     double ms = 0;        ///< wall time of the whole call
     std::uint32_t version = 0;  ///< file format: 1 plaintext, 2 encrypted
     std::string key_id;         ///< v2: the id of the KEK that wraps the file's data key
+    std::array<std::uint8_t, 16> checkpoint{};  ///< v2: random per file, authenticated (keep it to restore)
   };
   /// How a spill file is protected (docs/SESSIONS.md section 10). Spill: `kek` set writes format v2 under it; null
   /// writes plaintext v1 (only for a caller that chose plaintext). Restore / peek: a v2 file opens only with the KEK
@@ -374,6 +377,12 @@ class FlashNextGpu {
   struct SpillProtection {
     const core::crypt::Kek* kek = nullptr;
     bool accept_v1 = false;
+    /// Restore: the format the caller recorded for this file (2: a v1 file is refused whatever accept_v1 says;
+    /// 0: not known).
+    std::uint32_t expect_version = 0;
+    /// Restore (v2): the checkpoint id SpillInfo returned when the file was written. An authentic file of another
+    /// checkpoint (an older spill of the same session, epoch and tokens) is refused before the session is touched.
+    const std::array<std::uint8_t, 16>* expect_checkpoint = nullptr;
   };
   /// Writes the bound session's state to `path`: a temp file next to it (mode 0600), fsync, rename, fsync of the
   /// directory. True: the file at `path` is complete and durable. False: `path` is what it was before (absent or
@@ -403,6 +412,8 @@ class FlashNextGpu {
   /// 4 position + 1), to show the identity checks run behind the authentication.
   static inline int spill_test_identity_ = 0;
   static inline unsigned spill_threads_ = 4;  ///< I/O threads (each: one pinned staging buffer of a piece)
+  /// Test probe: restore pieces uploaded to the device so far (a failed restore must not add any after it returns).
+  static inline std::atomic<std::uint64_t> spill_uploads_{0};
   static inline std::size_t spill_piece_bytes_ = 16u << 20;  ///< I/O and checksum unit, a multiple of 4096
 
   // ---- P5 MTP draft layer (mtp.cpp), measurement stage: no verify path, the trunk's numerics untouched ----

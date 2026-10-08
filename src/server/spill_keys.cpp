@@ -11,28 +11,127 @@
 #include <cstring>
 #include <vector>
 
-extern char** environ;
-
 namespace halo::server {
 
 namespace crypt = core::crypt;
 
-MasterSpillKeys::MasterSpillKeys(std::string provider, crypt::SecretBytes master, std::uint64_t epoch)
-    : provider_(std::move(provider)), master_(std::move(master)), epoch_(epoch) {
-  prefix_ = provider_ + ":" + crypt::KeyName(master_.span());
+bool ParseU64(std::string_view s, std::uint64_t max, std::uint64_t* out) {
+  if (s.empty() || s.size() > 20) return false;
+  std::uint64_t v = 0;
+  for (char c : s) {
+    if (c < '0' || c > '9') return false;
+    const std::uint64_t d = static_cast<std::uint64_t>(c - '0');
+    if (v > (max - d) / 10) return false;
+    v = v * 10 + d;
+  }
+  *out = v;
+  return true;
+}
+
+bool WriteFileDurable(const std::string& path, std::string_view bytes, std::string* error) {
+  const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+  ::unlink(tmp.c_str());
+  const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (fd < 0) return *error = "cannot create " + tmp + ": " + std::strerror(errno), false;
+  std::size_t done = 0;
+  while (done < bytes.size()) {
+    const ssize_t w = ::write(fd, bytes.data() + done, bytes.size() - done);
+    if (w < 0 && errno == EINTR) continue;
+    if (w <= 0) {
+      ::close(fd);
+      ::unlink(tmp.c_str());
+      return *error = "write " + tmp + " failed", false;
+    }
+    done += static_cast<std::size_t>(w);
+  }
+  const bool synced = ::fsync(fd) == 0;
+  ::close(fd);
+  if (!synced || ::rename(tmp.c_str(), path.c_str()) != 0) {
+    ::unlink(tmp.c_str());
+    return *error = "cannot publish " + path + ": " + std::strerror(errno), false;
+  }
+  const auto slash = path.rfind('/');
+  const std::string dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : path.substr(0, slash));
+  const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  const bool dir_ok = dfd >= 0 && ::fsync(dfd) == 0;
+  if (dfd >= 0) ::close(dfd);
+  if (!dir_ok) return *error = "fsync of " + dir + " failed", false;
+  return true;
+}
+
+std::unique_ptr<MasterSpillKeys> MasterSpillKeys::Create(std::string provider, crypt::SecretBytes master,
+                                                         const std::string& epoch_file, std::string* error) {
+  if (!master.ok() || master.size() < crypt::kKeyBytes) return *error = "spill key: no master", nullptr;
+  std::unique_ptr<MasterSpillKeys> k(new MasterSpillKeys());
+  std::string name;
+  if (!crypt::KeyName(master.span(), &name)) return *error = "spill key: cannot name the master (HMAC failed)", nullptr;
+  k->provider_ = std::move(provider);
+  k->prefix_ = k->provider_ + ":" + name;
+  k->master_ = std::move(master);
+  k->epoch_file_ = epoch_file;
+  if (!epoch_file.empty()) {
+    // The epoch never goes back: a restart continues from the persisted one (an older epoch's files stay fenced).
+    const int fd = ::open(epoch_file.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd >= 0) {
+      char buf[32] = {};
+      const ssize_t r = ::read(fd, buf, sizeof(buf) - 1);
+      ::close(fd);
+      std::string_view v(buf, r > 0 ? static_cast<std::size_t>(r) : 0);
+      while (!v.empty() && (v.back() == '\n' || v.back() == ' ')) v.remove_suffix(1);
+      std::uint64_t e = 0;
+      if (!ParseU64(v, std::uint64_t{1} << 62, &e) || e == 0)
+        return *error = "spill key: epoch file " + epoch_file + " is malformed (refusing to start)", nullptr;
+      k->epoch_.store(e);
+    } else if (errno != ENOENT) {
+      return *error = "spill key: cannot read epoch file " + epoch_file + ": " + std::strerror(errno), nullptr;
+    } else if (!WriteFileDurable(epoch_file, "1\n", error)) {
+      return nullptr;
+    }
+  }
+  return k;
 }
 
 std::string MasterSpillKeys::Describe() const {
-  return prefix_ + " epoch " + std::to_string(epoch_.load()) + (master_.locked() ? "" : " (not mlocked)");
+  return prefix_ + " epoch " + std::to_string(epoch_.load());
 }
 
-bool MasterSpillKeys::Key(std::string_view session, Use, crypt::Kek* out, std::string* why) {
-  // Seal and open use the current epoch: a file of an earlier epoch names another key id and is refused.
-  return crypt::DeriveKek(master_.span(), session, epoch_.load(), prefix_, out, why);
+std::string MasterSpillKeys::IdFor(std::string_view label) const {
+  return prefix_ + ":e" + std::to_string(epoch_.load()) + ":" + std::string(label);
 }
 
-bool MasterSpillKeys::Rotate(std::string*) {
-  ++epoch_;
+bool MasterSpillKeys::Derive(std::string_view label, SpillLease* out, std::string* why) {
+  const std::uint64_t e = epoch_.load();
+  if (!crypt::DeriveKek(master_.span(), label, e, prefix_, &out->kek, why)) return false;
+  out->session = std::string(label);
+  out->epoch = e;
+  out->gen = 0;
+  out->yard = false;
+  return true;
+}
+
+bool MasterSpillKeys::SealLease(std::uint64_t, std::string_view label, bool yard_bound, SpillLease* out,
+                                std::string* why) {
+  if (yard_bound) return *why = "a yard-bound entry is never sealed under the master key", false;
+  return Derive(label, out, why);
+}
+
+bool MasterSpillKeys::OpenLease(std::string_view label, std::string_view file_key_id, SpillLease* out,
+                                std::string* why) {
+  // The current epoch only: a file of an earlier epoch names another key id, and the engine refuses it.
+  if (file_key_id != IdFor(label)) return *why = "spill file is of another master or epoch (fenced)", false;
+  return Derive(label, out, why);
+}
+
+bool MasterSpillKeys::MayOpen(std::string_view label, std::string_view file_key_id) {
+  return file_key_id == IdFor(label);
+}
+
+bool MasterSpillKeys::FenceEpoch(std::string* why) {
+  std::lock_guard<std::mutex> lk(mu_);
+  const std::uint64_t next = epoch_.load() + 1;
+  // Persisted before it takes effect: a crash cannot bring an older epoch back.
+  if (!epoch_file_.empty() && !WriteFileDurable(epoch_file_, std::to_string(next) + "\n", why)) return false;
+  epoch_.store(next);
   return true;
 }
 
@@ -112,7 +211,10 @@ std::string DefaultTpmCredentialPath() {
   return base + "/halo-flash/spill-master.cred";
 }
 
-bool LoadMasterTpm(const std::string& cred_path, const std::string& name, crypt::SecretBytes* out, std::string* error) {
+bool LoadMasterTpm(const std::string& cred_path, const std::string& name, crypt::SecretBytes* out, std::string* error,
+                   const std::string& systemd_creds) {
+  const std::string bin = systemd_creds.empty() ? kSystemdCreds : systemd_creds;
+  if (bin.empty() || bin[0] != '/') return *error = "spill key: systemd-creds must be an absolute path", false;
   // As a systemd service (LoadCredentialEncrypted=<name>:<cred>): systemd decrypted it into a private ramfs.
   if (const char* dir = std::getenv("CREDENTIALS_DIRECTORY"); dir && *dir) {
     const std::string p = std::string(dir) + "/" + name;
@@ -127,11 +229,15 @@ bool LoadMasterTpm(const std::string& cred_path, const std::string& name, crypt:
   posix_spawn_file_actions_init(&fa);
   posix_spawn_file_actions_adddup2(&fa, pipefd[1], 1);
   const std::string name_arg = "--name=" + name;
-  std::vector<char*> argv = {const_cast<char*>("systemd-creds"), const_cast<char*>("decrypt"),
+  std::vector<char*> argv = {const_cast<char*>(bin.c_str()), const_cast<char*>("decrypt"),
                              const_cast<char*>("--user"), const_cast<char*>(name_arg.c_str()),
                              const_cast<char*>(cred_path.c_str()), const_cast<char*>("-"), nullptr};
   pid_t pid = 0;
-  const int rc = ::posix_spawnp(&pid, "systemd-creds", &fa, nullptr, argv.data(), environ);
+  // A scrubbed environment: nothing from ours (PATH, LD_*, SYSTEMD_*) steers the binary that produces the master.
+  char env_path[] = "PATH=/usr/bin:/bin";
+  char env_lang[] = "LANG=C";
+  char* envp[] = {env_path, env_lang, nullptr};
+  const int rc = ::posix_spawn(&pid, bin.c_str(), &fa, nullptr, argv.data(), envp);
   posix_spawn_file_actions_destroy(&fa);
   ::close(pipefd[1]);
   if (rc != 0) {
@@ -153,7 +259,8 @@ bool LoadMasterTpm(const std::string& cred_path, const std::string& name, crypt:
   return ParseKey(buf.data(), n, out, error);
 }
 
-bool MakeSpillKeys(const std::string& spec, std::uint64_t epoch, std::unique_ptr<SpillKeys>* out, std::string* error) {
+bool MakeSpillKeys(const std::string& spec, const std::string& state_dir, std::unique_ptr<MasterSpillKeys>* out,
+                   std::string* error) {
   out->reset();
   if (spec == "none") return true;
   crypt::SecretBytes master;
@@ -168,8 +275,11 @@ bool MakeSpillKeys(const std::string& spec, std::uint64_t epoch, std::unique_ptr
   } else {
     return *error = "--spill-key: want tpm, tpm:CRED, file:PATH or none (got " + spec + ")", false;
   }
-  *out = std::make_unique<MasterSpillKeys>(provider, std::move(master), epoch);
-  return true;
+  std::string name;
+  if (!crypt::KeyName(master.span(), &name)) return *error = "spill key: cannot name the master", false;
+  *out = MasterSpillKeys::Create(provider, std::move(master),
+                                 state_dir.empty() ? "" : state_dir + "/master-" + name + ".epoch", error);
+  return *out != nullptr;
 }
 
 }  // namespace halo::server

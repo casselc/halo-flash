@@ -1593,8 +1593,8 @@ why = "as crypt-header-not-aad, end to end: a flipped header field nothing else 
 [[mutant]]
 name = "crypt-tag-unchecked"
 file = "src/core/spill_crypt.cpp"
-find = '  return EVP_DecryptFinal_ex(c, nullptr, &len) == 1;'
-replace = '  return EVP_DecryptFinal_ex(c, nullptr, &len) == 1 || true;'
+find = '  ok = ok && EVP_DecryptFinal_ex(c, nullptr, &len) == 1;'
+replace = '  ok = ok && (EVP_DecryptFinal_ex(c, nullptr, &len) == 1 || true);'
 suite = "cpu"
 binary = "crypt_tests"
 filter = "SpillCrypt.GcmRefusesEveryChangedBit"
@@ -1604,8 +1604,8 @@ why = "GCM decrypts but the tag is not checked: changed ciphertext, AAD, nonce o
 [[mutant]]
 name = "spill-tag-unchecked"
 file = "src/core/spill_crypt.cpp"
-find = '  return EVP_DecryptFinal_ex(c, nullptr, &len) == 1;'
-replace = '  return EVP_DecryptFinal_ex(c, nullptr, &len) == 1 || true;'
+find = '  ok = ok && EVP_DecryptFinal_ex(c, nullptr, &len) == 1;'
+replace = '  ok = ok && (EVP_DecryptFinal_ex(c, nullptr, &len) == 1 || true);'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "Spill.RefusesDamagedTruncatedAndMismatchedFiles"
@@ -1614,8 +1614,8 @@ why = "as crypt-tag-unchecked, end to end: a flipped payload bit, a wrong key or
 [[mutant]]
 name = "crypt-dek-in-clear"
 file = "src/core/spill_crypt.cpp"
-find = '  std::memcpy(wrapped, dek.data(), kKeyBytes);'
-replace = '  std::memcpy(wrapped, dek.data(), kKeyBytes); std::memcpy(header.data() + 244, dek.data(), kKeyBytes);'
+find = '  // Not in place: the DEK goes from its SecretBytes through the cipher; only ciphertext reaches the header.'
+replace = '  std::memcpy(header.data() + 300, dek.data(), kKeyBytes);'
 suite = "cpu"
 binary = "crypt_tests"
 filter = "SpillCrypt.DekWrapAuthenticatesTheHeaderAndHidesTheKey"
@@ -1625,8 +1625,8 @@ why = "the data key is also written unwrapped (into the reserved header bytes): 
 [[mutant]]
 name = "spill-dek-in-clear"
 file = "src/core/spill_crypt.cpp"
-find = '  std::memcpy(wrapped, dek.data(), kKeyBytes);'
-replace = '  std::memcpy(wrapped, dek.data(), kKeyBytes); std::memcpy(header.data() + 244, dek.data(), kKeyBytes);'
+find = '  // Not in place: the DEK goes from its SecretBytes through the cipher; only ciphertext reaches the header.'
+replace = '  std::memcpy(header.data() + 300, dek.data(), kKeyBytes);'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "Spill.EncryptedFilesNeverReuseANonceOrHoldKeys"
@@ -1646,8 +1646,8 @@ why = "the KEK does not depend on the epoch: a rotation (or a yard epoch bump) n
 [[mutant]]
 name = "cache-plaintext-on-key-error"
 file = "src/server/session_cache.cpp"
-find = '    if (!opt_.spill_keys->Key(label, SpillKeys::Use::kSeal, &kek, error)) {  // no key, no spill: never plaintext'
-replace = '    if (!opt_.spill_keys->Key(label, SpillKeys::Use::kSeal, &kek, error) && (prot.kek = nullptr, false)) {'
+find = '    if (!opt_.spill_keys->SealLease(en.key, Label(en), en.yard_bound, &lease, error)) {  // no key, no spill: never plaintext'
+replace = '    if (!opt_.spill_keys->SealLease(en.key, Label(en), en.yard_bound, &lease, error) && (prot.kek = nullptr, false)) {'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "SessionCache.SpillKeysRefuseKeepAndShred"
@@ -1658,8 +1658,8 @@ why = "when the provider has no key the spill falls back to a plaintext v1 file 
 [[mutant]]
 name = "yard-open-at-seal-epoch"
 file = "src/server/yard_keys.cpp"
-find = '  if (E <= *s.sealed)'
-replace = '  if (E < *s.sealed)'
+find = '  if (u == Use::kOpen && (!s.last_seal || E != *s.last_seal + 1))'
+replace = '  if (u == Use::kOpen && (!s.last_seal || E < *s.last_seal || E > *s.last_seal + 1))'
 suite = "cpu"
 binary = "crypt_tests"
 filter = "YardKeys.EpochRulesReplayDuplicatesAndShredding"
@@ -1689,21 +1689,10 @@ timeout = 300
 why = "a captured token can be replayed until it expires"
 
 [[mutant]]
-name = "yard-open-recorded-epoch"
-file = "src/server/yard_keys.cpp"
-find = '      return crypt::DeriveKek(slot.key.span(), session, slot.epoch - 1, "yard:" + slot.name, out, why);'
-replace = '      return crypt::DeriveKek(slot.key.span(), session, it->second.sealed.value_or(0), "yard:" + slot.name, out, why);'
-suite = "cpu"
-binary = "crypt_tests"
-filter = "YardKeys.EpochRulesReplayDuplicatesAndShredding"
-timeout = 300
-why = "an open opens the last sealed file whatever its epoch: an epoch bump no longer crypto-shreds"
-
-[[mutant]]
 name = "yard-audience-unchecked"
 file = "src/server/yard_keys.cpp"
-find = '    if (!ok) return fail("audience");'
-replace = '    (void)ok;'
+find = '  if (!aud_ok) return fail(JwtError::kAudience);'
+replace = '  (void)aud_ok;'
 suite = "cpu"
 binary = "crypt_tests"
 filter = "YardKeys.TokenRefusals"
@@ -1713,8 +1702,8 @@ why = "a token for another audience (scope, a cloud) registers spill keys"
 [[mutant]]
 name = "yard-key-unbound"
 file = "src/server/yard_keys.cpp"
-find = '        !crypt::Equal(want, key_hash))'
-replace = '        false)'
+find = '|| !crypt::Equal(want, key_hash))'
+replace = '|| false)'
 suite = "cpu"
 binary = "crypt_tests"
 filter = "YardKeys.TokenRefusals"
@@ -1724,12 +1713,408 @@ why = "a captured token registers a key of the holder's choosing"
 [[mutant]]
 name = "cache-yard-open-key-ignored"
 file = "src/server/session_cache.cpp"
-find = '    if (!opt_.spill_keys->KeyForFile(label, en.key_id, &kek, error)) {'
-replace = '    if (!opt_.spill_keys->KeyForFile(label, en.key_id, &kek, error) && false) {'
+find = '    if (!opt_.spill_keys->OpenLease(label, en.key_id, &lease, error)) {'
+replace = '    if (!opt_.spill_keys->OpenLease(label, en.key_id, &lease, error) && false) {'
 suite = "gpu"
 binary = "gpu_tests"
 filter = "SessionCache.YardKeysAuthoriseResume"
 why = "a restore without yard's open key is attempted anyway: refused by the engine and the waiting entry is erased"
+
+# ---- SE fix round: revoke fencing, one-shot records, expiry, persistence, leases, custody, JWKS/JWT, hygiene --
+
+[[mutant]]
+name = "yard-revoke-no-fence"
+file = "src/server/yard_keys.cpp"
+find = '  if (s.fence && file_epoch <= *s.fence)'
+replace = '  if (false)'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.RevokeFencesTheSession"
+timeout = 300
+why = "a revoked session takes a fresh seal or open at (or below) the revoked epoch: revocation is undone by the next token"
+
+[[mutant]]
+name = "yard-revoke-fence-lowers"
+file = "src/server/yard_keys.cpp"
+find = '    s.fence = std::max(s.fence.value_or(0), through);'
+replace = '    s.fence = through;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.RevokeFencesTheSession"
+timeout = 300
+why = "a later revoke with a lower `through` moves the fence back and re-opens fenced epochs"
+
+[[mutant]]
+name = "yard-consumed-rearmed"
+file = "src/server/yard_keys.cpp"
+find = 'r && r->state == OpState::kConsumed &&'
+replace = 'r && false &&'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.ConsumedKeysAreNeverRearmed"
+timeout = 300
+why = "a retry of a consumed operation is not recognised: the caller sees 409 instead of its recorded outcome"
+
+[[mutant]]
+name = "yard-used-check-off"
+file = "src/server/yard_keys.cpp"
+find = '  if (used) return answer(409,'
+replace = '  if (false) return answer(409,'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.ConsumedKeysAreNeverRearmed:YardKeys.EpochsSurviveARestart"
+timeout = 300
+why = "a fresh token re-arms a consumed one-shot key (a second file sealed, a second restore authorised)"
+
+[[mutant]]
+name = "yard-expiry-not-zeroed"
+file = "src/server/yard_keys.cpp"
+find = '        ZeroSlot(s, *slot, OpState::kExpired);'
+replace = '        (void)0;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.ExpiryZeroesKeys"
+timeout = 300
+why = "an expired key is only hidden: it stays in memory and still seals"
+
+[[mutant]]
+name = "yard-auth-ignores-exp"
+file = "src/server/yard_keys.cpp"
+find = 'std::min(std::chrono::seconds(o_.key_ttl_s), std::chrono::seconds(std::max<std::int64_t>(exp - t, 0)))'
+replace = 'std::chrono::seconds(o_.key_ttl_s)'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.ExpiryZeroesKeys"
+timeout = 300
+why = "a key registered just before its token expires stays usable for the whole TTL (authorization outlives the token)"
+
+[[mutant]]
+name = "yard-state-not-persisted"
+file = "src/server/yard_keys.cpp"
+find = '  return WriteFileDurable(o_.state_path, out, error);'
+replace = '  (void)out; return true;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.EpochsSurviveARestart"
+timeout = 300
+why = "the per-session epochs live in memory only: after a restart a replayed seal token re-arms a spilled epoch"
+
+[[mutant]]
+name = "yard-seal-fence-after-use"
+file = "src/server/yard_keys.cpp"
+find = '      s.last_spill = std::max(s.last_spill, sl.epoch);'
+replace = '      (void)0;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.ConsumedKeysAreNeverRearmed"
+timeout = 300
+why = "the used-seal fence is never raised: another key registers at a spilled epoch"
+
+[[mutant]]
+name = "yard-open-fence-after-use"
+file = "src/server/yard_keys.cpp"
+find = '  s.last_restore = std::max(s.last_restore, sl.epoch);'
+replace = '  (void)0;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.EpochsSurviveARestart"
+timeout = 300
+why = "the used-open fence is not persisted before the restore: a crash lets the open token register again"
+
+[[mutant]]
+name = "yard-stale-lease-consumes"
+file = "src/server/yard_keys.cpp"
+find = '  if (!slot || slot->gen != lease.gen) return;'
+replace = '  if (!slot) return;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.LeasesAreGenerationBound"
+timeout = 300
+why = "a spill that finishes after its key was revoked and replaced consumes the newer registration"
+
+[[mutant]]
+name = "yard-custody-fallback"
+file = "src/server/yard_keys.cpp"
+find = '  if (yard_bound) return *why = "yard-bound entry: a fresh seal registration is needed", false;'
+replace = '  (void)0;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.NoCustodyDowngrade"
+timeout = 300
+why = "a yard-bound entry without a seal registration is sealed under the TPM master (custody downgrade)"
+
+[[mutant]]
+name = "cache-yard-custody-fallback"
+file = "src/server/yard_keys.cpp"
+find = '  if (yard_bound) return *why = "yard-bound entry: a fresh seal registration is needed", false;'
+replace = '  (void)0;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.YardKeysAuthoriseResume"
+why = "as yard-custody-fallback, end to end: a restored yard session is re-spilled under the master"
+
+[[mutant]]
+name = "master-custody"
+file = "src/server/spill_keys.cpp"
+find = '  if (yard_bound) return *why = "a yard-bound entry is never sealed under the master key", false;'
+replace = '  (void)yard_bound;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.NoCustodyDowngrade:SpillKeys.MasterProviderEpochsAndFence"
+timeout = 300
+why = "the master provider seals an entry the cache says is yard-bound"
+
+[[mutant]]
+name = "master-epoch-not-persisted"
+file = "src/server/spill_keys.cpp"
+find = '  if (!epoch_file_.empty() && !WriteFileDurable(epoch_file_, std::to_string(next) + "\n", why)) return false;'
+replace = '  (void)0;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "SpillKeys.MasterProviderEpochsAndFence"
+timeout = 300
+why = "the master epoch is not persisted: a restart goes back to an earlier epoch and its fenced files open again"
+
+[[mutant]]
+name = "jwks-small-modulus"
+file = "src/server/yard_keys.cpp"
+find = 'bits >= 2048 && bits <= 16384'
+replace = 'bits >= 1024 && bits <= 16384'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.JwksKeyChecks"
+timeout = 300
+why = "a 1024-bit RSA signing key is trusted"
+
+[[mutant]]
+name = "jwks-any-exponent"
+file = "src/server/yard_keys.cpp"
+find = 'BN_is_word(be, 65537)'
+replace = 'true'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.JwksKeyChecks"
+timeout = 300
+why = "e = 3 (or 1) is accepted: with e = 1 any signature verifies"
+
+[[mutant]]
+name = "jwks-padded-modulus"
+file = "src/server/yard_keys.cpp"
+find = '    if (n.empty() || n[0] == 0 || e.empty() || e[0] == 0) continue;'
+replace = '    if (n.empty() || e.empty()) continue;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.JwksKeyChecks"
+timeout = 300
+why = "a non-canonical (zero-padded) modulus is accepted"
+
+[[mutant]]
+name = "jwks-duplicate-kid"
+file = "src/server/yard_keys.cpp"
+find = '  if (dup) {'
+replace = '  if (false) {'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.JwksKeyChecks"
+timeout = 300
+why = "a JWKS with two keys under one kid is loaded (the last silently wins)"
+
+[[mutant]]
+name = "jwks-use-unchecked"
+file = "src/server/yard_keys.cpp"
+find = '    if (const auto* u = k.find("use"); u && StrOr(u) != "sig") continue;'
+replace = ''
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.JwksKeyChecks"
+timeout = 300
+why = "an encryption key (use enc) verifies signatures"
+
+[[mutant]]
+name = "jwks-no-refresh"
+file = "src/server/yard_keys.cpp"
+find = '  if (!force && std::equal(sig, sig + 3, jwks_sig_) && now - jwks_loaded_ < std::chrono::seconds(o_.jwks_refresh_s))'
+replace = '  if (!force)'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.JwksRefreshRemovesKeys"
+timeout = 300
+why = "a signing key removed from the JWKS keeps verifying (refresh only on an unknown kid)"
+
+[[mutant]]
+name = "jwks-broken-keeps-old"
+file = "src/server/yard_keys.cpp"
+find = '    jwks_.Clear();'
+replace = '    (void)0;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.JwksRefreshRemovesKeys"
+timeout = 300
+why = "an unreadable or broken JWKS keeps the old key set instead of denying"
+
+[[mutant]]
+name = "jwt-exp-leeway"
+file = "src/server/yard_keys.cpp"
+find = '  if (now >= *exp) return fail(JwtError::kExpired);'
+replace = '  if (now >= *exp + 30) return fail(JwtError::kExpired);'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.TokenRefusals"
+timeout = 300
+why = "a token registers a key after its exp (30 s leeway)"
+
+[[mutant]]
+name = "jwt-claim-types-lax"
+file = "src/server/yard_keys.cpp"
+find = '  if (bad || !iat || !exp) return fail(JwtError::kClaims);'
+replace = '  if (!iat || !exp) return fail(JwtError::kClaims);'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.TokenRefusals"
+timeout = 300
+why = "a non-integer nbf is treated as absent"
+
+[[mutant]]
+name = "jwt-reversed-lifetime"
+file = "src/server/yard_keys.cpp"
+find = '  if (*exp <= *iat || *exp - *iat > c.max_ttl_s)'
+replace = '  if (*exp - *iat > c.max_ttl_s)'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.TokenRefusals"
+timeout = 300
+why = "exp <= iat passes the lifetime check"
+
+[[mutant]]
+name = "jwt-config-optional"
+file = "src/server/yard_keys.cpp"
+find = '  if (c.issuer.empty() || c.audience.empty()) return fail(JwtError::kConfig);'
+replace = '  if (c.issuer.empty()) return fail(JwtError::kConfig);'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.ConfigurationFailsClosed"
+timeout = 300
+why = "the verifier runs with an empty audience"
+
+[[mutant]]
+name = "yard-empty-audience-starts"
+file = "src/server/yard_keys.cpp"
+find = '  if (o.audience.empty()) return *error = "yard keys: --yard-audience must not be empty", nullptr;'
+replace = ''
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.ConfigurationFailsClosed"
+timeout = 300
+why = "halo_serve starts with an empty --yard-audience (the aud binding off)"
+
+[[mutant]]
+name = "jwt-duplicate-claims"
+file = "src/server/yard_keys.cpp"
+find = '{.max_depth = 6, .max_bytes = 8192, .reject_duplicate_keys = true}'
+replace = '{.max_depth = 6, .max_bytes = 8192}'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.TokenRefusals"
+timeout = 300
+why = "a token with a repeated claim is read with the last value winning"
+
+[[mutant]]
+name = "jwt-padding-pss"
+file = "src/server/yard_keys.cpp"
+find = 'RSA_PKCS1_PADDING'
+replace = 'RSA_PKCS1_PSS_PADDING'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.TokenRefusals"
+timeout = 300
+why = "RS256 verified with PSS padding: every genuine token is refused"
+
+[[mutant]]
+name = "b64-standard-alphabet"
+file = "src/server/yard_keys.cpp"
+find = '''  if (c == '-') return 62;'''
+replace = '''  if (c == '-' || c == '+') return 62; if (c == '/') return 63;'''
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.Base64UrlIsStrict"
+timeout = 300
+why = "JWT segments and keys in standard base64 are decoded"
+
+[[mutant]]
+name = "yard-body-not-wiped"
+file = "src/server/yard_keys.cpp"
+find = '    ~Wipe() { Cleanse(b); }'
+replace = '    ~Wipe() {}'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.TokenRefusals"
+timeout = 300
+why = "the request body (key and token) stays in the heap after the registration"
+
+[[mutant]]
+name = "yard-401-reason-leaks"
+file = "src/server/yard_keys.cpp"
+find = '    Answer a = answer(401, "token refused");'
+replace = '    Answer a = answer(401, std::string("token refused: ") + why);'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.TokenRefusals"
+timeout = 300
+why = "the 401 body tells the client which check failed (an oracle)"
+
+[[mutant]]
+name = "secret-fail-open"
+file = "src/core/spill_crypt.cpp"
+find = '''  if (!ok) {
+    (void)::munlock(p, m);'''
+replace = '''  if (false) {
+    (void)::munlock(p, m);'''
+suite = "cpu"
+binary = "crypt_tests"
+filter = "SpillCrypt.SecretBytesFailClosed"
+timeout = 300
+why = "a key buffer that could not be mlocked (or madvised) is handed out: keys may be swapped or dumped"
+
+[[mutant]]
+name = "gcm-open-no-wipe"
+file = "src/core/spill_crypt.cpp"
+find = '  if (!ok && n) OPENSSL_cleanse(buf, n);  // unauthenticated plaintext never survives a failed open'
+replace = ''
+suite = "cpu"
+binary = "crypt_tests"
+filter = "SpillCrypt.FailedOpenWipesAndSealCanWriteElsewhere"
+timeout = 300
+why = "a failed open leaves the (unauthenticated) plaintext in the caller buffer"
+
+[[mutant]]
+name = "spill-checkpoint-unchecked"
+file = "src/engine/session_spill.cpp"
+find = '  if (prot.expect_checkpoint &&'
+replace = '  if (false && prot.expect_checkpoint &&'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Spill.CheckpointIdentityDowngradeAndNoLateWrites"
+why = "an older authentic checkpoint of the same session, key and epoch is restored in place of the recorded one"
+
+[[mutant]]
+name = "spill-v1-for-v2"
+file = "src/engine/session_spill.cpp"
+find = '    if (prot.expect_version == 2)'
+replace = '    if (false)'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Spill.CheckpointIdentityDowngradeAndNoLateWrites"
+why = "with --spill-accept-v1 a plaintext v1 file satisfies a checkpoint written encrypted (integrity downgrade)"
+
+[[mutant]]
+name = "cache-fenced-file-kept"
+file = "src/server/session_cache.cpp"
+find = '      if (!opt_.spill_keys->MayOpen(label, en.key_id)) return ++counters_.restore_failed, Restored::kRefused;'
+replace = '      if (false) return ++counters_.restore_failed, Restored::kRefused;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.SpillKeysRefuseKeepAndShred"
+why = "an entry whose file is of a fenced epoch is kept waiting for a key that can never come (and its file kept on disk)"
 
 # ---- MTP in the server (src/server/decode_loop.cpp, flash_next_generator.cpp; docs/MTP.md) -------------------
 

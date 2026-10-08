@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 
@@ -67,14 +68,13 @@ std::string SessionCache::Label(const Entry& en) const {
 bool SessionCache::SpillEntry(Entry& en, std::string* error) {
   if (opt_.spill_dir.empty()) return *error = "no spill directory configured", false;
   if (en.spilled) return true;
-  // The key first: a provider without a key for this session refuses the spill (never a plaintext fallback);
+  // The key first: a provider without a key for this entry refuses the spill (never a plaintext fallback);
   // with no provider, plaintext only when the operator chose it.
   Engine::SpillProtection prot;
-  core::crypt::Kek kek;
-  const std::string label = Label(en);
+  SpillLease lease;
   if (opt_.spill_keys) {
-    prot.kek = &kek;
-    if (!opt_.spill_keys->Key(label, SpillKeys::Use::kSeal, &kek, error)) {  // no key, no spill: never plaintext
+    prot.kek = &lease.kek;
+    if (!opt_.spill_keys->SealLease(en.key, Label(en), en.yard_bound, &lease, error)) {  // no key, no spill: never plaintext
       ++counters_.spill_failed;
       ++counters_.no_key;
       return false;
@@ -85,18 +85,21 @@ bool SessionCache::SpillEntry(Entry& en, std::string* error) {
   }
   const std::string path = opt_.spill_dir + "/s" + std::to_string(::getpid()) + "-" + std::to_string(en.key) + ".spill";
   const auto prev = e_.BoundSession();
-  if (!e_.BindSession(en.id, error)) return false;
+  if (!e_.BindSession(en.id, error)) {
+    if (opt_.spill_keys) opt_.spill_keys->Finish(lease, SpillKeys::Use::kSeal, false);
+    return false;
+  }
   std::vector<std::uint8_t> blob(en.tokens.size() * 4);
   if (!blob.empty()) std::memcpy(blob.data(), en.tokens.data(), blob.size());
   Engine::SpillInfo info;
   const bool ok = e_.SpillSession(path, prot, blob, &info, error);
   std::string e2;
   (void)e_.BindSession(prev == en.id ? 0 : prev, &e2);
+  if (opt_.spill_keys) opt_.spill_keys->Finish(lease, SpillKeys::Use::kSeal, ok);
   if (!ok) {  // not done: the entry stays resident and unchanged
     ++counters_.spill_failed;
     return false;
   }
-  if (opt_.spill_keys) opt_.spill_keys->Used(label, SpillKeys::Use::kSeal);
   // Done: the file holds the state; the device copy goes (the memory guard sees it at once: DropSession frees the
   // session's ranges, docs/SESSIONS.md section 7).
   (void)Drop(en.id, &e2);
@@ -105,6 +108,13 @@ bool SessionCache::SpillEntry(Entry& en, std::string* error) {
   en.path = path;
   en.file_bytes = info.file_bytes;
   en.key_id = info.key_id;
+  en.version = info.version;
+  en.checkpoint_id = info.checkpoint;
+  if (lease.yard) {  // custody: from now on only yard keys seal or open this entry
+    en.yard_bound = true;
+    en.session = lease.session;
+    en.key_epoch = lease.epoch;
+  }
   ++counters_.spilled;
   return true;
 }
@@ -112,21 +122,34 @@ bool SessionCache::SpillEntry(Entry& en, std::string* error) {
 SessionCache::Restored SessionCache::RestoreEntry(Entry& en, std::string* error) {
   if (!en.spilled) return Restored::kDone;
   Engine::SpillProtection prot;
-  prot.accept_v1 = opt_.spill_accept_v1;
-  core::crypt::Kek kek;
+  prot.expect_version = en.version;
+  prot.expect_checkpoint = en.version == 2 ? &en.checkpoint_id : nullptr;
+  // Plaintext v1 only for an entry this process wrote as v1, and only when the operator allows it.
+  prot.accept_v1 = opt_.spill_accept_v1 && en.version == 1;
+  if (prot.accept_v1)
+    std::fprintf(stderr, "spill: WARNING restoring plaintext v1 file %s (--spill-accept-v1 1)\n", en.path.c_str());
+  SpillLease lease;
   const std::string label = Label(en);
-  if (opt_.spill_keys && !en.key_id.empty()) {
-    if (!opt_.spill_keys->KeyForFile(label, en.key_id, &kek, error)) {
+  const bool keyed = opt_.spill_keys && en.version == 2;
+  if (keyed) {
+    if (!opt_.spill_keys->OpenLease(label, en.key_id, &lease, error)) {
+      // A file the provider can never open again (a fenced master epoch, a revoked or restored yard epoch) is gone
+      // for good; otherwise nothing is touched and the file waits for its key.
+      if (!opt_.spill_keys->MayOpen(label, en.key_id)) return ++counters_.restore_failed, Restored::kRefused;
       ++counters_.no_key;
-      return Restored::kNoKey;  // nothing touched: the file waits for its key
+      return Restored::kNoKey;
     }
-    prot.kek = &kek;
+    prot.kek = &lease.kek;
   }
+  const auto finish = [&](bool ok) {
+    if (keyed) opt_.spill_keys->Finish(lease, SpillKeys::Use::kOpen, ok);
+  };
   const auto prev = e_.BoundSession();
   Engine::SessionId id;
-  if (!e_.NewSession(&id, error)) return ++counters_.restore_failed, Restored::kRefused;
+  if (!e_.NewSession(&id, error)) return finish(false), ++counters_.restore_failed, Restored::kRefused;
   std::string e2;
   const auto give_up = [&] {
+    finish(false);
     (void)e_.BindSession(prev, &e2);
     (void)e_.DropSession(id, &e2);
     ++counters_.restore_failed;
@@ -146,7 +169,7 @@ SessionCache::Restored SessionCache::RestoreEntry(Entry& en, std::string* error)
     *error = "spill file holds other tokens than its entry";
     return give_up();
   }
-  if (opt_.spill_keys && prot.kek) opt_.spill_keys->Used(label, SpillKeys::Use::kOpen);
+  finish(true);
   (void)e_.BindSession(prev, &e2);
   std::error_code ec;
   std::filesystem::remove(en.path, ec);
@@ -155,6 +178,8 @@ SessionCache::Restored SessionCache::RestoreEntry(Entry& en, std::string* error)
   en.path.clear();
   en.file_bytes = 0;
   en.key_id.clear();
+  en.version = 0;
+  en.checkpoint_id = {};
   ++counters_.restored;
   return Restored::kDone;
 }
@@ -179,14 +204,13 @@ std::vector<SessionCache::EntryInfo> SessionCache::List() const {
   std::vector<EntryInfo> out;
   for (const auto& en : entries_)
     out.push_back({en.key, en.tokens.size(), en.checkpoint, en.canonical, en.spilled, en.spilled ? 0 : Bytes(en),
-                   en.file_bytes, en.used, Label(en), en.key_id});
+                   en.file_bytes, en.used, Label(en), en.key_id, en.yard_bound});
   return out;
 }
 
-bool SessionCache::Spill(std::uint64_t key, std::string* error, std::string_view session) {
+bool SessionCache::Spill(std::uint64_t key, std::string* error) {
   for (auto& en : entries_)
     if (en.key == key) {
-      if (!session.empty() && !en.spilled) en.session = std::string(session);
       if (!SpillEntry(en, error)) return false;
       TrimSpilled();
       return true;
@@ -212,10 +236,10 @@ bool SessionCache::Restore(std::uint64_t key, std::string* error, bool* kept) {
   return *error = "no such entry", false;
 }
 
-std::size_t SessionCache::DropSpilledOf(std::string_view session) {
+std::size_t SessionCache::DropRevoked(std::string_view session, std::uint64_t through) {
   std::size_t n = 0;
   for (std::size_t i = 0; i < entries_.size();)
-    if (entries_[i].spilled && entries_[i].session == session) {
+    if (entries_[i].yard_bound && entries_[i].session == session && entries_[i].key_epoch <= through) {
       EraseEntry(i);
       ++n;
     } else {
@@ -228,15 +252,7 @@ std::size_t SessionCache::DropUnreadable() {
   std::size_t n = 0;
   for (std::size_t i = 0; i < entries_.size();) {
     const Entry& en = entries_[i];
-    bool unreadable = false;
-    if (en.spilled && opt_.spill_keys && !en.key_id.empty()) {
-      core::crypt::Kek kek;
-      std::string why;
-      // A provider that has no key now (yard: not registered) may get one later: only a different current id
-      // (rotated master, a later epoch) makes the file unreadable for good.
-      unreadable = opt_.spill_keys->KeyForFile(Label(en), en.key_id, &kek, &why) && kek.id != en.key_id;
-    }
-    if (unreadable) {
+    if (en.spilled && opt_.spill_keys && en.version == 2 && !opt_.spill_keys->MayOpen(Label(en), en.key_id)) {
       EraseEntry(i);
       ++n;
     } else {

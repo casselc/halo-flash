@@ -292,6 +292,7 @@ class Parser {
       SkipWs();
       auto item = ParseValue(depth + 1);
       if (!item) return std::nullopt;
+      if (limits_.reject_duplicate_keys && v.find(key)) return Err("duplicate object key");
       v.set(std::move(key), std::move(*item));
       SkipWs();
       if (i_ < s_.size() && s_[i_] == ',') { ++i_; continue; }

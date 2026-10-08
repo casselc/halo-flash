@@ -3,17 +3,20 @@
 
 // Key providers for encrypted session spill files (format v2, docs/SESSIONS.md section 10).
 //
-// A provider hands the session cache the KEK that seals (or opens) the spill file of one session:
+// A provider hands the session cache a lease on the KEK that seals (or opens) one spill file:
 //   - "tpm":  a 256-bit master key from a TPM2-sealed systemd credential, read once at startup (from
 //             $CREDENTIALS_DIRECTORY when run as a service with LoadCredentialEncrypted=, else by running
-//             `systemd-creds decrypt --user`, which works unprivileged for a user-scoped credential);
+//             /usr/bin/systemd-creds decrypt --user with a scrubbed environment; unprivileged for a user-scoped
+//             credential);
 //   - "file": the master key from a 0600 file (tests, machines without a TPM);
 //   - "none": no provider (spills are refused unless the operator chose plaintext);
-//   - "yard": per-session keys that yard-ctl registers over POST /admin/keys/{session} (yard_keys.hpp).
-// Master providers derive KEK = HKDF-SHA256(master, "halo-spill-v2" || session || epoch); bumping the epoch (Rotate)
-// makes every file sealed before it unreadable (crypto-shredding). Masters live in mlocked SecretBytes, zeroed on
-// exit; nothing here logs key bytes.
+//   - "yard": per-checkpoint keys that yard-ctl registers (yard_keys.hpp).
+// Master providers derive KEK = HKDF-SHA256(master, "halo-spill-v2" || be32(len) || session || be64(epoch)). Moving
+// the master to a new epoch (FenceEpoch) is an access fence, NOT crypto-shredding: the master still derives every
+// old KEK. The epoch is persisted (a 0600 sidecar) and never goes back across restarts. Keys live in mlocked
+// SecretBytes (fail closed), zeroed on exit; nothing here logs key bytes.
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -25,66 +28,100 @@
 
 namespace halo::server {
 
+/// A KEK handed out for one spill or restore. `gen` names the exact registration it came from: Finish consumes
+/// that registration and no newer one.
+struct SpillLease {
+  core::crypt::Kek kek;
+  std::string session;       ///< the label the file is sealed for (yard: the session the registration names)
+  std::uint64_t epoch = 0;   ///< the file epoch in the KEK
+  std::uint64_t gen = 0;     ///< provider-specific registration generation (0: not one-shot)
+  bool yard = false;         ///< a yard key (custody: the entry is yard-bound from now on)
+  std::uint64_t prev_fence = 0;  ///< yard: the used-epoch fence before this lease raised it (Finish restores it)
+};
+
 class SpillKeys {
  public:
   enum class Use : std::uint8_t { kSeal, kOpen };
   virtual ~SpillKeys() = default;
   /// Provider and key name, for logs and GET /admin/sessions (never key bytes).
   [[nodiscard]] virtual std::string Describe() const = 0;
-  /// The KEK for sealing a new file of `session`, or for opening one. False: no key; the caller refuses (a seal
-  /// never falls back to plaintext; an open leaves the file for a later attempt or re-prefills).
-  [[nodiscard]] virtual bool Key(std::string_view session, Use use, core::crypt::Kek* out, std::string* why) = 0;
-  /// The KEK to open an existing file of `session` whose header names `file_key_id` (a provider holding several
-  /// kinds of key picks by the id's prefix). Default: Key(session, kOpen).
-  [[nodiscard]] virtual bool KeyForFile(std::string_view session, std::string_view file_key_id, core::crypt::Kek* out,
-                                        std::string* why) {
-    (void)file_key_id;
-    return Key(session, Use::kOpen, out, why);
-  }
-  /// The file was sealed / opened (done). One-shot providers (yard) forget the session's key here.
-  virtual void Used(std::string_view session, Use use) {
-    (void)session;
+  /// A lease to seal a new file of cache entry `entry` (label `label`). `yard_bound`: the entry is or was sealed
+  /// under a yard key; such an entry is never sealed under a master key again (no custody downgrade). False: no
+  /// key; the caller refuses (never a plaintext fallback).
+  [[nodiscard]] virtual bool SealLease(std::uint64_t entry, std::string_view label, bool yard_bound, SpillLease* out,
+                                       std::string* why) = 0;
+  /// A lease to open the file of `label` whose header names `file_key_id`. False: no key now (the entry waits).
+  [[nodiscard]] virtual bool OpenLease(std::string_view label, std::string_view file_key_id, SpillLease* out,
+                                       std::string* why) = 0;
+  /// The spill / restore under `lease` is done (`ok`): one-shot providers consume exactly that registration; on
+  /// !ok the registration stays as it was (a retry may use it).
+  virtual void Finish(const SpillLease& lease, Use use, bool ok) {
+    (void)lease;
     (void)use;
+    (void)ok;
   }
-  /// Moves to a new key epoch: files sealed before are unreadable from now on. False when not supported.
-  [[nodiscard]] virtual bool Rotate(std::string* why) {
-    if (why) *why = "this spill key provider does not rotate";
+  /// Could `file_key_id` still open? False for a file the provider can never open again (an older master epoch, a
+  /// fenced yard epoch); true when it may (including "not registered yet").
+  [[nodiscard]] virtual bool MayOpen(std::string_view label, std::string_view file_key_id) = 0;
+  /// Master providers: moves to the next epoch (persisted first). Files of older epochs no longer open through
+  /// this process; this is an access fence, not erasure (the master still derives them). False when unsupported.
+  [[nodiscard]] virtual bool FenceEpoch(std::string* why) {
+    if (why) *why = "this spill key provider has no epoch to fence";
     return false;
   }
 };
 
-/// "tpm" / "file": one master key, an epoch (starts at `epoch`, Rotate adds one).
+/// "tpm" / "file": one master key and a persisted epoch.
 class MasterSpillKeys final : public SpillKeys {
  public:
-  MasterSpillKeys(std::string provider, core::crypt::SecretBytes master, std::uint64_t epoch);
+  /// `epoch_file`: where the epoch is kept (0600; created at 1 if absent; a malformed file refuses the start).
+  /// Empty: in memory only (tests).
+  static std::unique_ptr<MasterSpillKeys> Create(std::string provider, core::crypt::SecretBytes master,
+                                                 const std::string& epoch_file, std::string* error);
   [[nodiscard]] std::string Describe() const override;
-  [[nodiscard]] bool Key(std::string_view session, Use use, core::crypt::Kek* out, std::string* why) override;
-  [[nodiscard]] bool Rotate(std::string* why) override;
+  [[nodiscard]] bool SealLease(std::uint64_t entry, std::string_view label, bool yard_bound, SpillLease* out,
+                               std::string* why) override;
+  [[nodiscard]] bool OpenLease(std::string_view label, std::string_view file_key_id, SpillLease* out,
+                               std::string* why) override;
+  [[nodiscard]] bool MayOpen(std::string_view label, std::string_view file_key_id) override;
+  [[nodiscard]] bool FenceEpoch(std::string* why) override;
   [[nodiscard]] std::uint64_t epoch() const { return epoch_.load(); }
-  [[nodiscard]] bool locked() const { return master_.locked(); }
   /// The prefix of every key id: "<provider>:<master name>".
   [[nodiscard]] const std::string& prefix() const { return prefix_; }
+  /// The id this provider gives a file of `label` at the current epoch.
+  [[nodiscard]] std::string IdFor(std::string_view label) const;
 
  private:
-  std::string provider_, prefix_;
+  MasterSpillKeys() = default;
+  bool Derive(std::string_view label, SpillLease* out, std::string* why);
+  std::string provider_, prefix_, epoch_file_;
   core::crypt::SecretBytes master_;
-  std::atomic<std::uint64_t> epoch_;
+  std::atomic<std::uint64_t> epoch_{1};
+  std::mutex mu_;
 };
 
 /// Reads a 32-byte master key: exactly 32 raw bytes, or 64 hex digits (and an optional newline). The file must not
-/// be readable or writable by group or others.
+/// be readable or writable by group or others, and must not be a symlink.
 [[nodiscard]] bool LoadMasterFile(const std::string& path, core::crypt::SecretBytes* out, std::string* error);
 /// The master key from the TPM-sealed credential `name`: $CREDENTIALS_DIRECTORY/<name> when set and present, else
-/// `systemd-creds decrypt --user --name=<name> <cred_path> -` (stdout read straight into SecretBytes).
+/// `<systemd_creds> decrypt --user --name=<name> <cred_path> -` run with a scrubbed environment (stdout read
+/// straight into SecretBytes). `systemd_creds`: an absolute path (empty: kSystemdCreds).
 [[nodiscard]] bool LoadMasterTpm(const std::string& cred_path, const std::string& name, core::crypt::SecretBytes* out,
-                                 std::string* error);
+                                 std::string* error, const std::string& systemd_creds = "");
 /// The default credential path: $XDG_CONFIG_HOME (or $HOME/.config) + "/halo-flash/spill-master.cred".
 [[nodiscard]] std::string DefaultTpmCredentialPath();
 constexpr const char* kSpillCredentialName = "halo-spill-master";
+constexpr const char* kSystemdCreds = "/usr/bin/systemd-creds";
 
-/// `--spill-key` value: "tpm" | "tpm:CRED" | "file:PATH" | "none". "none" yields null (and true).
-[[nodiscard]] bool MakeSpillKeys(const std::string& spec, std::uint64_t epoch, std::unique_ptr<SpillKeys>* out,
-                                 std::string* error);
+/// `--spill-key` value: "tpm" | "tpm:CRED" | "file:PATH" | "none". "none" yields null (and true). `state_dir`: where
+/// the master's epoch sidecar lives (master-<key name>.epoch); empty: in memory (tests).
+[[nodiscard]] bool MakeSpillKeys(const std::string& spec, const std::string& state_dir,
+                                 std::unique_ptr<MasterSpillKeys>* out, std::string* error);
+
+/// Atomic small-file write: temp (0600, O_EXCL) + fsync + rename + fsync of the directory.
+[[nodiscard]] bool WriteFileDurable(const std::string& path, std::string_view bytes, std::string* error);
+/// Parses a decimal unsigned integer exactly (no sign, no junk, no overflow, <= max).
+[[nodiscard]] bool ParseU64(std::string_view s, std::uint64_t max, std::uint64_t* out);
 
 }  // namespace halo::server
 

@@ -334,8 +334,10 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
     // Encrypted spills (v2) under a master provider; admin 4 rotates its epoch (crypto-shredding).
     core::crypt::SecretBytes master(32);
     ASSERT_TRUE(core::crypt::RandomBytes({master.data(), 32}));
-    server::MasterSpillKeys keys("test", std::move(master), 1);
-    exact.spill_keys = &keys;
+    std::string ke;
+    auto keys = server::MasterSpillKeys::Create("test", std::move(master), "", &ke);
+    ASSERT_TRUE(keys) << ke;
+    exact.spill_keys = keys.get();
     exact.max_spilled = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 6}));
     server::FlashNextGenerator a(*ea, std::vector<text::TokenId>{}, kCtx, exact);
     server::FlashNextGenerator b(*eb, std::vector<text::TokenId>{}, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
@@ -409,7 +411,7 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
         if (admin == 4) {  // a new epoch: every spilled entry is unreadable, erased, its file deleted
           std::size_t had = 0;
           for (const auto& en : c.List()) had += en.spilled;
-          EXPECT_TRUE(keys.Rotate(&why));
+          EXPECT_TRUE(keys->FenceEpoch(&why));
           EXPECT_EQ(c.DropUnreadable(), had);
           for (const auto& en : c.List()) EXPECT_FALSE(en.spilled);
           ++rotations;
@@ -444,10 +446,16 @@ struct GateKeys final : server::SpillKeys {
   server::MasterSpillKeys& inner;
   bool seal = true, open = true;
   std::string Describe() const override { return "gate:" + inner.Describe(); }
-  bool Key(std::string_view session, Use use, core::crypt::Kek* out, std::string* why) override {
-    if ((use == Use::kSeal && !seal) || (use == Use::kOpen && !open)) return *why = "key withheld", false;
-    return inner.Key(session, use, out, why);
+  bool SealLease(std::uint64_t entry, std::string_view label, bool bound, server::SpillLease* out,
+                 std::string* why) override {
+    if (!seal) return *why = "key withheld", false;
+    return inner.SealLease(entry, label, bound, out, why);
   }
+  bool OpenLease(std::string_view label, std::string_view id, server::SpillLease* out, std::string* why) override {
+    if (!open) return *why = "key withheld", false;
+    return inner.OpenLease(label, id, out, why);
+  }
+  bool MayOpen(std::string_view label, std::string_view id) override { return inner.MayOpen(label, id); }
 };
 std::size_t FilesIn(const std::string& dir) {
   std::size_t n = 0;
@@ -475,8 +483,9 @@ TEST(SessionCache, SpillKeysRefuseKeepAndShred) {
   ASSERT_TRUE(ea && eb) << e;
   core::crypt::SecretBytes master(32);
   ASSERT_TRUE(core::crypt::RandomBytes({master.data(), 32}));
-  server::MasterSpillKeys master_keys("test", std::move(master), 1);
-  GateKeys gate(master_keys);
+  auto master_keys = server::MasterSpillKeys::Create("test", std::move(master), "", &e);
+  ASSERT_TRUE(master_keys) << e;
+  GateKeys gate(*master_keys);
   std::vector<std::int32_t> prompt(200);
   for (std::size_t i = 0; i < prompt.size(); ++i) prompt[i] = static_cast<std::int32_t>((i * 7919 + 3) % 1000);
   const auto collect = [](std::vector<std::int32_t>* out) {
@@ -541,7 +550,7 @@ TEST(SessionCache, SpillKeysRefuseKeepAndShred) {
         gate.open = true;
         EXPECT_TRUE(c.Restore(key, &why, &kept)) << why;
         EXPECT_TRUE(c.Spill(key, &why)) << why;
-        EXPECT_TRUE(master_keys.Rotate(&why));
+        EXPECT_TRUE(master_keys->FenceEpoch(&why));
         EXPECT_FALSE(c.Restore(key, &why, &kept)) << "a file of the previous epoch restored";
         EXPECT_FALSE(kept);
         EXPECT_EQ(c.List().size(), 0u);
@@ -1295,9 +1304,38 @@ TEST(SessionCache, ReleasedRangesComeBackAndRemapCleanly) {
   for (auto& r : small) dev->ReleaseRange(r);
 }
 
-// Phase B in the cache: a yard session's entry is sealed only under the key yard-ctl registered for it, cannot be
-// restored until yard registers the open key at the next epoch (the entry waits, untouched), restores bit-exact
-// then, needs a new seal registration for the next spill (keys are one-shot), and a revocation erases it.
+namespace {
+// Delegates to the yard provider; when armed, a revoke arrives right after a restore took its open lease (a
+// restore in flight at the revoke).
+struct RevokeDuringRestore final : server::SpillKeys {
+  server::YardSpillKeys& y;
+  const yardtest::Signer& signer;
+  bool armed = false;
+  server::YardSpillKeys::Answer revoke;
+  RevokeDuringRestore(server::YardSpillKeys& yard, const yardtest::Signer& s) : y(yard), signer(s) {}
+  std::string Describe() const override { return y.Describe(); }
+  bool SealLease(std::uint64_t entry, std::string_view label, bool bound, server::SpillLease* out,
+                 std::string* why) override {
+    return y.SealLease(entry, label, bound, out, why);
+  }
+  bool OpenLease(std::string_view label, std::string_view id, server::SpillLease* out, std::string* why) override {
+    const bool ok = y.OpenLease(label, id, out, why);
+    if (ok && armed) {
+      armed = false;
+      revoke = yardtest::Register(y, signer, std::string(label), "revoke", 9, "");
+    }
+    return ok;
+  }
+  void Finish(const server::SpillLease& lease, Use use, bool ok) override { y.Finish(lease, use, ok); }
+  bool MayOpen(std::string_view label, std::string_view id) override { return y.MayOpen(label, id); }
+};
+}  // namespace
+
+// Phase B in the cache: an entry is sealed only under the key yard-ctl registered for that entry (the seal claim
+// names it; there is no ?session=), cannot be restored until yard registers the open key at the next epoch (the
+// entry waits, untouched), restores bit-exact then, needs a new seal registration for the next spill (keys are
+// one-shot) and never falls back to the master once yard-bound (custody); a revocation erases exactly the entries
+// at or below its fence; a restore in flight at a revoke completes and the revoke's cleanup then erases it.
 TEST(SessionCache, YardKeysAuthoriseResume) {
   auto m = OpenSmall();
   if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
@@ -1308,12 +1346,19 @@ TEST(SessionCache, YardKeysAuthoriseResume) {
   std::filesystem::create_directories(dir);
   yardtest::Signer signer("kid-a");
   yardtest::WriteFile(dir + "/jwks.json", yardtest::JwksJson({&signer}));
+  std::string e;
+  core::crypt::SecretBytes mk(32);
+  ASSERT_TRUE(core::crypt::RandomBytes({mk.data(), 32}));
+  auto master = server::MasterSpillKeys::Create("test", std::move(mk), "", &e);
+  ASSERT_TRUE(master) << e;
   server::YardSpillKeys::Options yo;
   yo.jwks_path = dir + "/jwks.json";
   yo.issuer = "https://id.example.org/yard";
-  server::YardSpillKeys yard(yo);
-  std::string e;
-  ASSERT_TRUE(yard.LoadJwks(&e)) << e;
+  yo.fallback = master.get();  // --spill-yard-fallback master: still never for a yard-bound entry
+  yo.state_path = dir + "/yard-state";
+  auto yard = server::YardSpillKeys::Create(yo, &e);
+  ASSERT_TRUE(yard) << e;
+  RevokeDuringRestore keys(*yard, signer);
   constexpr std::uint32_t kCtx = 1024;
   auto ea = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
   auto eb = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
@@ -1330,32 +1375,45 @@ TEST(SessionCache, YardKeysAuthoriseResume) {
   ASSERT_TRUE(cold.GenerateIds(prompt, 190, p, collect(&want)).error.empty());
   server::SessionCacheOptions o{.mode = server::SessionCacheOptions::Mode::kExact, .align = 64, .max_retained = 4};
   o.spill_dir = dir + "/spill";
-  o.spill_keys = &yard;
+  o.spill_keys = &keys;
   server::FlashNextGenerator g(*ea, std::vector<text::TokenId>{}, kCtx, o);
   std::vector<std::int32_t> got;
   ASSERT_TRUE(g.GenerateIds(prompt, 190, p, collect(&got)).error.empty());
   ASSERT_EQ(got, want);
-  const std::string k1 = yardtest::Key32(1), k2 = yardtest::Key32(2);
+  const std::string k1 = yardtest::Key32(1), k2 = yardtest::Key32(2), k3 = yardtest::Key32(3);
   g.WithCache([&](server::SessionCache& c) {
     const auto key = c.List().front().key;
+    const auto entry = static_cast<std::int64_t>(key);
     std::string why;
     bool kept = false;
-    EXPECT_FALSE(c.Spill(key, &why, "sess-1")) << "spilled without a registered key";
-    EXPECT_EQ(FilesIn(o.spill_dir), 0u);
-    EXPECT_EQ(yardtest::Register(yard, signer, "sess-1", "seal", 3, k1).status, 200);
-    EXPECT_TRUE(c.Spill(key, &why, "sess-1")) << why;
+    // A seal registration for another entry does not seal this one.
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "seal", 3, k1, entry + 100).status, 200);
+    EXPECT_TRUE(c.Spill(key, &why)) << why;  // never yard-bound: the master fallback seals it
+    EXPECT_EQ(c.List().front().key_id.rfind("test:", 0), 0u) << c.List().front().key_id;
+    EXPECT_TRUE(c.Restore(key, &why)) << why;
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "seal", 4, k1, entry).status, 200);
+    EXPECT_TRUE(c.Spill(key, &why)) << why;
     EXPECT_EQ(c.List().front().key_id.rfind("yard:", 0), 0u) << c.List().front().key_id;
     EXPECT_EQ(c.List().front().session, "sess-1");
+    EXPECT_TRUE(c.List().front().yard_bound);
     EXPECT_FALSE(c.Restore(key, &why, &kept));
     EXPECT_TRUE(kept) << "an entry waiting for yard's open key was dropped: " << why;
-    EXPECT_EQ(yardtest::Register(yard, signer, "sess-1", "open", 3, k1).status, 409) << "open before the commit";
-    EXPECT_EQ(yardtest::Register(yard, signer, "sess-1", "open", 4, k1).status, 200);
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "open", 4, k1).status, 409) << "open before the commit";
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "open", 5, k1).status, 200);
     EXPECT_TRUE(c.Restore(key, &why, &kept)) << why;
-    EXPECT_FALSE(c.Spill(key, &why, "sess-1")) << "a used seal key sealed a second file";
-    EXPECT_EQ(yardtest::Register(yard, signer, "sess-1", "seal", 4, k2).status, 200);
-    EXPECT_TRUE(c.Spill(key, &why, "sess-1")) << why;
-    EXPECT_EQ(yardtest::Register(yard, signer, "sess-1", "revoke", 5, "").status, 200);
-    for (const auto& s : yard.TakeRevoked()) EXPECT_EQ(c.DropSpilledOf(s), 1u);
+    // Custody: no seal registration now; the master fallback must not take a yard-bound entry.
+    EXPECT_FALSE(c.Spill(key, &why)) << "a yard-bound entry was sealed under the master (custody downgrade)";
+    EXPECT_EQ(FilesIn(o.spill_dir), 0u);
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "seal", 5, k2, entry).status, 200);
+    EXPECT_TRUE(c.Spill(key, &why)) << why;
+    // A restore in flight when a revoke (through 5) lands: it completes with the key it holds; the revoke's
+    // cleanup, which the route runs under the generation lock after it, erases the restored entry.
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "open", 6, k2).status, 200);
+    keys.armed = true;
+    EXPECT_TRUE(c.Restore(key, &why, &kept)) << why;
+    EXPECT_EQ(keys.revoke.status, 200) << keys.revoke.body;
+    EXPECT_EQ(keys.revoke.revoked_through, 9u);
+    EXPECT_EQ(c.DropRevoked(keys.revoke.revoked_session, keys.revoke.revoked_through), 1u);
     EXPECT_EQ(c.List().size(), 0u);
     EXPECT_EQ(FilesIn(o.spill_dir), 0u);
     return true;
@@ -1369,5 +1427,15 @@ TEST(SessionCache, YardKeysAuthoriseResume) {
   }
   EXPECT_EQ(got, want);
   EXPECT_EQ(reused, 0u) << "a revoked entry was reused";
+  // The revoke's fence: a newer checkpoint (sealed at 10 > 9) survives a delayed cleanup of the old revoke.
+  g.WithCache([&](server::SessionCache& c) {
+    const auto key = c.List().front().key;
+    std::string why;
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "seal", 10, k3, static_cast<std::int64_t>(key)).status, 200);
+    EXPECT_TRUE(c.Spill(key, &why)) << why;
+    EXPECT_EQ(c.DropRevoked("sess-1", 9), 0u) << "a delayed revoke cleanup erased a newer checkpoint";
+    EXPECT_TRUE(c.List().front().spilled);
+    return true;
+  });
   std::filesystem::remove_all(dir);
 }

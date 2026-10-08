@@ -75,32 +75,68 @@ TEST(SpillKeys, MasterFileFormatsAndPermissions) {
   std::filesystem::remove_all(dir);
 }
 
-// Epochs: the same session at the same epoch gets the same KEK (a file can be opened); Rotate changes every
-// session's key and id (files sealed before are unreadable: crypto-shredding); sessions never share a key.
-TEST(SpillKeys, MasterProviderEpochsAndRotation) {
-  sc::SecretBytes m(32);
-  ASSERT_TRUE(sc::RandomBytes({m.data(), 32}));
-  MasterSpillKeys k("file", std::move(m), 5);
+// Epochs: the same label at the same epoch gets the same KEK (a file can be opened); FenceEpoch moves every label
+// to new keys and ids (files sealed before no longer open here: an access fence; the master still derives them).
+// The epoch is persisted in a 0600 sidecar and never goes back across a restart; a malformed sidecar refuses the
+// start. A yard-bound entry is never sealed under the master.
+TEST(SpillKeys, MasterProviderEpochsAndFence) {
+  const auto dir = TempDir("epoch");
+  const std::string ef = dir + "/master.epoch";
+  const auto master = [] {
+    sc::SecretBytes m(32);
+    for (int i = 0; i < 32; ++i) m.data()[i] = static_cast<std::uint8_t>(i * 3);
+    return m;
+  };
   std::string e;
-  sc::Kek s1, s1b, s2, s1r;
-  ASSERT_TRUE(k.Key("a", SpillKeys::Use::kSeal, &s1, &e)) << e;
-  ASSERT_TRUE(k.Key("a", SpillKeys::Use::kOpen, &s1b, &e)) << e;
-  ASSERT_TRUE(k.Key("b", SpillKeys::Use::kSeal, &s2, &e)) << e;
-  EXPECT_TRUE(sc::Equal(s1.key.span(), s1b.key.span()));
-  EXPECT_EQ(s1.id, s1b.id);
-  EXPECT_FALSE(sc::Equal(s1.key.span(), s2.key.span()));
-  EXPECT_EQ(s1.id, k.prefix() + ":e5:a");
-  EXPECT_EQ(k.prefix().rfind("file:", 0), 0u);
-  ASSERT_TRUE(k.Rotate(&e));
-  EXPECT_EQ(k.epoch(), 6u);
-  ASSERT_TRUE(k.Key("a", SpillKeys::Use::kOpen, &s1r, &e)) << e;
-  EXPECT_FALSE(sc::Equal(s1.key.span(), s1r.key.span()));
-  EXPECT_NE(s1.id, s1r.id);
-  EXPECT_EQ(k.Describe().find(kHex), std::string::npos);
+  auto k = MasterSpillKeys::Create("file", master(), ef, &e);
+  ASSERT_TRUE(k) << e;
+  EXPECT_EQ(k->epoch(), 1u);
+  struct stat st {};
+  ASSERT_EQ(::stat(ef.c_str(), &st), 0);
+  EXPECT_EQ(st.st_mode & 0777, 0600u);
+  halo::server::SpillLease s1, s1b, s2, s1r;
+  ASSERT_TRUE(k->SealLease(1, "a", false, &s1, &e)) << e;
+  ASSERT_TRUE(k->OpenLease("a", s1.kek.id, &s1b, &e)) << e;
+  ASSERT_TRUE(k->SealLease(2, "b", false, &s2, &e)) << e;
+  EXPECT_TRUE(sc::Equal(s1.kek.key.span(), s1b.kek.key.span()));
+  EXPECT_FALSE(sc::Equal(s1.kek.key.span(), s2.kek.key.span()));
+  EXPECT_EQ(s1.kek.id, k->prefix() + ":e1:a");
+  EXPECT_EQ(k->prefix().rfind("file:", 0), 0u);
+  EXPECT_FALSE(k->SealLease(1, "sess-1", true, &s1r, &e)) << "a yard-bound entry sealed under the master";
+  ASSERT_TRUE(k->FenceEpoch(&e)) << e;
+  ASSERT_TRUE(k->FenceEpoch(&e)) << e;
+  EXPECT_EQ(k->epoch(), 3u);
+  EXPECT_FALSE(k->MayOpen("a", s1.kek.id));
+  EXPECT_FALSE(k->OpenLease("a", s1.kek.id, &s1r, &e)) << "a fenced epoch's file opened";
+  ASSERT_TRUE(k->SealLease(1, "a", false, &s1r, &e)) << e;
+  EXPECT_FALSE(sc::Equal(s1.kek.key.span(), s1r.kek.key.span()));
+  EXPECT_NE(s1.kek.id, s1r.kek.id);
+  EXPECT_EQ(k->Describe().find(kHex), std::string::npos);
+  // A restart continues at the persisted epoch (never back to 1).
+  k.reset();
+  k = MasterSpillKeys::Create("file", master(), ef, &e);
+  ASSERT_TRUE(k) << e;
+  EXPECT_EQ(k->epoch(), 3u) << "the epoch went back across a restart";
+  EXPECT_FALSE(k->MayOpen("a", s1.kek.id));
+  k.reset();
+  Write(ef, "zero\n", 0600);
+  EXPECT_FALSE(MasterSpillKeys::Create("file", master(), ef, &e)) << "a malformed epoch file was accepted";
+  Write(ef, "0\n", 0600);
+  EXPECT_FALSE(MasterSpillKeys::Create("file", master(), ef, &e));
+  // MakeSpillKeys keeps the sidecar per master (by key name) in the state directory.
+  Write(dir + "/k", kHex, 0600);
+  std::unique_ptr<MasterSpillKeys> m2;
+  ASSERT_TRUE(halo::server::MakeSpillKeys("file:" + dir + "/k", dir, &m2, &e)) << e;
+  ASSERT_TRUE(m2->FenceEpoch(&e));
+  m2.reset();
+  ASSERT_TRUE(halo::server::MakeSpillKeys("file:" + dir + "/k", dir, &m2, &e)) << e;
+  EXPECT_EQ(m2->epoch(), 2u);
+  std::filesystem::remove_all(dir);
 }
 
-// The TPM path: $CREDENTIALS_DIRECTORY first (a systemd service), else `systemd-creds decrypt --user` (here a
-// stand-in on PATH that checks its arguments); a failing decrypt is an error, never a zero key.
+// The TPM path: $CREDENTIALS_DIRECTORY first (a systemd service), else `systemd-creds decrypt --user` by absolute
+// path with a scrubbed environment (here a stand-in that checks its arguments and its environment); a relative
+// path is refused; a failing decrypt is an error, never a zero key.
 TEST(SpillKeys, TpmCredentialFromServiceDirectoryOrSystemdCreds) {
   const auto dir = TempDir("tpm");
   std::string e;
@@ -117,21 +153,25 @@ TEST(SpillKeys, TpmCredentialFromServiceDirectoryOrSystemdCreds) {
         "[ \"$1 $2 $3 $4\" = \"decrypt --user --name=halo-spill-master " + dir + "/m.cred\" ] || exit 3\n"
         "[ \"$5\" = - ] || exit 4\n"
         "[ -f \"$4\" ] || exit 5\n"
+        "[ \"$PATH\" = /usr/bin:/bin ] || exit 6\n"
+        "[ -z \"$HALO_LEAK\" ] || exit 7\n"
         "printf '" + kHex + "\\n'\n",
         0700);
   Env path("PATH", bin + ":" + std::string(std::getenv("PATH") ? std::getenv("PATH") : ""));
+  Env leak("HALO_LEAK", "1");
   Env cd("CREDENTIALS_DIRECTORY", "");
   Write(dir + "/m.cred", "ciphertext", 0600);
-  ASSERT_TRUE(halo::server::LoadMasterTpm(dir + "/m.cred", halo::server::kSpillCredentialName, &b, &e)) << e;
+  const std::string creds = bin + "/systemd-creds";
+  ASSERT_TRUE(halo::server::LoadMasterTpm(dir + "/m.cred", halo::server::kSpillCredentialName, &b, &e, creds)) << e;
   EXPECT_TRUE(sc::Equal(a.span(), b.span()));
-  EXPECT_FALSE(halo::server::LoadMasterTpm(dir + "/other.cred", halo::server::kSpillCredentialName, &b, &e));
+  EXPECT_FALSE(halo::server::LoadMasterTpm(dir + "/other.cred", halo::server::kSpillCredentialName, &b, &e, creds));
   EXPECT_NE(e.find("failed"), std::string::npos) << e;
-  std::unique_ptr<SpillKeys> keys;
-  ASSERT_TRUE(halo::server::MakeSpillKeys("tpm:" + dir + "/m.cred", 1, &keys, &e)) << e;
-  EXPECT_EQ(keys->Describe().rfind("tpm:", 0), 0u);
-  ASSERT_TRUE(halo::server::MakeSpillKeys("none", 1, &keys, &e));
+  EXPECT_FALSE(halo::server::LoadMasterTpm(dir + "/m.cred", halo::server::kSpillCredentialName, &b, &e, "systemd-creds"))
+      << "a PATH-searched systemd-creds was run";
+  std::unique_ptr<MasterSpillKeys> keys;
+  ASSERT_TRUE(halo::server::MakeSpillKeys("none", "", &keys, &e));
   EXPECT_FALSE(keys);
-  EXPECT_FALSE(halo::server::MakeSpillKeys("tmp", 1, &keys, &e));
+  EXPECT_FALSE(halo::server::MakeSpillKeys("tmp", "", &keys, &e));
   std::filesystem::remove_all(dir);
 }
 

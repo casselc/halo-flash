@@ -101,7 +101,8 @@ struct SpillHeaderV2 {
   std::uint32_t reserved0;
   char key_id[crypt::kKeyIdBytes];  // the KEK's id (printable): provider, master name, epoch, session
   std::uint8_t wrap_nonce[crypt::kNonceBytes];
-  std::uint8_t reserved[204];  // zero (authenticated)
+  std::uint8_t checkpoint[crypt::kCheckpointBytes];  // random per file: which checkpoint (the caller keeps it)
+  std::uint8_t reserved[188];  // zero (authenticated)
   // ---- end of the AAD (crypt::kAadBytes) ----
   std::uint8_t wrapped_dek[crypt::kKeyBytes];
   std::uint8_t wrap_tag[crypt::kTagBytes];
@@ -110,6 +111,7 @@ struct SpillHeaderV2 {
 static_assert(sizeof(SpillHeaderV2) == crypt::kHeaderBytes);
 static_assert(offsetof(SpillHeaderV2, position) == 40 && offsetof(SpillHeaderV2, model_fp) == 16);
 static_assert(offsetof(SpillHeaderV2, wrap_nonce) == crypt::kWrapNonceOff);
+static_assert(offsetof(SpillHeaderV2, checkpoint) == crypt::kCheckpointOff);
 static_assert(offsetof(SpillHeaderV2, wrapped_dek) == crypt::kWrappedDekOff && crypt::kWrappedDekOff == crypt::kAadBytes);
 static_assert(offsetof(SpillHeaderV2, wrap_tag) == crypt::kWrapTagOff);
 static_assert(offsetof(SpillHeaderV2, meta_tag) == crypt::kMetaTagOff);
@@ -198,6 +200,7 @@ struct Meta {
   std::vector<std::uint8_t> blob;
   // v2
   std::uint8_t salt[crypt::kSaltBytes] = {};
+  std::uint8_t checkpoint[crypt::kCheckpointBytes] = {};
   std::string key_id;
   alignas(8) std::uint8_t raw[crypt::kHeaderBytes] = {};  // the header as read (its first kAadBytes: the AAD)
 };
@@ -316,6 +319,7 @@ void FillV2(const Meta& m, SpillHeaderV2* h) {
   h->meta_bytes = f.meta_bytes;
   h->piece_bytes = f.piece_bytes;
   std::memcpy(h->salt, m.salt, sizeof(h->salt));
+  std::memcpy(h->checkpoint, m.checkpoint, sizeof(h->checkpoint));
   h->key_id_bytes = static_cast<std::uint32_t>(m.key_id.size());
   std::memcpy(h->key_id, m.key_id.data(), m.key_id.size());
 }
@@ -355,6 +359,8 @@ bool Decode(int fd, std::uint64_t file_size, const FlashNextGpu::SpillProtection
   std::uint32_t version = 0;
   if (!PreadAll(fd, magic, 8, 0) || !PreadAll(fd, &version, 4, 8)) return Fail(error, "spill file: cannot read the header");
   if (std::memcmp(magic, kMagic1, 8) == 0) {
+    if (prot.expect_version == 2)
+      return Fail(error, "spill file is plaintext v1 but this checkpoint was written encrypted (v2): refused");
     if (!prot.accept_v1)
       return Fail(error, "spill file is plaintext format v1: refused (--spill-accept-v1 0)");
     SpillHeader h;
@@ -382,6 +388,7 @@ bool Decode(int fd, std::uint64_t file_size, const FlashNextGpu::SpillProtection
   if (h.key_id_bytes > crypt::kKeyIdBytes) return Fail(error, "spill file key id invalid");
   m->key_id.assign(h.key_id, h.key_id_bytes);
   std::memcpy(m->salt, h.salt, sizeof(m->salt));
+  std::memcpy(m->checkpoint, h.checkpoint, sizeof(m->checkpoint));
   if (!CheckSizes(m->f, file_size, error)) return false;
   // The key: the file names its KEK; another id is refused before any decryption is tried (wrong session, epoch,
   // provider or master). The unwrap then authenticates the whole header (its AAD) under that KEK.
@@ -390,6 +397,10 @@ bool Decode(int fd, std::uint64_t file_size, const FlashNextGpu::SpillProtection
     return Fail(error, "spill file is sealed under key id " + m->key_id + ", not " + prot.kek->id);
   if (!crypt::UnwrapDek(*prot.kek, std::span<const std::uint8_t, crypt::kHeaderBytes>(raw, crypt::kHeaderBytes), dek))
     return Fail(error, "spill file: the data key does not unwrap (wrong key, or the header was changed)");
+  // Authentic from here. Which checkpoint: an older authentic file of the same session and key is refused.
+  if (prot.expect_checkpoint &&
+      !crypt::Equal(*prot.expect_checkpoint, std::span<const std::uint8_t>(m->checkpoint, crypt::kCheckpointBytes)))
+    return Fail(error, "spill file is another checkpoint than the one recorded for this entry");
   std::vector<std::uint8_t> meta(m->f.meta_bytes);
   if (!PreadAll(fd, meta.data(), meta.size(), crypt::kHeaderBytes)) return Fail(error, "spill file: cannot read meta");
   crypt::Gcm gcm;
@@ -553,7 +564,11 @@ bool FlashNextGpu::SpillSession(const std::string& path, const SpillProtection& 
   m.f.mtp_blocks = mtp ? mtp_attn_.blocks : 0;
   for (const auto& s : attn_) m.blocks.push_back(s.blocks);
   m.ngram.assign(ngram_history_.prev.begin(), ngram_history_.prev.end());
+  // The format caps header + meta at 64 MB (the reader refuses more): every size is checked against it before it is
+  // narrowed to a 32-bit field.
+  if (m.ngram.size() > (16u << 20)) return Fail(error, "spill: n-gram history larger than the format allows");
   m.f.ngram_n = static_cast<std::uint32_t>(m.ngram.size());
+  if (blob.size() > (32u << 20)) return Fail(error, "spill: blob larger than 32 MB");
   m.blob.assign(blob.begin(), blob.end());
   m.f.blob_bytes = static_cast<std::uint32_t>(m.blob.size());
   const auto sections = SpillLayout(position_, m.blocks, mtp, m.f.mtp_pos, m.f.mtp_blocks);
@@ -563,6 +578,7 @@ bool FlashNextGpu::SpillSession(const std::string& path, const SpillProtection& 
   m.tasks = Tasks(sizes, 0, kPiece);
   if (m.tasks.size() >= crypt::kMetaIndex) return Fail(error, "spill: too many pieces");
   m.f.n_tasks = static_cast<std::uint32_t>(m.tasks.size());
+  if (MetaBytes(m) + HeadBytes(m.f.version) > (64u << 20)) return Fail(error, "spill: meta larger than the 64 MB cap");
   m.f.meta_bytes = static_cast<std::uint32_t>(MetaBytes(m));
   const std::size_t header_bytes = AlignUp(HeadBytes(m.f.version) + m.f.meta_bytes);
   m.f.header_bytes = static_cast<std::uint32_t>(header_bytes);
@@ -585,8 +601,9 @@ bool FlashNextGpu::SpillSession(const std::string& path, const SpillProtection& 
   const std::span<std::uint8_t, crypt::kHeaderBytes> head2s(head2, crypt::kHeaderBytes);
   if (v2) {
     dek = crypt::SecretBytes(crypt::kKeyBytes);
-    if (!dek.ok() || !crypt::RandomBytes({dek.data(), crypt::kKeyBytes}) || !crypt::RandomBytes(m.salt))
-      return Fail(error, "spill: cannot draw a data key");
+    if (!dek.ok() || !crypt::RandomBytes({dek.data(), crypt::kKeyBytes}) || !crypt::RandomBytes(m.salt) ||
+        !crypt::RandomBytes(m.checkpoint))
+      return Fail(error, "spill: cannot draw a data key (secure memory or RNG)");
     m.key_id = prot.kek->id;
     SpillHeaderV2 h;
     FillV2(m, &h);
@@ -635,7 +652,10 @@ bool FlashNextGpu::SpillSession(const std::string& path, const SpillProtection& 
         return true;
       },
       error);
-  if (!ok) return abandon(error ? *error : "spill failed");
+  if (!ok) {
+    if (v2) crypt::Wipe(head2, sizeof(head2));
+    return abandon(error ? *error : "spill failed");
+  }
   if (spill_fault_ == 1) {  // simulated crash mid-write: the temp file stays, nothing renamed
     ::close(fd);
     return Fail(error, "injected fault: crash mid-write");
@@ -675,6 +695,7 @@ bool FlashNextGpu::SpillSession(const std::string& path, const SpillProtection& 
     info->mtp = mtp;
     info->version = m.f.version;
     info->key_id = m.key_id;
+    std::memcpy(info->checkpoint.data(), m.checkpoint, crypt::kCheckpointBytes);
     info->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   }
   return true;
@@ -705,6 +726,7 @@ bool FlashNextGpu::SpillPeek(const std::string& path, const SpillProtection& pro
     info->mtp = m.f.mtp != 0;
     info->version = m.f.version;
     info->key_id = m.key_id;
+    std::memcpy(info->checkpoint.data(), m.checkpoint, crypt::kCheckpointBytes);
   }
   return true;
 }
@@ -758,6 +780,9 @@ bool FlashNextGpu::RestoreSession(const std::string& path, const SpillProtection
   // From here the session is written: any failure resets it to empty.
   const auto fail_reset = [&](std::string why) {
     std::string e2;
+    // Every worker has joined (RunPool); the device finishes what they queued before the state is reset, so no
+    // write of this restore lands after it returns.
+    (void)dev_.Synchronize(&e2);
     (void)Reset(&e2);
     if (reset) *reset = true;
     return Fail(error, std::move(why));
@@ -797,7 +822,9 @@ bool FlashNextGpu::RestoreSession(const std::string& path, const SpillProtection
         std::size_t first = t;
         while (first > 0 && m.tasks[first - 1].section == k.section) --first;
         std::lock_guard<std::mutex> lk(dev_mu);
-        return dev_.Upload(sections[k.section].view, (t - first) * kPiece, buf, k.bytes, e);
+        if (!dev_.Upload(sections[k.section].view, (t - first) * kPiece, buf, k.bytes, e)) return false;
+        spill_uploads_.fetch_add(1, std::memory_order_relaxed);
+        return true;
       },
       error);
   if (!ok) return fail_reset(error ? *error : "restore failed");
@@ -816,6 +843,7 @@ bool FlashNextGpu::RestoreSession(const std::string& path, const SpillProtection
     info->mtp = take_mtp;
     info->version = h.version;
     info->key_id = m.key_id;
+    std::memcpy(info->checkpoint.data(), m.checkpoint, crypt::kCheckpointBytes);
     info->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   }
   return true;

@@ -10,6 +10,9 @@
 
 #include <unistd.h>
 
+#include <chrono>
+#include <thread>
+
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -101,7 +104,9 @@ const sc::SecretBytes& TestMaster() {
 sc::Kek MakeKek(std::string_view session, std::uint64_t epoch, const sc::SecretBytes& master = TestMaster()) {
   sc::Kek k;
   std::string e;
-  if (!sc::DeriveKek(master.span(), session, epoch, "test:" + sc::KeyName(master.span()), &k, &e)) std::abort();
+  std::string name;
+  if (!sc::KeyName(master.span(), &name) || !sc::DeriveKek(master.span(), session, epoch, "test:" + name, &k, &e))
+    std::abort();
   return k;
 }
 const sc::Kek& TestKek() {
@@ -861,4 +866,80 @@ TEST(MtpSpec, SpillRestoreKeepsDraftHistoryOnRealModel) {
                 si.file_bytes / 1e6, si.ms, ri.ms, da, aa);
   }
   std::filesystem::remove(file);
+}
+
+// Checkpoint identity and downgrade: two authentic files of the same session, key and epoch (an older checkpoint
+// and a newer one) are told apart by the random checkpoint id the caller recorded, and the older one is refused
+// before the session is touched; a v1 file never satisfies a checkpoint recorded as v2, even with accept_v1. And a
+// restore whose late piece fails returns only after every worker joined and the device finished: no restore write
+// lands after it returns (the session is reset).
+TEST(Spill, CheckpointIdentityDowngradeAndNoLateWrites) {
+  Small* s = LoadSmall();
+  if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  std::string error;
+  auto dev = rt::Device::Create(rt::Backend::kHip, &error);
+  if (!dev) GTEST_SKIP() << "no HIP device";
+  Statics guard;
+  E::spill_piece_bytes_ = 64u << 10;  // many pieces: the four workers interleave
+  E::spill_threads_ = 4;
+  const std::size_t V = s->weights->config.vocab_size;
+  constexpr std::uint32_t kMaxContext = 512;
+  const std::string fa = SpillDir() + "/ck_a.spill", fb = SpillDir() + "/ck_b.spill", f1 = SpillDir() + "/ck_v1.spill",
+                    fbad = SpillDir() + "/ck_bad.spill";
+  auto gpu = E::Create(*dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+  auto oracle = E::Create(*dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+  ASSERT_TRUE(gpu && oracle) << error;
+  std::vector<std::int32_t> a(300), b(40);
+  for (std::size_t i = 0; i < a.size(); ++i) a[i] = static_cast<std::int32_t>((i * 7919) % V);
+  for (std::size_t i = 0; i < b.size(); ++i) b[i] = static_cast<std::int32_t>((i * 104729 + 5) % V);
+  std::vector<float> got(V), want(V);
+  ASSERT_TRUE(gpu->Prefill(a, {}, &error)) << error;
+  E::SpillInfo ia, ib;
+  ASSERT_TRUE(gpu->SpillSession(fa, Prot(), {}, &ia, &error)) << error;
+  ASSERT_TRUE(gpu->Step(17, got, &error)) << error;
+  ASSERT_TRUE(gpu->SpillSession(fb, Prot(), {}, &ib, &error)) << error;
+  ASSERT_TRUE(gpu->SpillSession(f1, Prot1(), {}, nullptr, &error)) << error;
+  ASSERT_EQ(ia.key_id, ib.key_id);
+  ASSERT_NE(ia.checkpoint, ib.checkpoint) << "two files share a checkpoint id";
+  ASSERT_TRUE(gpu->Reset(&error) && gpu->Prefill(b, {}, &error) && oracle->Prefill(b, {}, &error)) << error;
+  int step = 0;
+  const auto unchanged = [&](const std::string& what) {
+    ASSERT_EQ(gpu->Position(), b.size() + step) << what;
+    const std::int32_t t = 11 + step++;
+    ASSERT_TRUE(gpu->Step(t, got, &error) && oracle->Step(t, want, &error)) << error;
+    ASSERT_EQ(std::memcmp(got.data(), want.data(), V * 4), 0) << what << ": the refused restore changed the session";
+  };
+  E::SpillProtection pa = Prot();
+  pa.expect_version = 2;
+  pa.expect_checkpoint = &ia.checkpoint;
+  bool reset = false;
+  EXPECT_FALSE(gpu->RestoreSession(fb, pa, nullptr, nullptr, &error, &reset)) << "another checkpoint restored";
+  EXPECT_NE(error.find("another checkpoint"), std::string::npos) << error;
+  EXPECT_FALSE(reset);
+  unchanged("another checkpoint");
+  E::SpillProtection p1 = Prot();
+  p1.accept_v1 = true;
+  p1.expect_version = 2;
+  EXPECT_FALSE(gpu->RestoreSession(f1, p1, nullptr, nullptr, &error, &reset)) << "a v1 file satisfied a v2 checkpoint";
+  EXPECT_NE(error.find("v1"), std::string::npos) << error;
+  unchanged("v1 for v2");
+  // The right checkpoint restores (and continues exactly like the uninterrupted state at that point).
+  ASSERT_TRUE(gpu->RestoreSession(fa, pa, nullptr, nullptr, &error, &reset)) << error;
+  EXPECT_EQ(gpu->Position(), a.size());
+  // A late piece fails: damage every 4 KB of the payload's last quarter (some byte lands in a piece's data).
+  auto bytes = ReadFile(fa);
+  for (std::size_t at = bytes.size() * 3 / 4; at < bytes.size(); at += 4096) bytes[at] ^= 0x55;
+  WriteFile(fbad, bytes);
+  const auto before = E::spill_uploads_.load();
+  reset = false;
+  EXPECT_FALSE(gpu->RestoreSession(fbad, pa, nullptr, nullptr, &error, &reset));
+  EXPECT_NE(error.find("authentication"), std::string::npos) << error;
+  EXPECT_TRUE(reset);
+  const auto after = E::spill_uploads_.load();
+  EXPECT_GT(after, before) << "no piece was uploaded before the failure: the race is not exercised";
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_EQ(E::spill_uploads_.load(), after) << "a restore worker uploaded after RestoreSession returned";
+  EXPECT_EQ(gpu->Position(), 0u);
+  ASSERT_TRUE(gpu->Prefill(b, {}, &error)) << error;  // the reset session works
+  for (const auto* f : {&fa, &fb, &f1, &fbad}) std::filesystem::remove(*f);
 }

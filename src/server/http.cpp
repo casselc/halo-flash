@@ -7,6 +7,8 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -17,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <string.h>
 #include <list>
 
 #include "core/json.hpp"
@@ -171,6 +174,9 @@ HttpParser::Status HttpParser::Next(HttpRequest* out) {
   r.body = buf_.substr(end + 4, length);
   const std::string* conn = r.Header("connection");
   r.keep_alive = http10 ? (conn && HasToken(*conn, "keep-alive")) : !(conn && HasToken(*conn, "close"));
+  // The consumed bytes are overwritten before they are dropped: a request may carry a secret (the key route's body),
+  // and erase() would leave it in the buffer's spare capacity.
+  explicit_bzero(buf_.data(), end + 4 + length);
   buf_.erase(0, end + 4 + length);
   *out = std::move(r);
   return Status::kRequest;
@@ -237,7 +243,50 @@ void HttpServer::RoutePrefix(std::string method, std::string prefix, HttpHandler
   prefix_routes_.push_back({{std::move(method), std::move(prefix)}, std::move(handler)});
 }
 
+bool HttpServer::StartUnix(std::string* error) {
+  // A Unix socket in a directory only this user can enter (0700, ours), the socket itself 0600; every connection's
+  // peer credentials are checked too (accept loop), so neither a loose umask nor a moved socket opens it up.
+  const std::string& path = opt_.unix_path;
+  sockaddr_un addr{};
+  if (path.size() >= sizeof addr.sun_path) return *error = "unix socket path too long: " + path, false;
+  const auto slash = path.rfind('/');
+  const std::string dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : path.substr(0, slash));
+  struct stat st {};
+  if (::lstat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != ::geteuid() || (st.st_mode & 077) != 0)
+    return *error = "unix socket directory " + dir + " must exist, be ours and mode 0700", false;
+  if (::lstat(path.c_str(), &st) == 0) {
+    if (!S_ISSOCK(st.st_mode)) return *error = path + " exists and is not a socket", false;
+    ::unlink(path.c_str());  // a stale socket of an earlier run
+  }
+  listen_fd_ = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (listen_fd_ < 0) return *error = std::string("socket: ") + std::strerror(errno), false;
+  addr.sun_family = AF_UNIX;
+  std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+  if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) < 0 || ::chmod(path.c_str(), 0600) != 0 ||
+      ::listen(listen_fd_, 128) < 0) {
+    *error = "bind/listen " + path + ": " + std::strerror(errno);
+    ::close(listen_fd_);
+    listen_fd_ = -1;
+    ::unlink(path.c_str());
+    return false;
+  }
+  unix_ = true;
+  acceptor_ = std::thread([this] { AcceptLoop(); });
+  return true;
+}
+
+bool HttpServer::PeerAllowed(int fd) const {
+  if (!unix_) return true;
+  ucred cr{};
+  socklen_t len = sizeof cr;
+  if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &len) != 0) return false;
+  if (cr.uid == ::geteuid()) return true;
+  return std::find(opt_.unix_peer_uids.begin(), opt_.unix_peer_uids.end(), static_cast<long>(cr.uid)) !=
+         opt_.unix_peer_uids.end();
+}
+
 bool HttpServer::Start(std::string* error) {
+  if (!opt_.unix_path.empty()) return StartUnix(error);
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (listen_fd_ < 0) return *error = std::string("socket: ") + std::strerror(errno), false;
   const int one = 1;
@@ -285,6 +334,10 @@ void HttpServer::AcceptLoop() {
     const int fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
     if (fd < 0) continue;
     reap(false);
+    if (!PeerAllowed(fd)) {  // a Unix socket peer of another uid: closed without a word
+      ::close(fd);
+      continue;
+    }
     if (active_.load() >= opt_.max_connections) {
       // On the accept thread: a short deadline, so a client that does not read cannot hold up accepting.
       (void)SendAll(fd, SerializeResponse(HttpResponse::Json(503, ErrorJson("too many connections")), false),
@@ -424,6 +477,7 @@ void HttpServer::Serve(int fd) {
     const ssize_t n = ready < 0 ? -1 : ::recv(fd, buf, sizeof buf, 0);
     if (n <= 0) return;  // closed, reset or shut down by Stop()
     parser.Feed(std::string_view(buf, static_cast<std::size_t>(n)));
+    explicit_bzero(buf, static_cast<std::size_t>(n));
   }
 }
 
@@ -432,6 +486,7 @@ void HttpServer::Stop() {
   if (acceptor_.joinable()) acceptor_.join();
   if (listen_fd_ >= 0) ::close(listen_fd_);
   listen_fd_ = -1;
+  if (unix_) ::unlink(opt_.unix_path.c_str());
 }
 
 }  // namespace halo::server
