@@ -31,6 +31,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -107,6 +108,7 @@ class YardSpillKeys final : public SpillKeys {
     bool sweeper = true;            ///< a thread that zeroes expired keys (tests may sweep by hand)
     std::string incarnation;        ///< this server incarnation's id: 32 hex digits (empty: 128 random bits)
     std::size_t max_sessions = 4096;  ///< persisted sessions (the state file is rewritten whole: bounded)
+    std::function<void()> clock_gap_for_test;  ///< test seam: runs between the steady and the wall clock samples
   };
   struct Answer {
     int status = 500;  ///< 200 done, 400 malformed, 401 token refused, 409 refused by the rules, 500 not done, 503 stopped
@@ -159,17 +161,23 @@ class YardSpillKeys final : public SpillKeys {
     std::array<std::uint8_t, 32> key_hash{};
     std::string name;   // KeyName(key): display and ids only
     std::string entry;  // seal: the cache entry id it is for
-    Clock::time_point deadline, cap;  // authorization end; cap = first registration + TTL (retries never pass it)
+    std::string op;     // the signed operation id (halo_spill.op; "" when the token carries none)
+    Clock::time_point deadline, cap;  // authorization end; cap = the operation's first registration + TTL
     std::uint64_t gen = 0;
     bool reserved = false;  // a spill / restore holds a lease on it
   };
   enum class OpState : std::uint8_t { kRegistered, kConsumed, kExpired, kRevoked };
-  struct OpRecord {  // non-secret: what happened to (use, epoch, key hash)
+  /// Non-secret: what happened to one operation. Identity: the signed op id when the token carries one, and always
+  /// (use, epoch, key hash) too (K is fresh per checkpoint); a record matches a request on either.
+  struct OpRecord {
     Use use;
     std::uint64_t epoch;
     std::array<std::uint8_t, 32> key_hash;
     std::string entry;
+    std::string op;
     OpState state;
+    Clock::time_point cap;         // first registration + TTL: a re-registration after expiry never passes it
+    Clock::time_point keep_until;  // kRevoked: kept at least this long (no pre-cancel token can still arrive)
   };
   struct Epochs {  // the persisted part
     std::uint64_t high = 0;
@@ -179,7 +187,7 @@ class YardSpillKeys final : public SpillKeys {
   struct Session {
     Epochs e;
     std::optional<Slot> seal, open;
-    std::vector<OpRecord> ops;  // the last 32
+    std::vector<OpRecord> ops;  // the last 32, and every revoked one until its keep_until
   };
   bool LoadState(std::string* error);
   /// Publishes the state with `cand` as `name`'s epochs (under mu_). kDurable: memory takes `cand`. kUnpublished:
@@ -187,10 +195,13 @@ class YardSpillKeys final : public SpillKeys {
   Persist Commit(std::string_view name, const Epochs& cand, std::string* why);
   void Stop(const std::string& why);  // under mu_
   void ZeroSlot(Session& s, std::optional<Slot>& slot, OpState why);
-  void Record(Session& s, Use use, std::uint64_t epoch, const std::array<std::uint8_t, 32>& h, const std::string& entry,
-              OpState st);
-  const OpRecord* FindOp(const Session& s, Use use, std::uint64_t epoch, const std::array<std::uint8_t, 32>& h) const;
+  OpRecord* Record(Session& s, Use use, std::uint64_t epoch, const std::array<std::uint8_t, 32>& h,
+                   const std::string& entry, const std::string& op, OpState st);
+  OpRecord* FindOp(Session& s, Use use, std::uint64_t epoch, const std::array<std::uint8_t, 32>& h,
+                   const std::string& op);
   std::size_t SweepLocked(Clock::time_point now);
+  /// The steady anchor, then the wall clock (ms; `fixed_now` seconds if non-zero).
+  Clock::time_point SampleClocks(std::int64_t fixed_now, std::int64_t* wall_ms) const;
   std::shared_ptr<const Jwks> Keys() const;
 
   Options o_;

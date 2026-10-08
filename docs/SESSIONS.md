@@ -487,7 +487,11 @@ format halo_serve writes unless the operator asks for plaintext**.
   Round 4: a poisoned engine also **quarantines** its device memory: `DropSession`, `ReleaseKvPages`, the session
   free path and the destructor release nothing for reuse (queued writes may still target it; the process exit
   releases it with the device context), so the cache's own failure cleanup cannot hand those pages to another
-  session (`SessionCache.PoisonedRestoreQuarantinesItsMemory`). `SpillPeek` touches no device memory.
+  session (`SessionCache.PoisonedRestoreQuarantinesItsMemory`). `SpillPeek` touches no device memory. The
+  destructor's early return leaves the members to their own destructors: buffers and graphs are plain handles
+  (static_assert), and the KV pages and sessions, whose destructors would release pages, are leaked on purpose
+  (round 5, tested with a page-release probe). halo_serve does not recover in the same device context: it notices the
+  poison, stops serving and exits with status 3 for its supervisor to restart it.
 - **Spill outcomes.** `SpillInfo::published` tells "nothing published" (the path is what it was) from "published but
   the directory fsync failed" (durability unknown). The cache reports the latter to the key provider as
   `Outcome::kUncertain`: the key counts as used (never handed back for another file), and the file is removed.
@@ -604,8 +608,9 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
   - seal at E: `E > fence`, `E >= highest`, `E > last spill`; for exactly one entry;
   - open at E: `E - 1 > fence`, `E >= highest`, `E == last seal + 1`, `E > last restore`; opens exactly the file of
     `E - 1`;
-  - revoke at token epoch T: **every effect is bounded by T** (round 4: a delayed revoke never touches newer state).
-    The fence R is the claim `through` (<= T), else min(last spilled epoch, T), none if nothing was spilled (round 3,
+  - revoke at token epoch T: **a token cannot expand revocation beyond its authority T** (round 4: a delayed revoke
+    never fences, erases or zeroes newer state; cleanup may still apply a fence an earlier revoke already set).
+    The fence R is the claim `through` (1 <= R <= T; `through: 0` is refused), else min(last spilled epoch, T), none if nothing was spilled (round 3,
     GLM NL3: an abort before any spill does not poison its epoch). With R: `fence = max(fence, R)`. Keys zeroed: a
     slot registered at an epoch <= T (a pending operation the token may cancel) or whose file epoch is fenced (it could
     never be used); a registration after T survives. The last seal is forgotten if fenced. A revoke whose T is below
@@ -615,8 +620,26 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
     checkpoint survives a late cleanup). A revoke is never stale and repeating it is a no-op 200
     (`"duplicate":true`). yard-ctl sends `through` = the epoch of the last checkpoint it wants gone when it knows it.
   - a registration below the highest epoch is stale (409); a seen jti is a replay (409).
-- **One-shot, really.** halo keeps a non-secret record per operation (use, epoch, key hash, entry; registered /
-  consumed / expired / revoked). The same registration again (fresh token, same use, epoch, key and entry) is a no-op
+- **Operation identity (round 5).** A seal or open token may carry `halo_spill.op`, a signed operation id
+  ([A-Za-z0-9._-]{1,64}) that yard's key service mints per checkpoint operation. When the request and the record
+  both have one, the op id decides which operation a token belongs to (a new op id is a newly authorized operation,
+  even with the same key, as an open that reopens the same file); otherwise (use, epoch, key hash) decides (K is
+  fresh per checkpoint). An op id never names two operations (another key or epoch: 409).
+  - **Cancelled stays cancelled.** A revoke that cancels an unused operation (registered, or expired unused) without
+    fencing a file marks it revoked; any later token of that operation (a delayed one minted before the revoke) is
+    refused (409 "cancelled"). Revoked records are kept at least 330 s after the cancel (the longest a pre-cancel
+    token can still arrive: 300 s lifetime + 30 s skew), whatever else the session does; the "last 32" retention
+    applies only to the other records. A new checkpoint at the same epoch (new op id and key) is allowed.
+  - **Expired, never used.** An operation whose key expired unused may be registered again with a fresh token while
+    its first registration + TTL lasts (its slot died with a token, not the operation); after that it is over (409:
+    register a new operation, a new op id). A revoked or consumed operation is never registered again.
+  - Records are memory only. After a restart a delayed seal token dies on the incarnation check; a delayed open token
+    may register its key, but nothing can be opened with it (the cache's entries and files did not survive the
+    restart), and the key dies at its TTL.
+  - A repeated default revoke is recomputed when it is delivered: after a new checkpoint was spilled at the same
+    epoch it covers that one too; yard retries with an explicit `through`.
+- **One-shot, really.** halo keeps a non-secret record per operation (use, epoch, key hash, entry, op id;
+  registered / consumed / expired / revoked). The same registration again (fresh token, same use, epoch, key and entry) is a no-op
   200: `"state":"registered"` while the key is live, `"state":"consumed"` after its spill or restore, and then the key
   is **not** re-armed. Another key at a used epoch is refused (409 "used"). A persisted used fence means "an attempt
   started", not "a checkpoint is available": a 409 "used" is answered both when the spill or restore happened and
@@ -625,14 +648,22 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
 - **Expiry is erasure.** A key's authorization ends at `min(token exp, registration + TTL)` (steady clock for the
   TTL). The token is checked again at the transition boundary, after the provider lock is taken (another
   registration's fsync may have held it past exp): an expired one is refused, and the key's deadline is computed from
-  that in-lock wall-clock sample in milliseconds, so it never outlives the token's absolute exp (round 4); a retry with a fresh token may extend it to that token's exp, but never past the first registration + TTL; a sweeper thread zeroes and unmaps expired keys once a second (a key reserved by a running spill or restore is
+  that in-lock wall-clock sample in milliseconds, so it never outlives the token's absolute exp (round 4). The steady
+  anchor is taken before the wall sample, so a pause between them can only shorten the key's life (round 5). A later
+  forward jump of the wall clock does not shorten an installed key: its deadline is on the steady clock; a retry with a fresh token may extend it to that token's exp, but never past the first registration + TTL; a sweeper thread zeroes and unmaps expired keys once a second (a key reserved by a running spill or restore is
   zeroed when that finishes).
+- **Files that can never open again.** `MayOpen` (and so `DropUnreadable` and a failed restore) treats a yard file of
+  epoch E as unreadable for good when it is fenced, already restored, behind a newer seal (the last seal is not E),
+  or behind the highest epoch (an open at E + 1 would be stale): its entry and file are dropped instead of waiting for
+  a key that can never be registered (round 5).
 - **Leases and races.** A spill or restore takes a lease on the exact registration (its generation) under the
   provider's lock; finishing consumes that registration and no newer one; a registration cannot replace a slot a
   lease holds, the other use's slot included (a new seal would end a reserved open, an open a reserved seal: 409,
   retry). A lease is granted only while its epoch is unused and unfenced. A seal that published nothing gives its used
-  fence back (also when its slot was revoked meanwhile); if that rollback cannot be made durable, the stricter fence
-  stays and the key is zeroed. A seal published with uncertain durability keeps the fence and consumes the key.
+  fence back (also when its slot was revoked meanwhile). If that rollback is not published, the stricter fence stays
+  and the key is zeroed; if its publication is uncertain, memory takes the lowered fence (what the disk may show) and
+  the provider stops, so safety comes from the fail-stop and the zeroed slots, not from the fence. A seal published
+  with uncertain durability keeps the fence and consumes the key.
   Lock order: the cache's generation lock, then the provider's lock; never the reverse
   (a registration runs outside the generation lock; only its revoke cleanup enters it afterwards). **In-flight restore
   at a revoke:** the revoke zeroes the slot at once; a restore that already holds its lease finishes with its own copy
@@ -652,14 +683,16 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
   transition is staged: memory takes the new epochs only after a durable publish, and no live key is destroyed before
   that (except a revoke's keys: fail-closed, documented). On *uncertain* the outcome is unknown, not "not done": the
   yard provider **stops** (its key slots are zeroed; leases already handed out keep their own KEK copies and finish;
-  every registration answers 503 and every new lease is refused until a restart reloads what the disk holds); the
+  every registration answers 503 and every new lease is refused until a restart reloads what the disk holds; round 5:
+  through the master fallback too, seal and open alike, one policy for the composite provider); the
   master takes the new epoch (what the disk shows, the stricter fence), reports the failure, and seals nothing at that
   epoch until a later durable write confirms it (each seal attempt retries that write), since a crash could revert
   the epoch and orphan files sealed at it. Loading opens the directory and then
   the file relative to it with `O_NOFOLLOW`, requires a regular file owned by us with no group/other bits, reads it
   to EOF bounded by its size, and refuses junk, unterminated lines, duplicate sessions and inconsistent epochs.
   `<file>.init` marks a state that was initialized: a missing state with its marker refuses the start ("recovery
-  required"). The first initialization writes the state, then the marker; a state without its marker (from before
+  required"). Only `ENOENT` counts as absent when the marker is looked up; any other error refuses (round 5). State
+  file names are single plain names (no `/`, not `.` or `..`). The first initialization writes the state, then the marker; a state without its marker (from before
   round 3, or a first start interrupted between the two writes) gets the marker on its next load, under the lock.
   Restoring an older copy of both from a backup is out of scope (no external monotonic anchor).
   **Recovery** when a start says "recovery required":
@@ -689,7 +722,7 @@ this route implements its halo side (`staleCheck`, `usedCheck`, `haloDurable`).
 | spill without a seal key (not landed, expired, or another entry's) | spill refused (409), nothing written | 409 from the spill route | register again (verify first), then spill again (SR4: a spill is safe to repeat) |
 | restore without an open key | 409, entry kept | 409 | register the open key, then restore again |
 | revoke lost | keys held until `min(token exp, registration + TTL)` (<= 300 s from the last token's iat); an unexpired open token can still register until its exp | no answer | **verify** (`revoked_through` >= R) and retry; the shred completes only by the settle bound or a verified revoke (above) |
-| halo restart | keys and leases gone; epochs and fences kept | `GET /admin/keys` shows no slots | re-register (fresh token) before the spill or restore; a 409 "used" means the operation already happened |
+| halo restart | keys and leases gone; epochs and fences kept | `GET /admin/keys` shows no slots | re-register (fresh token) before the spill or restore; a 409 "used" means an attempt started (the operation happened, or its key was disabled after a failure): re-prefill either way |
 
 ### Threat model
 
@@ -770,7 +803,9 @@ re-prefill from empty, which equals a cold prefill (`Spill.LongContextRoundTripA
 ### Ambiguity (done / not done / unknown) and the caller rules
 
 Every call is synchronous: when it returns, no I/O of it is in flight (threads joined, `fsync` returned), so the
-settle bound is the return, or the process's death.
+settle bound is the return, or the process's death. One exception: a restore whose failure cleanup could not
+synchronize the device poisons the engine; its device writes may still be queued, so its settle bound is the process's
+death (halo_serve then stops and exits with status 3; see "Partial restores").
 
 | Call | Done | Not done | Unknown, and the caller rule |
 |---|---|---|---|

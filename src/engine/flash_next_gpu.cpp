@@ -2,6 +2,7 @@
 #include "engine/flash_next_gpu.hpp"
 
 #include <algorithm>
+#include <type_traits>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -46,10 +47,24 @@ std::unique_ptr<FlashNextGpu> FlashNextGpu::Create(rt::Device& device, const mod
   return m;
 }
 
+// The early return of a poisoned engine's destructor leaves the members to their own destructors: none of them may
+// release device memory. Buffers and graphs are plain handles; KV pages (whose destructor releases the page) and the
+// sessions holding them are deliberately leaked there (see the destructor).
+static_assert(std::is_trivially_destructible_v<rt::Buffer> && std::is_trivially_destructible_v<rt::Graph>,
+              "engine members must not release device memory in their destructors (poison quarantine)");
+
 FlashNextGpu::~FlashNextGpu() {
   // Poisoned: device work may still be queued against this engine's memory (a failed restore whose synchronize
   // failed). Nothing goes back to the allocator for reuse; the process exit releases it with the device context.
-  if (poisoned_) return;
+  if (poisoned_) {
+    // Leak, on purpose: a page released here could be handed to another engine on this device while queued writes
+    // still target it. The process exit releases everything with the device context.
+    for (auto& r : kv_)
+      for (auto& pg : r.pages)
+        if (pg) (void)new std::shared_ptr<KvPage>(std::move(pg));
+    for (auto& sp : sessions_) (void)sp.release();
+    return;
+  }
   (void)dev_.Synchronize(nullptr);
   for (auto& g : batch_graphs_) dev_.FreeGraph(g.graph);
   for (auto& sp : sessions_)
@@ -1028,7 +1043,10 @@ struct FlashNextGpu::KvPage {
   rt::Device& dev;
   void* handle = nullptr;
   KvPage(rt::Device& d, void* h) : dev(d), handle(h) {}
-  ~KvPage() { dev.ReleasePage(handle); }
+  ~KvPage() {
+    dev.ReleasePage(handle);
+    kv_pages_released_.fetch_add(1, std::memory_order_relaxed);
+  }
   KvPage(const KvPage&) = delete;
   KvPage& operator=(const KvPage&) = delete;
 };

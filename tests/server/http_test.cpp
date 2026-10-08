@@ -576,3 +576,13 @@ TEST(Http, UnixSocketProbeFailsClosed) {
   ::close(lfd);
   std::filesystem::remove_all(dir);
 }
+
+// An over-long socket path is refused before anything is copied into sockaddr_un.
+TEST(Http, UnixSocketPathLengthIsBounded) {
+  HttpServerOptions o;
+  o.unix_path = (std::filesystem::temp_directory_path() / std::string(200, 'x')).string();
+  HttpServer s(o);
+  std::string err;
+  EXPECT_FALSE(s.Start(&err));
+  EXPECT_NE(err.find("too long"), std::string::npos) << err;
+}

@@ -295,6 +295,7 @@ bool HttpServer::StartUnix(std::string* error) {
     if (probe < 0) return *error = "cannot probe " + path + ": " + std::strerror(errno), false;
     sockaddr_un pa{};
     pa.sun_family = AF_UNIX;
+    if (path.size() >= sizeof pa.sun_path) return *error = "unix socket path too long: " + path, false;  // also above
     std::memcpy(pa.sun_path, path.c_str(), path.size() + 1);
     int rc = ::connect(probe, reinterpret_cast<sockaddr*>(&pa), sizeof pa);
     int err = rc == 0 ? 0 : errno;

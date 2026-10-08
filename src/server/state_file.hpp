@@ -15,6 +15,7 @@
 //   - Write: temp (0600, O_EXCL) + fsync + renameat + fsync of the directory fd. The outcome is typed: kUnpublished
 //     (the old file is still in place), kDurable, or kUncertain (the rename happened but the directory fsync failed:
 //     the new content is visible and may or may not survive a crash). Callers never treat kUncertain as "not done".
+//   - Names are single plain file names (no '/', not "." or ".."): openat does not confine anything else.
 //   - Read: openat O_NOFOLLOW; a regular file owned by us with no group/other bits; a bounded read to EOF that must
 //     match the size. "<name>.init" marks a state that was initialized: a missing state with its marker refuses
 //     (recovery required). Init writes the state first and the marker second (a crash between them leaves a state
@@ -38,6 +39,8 @@ enum class StateRead : std::uint8_t { kOk, kFresh, kError };
 /// Test hook: 1 = the next write fails before its rename (unpublished); 2 = the next write fails at the directory
 /// fsync after its rename (uncertain). Taken by exactly one write (atomic exchange).
 inline std::atomic<int> g_state_write_fault{0};
+/// Test hook: the next existence check (of an init marker) fails with this errno (e.g. EIO).
+inline std::atomic<int> g_state_stat_fault{0};
 
 class StateLock {
  public:
@@ -74,7 +77,9 @@ class StateDir {
 
  private:
   StateDir(int fd, std::string path) : fd_(fd), path_(std::move(path)) {}
-  [[nodiscard]] bool Exists(const std::string& name) const;
+  enum class Presence : std::uint8_t { kAbsent, kPresent, kError };
+  [[nodiscard]] Presence Exists(const std::string& name, std::string* error) const;
+  [[nodiscard]] bool ValidName(const std::string& name, std::string* error) const;
   int fd_ = -1;
   std::string path_;
 };

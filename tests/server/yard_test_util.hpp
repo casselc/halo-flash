@@ -92,6 +92,7 @@ struct Claims {
   bool with_halo_spill = true;
   std::string entry = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f.1";  // halo_spill.entry (seal): "<incarnation>.<key>"; "": absent
   std::int64_t through = 0;  // halo_spill.through (revoke); 0: absent
+  std::string op;            // halo_spill.op (seal, open); "": absent
   std::string nbf;           // raw JSON for nbf ("" = iat)
   std::string aud_json;      // raw JSON for aud ("" = the string aud)
   std::string extra;         // raw JSON members appended to the claims (",\"x\":1")
@@ -124,6 +125,7 @@ inline std::string Token(const Signer& s, Claims c, const std::string& alg = "RS
     body += ",\"halo_spill\":{\"use\":\"" + c.use + "\",\"key_sha256\":\"" + c.key_sha256 + "\"";
     if (c.use == "seal" && !c.entry.empty()) body += ",\"entry\":\"" + c.entry + "\"";
     if (c.through) body += ",\"through\":" + std::to_string(c.through);
+    if (!c.op.empty()) body += ",\"op\":\"" + c.op + "\"";
     body += "}";
   }
   body += c.extra + "}";

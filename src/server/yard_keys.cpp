@@ -470,28 +470,57 @@ void YardSpillKeys::Stop(const std::string& why) {
   }
 }
 
-void YardSpillKeys::Record(Session& s, Use use, std::uint64_t epoch, const std::array<std::uint8_t, 32>& h,
-                           const std::string& entry, OpState st) {
-  for (auto& r : s.ops)
-    if (r.use == use && r.epoch == epoch && crypt::Equal(r.key_hash, h)) {
-      r.state = st;
-      r.entry = entry;
-      return;
+namespace {
+// A pre-cancellation token can still arrive until its exp: at most max lifetime (300 s) + skew after the cancel.
+constexpr auto kCancelKeep = std::chrono::seconds(300 + 30);
+}  // namespace
+
+YardSpillKeys::OpRecord* YardSpillKeys::FindOp(Session& s, Use use, std::uint64_t epoch,
+                                               const std::array<std::uint8_t, 32>& h, const std::string& op) {
+  // With op ids on both sides the op id decides (a new op id is a newly authorized operation, even with the same key:
+  // a reopen of the same file); otherwise (use, epoch, key hash) does.
+  for (auto& r : s.ops) {
+    if (r.use != use) continue;
+    if (!op.empty() && !r.op.empty()) {
+      if (r.op == op) return &r;
+    } else if (r.epoch == epoch && crypt::Equal(r.key_hash, h)) {
+      return &r;
     }
-  s.ops.push_back({use, epoch, h, entry, st});
-  if (s.ops.size() > 32) s.ops.erase(s.ops.begin());
+  }
+  return nullptr;
 }
 
-const YardSpillKeys::OpRecord* YardSpillKeys::FindOp(const Session& s, Use use, std::uint64_t epoch,
-                                                     const std::array<std::uint8_t, 32>& h) const {
-  for (const auto& r : s.ops)
-    if (r.use == use && r.epoch == epoch && crypt::Equal(r.key_hash, h)) return &r;
-  return nullptr;
+YardSpillKeys::OpRecord* YardSpillKeys::Record(Session& s, Use use, std::uint64_t epoch,
+                                               const std::array<std::uint8_t, 32>& h, const std::string& entry,
+                                               const std::string& op, OpState st) {
+  const auto now = Clock::now();
+  OpRecord* r = FindOp(s, use, epoch, h, op);
+  if (!r) {
+    s.ops.push_back({use, epoch, h, entry, op, st, now + std::chrono::seconds(o_.key_ttl_s), {}});
+    r = &s.ops.back();
+  }
+  // A cancellation never weakens into anything else while its replay window is open.
+  if (r->state != OpState::kRevoked || now >= r->keep_until) r->state = st;
+  r->entry = entry;
+  if (!op.empty()) r->op = op;
+  if (st == OpState::kRevoked) r->keep_until = now + kCancelKeep;
+  // Retention: revoked records until their keep_until; of the others, the newest 32.
+  std::erase_if(s.ops, [&](const OpRecord& x) { return x.state == OpState::kRevoked && now >= x.keep_until; });
+  std::size_t others = 0;
+  for (const auto& x : s.ops) others += x.state != OpState::kRevoked;
+  for (auto it = s.ops.begin(); others > 32 && it != s.ops.end();)
+    if (it->state != OpState::kRevoked && &*it != r) {
+      it = s.ops.erase(it);
+      --others;
+    } else {
+      ++it;
+    }
+  return FindOp(s, use, epoch, h, op);  // the vector may have moved
 }
 
 void YardSpillKeys::ZeroSlot(Session& s, std::optional<Slot>& slot, OpState why) {
   if (!slot) return;
-  Record(s, &slot == &s.seal ? Use::kSeal : Use::kOpen, slot->epoch, slot->key_hash, slot->entry, why);
+  (void)Record(s, &slot == &s.seal ? Use::kSeal : Use::kOpen, slot->epoch, slot->key_hash, slot->entry, slot->op, why);
   slot->key.Clear();  // zeroed and unmapped now
   slot.reset();
 }
@@ -552,6 +581,21 @@ void YardSpillKeys::RefreshJwks(bool force) {
   }
   std::copy(sig, sig + 4, jwks_sig_);
   jwks_loaded_ = now;
+}
+
+std::chrono::steady_clock::time_point YardSpillKeys::SampleClocks(std::int64_t fixed_now, std::int64_t* wall_ms) const {
+  // The steady anchor first, then the wall sample: a pause between them can only shorten a key's life, never extend
+  // it past exp (deadline = anchor + (exp - wall), with wall >= the wall time at the anchor).
+  const auto wall = [&] {
+    return fixed_now ? fixed_now * 1000
+                     : std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+  };
+  const auto steady = Clock::now();
+  if (o_.clock_gap_for_test) o_.clock_gap_for_test();
+  *wall_ms = wall();
+  return steady;
 }
 
 YardSpillKeys::Answer YardSpillKeys::Register(std::string_view session, std::string& body, std::int64_t now) {
@@ -626,11 +670,22 @@ YardSpillKeys::Answer YardSpillKeys::Register(std::string_view session, std::str
     if (const auto* body_entry = req->find("entry"); body_entry && StrOr(body_entry) != entry)
       return answer(400, "entry differs from the token's");
   }
+  // The operation's signed id (optional; yard's key service mints one per checkpoint operation): what tells a retry
+  // of the same operation from a newly authorized one.
+  std::string op;
+  if (use != "revoke") {
+    if (const json::Value* ov = hs->find("op")) {
+      const std::string* o = Str(ov);
+      if (!o || !ValidSession(*o) || o->size() > 64) return refuse("op");
+      op = *o;
+    }
+  }
   const auto E = static_cast<std::uint64_t>(*epoch);
   std::optional<std::uint64_t> through;
   if (use == "revoke") {
     const auto th = Int(hs->find("through"), &bad);
     if (bad) return refuse("through");
+    if (th && *th < 1) return refuse("through must be >= 1");  // epochs start at 1: 0 is not "absent"
     if (th) through = static_cast<std::uint64_t>(*th);
     if (through && *through > E) return refuse("revoke through a later epoch than the token's");
   }
@@ -639,14 +694,11 @@ YardSpillKeys::Answer YardSpillKeys::Register(std::string_view session, std::str
   std::lock_guard<std::mutex> lk(mu_);
   // The transition boundary: the token must still be valid now that the state is ours (another registration's
   // fsync may have held the lock past its exp), and the key's deadline comes from this fresh wall-clock sample.
-  const std::int64_t t_ms = now ? now * 1000
-                                : std::chrono::duration_cast<std::chrono::milliseconds>(
-                                      std::chrono::system_clock::now().time_since_epoch())
-                                      .count();
+  std::int64_t t_ms = 0;
+  const auto tnow = SampleClocks(now, &t_ms);
   const std::int64_t t = t_ms / 1000;
   if (t_ms >= exp * 1000) return refuse("expired while waiting for the key state");
   if (stopped_) return answer(503, "key provider stopped (state durability uncertain): restart halo_serve");
-  const auto tnow = Clock::now();
   (void)SweepLocked(tnow);
   for (auto it = seen_jti_.begin(); it != seen_jti_.end();) it = it->second < t ? seen_jti_.erase(it) : std::next(it);
   if (seen_jti_.contains(jti)) return answer(409, "token replayed (jti already used)");
@@ -702,8 +754,11 @@ YardSpillKeys::Answer YardSpillKeys::Register(std::string_view session, std::str
         ZeroSlot(s, s.open, OpState::kRevoked);
       }
       for (auto& r : s.ops)
-        if (r.state == OpState::kRegistered && hit(r.epoch, r.use == Use::kSeal ? r.epoch : r.epoch - 1))
-          r.state = OpState::kRevoked;
+        if ((r.state == OpState::kRegistered || r.state == OpState::kExpired) &&
+            hit(r.epoch, r.use == Use::kSeal ? r.epoch : r.epoch - 1)) {
+          r.state = OpState::kRevoked;  // cancelled: no token of this operation registers again (Register)
+          r.keep_until = Clock::now() + kCancelKeep;
+        }
     }
     const bool dup = !zeroed && cand.fence == s.e.fence && cand.high == s.e.high;
     std::string pe;
@@ -734,7 +789,19 @@ YardSpillKeys::Answer YardSpillKeys::Register(std::string_view session, std::str
   if (s.e.fence && file_epoch <= *s.e.fence) return answer(409, "revoked: epoch " + std::to_string(file_epoch) + " is fenced");
   if (E < s.e.high) return answer(409, "stale epoch " + std::to_string(E) + " (session at " + std::to_string(s.e.high) + ")");
   // One-shot: the same registration again reports what happened to it (a consumed key is never re-armed).
-  if (const OpRecord* r = FindOp(s, u, E, key_hash); r && r->state == OpState::kConsumed && (u == Use::kOpen || r->entry == entry)) {
+  OpRecord* known = FindOp(s, u, E, key_hash, op);
+  if (known && (known->epoch != E || !crypt::Equal(known->key_hash, key_hash) || (!op.empty() && !known->op.empty() && known->op != op)))
+    return answer(409, "operation id " + op + " already names another operation (key or epoch)");
+  // A cancelled operation stays cancelled: a delayed token minted before the revoke never re-installs its key (a new
+  // checkpoint at the same epoch has a new key and op id, and is allowed).
+  if (known && known->state == OpState::kRevoked && tnow < known->keep_until)
+    return answer(409, std::string(use) + " operation at epoch " + std::to_string(E) + " was cancelled by a revoke");
+  // An expired, never-used operation may be registered again with a fresh token while its first registration + TTL
+  // lasts; after that it is over: yard registers a new operation (a new op id) instead.
+  if (known && known->state == OpState::kExpired && tnow >= known->cap)
+    return answer(409, std::string(use) + " operation at epoch " + std::to_string(E) +
+                           " outlived its TTL: register a new operation (a new op id)");
+  if (const OpRecord* r = known; r && r->state == OpState::kConsumed && (u == Use::kOpen || r->entry == entry)) {
     seen_jti_[jti] = exp;
     return ok_body(true, "consumed");
   }
@@ -773,8 +840,11 @@ YardSpillKeys::Answer YardSpillKeys::Register(std::string_view session, std::str
   std::optional<Slot>& lother = u == Use::kSeal ? live.open : live.seal;
   ZeroSlot(live, lslot, OpState::kExpired);  // replaced before use (a new key for the same op)
   ZeroSlot(live, lother, OpState::kExpired);  // a new checkpoint ends the old open; an open ends the seal
-  lslot = Slot{E, std::move(key), key_hash, name, entry, deadline, tnow + ttl, ++gen_, false};
-  Record(live, u, E, key_hash, entry, OpState::kRegistered);
+  // The cap counts from the operation's first registration, also across an expiry and a re-registration.
+  const OpRecord* first = FindOp(live, u, E, key_hash, op);
+  const auto cap = first ? first->cap : tnow + ttl;
+  lslot = Slot{E, std::move(key), key_hash, name, entry, op, std::min(deadline, cap), cap, ++gen_, false};
+  (void)Record(live, u, E, key_hash, entry, op, OpState::kRegistered);
   seen_jti_[jti] = exp;
   return ok_body(false, "registered");
 }
@@ -850,6 +920,12 @@ bool YardSpillKeys::SealLease(std::string_view entry, std::string_view label, bo
 }
 
 bool YardSpillKeys::OpenLease(std::string_view label, std::string_view file_key_id, SpillLease* out, std::string* why) {
+  {
+    // A stopped provider issues no lease at all, the master fallback's included (as SealLease): one policy for the
+    // composite provider.
+    std::lock_guard<std::mutex> lk(mu_);
+    if (stopped_) return *why = "key provider stopped (state durability uncertain)", false;
+  }
   if (file_key_id.rfind("yard:", 0) != 0) {
     if (o_.fallback) return o_.fallback->OpenLease(label, file_key_id, out, why);
     return *why = "file not sealed by yard and no fallback provider", false;
@@ -933,7 +1009,11 @@ bool YardSpillKeys::MayOpen(std::string_view label, std::string_view file_key_id
   const auto it = sessions_.find(label);
   if (it == sessions_.end()) return true;
   const Session& s = it->second;
-  return !(s.e.fence && fe <= *s.e.fence) && fe >= s.e.last_restore;  // fenced, or already restored: never again
+  // The open that could reach this file is a registration at fe + 1: it must not be fenced, not used (an open at or
+  // below the last restore), right after the last seal (a newer seal advanced the checkpoint for good), and not below
+  // the highest epoch (the session moved on). Any of these is irreversible: the file can never open again.
+  const bool advanced = !s.e.last_seal || *s.e.last_seal != fe || fe + 1 < s.e.high;
+  return !(s.e.fence && fe <= *s.e.fence) && fe >= s.e.last_restore && !advanced;
 }
 
 }  // namespace halo::server

@@ -1552,6 +1552,7 @@ TEST(SessionCache, PoisonedRestoreQuarantinesItsMemory) {
   server::SessionCacheOptions o{.mode = server::SessionCacheOptions::Mode::kExact, .align = 64, .max_retained = 4};
   o.spill_dir = dir;
   o.spill_keys = keys.get();
+  std::uint64_t released_at_poison = 0;
   {
     server::FlashNextGenerator g(*ea, std::vector<text::TokenId>{}, kCtx, o);
     std::vector<std::int32_t> prompt(300), got;
@@ -1583,6 +1584,7 @@ TEST(SessionCache, PoisonedRestoreQuarantinesItsMemory) {
       EXPECT_FALSE(c.Restore(key, &why));
       engine::FlashNextGpu::restore_sync_fault_ = false;
       EXPECT_TRUE(ea->poisoned());
+      released_at_poison = engine::FlashNextGpu::kv_pages_released_.load();
       EXPECT_EQ(ea->LiveSessions(), live + 1) << "the cache's cleanup released the half-restored session's memory";
       EXPECT_FALSE(ea->DropSession(extra, &why)) << "a poisoned engine released a session for reuse";
       EXPECT_EQ(ea->LiveSessions(), live + 1);
@@ -1592,5 +1594,11 @@ TEST(SessionCache, PoisonedRestoreQuarantinesItsMemory) {
     });
     engine::FlashNextGpu::spill_piece_bytes_ = saved_piece;
   }
+  // Tearing down the cache and the poisoned engine releases no KV page either (the destructor's early return leaves
+  // the members to their own destructors: the pages and sessions are leaked on purpose).
+  ASSERT_TRUE(ea->poisoned());
+  ea.reset();
+  EXPECT_EQ(engine::FlashNextGpu::kv_pages_released_.load(), released_at_poison)
+      << "the cache's or the poisoned engine's teardown released KV pages";
   std::filesystem::remove_all(dir);
 }

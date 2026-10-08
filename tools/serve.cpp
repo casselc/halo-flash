@@ -38,6 +38,8 @@
 // pointer_head part, on /v1/systemone. A variant built for another base is
 // refused at startup.
 
+#include <sys/un.h>
+
 #include <algorithm>
 #include <chrono>
 #include <csignal>
@@ -228,7 +230,9 @@ int main(int argc, char** argv) {
           "                        Default KV reliably holds ~150K positions; 262144 needs fp16-only KV.\n"
           "  --prefix-cache exact|fast|off  prompt-prefix reuse (default exact: byte-identical to a cold prefill)\n"
           "  --prefix-cache-sessions N --prefix-cache-gb G --prefix-cache-align N\n"
-          "  --spill-dir DIR       session spill files (default /data/halo-work/spill; 0700 dir, 0600 files)\n"
+          "  --spill-dir DIR       session spill files and key state (default /data/halo-work/spill; 0700 dir, 0600\n"
+          "                        files). Always required: halo_serve creates it and owns it (spill-dir.lock), also with\n"
+          "                        --spill-key none; a second halo_serve on it refuses to start\n"
           "  --spill-evict 0|1     cache eviction spills to DIR instead of dropping (default 0). Admin routes:\n"
           "                        GET /admin/sessions, POST /admin/sessions/{key}/spill | /restore,\n"
           "                        POST /admin/spill/fence-epoch (master epoch + 1, persisted: older files are\n"
@@ -308,7 +312,11 @@ int main(int argc, char** argv) {
       std::uint64_t t = 0;
       if (!server::ParseU64(v, 3600, &t) || t < 1) return std::fprintf(stderr, "--yard-key-ttl must be 1..3600 s\n"), 2;
       yard_opt.key_ttl_s = static_cast<std::int64_t>(t);
-    } else if (a == "--admin-socket") admin_socket = v;
+    } else if (a == "--admin-socket") {
+      if (v.empty() || v.size() > sizeof(sockaddr_un::sun_path) - 1)
+        return std::fprintf(stderr, "--admin-socket: a path of 1..%zu bytes\n", sizeof(sockaddr_un::sun_path) - 1), 2;
+      admin_socket = v;
+    }
     else if (a == "--admin-socket-peer-uid") {
       return std::fprintf(stderr, "--admin-socket-peer-uid was removed: the admin socket (0700 dir, 0600 socket) only "
                                   "admits halo_serve's own uid; see IDENTITY.md \"Transport\"\n"), 2;
@@ -608,7 +616,18 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "serving %s on http://%s:%d\n", model_id.c_str(), host.c_str(), http.port());
   std::signal(SIGINT, OnSignal);
   std::signal(SIGTERM, OnSignal);
-  while (!g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  // A poisoned engine (a failed restore whose device synchronize failed: its memory is quarantined, every call
+  // refused) is not recovered in this device context: halo_serve stops serving and exits non-zero, so the supervisor
+  // restarts it with a fresh device context.
+  int exit_code = 0;
+  while (!g_stop) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (engine && engine->poisoned()) {
+      std::fprintf(stderr, "halo_serve: the engine is POISONED (device state unverifiable): stopping, exit status 3\n");
+      exit_code = 3;
+      break;
+    }
+  }
 #if HALO_WITH_SCOPE
   if (eval_service) eval_service->Shutdown();  // running experiments stop after their current item
 #endif
@@ -625,4 +644,5 @@ int main(int argc, char** argv) {
     halo_scope_close(scope);
   }
 #endif
+  return exit_code;
 }

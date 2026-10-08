@@ -429,6 +429,8 @@ class FlashNextGpu {
   static inline bool restore_sync_fault_ = false;
   /// Test probe: restore pieces uploaded to the device so far (a failed restore must not add any after it returns).
   static inline std::atomic<std::uint64_t> spill_uploads_{0};
+  /// Test probe: KV pages released back to the device (a poisoned engine releases none, also when destroyed).
+  static inline std::atomic<std::uint64_t> kv_pages_released_{0};
   static inline std::size_t spill_piece_bytes_ = 16u << 20;  ///< I/O and checksum unit, a multiple of 4096
 
   // ---- P5 MTP draft layer (mtp.cpp), measurement stage: no verify path, the trunk's numerics untouched ----

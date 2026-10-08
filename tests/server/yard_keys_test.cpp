@@ -1003,3 +1003,225 @@ TEST(YardKeys, JwksFileIsChecked) {
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
   EXPECT_EQ(f.Reg("seal", 3, Key32(49), 3).status, 401) << "a symlinked JWKS verified a token";
 }
+
+// ---- round 5 ----
+
+namespace {
+std::string SealBody(const Signer& s, std::int64_t epoch, const std::string& key, const std::string& op,
+                     std::int64_t entry = 1) {
+  Claims c;
+  c.epoch = epoch;
+  c.entry = Entry(entry);
+  c.op = op;
+  c.key_sha256 = KeyHash(key);
+  return Body(Token(s, c), "seal", key);
+}
+}  // namespace
+
+// A cancelled operation stays cancelled: after a revoke that cancels an unused registration without fencing any
+// file, a delayed token minted before the cancel (same operation: same op id, or the same key and epoch) is refused,
+// for at least the token lifetime and whatever else happens in the session meanwhile; a new checkpoint at the same
+// epoch (new op id and key) is allowed. An op id never names two operations.
+TEST(YardKeys, CancelledOperationsStayCancelled) {
+  Fixture f;
+  const std::string k1 = Key32(51), k2 = Key32(52);
+  std::string first = SealBody(f.signer, 3, k1, "ckpt-a");
+  std::string delayed = SealBody(f.signer, 3, k1, "ckpt-a");    // minted now, delivered after the revoke
+  std::string delayed_noop = SealBody(f.signer, 3, k1, "");      // the same operation without an op id
+  ASSERT_EQ(f.y->Register("sess-1", first).status, 200);
+  const auto r = f.Reg("revoke", 3, "");
+  ASSERT_EQ(r.status, 200);
+  ASSERT_TRUE(Has(r, "\"through\":null")) << "nothing was spilled: no file fence";
+  // 40 other operations in another session and in this one: retention must not evict the cancellation.
+  for (int i = 0; i < 40; ++i) {
+    Claims o;
+    o.epoch = 3;
+    o.entry = Entry(100 + i);
+    o.op = "other-" + std::to_string(i);
+    o.key_sha256 = KeyHash(Key32(static_cast<std::uint8_t>(100 + i)));
+    std::string ob = Body(Token(f.signer, o), "seal", Key32(static_cast<std::uint8_t>(100 + i)));
+    ASSERT_EQ(f.y->Register("sess-1", ob).status, 200);
+  }
+  auto a = f.y->Register("sess-1", delayed);
+  EXPECT_EQ(a.status, 409) << "a delayed pre-cancel token re-installed the cancelled key: " << a.body;
+  EXPECT_TRUE(Has(a, "cancelled")) << a.body;
+  a = f.y->Register("sess-1", delayed_noop);
+  EXPECT_EQ(a.status, 409) << "the same operation without its op id re-installed: " << a.body;
+  SpillLease l;
+  EXPECT_FALSE(f.Seal(1, "x", false, &l));
+  // A new checkpoint at the same epoch: a new op id and a new key.
+  std::string fresh = SealBody(f.signer, 3, k2, "ckpt-b");
+  ASSERT_EQ(f.y->Register("sess-1", fresh).status, 200) << "a new checkpoint at the cancelled epoch was refused";
+  // The op id cannot be reused for another key.
+  std::string reuse = SealBody(f.signer, 3, Key32(53), "ckpt-b");
+  EXPECT_EQ(f.y->Register("sess-1", reuse).status, 409);
+  ASSERT_TRUE(f.Seal(1, "x", false, &l));
+  f.y->Finish(l, SpillKeys::Use::kSeal, SpillKeys::Outcome::kDone);
+  // A repeated default revoke after that new checkpoint was spilled at the same epoch: the default fences what was
+  // spilled at <= T when it is delivered, so this one covers ckpt-b (yard retries with an explicit through).
+  const auto r2 = f.Reg("revoke", 3, "");
+  ASSERT_EQ(r2.status, 200);
+  EXPECT_EQ(r2.revoked_through, 3u);
+  EXPECT_FALSE(f.y->MayOpen("sess-1", l.kek.id));
+  // through = 0 is refused, not taken for "absent" (epochs start at 1).
+  Claims z2;
+  z2.use = "revoke";
+  z2.epoch = 3;
+  z2.with_halo_spill = false;
+  z2.extra = ",\"halo_spill\":{\"use\":\"revoke\",\"key_sha256\":\"\",\"through\":0}";
+  std::string zb2 = Body(Token(f.signer, z2), "revoke", "");
+  const auto a0 = f.y->Register("sess-1", zb2);
+  EXPECT_EQ(a0.status, 401);
+  EXPECT_NE(a0.reason.find("through"), std::string::npos) << a0.reason;
+}
+
+// Re-registering an expired, never-used operation (yard's reopen path): allowed with a fresh token while the
+// operation's first registration + TTL lasts (the slot only died with its token); after that the operation is over
+// (409) and yard registers a new operation (a new op id; for an open, the same file key is fine). A revoked or
+// consumed operation is never re-registered.
+TEST(YardKeys, ExpiredUnusedOperations) {
+  {
+    Fixture f;  // TTL 600: the slot dies with its token (exp in 2 s), the operation is still within its TTL
+    const std::int64_t now = std::time(nullptr);
+    Claims c;
+    c.epoch = 1;
+    c.op = "ckpt-d";
+    c.iat = now - 298;
+    c.exp = now + 2;
+    c.key_sha256 = KeyHash(Key32(60));
+    std::string b1 = Body(Token(f.signer, c), "seal", Key32(60));
+    ASSERT_EQ(f.y->Register("sess-1", b1).status, 200);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2300));
+    EXPECT_EQ(f.y->Sweep(), 1u);
+    std::string b2 = SealBody(f.signer, 1, Key32(60), "ckpt-d");
+    ASSERT_EQ(f.y->Register("sess-1", b2).status, 200) << "an expired unused operation could not be re-registered";
+    SpillLease l;
+    EXPECT_TRUE(f.Seal(1, "x", false, &l));
+  }
+  {
+    // TTL 3, a token expiring after 1 s: re-registered at ~1.3 s, the key still ends at the first registration + 3 s.
+    Fixture g(nullptr, false, 3);
+    const std::int64_t now = std::time(nullptr);
+    Claims c;
+    c.epoch = 1;
+    c.op = "ckpt-f";
+    c.iat = now - 299;
+    c.exp = now + 1;
+    c.key_sha256 = KeyHash(Key32(62));
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string b1 = Body(Token(g.signer, c), "seal", Key32(62));
+    ASSERT_EQ(g.y->Register("sess-1", b1).status, 200);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1300));
+    (void)g.y->Sweep();
+    std::string b2 = SealBody(g.signer, 1, Key32(62), "ckpt-f");
+    ASSERT_EQ(g.y->Register("sess-1", b2).status, 200);
+    std::this_thread::sleep_until(t0 + std::chrono::milliseconds(3200));
+    SpillLease l;
+    EXPECT_FALSE(g.Seal(1, "x", false, &l)) << "the re-registration started a new TTL for the same operation";
+  }
+  Fixture f(nullptr, false, 2);  // TTL 2: the operation itself runs out
+  const std::string k = Key32(54);
+  std::string b1 = SealBody(f.signer, 1, k, "ckpt-c"), b2 = SealBody(f.signer, 1, k, "ckpt-c"),
+              b3 = SealBody(f.signer, 1, k, "ckpt-c2");
+  ASSERT_EQ(f.y->Register("sess-1", b1).status, 200);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+  EXPECT_EQ(f.y->Sweep(), 1u);
+  const auto a = f.y->Register("sess-1", b2);
+  EXPECT_EQ(a.status, 409) << "an operation outlived its first registration + TTL: " << a.body;
+  EXPECT_TRUE(Has(a, "new op id")) << a.body;
+  ASSERT_EQ(f.y->Register("sess-1", b3).status, 200) << "a new operation (new op id) was refused";
+  SpillLease l;
+  EXPECT_TRUE(f.Seal(1, "x", false, &l));
+}
+
+// The steady anchor is taken before the wall-clock sample: a pause between them shortens the key's life, never
+// extends it past the token's exp.
+TEST(YardKeys, ClockSamplingIsConservative) {
+  Fixture f;
+  bool once = true;
+  f.o.clock_gap_for_test = [&] {
+    if (once) std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    once = false;
+  };
+  f.Restart();
+  const std::int64_t now = std::time(nullptr);
+  Claims c;
+  c.epoch = 1;
+  c.iat = now - 297;
+  c.exp = now + 3;
+  c.key_sha256 = KeyHash(Key32(55));
+  std::string body = Body(Token(f.signer, c), "seal", Key32(55));
+  ASSERT_EQ(f.y->Register("sess-1", body).status, 200);
+  while (std::time(nullptr) < c.exp) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  SpillLease l;
+  EXPECT_FALSE(f.Seal(1, "x", false, &l)) << "the pause between the clock samples extended the key past exp";
+}
+
+// Marker lookups fail closed: only ENOENT means absent. A missing state whose marker cannot be checked (EIO) is not
+// "fresh"; state file names are single plain names.
+TEST(YardKeys, MarkerLookupFailsClosed) {
+  Fixture f(nullptr, true);
+  ASSERT_EQ(f.Reg("seal", 2, Key32(56)).status, 200);
+  f.y.reset();
+  std::filesystem::remove(f.o.state_path);
+  std::filesystem::remove(f.o.state_path + ".init");
+  std::string e;
+  halo::server::g_state_stat_fault = EIO;
+  EXPECT_FALSE(YardSpillKeys::Create(f.o, &e)) << "an unknowable marker was taken for a fresh start";
+  EXPECT_NE(e.find("cannot tell"), std::string::npos) << e;
+  EXPECT_TRUE(YardSpillKeys::Create(f.o, &e)) << "a really fresh start was refused: " << e;
+  auto d = halo::server::StateDir::Open(f.dir, &e);
+  ASSERT_TRUE(d) << e;
+  EXPECT_FALSE(d->Lock("../x", &e));
+  EXPECT_EQ(d->Write("a/b", "x", &e), halo::server::Persist::kUnpublished);
+  EXPECT_EQ(d->Write("..", "x", &e), halo::server::Persist::kUnpublished);
+  std::string out;
+  EXPECT_EQ(d->Read("/etc/passwd", 100, &out, &e), halo::server::StateRead::kError);
+}
+
+// A stopped provider issues no lease at all, through the master fallback included (seal and open alike); a yard-bound
+// entry never falls back in any case.
+TEST(YardKeys, StoppedProviderIssuesNoLease) {
+  sc::SecretBytes m(32);
+  ASSERT_TRUE(sc::RandomBytes({m.data(), 32}));
+  std::string e;
+  auto master = halo::server::MasterSpillKeys::Create("file", std::move(m), "", &e);
+  ASSERT_TRUE(master) << e;
+  Fixture f(master.get(), true);
+  SpillLease ml, l;
+  ASSERT_TRUE(f.Seal(7, "s7", false, &ml));  // a fallback (master) file before the stop
+  halo::server::g_state_write_fault = 2;
+  ASSERT_EQ(f.Reg("seal", 2, Key32(57)).status, 503);
+  ASSERT_TRUE(f.y->stopped());
+  EXPECT_FALSE(f.Seal(8, "s8", false, &l)) << "a stopped provider sealed through the master";
+  EXPECT_FALSE(f.Open("s7", ml.kek.id, &l)) << "a stopped provider opened through the master";
+  EXPECT_FALSE(f.Seal(1, "sess-1", true, &l));
+}
+
+// An old file the rules can never open again (a newer seal advanced the checkpoint, or the session moved past its
+// open epoch) is unreadable: the cache drops it instead of keeping it waiting.
+TEST(YardKeys, AdvancedCheckpointsAreUnreadable) {
+  Fixture f;
+  ASSERT_EQ(f.Reg("seal", 2, Key32(58)).status, 200);
+  SpillLease l;
+  ASSERT_TRUE(f.Seal(1, "x", false, &l));
+  f.y->Finish(l, SpillKeys::Use::kSeal, SpillKeys::Outcome::kDone);
+  EXPECT_TRUE(f.y->MayOpen("sess-1", l.kek.id));
+  ASSERT_EQ(f.Reg("seal", 4, Key32(59), 2).status, 200);  // a newer checkpoint (another entry)
+  EXPECT_FALSE(f.y->MayOpen("sess-1", l.kek.id)) << "a file behind a newer seal still waits for a key";
+  EXPECT_EQ(f.Reg("open", 3, Key32(58)).status, 409) << "consistency: its open is indeed refused";
+}
+
+// An expired (swept) unused operation that a revoke then cancels stays cancelled too.
+TEST(YardKeys, ExpiredThenCancelledStaysCancelled) {
+  Fixture f(nullptr, false, 1);
+  std::string b1 = SealBody(f.signer, 2, Key32(61), "ckpt-e"), late = SealBody(f.signer, 2, Key32(61), "ckpt-e");
+  ASSERT_EQ(f.y->Register("sess-1", b1).status, 200);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  EXPECT_EQ(f.y->Sweep(), 1u);
+  ASSERT_EQ(f.Reg("revoke", 2, "").status, 200);
+  const auto a = f.y->Register("sess-1", late);
+  EXPECT_EQ(a.status, 409) << a.body;
+  EXPECT_TRUE(Has(a, "cancelled")) << a.body;
+}

@@ -69,12 +69,26 @@ StateDir::~StateDir() {
   if (fd_ >= 0) ::close(fd_);
 }
 
-bool StateDir::Exists(const std::string& name) const {
+StateDir::Presence StateDir::Exists(const std::string& name, std::string* error) const {
   struct stat st {};
-  return ::fstatat(fd_, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0;
+  const int fault = g_state_stat_fault.exchange(0);
+  if (fault == 0 && ::fstatat(fd_, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0) return Presence::kPresent;
+  const int e = fault ? fault : errno;
+  if (e == ENOENT) return Presence::kAbsent;  // only ENOENT means absent; anything else is not knowing
+  *error = path_ + "/" + name + ": cannot tell whether it exists (" + std::strerror(e) + ")";
+  return Presence::kError;
+}
+
+bool StateDir::ValidName(const std::string& name, std::string* error) const {
+  // A single safe basename: openat does not confine an absolute path or "..".
+  if (name.empty() || name.size() > 200 || name == "." || name == ".." || name.find('/') != std::string::npos ||
+      name.find('\0') != std::string::npos)
+    return *error = "state file name \"" + name + "\" must be a single plain file name", false;
+  return true;
 }
 
 Persist StateDir::Write(const std::string& name, std::string_view bytes, std::string* error) const {
+  if (!ValidName(name, error)) return Persist::kUnpublished;
   const int fault = g_state_write_fault.exchange(0);
   const std::string tmp = name + ".tmp." + std::to_string(::getpid());
   ::unlinkat(fd_, tmp.c_str(), 0);
@@ -94,16 +108,20 @@ Persist StateDir::Write(const std::string& name, std::string_view bytes, std::st
 
 StateRead StateDir::Read(const std::string& name, std::size_t max_bytes, std::string* out, std::string* error) const {
   out->clear();
+  if (!ValidName(name, error)) return StateRead::kError;
   const std::string full = path_ + "/" + name;
   const int fd = ::openat(fd_, name.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) {
     const int e = errno;
     if (e != ENOENT) return *error = full + ": " + std::strerror(e), StateRead::kError;
-    if (Exists(name + ".init"))
-      return *error = full + " is missing but was initialized (" + name +
-                      ".init exists): recovery required (docs/SESSIONS.md section 10, \"Recovery\")",
-             StateRead::kError;
-    return StateRead::kFresh;
+    switch (Exists(name + ".init", error)) {
+      case Presence::kAbsent: return StateRead::kFresh;
+      case Presence::kError: return StateRead::kError;  // never "fresh" on a lookup failure
+      case Presence::kPresent: break;
+    }
+    return *error = full + " is missing but was initialized (" + name +
+                    ".init exists): recovery required (docs/SESSIONS.md section 10, \"Recovery\")",
+           StateRead::kError;
   }
   struct stat st {};
   const auto fail = [&](std::string why) {
@@ -146,11 +164,14 @@ bool StateDir::Init(const std::string& name, std::string_view bytes, std::string
 }
 
 bool StateDir::EnsureMarker(const std::string& name, std::string* error) const {
-  if (Exists(name + ".init")) return true;
+  const Presence p = Exists(name + ".init", error);
+  if (p == Presence::kError) return false;
+  if (p == Presence::kPresent) return true;
   return Write(name + ".init", "initialized\n", error) == Persist::kDurable;
 }
 
 std::unique_ptr<StateLock> StateDir::Lock(const std::string& name, std::string* error) const {
+  if (!ValidName(name, error)) return nullptr;
   const std::string ln = name + ".lock";
   const int fd = ::openat(fd_, ln.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
   if (fd < 0) return *error = "cannot open " + path_ + "/" + ln + ": " + std::strerror(errno), nullptr;

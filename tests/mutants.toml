@@ -2257,8 +2257,8 @@ why = "a valid prefix followed by junk loads as the whole state"
 [[mutant]]
 name = "r3-state-missing-resets"
 file = "src/server/state_file.cpp"
-find = '    if (Exists(name + ".init"))'
-replace = '    if (false)'
+find = '      case Presence::kPresent: break;'
+replace = '      case Presence::kPresent: return StateRead::kFresh;'
 suite = "cpu"
 binary = "crypt_tests"
 filter = "YardKeys.StateLoadingRefusesUnsafeOrPartialState"
@@ -2433,8 +2433,8 @@ why = "a token that expired while the state lock was held still takes effect"
 [[mutant]]
 name = "r4-marker-not-upgraded"
 file = "src/server/state_file.cpp"
-find = '  if (Exists(name + ".init")) return true;'
-replace = '  return true;'
+find = '  if (p == Presence::kPresent) return true;'
+replace = '  if (true) return true;'
 suite = "cpu"
 binary = "crypt_tests"
 filter = "YardKeys.MarkerlessStateIsUpgraded"
@@ -2527,6 +2527,152 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "SessionCache.PoisonedRestoreQuarantinesItsMemory"
 why = "the cache cleanup releases a poisoned session whose device writes may still be queued"
+
+# ---- SE round 5: cancelled operations, op identity, clock order, marker errors, stopped policy, MayOpen ------
+
+[[mutant]]
+name = "r5-cancelled-reinstalled"
+file = "src/server/yard_keys.cpp"
+find = '  if (known && known->state == OpState::kRevoked && tnow < known->keep_until)'
+replace = '  if (false)'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.CancelledOperationsStayCancelled"
+timeout = 600
+why = "a delayed pre-cancel token re-installs the key of a cancelled operation"
+
+[[mutant]]
+name = "r5-cancel-evicted"
+file = "src/server/yard_keys.cpp"
+find = '    if (it->state != OpState::kRevoked && &*it != r) {'
+replace = '    if (&*it != r) {'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.CancelledOperationsStayCancelled"
+timeout = 600
+why = "the last-32 retention evicts a cancellation whose tokens can still arrive"
+
+[[mutant]]
+name = "r5-expired-not-cancelled"
+file = "src/server/yard_keys.cpp"
+find = '        if ((r.state == OpState::kRegistered || r.state == OpState::kExpired) &&'
+replace = '        if ((r.state == OpState::kRegistered) &&'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.ExpiredThenCancelledStaysCancelled"
+timeout = 600
+why = "a revoke does not cancel an operation whose slot already expired: a delayed token re-registers it"
+
+[[mutant]]
+name = "r5-op-id-reuse"
+file = "src/server/yard_keys.cpp"
+find = '  if (known && (known->epoch != E || !crypt::Equal(known->key_hash, key_hash) || (!op.empty() && !known->op.empty() && known->op != op)))'
+replace = '  if (false)'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.CancelledOperationsStayCancelled"
+timeout = 600
+why = "one op id names two operations (another key)"
+
+[[mutant]]
+name = "r5-ttl-per-slot"
+file = "src/server/yard_keys.cpp"
+find = '  const auto cap = first ? first->cap : tnow + ttl;'
+replace = '  const auto cap = tnow + ttl;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.ExpiredUnusedOperations"
+timeout = 600
+why = "a re-registration after expiry starts a new TTL for the same operation"
+
+[[mutant]]
+name = "r5-expired-op-forever"
+file = "src/server/yard_keys.cpp"
+find = '  if (known && known->state == OpState::kExpired && tnow >= known->cap)'
+replace = '  if (false)'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.ExpiredUnusedOperations"
+timeout = 600
+why = "an operation past its TTL answers 200 with a key that is already dead"
+
+[[mutant]]
+name = "r5-wall-before-steady"
+file = "src/server/yard_keys.cpp"
+find = '  const auto steady = Clock::now();'
+replace = '  if (true) { const std::int64_t early = wall(); if (o_.clock_gap_for_test) o_.clock_gap_for_test(); *wall_ms = early; return Clock::now(); } const auto steady = Clock::now();'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.ClockSamplingIsConservative"
+timeout = 600
+why = "the steady anchor is taken after the wall sample: a pause between them extends the key past exp"
+
+[[mutant]]
+name = "r5-marker-error-absent"
+file = "src/server/state_file.cpp"
+find = '  if (e == ENOENT) return Presence::kAbsent;  // only ENOENT means absent; anything else is not knowing'
+replace = '  return Presence::kAbsent;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.MarkerLookupFailsClosed"
+timeout = 600
+why = "a marker lookup error (EIO) is taken for absent: a fresh start from zero"
+
+[[mutant]]
+name = "r5-name-unchecked"
+file = "src/server/state_file.cpp"
+find = '    return *error = "state file name \"" + name + "\" must be a single plain file name", false;'
+replace = '    return true;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.MarkerLookupFailsClosed"
+timeout = 600
+why = "a state file name with a slash or .. escapes the pinned directory"
+
+[[mutant]]
+name = "r5-stopped-fallback-open"
+file = "src/server/yard_keys.cpp"
+find = '''    // composite provider.
+    std::lock_guard<std::mutex> lk(mu_);
+    if (stopped_) return *why = "key provider stopped (state durability uncertain)", false;'''
+replace = '''    // composite provider.'''
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.StoppedProviderIssuesNoLease"
+timeout = 600
+why = "a stopped provider still opens files through the master fallback"
+
+[[mutant]]
+name = "r5-mayopen-ignores-advance"
+file = "src/server/yard_keys.cpp"
+find = '  const bool advanced = !s.e.last_seal || *s.e.last_seal != fe || fe + 1 < s.e.high;'
+replace = '  const bool advanced = false;'
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.AdvancedCheckpointsAreUnreadable"
+timeout = 600
+why = "a file behind a newer seal is kept waiting for a key that can never be registered"
+
+[[mutant]]
+name = "r5-through-zero"
+file = "src/server/yard_keys.cpp"
+find = '    if (th && *th < 1) return refuse("through must be >= 1");  // epochs start at 1: 0 is not "absent"'
+replace = ''
+suite = "cpu"
+binary = "crypt_tests"
+filter = "YardKeys.CancelledOperationsStayCancelled"
+timeout = 600
+why = "through = 0 is accepted as a revoke target"
+
+[[mutant]]
+name = "r5-poison-dtor-releases"
+file = "src/engine/flash_next_gpu.cpp"
+find = '        if (pg) (void)new std::shared_ptr<KvPage>(std::move(pg));'
+replace = ''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "SessionCache.PoisonedRestoreQuarantinesItsMemory"
+why = "a poisoned engine destructor releases KV pages through the member destructors"
 
 # ---- MTP in the server (src/server/decode_loop.cpp, flash_next_generator.cpp; docs/MTP.md) -------------------
 
