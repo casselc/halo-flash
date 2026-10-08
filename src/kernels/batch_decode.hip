@@ -777,6 +777,52 @@ HALO_FOR_NB(HALO_MIX_A_B)
 HALO_FOR_NB(HALO_MIX_B_B)
 #undef HALO_MIX_B_B
 
+// ---- Draft-block catch-up over prompt rows (src/engine/mtp_catchup.cpp) -----------------------------------------
+// halo_matvec_bf16_dual with the column on grid y: column b reads x + b * xstride and writes y1 + b * y1stride,
+// y2 + b * y2stride; each row's arithmetic is the single kernel's (lane l: columns l, l + 32, ..., kBatch loads a
+// lane at a time, one FMA chain, WarpSum). grid (blocks1 + ceil(rows2 / 8), columns), block 256.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_matvec_bf16_dual_y(const std::uint16_t* w1, float* y1, std::uint32_t rows1, const std::uint16_t* w2,
+                            float* y2, std::uint32_t rows2, const float* x, std::uint32_t cols, std::uint32_t blocks1,
+                            std::uint32_t xstride, std::uint32_t y1stride, std::uint32_t y2stride) {
+  x += static_cast<std::size_t>(blockIdx.y) * xstride;
+  y1 += static_cast<std::size_t>(blockIdx.y) * y1stride;
+  y2 += static_cast<std::size_t>(blockIdx.y) * y2stride;
+  const bool first = blockIdx.x < blocks1;
+  const std::uint32_t b = first ? blockIdx.x : blockIdx.x - blocks1;
+  const std::uint32_t r = b * (blockDim.x / kWarp) + threadIdx.x / kWarp, rows = first ? rows1 : rows2;
+  if (r >= rows) return;
+  const std::uint16_t* row = (first ? w1 : w2) + static_cast<std::size_t>(r) * cols;
+  float* y = first ? y1 : y2;
+  const std::uint32_t lane = threadIdx.x % kWarp, n = cols / kWarp;
+  constexpr std::uint32_t kBatch = 16;
+  float acc = 0.0f;
+  for (std::uint32_t j0 = 0; j0 < n; j0 += kBatch) {
+    std::uint16_t wv[kBatch];
+    float xv[kBatch];
+#pragma unroll
+    for (std::uint32_t k = 0; k < kBatch; ++k) {
+      const std::uint32_t c = min(j0 + k, n - 1) * kWarp + lane;
+      wv[k] = row[c];
+      xv[k] = x[c];
+    }
+#pragma unroll
+    for (std::uint32_t k = 0; k < kBatch; ++k)
+      if (j0 + k < n) acc = __builtin_fmaf(Bf16(wv[k]), xv[k], acc);
+  }
+  acc = WarpSum(acc);
+  if (lane == 0) y[r] = acc;
+}
+// The draft block's fused input rows: column t * hc + s = [en[t] ; hn[t * hc + s]] (2h floats each), the vector
+// MtpRun builds in mtp_cat_ for stream s. grid (ceil(2h / 256), T * hc).
+extern "C" __global__ void halo_mtp_cat_rows(const float* en, const float* hn, float* cat, std::uint32_t h,
+                                             std::uint32_t hc) {
+  const std::uint32_t col = blockIdx.y, t = col / hc;
+  float* out = cat + static_cast<std::size_t>(col) * 2 * h;
+  for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < 2 * h; i += gridDim.x * blockDim.x)
+    out[i] = i < h ? en[static_cast<std::size_t>(t) * h + i] : hn[static_cast<std::size_t>(col) * h + (i - h)];
+}
+
 // ---- Per-session small kernels for NB entries in one launch (blockIdx.y = entry): the single kernels' bodies
 // verbatim, pointers offset to the entry's slice. ---------------------------------------------------------------
 extern "C" __global__ void halo_hc_norm_scales_u_y(const float* res, float* scale, std::uint32_t h, float eps, std::uint32_t hc) {

@@ -304,7 +304,7 @@ bool FlashNextGpu::SpecVerify(std::span<const std::int32_t> rows_tok, std::span<
   mtp_pos_ = p - mtp_base_;  // drafting needed MtpPending: mtp_base_ + mtp_pos_ + 1 == p before the drafts
   for (std::uint32_t e = 0; e < a; ++e) {
     const rt::Buffer h = View(bb_.res, std::size_t{e} * D * 4, D * 4);
-    if (!MtpRun(rows_tok[e + 1], &h, {}, error)) return false;
+    if (!MtpRun(rows_tok[e + 1], &h, {}, error, mtp_catchup_ != kMtpCatchUpFull)) return false;
   }
   return CopyFloats(mtp_hpend_, View(bb_.res, std::size_t{a} * D * 4, D * 4), D, error) && dev_.Synchronize(error);
 }

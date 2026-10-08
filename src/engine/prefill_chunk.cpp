@@ -1472,9 +1472,41 @@ bool FlashNextGpu::MtpAfterPrefillRows(std::span<const std::int32_t> tokens, std
   // Row t is trunk position P = position_ + t. Pending (the hidden of P - 1 kept): the base step for its token;
   // following (P is the next position to keep): keep its hidden. Rows before mtp_base_ (the history window) and
   // a broken history (kMtpNever) do neither.
+  // Rows [a, T) take a base step: the first one where the draft block is pending (the hidden of P - 1 kept) or
+  // the row after the one where it starts following.
+  std::uint32_t a = T, steps = 0;
   for (std::uint32_t t = 0; t < T; ++t) {
     const std::uint32_t P = position_ + t;
-    if (P > 0 && mtp_base_ + mtp_pos_ + 1 == P && !MtpRun(tokens[t], &mtp_hpend_, {}, error)) return false;
+    if (P > 0 && mtp_base_ + mtp_pos_ + 1 == P) a = t;
+    else if (mtp_base_ + mtp_pos_ == P) a = t + 1;
+    if (a <= t + 1) break;
+  }
+  steps = T - std::min(a, T);
+  // Wall time (the chunk's trunk work has finished: PrefillChunk synchronized before this).
+  struct Clock {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    std::uint32_t rows;
+    ~Clock() {
+      mtp_catchup_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      mtp_catchup_rows_ += rows;
+    }
+  } clock{.rows = steps};
+  if (mtp_catchup_ == kMtpCatchUpBatched && steps >= std::max(1u, mtp_batch_min_) && MtpBatchUnsupported().empty()) {
+    static const bool kt = std::getenv("HALO_MTP_CATCHUP_TIMING") != nullptr;  // kernel table of the batched path
+    if (kt && !StartKernelTiming(1 << 20, error)) return false;
+    const bool ok = MtpCatchUpBatched(tokens, a, error);
+    if (kt) {
+      double span = 0;
+      const auto times = StopKernelTiming(&span, nullptr, error);
+      std::fprintf(stderr, "mtp catch-up kernels, %u rows: %.2f ms\n", steps, span);
+      for (const auto& k : times) std::fprintf(stderr, "  %-60s %8.3f ms %6zu calls\n", k.key.c_str(), k.ms, k.calls);
+    }
+    return ok;
+  }
+  const bool state_only = mtp_catchup_ != kMtpCatchUpFull;
+  for (std::uint32_t t = 0; t < T; ++t) {
+    const std::uint32_t P = position_ + t;
+    if (P > 0 && mtp_base_ + mtp_pos_ + 1 == P && !MtpRun(tokens[t], &mtp_hpend_, {}, error, state_only)) return false;
     if (mtp_base_ + mtp_pos_ != P) continue;
     const bool ok = Res16() ? Launch(Rk("halo_res_to_f32", Res16()).c_str(), {Blocks(D)}, {kBlock},
                                      {rt::Arg::Buf(mtp_hpend_), rt::Arg::Buf(ck_.res, std::size_t{t} * D * 2), rt::Arg::Val(D)},

@@ -609,47 +609,55 @@ bool FlashNextGpu::Attention(const model::LayerWeights& l, AttnState& s, std::st
   };
   const std::uint32_t ratio = c.compress_ratio, budget = c.indexer_top_k / ratio;
   const std::uint32_t max_blocks = max_context_ / ratio + 1;
-  return (skip_attn_proj_ || (MatVec(l.attn_q, 0, mixed_, qg_, error) && MatVec(l.attn_k, 0, mixed_, k_, error) &&
-                              MatVec(l.attn_v, 0, mixed_, v_, error))) &&
-         Launch("halo_split_qgate", {nh}, {kBlock},
-                {rt::Arg::Buf(qg_), rt::Arg::Buf(q_), rt::Arg::Buf(gate_), rt::Arg::Val(hd)}, error) &&
-         norm(q_, l.attn_q_norm, nh, hd) && norm(k_, l.attn_k_norm, nkv, hd) && rope(q_, nh, hd, kHaloPosition, 1) &&
-         rope(k_, nkv, hd, kHaloPosition, 1) && append_kv(s.k, s.k16, k_, nkv * hd) &&
-         append_kv(s.v, s.v16, v_, nkv * hd) &&
+  // attn_state_only_ (the draft block's catch-up steps): only the launches that write the cache rows (k / v and
+  // their norm and rope, the appends, the indexer key and the pooled block), each exactly as in a full step.
+  const bool so = attn_state_only_;
+  return (skip_attn_proj_ ||
+          ((so || MatVec(l.attn_q, 0, mixed_, qg_, error)) && MatVec(l.attn_k, 0, mixed_, k_, error) &&
+           MatVec(l.attn_v, 0, mixed_, v_, error))) &&
+         (so || Launch("halo_split_qgate", {nh}, {kBlock},
+                       {rt::Arg::Buf(qg_), rt::Arg::Buf(q_), rt::Arg::Buf(gate_), rt::Arg::Val(hd)}, error)) &&
+         (so || norm(q_, l.attn_q_norm, nh, hd)) && norm(k_, l.attn_k_norm, nkv, hd) &&
+         (so || rope(q_, nh, hd, kHaloPosition, 1)) && rope(k_, nkv, hd, kHaloPosition, 1) &&
+         append_kv(s.k, s.k16, k_, nkv * hd) && append_kv(s.v, s.v16, v_, nkv * hd) &&
          // QSA indexer: raw keys cached; the block holding this token is
          // pooled, normalized and rotated at its start every step, final
          // once complete (incomplete slots are never scored).
          indexer_qk() &&
-         append(s.index_k, ik_, kHaloPosition, idim) && norm(iq_, l.indexer_q_norm, c.indexer_heads, idim) &&
-         rope(iq_, c.indexer_heads, idim, kHaloPosition, 1) &&
+         append(s.index_k, ik_, kHaloPosition, idim) &&
+         (so || (norm(iq_, l.indexer_q_norm, c.indexer_heads, idim) &&
+                 rope(iq_, c.indexer_heads, idim, kHaloPosition, 1))) &&
          Launch("halo_pool_block", {1}, {128},
                 {rt::Arg::Buf(s.index_k), rt::Arg::Buf(pooled_), params, rt::Arg::Val(ratio), rt::Arg::Val(idim)},
                 error) &&
          norm(pooled_, l.indexer_k_norm, 1, idim) && rope(pooled_, 1, idim, kHaloBlock, ratio) &&
          append(s.block_k, pooled_, kHaloBlock, idim) &&
-         // Selection on device with the reference's rule.
-         Launch((decode_opt_ & kDecodeQsaScores) && c.indexer_heads <= 8 && c.indexer_heads * idim <= 2048 &&
-                        idim % 8 == 0
-                    ? "halo_qsa_scores_b"
-                    : "halo_qsa_scores",
-                {(decode_opt_ & kDecodeScoresWide) ? Blocks(max_blocks) : std::min(Blocks(max_blocks), 64u)}, {kBlock},
-                {rt::Arg::Buf(iq_), rt::Arg::Buf(s.block_k), rt::Arg::Buf(block_scores_), params,
-                 rt::Arg::Val(c.indexer_heads), rt::Arg::Val(idim)},
-                error) &&
-         Launch((decode_opt_ & kDecodeSelect256) ? "halo_qsa_select256" : "halo_qsa_select", {1},
-                {(decode_opt_ & kDecodeSelect256) ? 256u : 1024u},
-                {rt::Arg::Buf(block_scores_), rt::Arg::Buf(visible_), params, rt::Arg::Val(budget), rt::Arg::Val(ratio)},
-                error) &&
-         Launch(decode_attn_batched_ && hd % 32 == 0 && hd <= kBlock && kBlock <= 256
-                    ? (kv16_only_ ? "halo_attention_select_bh" : "halo_attention_select_b")
-                    : (kv16_only_ ? "halo_attention_select_h" : "halo_attention_select"),
-                {nh}, {kBlock},
-                {rt::Arg::Buf(q_), rt::Arg::Buf(kv16_only_ ? s.k16 : s.k), rt::Arg::Buf(kv16_only_ ? s.v16 : s.v),
-                 rt::Arg::Buf(gate_), rt::Arg::Buf(visible_),
-                 rt::Arg::Buf(ctx_), rt::Arg::Buf(scores_), params, rt::Arg::Val(nh), rt::Arg::Val(nkv),
-                 rt::Arg::Val(hd), rt::Arg::Val(AttnVisibleStride())},
-                error) &&
-         (skip_attn_proj_ || MatVec(l.attn_out, 0, ctx_, block_out_, error));
+         (so ||
+          (  // Selection on device with the reference's rule.
+              Launch((decode_opt_ & kDecodeQsaScores) && c.indexer_heads <= 8 && c.indexer_heads * idim <= 2048 &&
+                             idim % 8 == 0
+                         ? "halo_qsa_scores_b"
+                         : "halo_qsa_scores",
+                     {(decode_opt_ & kDecodeScoresWide) ? Blocks(max_blocks) : std::min(Blocks(max_blocks), 64u)},
+                     {kBlock},
+                     {rt::Arg::Buf(iq_), rt::Arg::Buf(s.block_k), rt::Arg::Buf(block_scores_), params,
+                      rt::Arg::Val(c.indexer_heads), rt::Arg::Val(idim)},
+                     error) &&
+              Launch((decode_opt_ & kDecodeSelect256) ? "halo_qsa_select256" : "halo_qsa_select", {1},
+                     {(decode_opt_ & kDecodeSelect256) ? 256u : 1024u},
+                     {rt::Arg::Buf(block_scores_), rt::Arg::Buf(visible_), params, rt::Arg::Val(budget),
+                      rt::Arg::Val(ratio)},
+                     error) &&
+              Launch(decode_attn_batched_ && hd % 32 == 0 && hd <= kBlock && kBlock <= 256
+                         ? (kv16_only_ ? "halo_attention_select_bh" : "halo_attention_select_b")
+                         : (kv16_only_ ? "halo_attention_select_h" : "halo_attention_select"),
+                     {nh}, {kBlock},
+                     {rt::Arg::Buf(q_), rt::Arg::Buf(kv16_only_ ? s.k16 : s.k),
+                      rt::Arg::Buf(kv16_only_ ? s.v16 : s.v), rt::Arg::Buf(gate_), rt::Arg::Buf(visible_),
+                      rt::Arg::Buf(ctx_), rt::Arg::Buf(scores_), params, rt::Arg::Val(nh), rt::Arg::Val(nkv),
+                      rt::Arg::Val(hd), rt::Arg::Val(AttnVisibleStride())},
+                     error) &&
+              (skip_attn_proj_ || MatVec(l.attn_out, 0, ctx_, block_out_, error))));
 }
 
 bool FlashNextGpu::ExpertMatVec(const model::TensorRef& t, std::uint32_t slot, const rt::Buffer& x,
@@ -1005,7 +1013,7 @@ bool FlashNextGpu::Run(std::int32_t token, Head head, const SampleRequest* reque
   if (mtp_track_ && bound_ == mtp_owner_) {
     // The draft block follows: its pending base step (last position's hidden, this token), then this step's
     // hidden becomes the pending one.
-    if (MtpPending() && !MtpRun(token, &mtp_hpend_, {}, error)) return false;
+    if (MtpPending() && !MtpRun(token, &mtp_hpend_, {}, error, mtp_catchup_ != kMtpCatchUpFull)) return false;
     if (MtpKeepsHidden() && !CopyFloats(mtp_hpend_, res_, c.HcDim(), error)) return false;
   }
   ngram_history_ = history;
