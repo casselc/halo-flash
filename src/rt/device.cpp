@@ -1,6 +1,12 @@
 #include "rt/device.hpp"
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
+#include <cstdio>
 #include <cstdlib>
+#include <string_view>
 
 namespace halo::rt {
 
@@ -49,7 +55,36 @@ bool Device::UnmapPage(const Buffer&, std::size_t, std::string* error) { return 
 
 const char* BackendName(Backend b) noexcept { return b == Backend::kHip ? "hip" : "hrx"; }
 
+namespace {
+// The shared-GPU rule (/data/halo-work/streams/RULES.md): every process that opens the GPU runs under
+// `flock <lock> env HALO_GPU_LOCKED=1 ...`. Two model instances at once run the host out of memory (2026-10-07: a
+// bench started without the lock overlapped another stream's real-model run and both failed), so a device is refused
+// unless the lock is held right now AND this process was started under it. The check applies only on hosts where the
+// lock file exists; HALO_GPU_LOCK_ENFORCE=0 disables it (e.g. a machine with its own GPU), HALO_GPU_LOCK_FILE moves it.
+bool GpuLockOk(std::string* error) {
+  const char* enforce = std::getenv("HALO_GPU_LOCK_ENFORCE");
+  if (enforce && std::string_view(enforce) == "0") return true;
+  const char* f = std::getenv("HALO_GPU_LOCK_FILE");
+  const std::string path = f && *f ? f : "/data/halo-work/gpu.lock";
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return true;  // no shared-GPU policy on this host
+  const bool free = ::flock(fd, LOCK_EX | LOCK_NB) == 0;  // nobody holds it: we are not running under it
+  if (free) ::flock(fd, LOCK_UN);
+  ::close(fd);
+  const char* held = std::getenv("HALO_GPU_LOCKED");
+  if (!free && held && std::string_view(held) == "1") return true;
+  const std::string why = std::string("GPU lock not held: run under `flock ") + path +
+                          " env HALO_GPU_LOCKED=1 <cmd>` (" +
+                          (free ? "the lock is free" : "another process holds the lock") +
+                          "; HALO_GPU_LOCK_ENFORCE=0 turns this check off)";
+  std::fprintf(stderr, "halo: %s\n", why.c_str());  // loud: tests that skip on a missing device must not hide it
+  if (error) *error = why;
+  return false;
+}
+}  // namespace
+
 std::unique_ptr<Device> Device::Create(Backend backend, std::string* error) {
+  if (!GpuLockOk(error)) return nullptr;
   switch (backend) {
     case Backend::kHip:
 #if HALO_WITH_HIP
