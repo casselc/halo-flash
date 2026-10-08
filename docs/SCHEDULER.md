@@ -1,8 +1,9 @@
 # G3: a fair GPU scheduler for halo_serve (design, 2026-10-07)
 
-Design and model only: nothing here is built. Model: `spec/scheduler/` (Quint 0.32, `quint run` only), checked by
+Design, model and build. Model: `spec/scheduler/` (Quint 0.32, `quint run` only), checked by
 `spec/scheduler/run.sh`, results in `spec/scheduler/results.txt`. Predictions (written before any G3 code):
-`/data/halo-work/streams/B/PREDICTIONS-G3.md`, summarised in section 9.
+`/data/halo-work/streams/B/PREDICTIONS-G3.md`, summarised in section 9. Fairness is two-level since A2A-MCP D9 (chain
+root, then sandbox: section 4). What is built and measured: section 12.
 
 ## 0. Recommendation in one paragraph
 
@@ -11,12 +12,14 @@ while anyone else is runnable, 8192 when alone), a **batched decode unit** (Step
 a short burst of steps), or a decider evaluation. Between units it **fences** departed requests (parking their
 slice-aligned progress as a retained prefix) and **picks** the next unit: a decider with **credit** first, then
 **start-time fair queuing by GPU time over sandbox principals** (the decider class is one more principal once out of
-credit). HTTP threads **admit** under the same lock against a **reservation ledger** (retained prefixes + every
+credit). The fair queue has **two levels** (A2A-MCP D9): the **chain root** a request serves first, then the sandbox
+principal within that root, so an agent chain that fans out to several sandboxes holds one share, not one per
+sandbox. HTTP threads **admit** under the same lock against a **reservation ledger** (retained prefixes + every
 admitted request's reservation; eviction counts what it frees), with a per-principal in-flight limit; a refusal is
 a **429 with Retry-After** that takes the request off the queue in the same critical section. Clients get **SSE
 heartbeats** while queued or prefilling, and every turn carries an **idempotency key**: a retry of a finished turn
-replays the stored answer, a retry of an in-flight one adopts it. The model holds all 11 properties for this design
-(two seeds, 20000 traces each); today's scheduling and each of 13 mutants (one rule off each) break the property
+replays the stored answer, a retry of an in-flight one adopts it. The model holds all 12 properties for this design
+(two seeds, 20000 traces each); today's scheduling and each of 14 mutants (one rule off each) break the property
 they are named for.
 
 ## 1. Today (main ac2ec31)
@@ -79,14 +82,41 @@ impossible without changing kernels.
 
 ## 4. Q2: policy, fairness and admission
 
-**Fairness.** Start-time fair queuing (SFQ) over **principals** (one per sandbox, from the broker's
-`X-Halo-*`/`X-Halo-Session-Id`; unknown callers are one shared principal), charged by **GPU time actually used**
-(the unit's measured duration; a batched decode unit charges each participant its share). Within a principal,
-FIFO. A principal that was idle **joins at the system virtual time** (the start tag of the last unit picked: it
-banks no credit while idle). Joining at the minimum over the *other runnable* principals is not enough: a principal
-briefly not runnable (departed, then adopted by its retry) is left out of that minimum and then waits for the
-joiner to catch up; the model found this at 20000 samples (`boundedWait` 11 > 10 ticks). This is what makes a cold 128K prompt coexist with other sandboxes: it gets its share, the
-others keep theirs.
+**Fairness: two levels (A2A-MCP D9).** Start-time fair queuing (SFQ) by **GPU time actually used** (the unit's
+measured duration; a batched decode unit charges each participant a whole unit), on two levels:
+1. over **chain roots**: a request carries the chain it serves (`X-Halo-Chain-Id`, stamped by yard-relay on
+   deliveries and forwarded by the callee's broker); a sandbox outside any chain is its own root, so lone agents
+   see no change;
+2. within a root, over its **sandbox principals** (`X-Halo-Principal`; unknown callers are one shared principal);
+3. within a principal, FIFO.
+Each root and principal has a virtual time; the pick takes the root with the least, then its principal with the
+least. A root that was idle **joins at the system virtual time** (the least tag among the backlogged roots at the
+last pick: it banks no credit while idle), and a principal joins at its root's own system virtual time. Joining at
+the minimum over the *other runnable* principals is not enough: a principal briefly not runnable (departed, then
+adopted by its retry) is left out of that minimum and then waits for the joiner to catch up; the model found this
+at 20000 samples (`boundedWait` 11 > 10 ticks). This is what makes a cold 128K prompt coexist with other
+sandboxes: it gets its share, the others keep theirs.
+
+Why two levels: with one level, a chain whose root calls B, C and D at once holds three shares (and a loop of
+agents calling each other crowds out an unrelated interactive sandbox). With two, the chain holds one share and
+its sandboxes split it: a request that shares its root with another sandbox waits about twice as long between
+units (`WAIT_CHAIN` = 2 x `WAIT_BOUND` - one unit, section 10), and an unrelated root's service stays within
+`LAG_BOUND` of the chain's (`chainFair`; the one-level mutant `oneLevelSfq` breaks it). Batching adds **rides**: a
+decoding request is in every decode unit, also one another root starts, and is charged for it; the lag bound
+counts one root's catch-up of rides.
+
+**Request headers** (set by the broker, never by a sandbox):
+| Header | Meaning | Default when absent |
+|---|---|---|
+| `X-Halo-Principal` | the sandbox principal (fair-queuing principal, D3 limit) | `anonymous` (one shared principal) |
+| `X-Halo-Chain-Id` | the chain root the request serves (A2A-MCP 5.7, 9) | the principal itself |
+| `Idempotency-Key` | the turn's key (section 7) | with a principal: `d5:` sha256(principal, previous_response_id, input, API); without one: none |
+yard-relay stamps `yard_chain` on deliveries and the callee's broker forwards it as `X-Halo-Chain-Id`; the broker
+sets `X-Halo-Principal` from the sandbox's tap identity (A2A-MCP 3: "headers from the VM never carry identity").
+halo_serve trusts these headers as it trusts the broker's other `X-Halo-*` headers: **the broker must strip any
+`X-Halo-*` and `Idempotency-Key` header a sandbox sends and set its own** (a sandbox that could pick its principal
+or chain could take another's share or its key's replay). The default key applies only to principal-stamped
+requests: an anonymous caller repeating a prompt (an eval sampling N answers) means it, and must not get a replay.
 
 **Decider priority with a budget.** A decider call carries the `systemone` class. While the class has **credit**
 (a token bucket: `DEC_BURST` evaluations, refilled one per `DEC_REFILL`), it runs at the next unit boundary ahead of
@@ -245,12 +275,19 @@ halo_serve were modelled together (the broker's token bucket and one-in-flight r
 
 **Durations.** Time is ticks (one tick ~0.6 s, half a 2048-token slice). A slice costs 2, a decode unit 1, a decider
 1; units run to their end; the client idle timeout is 5 ticks, a vanished peer is known gone after 2, Retry-After is
-3, the decider credit refills 1 per 8 ticks. Two conversations (sandboxes A, B), two turns each (3 and 5 slices,
-the second extends the first), up to 12 decider calls, 2 client faults a run, memory for 9 KV units. A unit maps
-the page it writes when it starts (EnsureKv before the chunk or step), so the memory properties see it.
+3, the decider credit refills 1 per 8 ticks. Three conversations (sandboxes A, B, C), two turns each (3 and 5
+slices, the second extends the first); each sandbox serves its own chain or the chain X (drawn at the start, so a
+run has a fan-out of two or three sandboxes under X, or none); up to 12 decider calls, 2 client faults a run, memory
+for 14 KV units, 48 ticks a run (160 steps: long enough for a second turn with three sandboxes). A unit maps the
+page it writes when it starts (EnsureKv before the chunk or step), so the memory properties see it.
 
-**Bounds the properties check.** `WAIT_BOUND` = the unit in service (2) + the other sandbox's catch-up after its
-join (3) + the decider principal's catch-up (3) + two credited deciders (2) = 10 ticks (~6 s); `DEC_BOUND` = the
+**Bounds the properties check.** `WAIT_BOUND` (a request alone in its chain root) = the unit in service (2) + the
+catch-up of the two other agent roots after their join (3 each) + the decider root's catch-up (3) + two credited
+deciders (2) = 13 ticks (~8 s); `WAIT_CHAIN` (a request whose root holds another sandbox's request too) = 2 x
+`WAIT_BOUND` - one unit = 24 ticks (~14 s): it gets half its root's turns, and its root-mate's decode rides in the
+other roots' batches are charged to the root; the simulation's worst case is this bound (22 breaks at 48 ticks with
+seed 0xbeef, 24 holds on both seeds). `LAG_BOUND` (two agent roots backlogged together: their GPU service since
+then stays within) = one unit of each (2 x 2) + one root's catch-up of rides (2 + 1) = 7 ticks. `DEC_BOUND` = the
 unit in service + one credited decider ahead = 4 ticks (~2.4 s); `GONE_BOUND` = `ACK_TO` + one unit = 4 ticks.
 The client idle timeout (5) is below `WAIT_BOUND` on purpose: without heartbeats a fairly served request can time
 out, which is the D3 trigger.
@@ -258,21 +295,24 @@ out, which is the D3 trigger.
 **Model bugs found while running it** (fixed before the table below): admission counted the arriving request in
 its own ledger (false memory 429s); the unit kind was chosen before the reused prefix was bound (an extra slice);
 a 429 sent to a late attempt released the client's newer request. The fourth was a design bug, not a model bug: the
-fair-queuing join rule above.
+fair-queuing join rule above. With two levels: the first `chainFair` bound (one unit of each, 4) broke in the design:
+a decoding root rides batches another root starts while catching up; and the first two `WAIT_CHAIN` derivations (18,
+then 20) undercounted the root-mate's tag ties and rides (found at 36 and 48 ticks).
 
 **Rules** (`Rules` record; the design sets all; each mutant in `schedTest.qnt` turns one off): preempt,
 deciderPrio, deciderBudget, fenceDeparture, deadPeerProbe, heartbeat, parkOnCancel, bindAtStart, reserveLedger,
-evictSeesFreed, pinPlanned, atomic429, idempotency.
+evictSeesFreed, pinPlanned, atomic429, idempotency, twoLevel.
 
-**Properties**: `rejectedNeverRuns`, `boundedWait`, `deciderLatency`, `workAfterGoneBounded`,
-`noSpuriousTimeout`, `noOvercommit`, `withinReservation`, `refuseOnlyIfShort`, `noRecompute`,
-`noSelfInflicted429`, `generatedOnce` (and `safety`, their conjunction).
+**Properties**: `rejectedNeverRuns`, `boundedWait` (with groups: `WAIT_BOUND` / `WAIT_CHAIN`), `deciderLatency`,
+`workAfterGoneBounded`, `noSpuriousTimeout`, `noOvercommit`, `withinReservation`, `refuseOnlyIfShort`,
+`noRecompute`, `noSelfInflicted429`, `generatedOnce`, `chainFair` (and `safety`, their conjunction).
 
-**Results** (`spec/scheduler/results.txt`, seed 0x5eed, 120 steps; 20000 traces for the design, 5000 per mutant):
+**Results** (`spec/scheduler/results.txt`, seed 0x5eed, 160 steps; 20000 traces for the design, 5000 per mutant but
+`generatedOnce`'s, which needs 20000: a replay is rare with three sandboxes):
 
 | Instance | Property | Expect | Result | What breaks it |
 |---|---|---|---|---|
-| design (seeds 0x5eed, 0xbeef) | `safety` (all 11) | ok | ok, 2 x 20000 | |
+| design (seeds 0x5eed, 0xbeef) | `safety` (all 12) | ok | ok, 2 x 20000 | |
 | design, keyless clients (`noIdempotency`) | `noRecompute`, `boundedWait` | ok | ok | park on cancel + bind at start protect keyless retries |
 | today (one mutex, FIFO, to the end) | `boundedWait` / `deciderLatency` | VIOLATED | VIOLATED / VIOLATED | a turn or a decider waits for another sandbox's whole request |
 | `noPreempt` | `boundedWait` | VIOLATED | VIOLATED | whole requests as units |
@@ -288,22 +328,27 @@ evictSeesFreed, pinPlanned, atomic429, idempotency.
 | `evictPlanned` | `withinReservation` | VIOLATED | VIOLATED | a planned prefix evicted under an admitted request |
 | `queued429` | `rejectedNeverRuns` | VIOLATED | VIOLATED | AUDIT N4: a 429'd request still runs |
 | `noIdempotency` | `generatedOnce` / `noSelfInflicted429` | VIOLATED | VIOLATED / VIOLATED | a lost answer regenerated; a retry refused by its own attempt |
+| `oneLevelSfq` | `chainFair` | VIOLATED | VIOLATED | a chain fanned out to two sandboxes takes two shares (A2A-MCP D9) |
 
-Witnesses (design, 20000 traces): preempted 99.97%, batched 70.2%, decider between slices 99.8%, decider out of
-credit served fairly 100%, parked on cancel 13.0%, evicted 34.1%, memory 429 94.7%, retry after 429 75.3%, client
-timeout 40.9%, fenced after FIN 21.7% / after a vanished peer 6.1%, late arrival 44.1%, replayed 7 traces,
-adopted 36.6%, second turn done 0.9%; keyless instance (5000): limit 429 30.1%, prefix bound later 4.9%.
+Witnesses (design, 20000 traces): preempted 100%, batched 99.3%, decider between slices 99.97%, decider out of
+credit served fairly 100%, parked on cancel 11.2%, evicted 91.7%, memory 429 96.6%, retry after 429 88.7%, client
+timeout 52.4%, fenced after FIN 26.8% / after a vanished peer 8.3%, late arrival 53.9%, replayed 4 traces, adopted
+42.1%, second turn done 34.1%, chain fan-out (a root with two backlogged sandboxes beside another root) 36.4%;
+keyless instance (5000): limit 429 38.5%, prefix bound later 7.1%. A run takes ~10 min per 20000 traces.
 
-**Limits of the model.** Two principals and one conversation each; the eviction candidate is the other
-conversation's prefix only; decode units charge each participant a whole unit (the doc's rule charges shares);
-memory is in abstract units with no page rounding or fork constant; simulation, not exhaustive checking.
+**Limits of the model.** Three principals and one conversation each, one chain (X) besides the lone roots, a
+conversation's chain fixed for the run; an admission that needs room evicts every evictable prefix at once (the
+code evicts least recently used first until it fits); decode units charge each participant a whole unit (as the
+code does); memory is in abstract units with no page rounding or fork constant; simulation, not exhaustive
+checking; the bounds are the simulation's worst case, derived after the fact for `WAIT_CHAIN` and `LAG_BOUND`.
 
 ## 11. Decisions for the user
 
 **Decided 2026-10-07: the user accepted every recommendation below.** D1 2048 contended / 8192 alone; D2 measure
 the decider's GPU contention first (M4), flash-pointer deciders as units; D3 one in-flight turn per sandbox; D4
 burst 4, refill 2/s; D5 default key = digest of (principal, previous_response_id, input); D6 heartbeats on (main
-24cab4b: `halo_serve --sse-keepalive` defaults to 15 s).
+24cab4b: `halo_serve --sse-keepalive` defaults to 15 s). Also accepted (A2A-MCP.md D9): two-level fair queuing,
+chain root then sandbox (section 4; model re-checked, section 10).
 
 - **D1 slice size**: 2048-token slices under contention, 8192 alone (recommended), or always 8192 (7% faster
   contended prefill, 5-8 s preemption bound).
