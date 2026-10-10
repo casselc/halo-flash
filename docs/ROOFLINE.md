@@ -1503,3 +1503,36 @@ docs/SESSIONS.md section 11. Correctness, not speed: the rows record what each e
 | VMM settle (no GPU work until 1 ms after a map / unmap) + fork maps before copies, fix off, W 0 | 0 of 4; TTFT +1 ms a fork | 0 of 4; final defaults, no diagnostics (E10): 0 of 4; TTFT and decode within run-to-run noise (+-5%) | yes (default 1000 us) |
 | Range pool (6240e69) | - | removed the fault by keeping forks off freshly freed addresses, but kept every pooled range's high-water pages charged (4 GB probe: freed only with the range); 128K OOM on main (stream SE) | no (removed; `HALO_DIAG_RANGE=pool` for A/B) |
 | Ranges freed + VMM settle, 128K spill bench (SE's B0) | restores like SR4 (2.56 s) | restore 2571 ms, logits bit-identical | yes |
+
+## 18. 2026-10-10 (stream ST, branch `stream/short-t`): short Prefill calls
+
+Every Prefill call takes the chunk path whatever its length, so a short call (an agent
+turn's new tokens, a one-token remainder past an 8192-token chunk) paid ~89 ms of dense
+GEMMs for any T up to 64 (`halo_run --kernel-timing 1`, depth 0, pinned; K2 stream sweep):
+
+| T | wall | kernels | dense GEMMs | routed MoE |
+|---:|---:|---:|---:|---:|
+| 1 | 111 ms | 110.5 | 89.1 | 11.4 |
+| 16 | 150 ms | 149.2 | 87.7 | 50.9 |
+| 64 | 185 ms | 184.1 | 89.9 | 80.5 |
+| 256 | 280 ms | 279.3 | 122.5 | 125.0 |
+
+The large tiles' grids are ceil(T / 128) x rows / 256 (the tall 320 x 10240 shape one
+block), so 1..48 workgroups ran, each a chain of latency-bound K stages (`_mb`: 160 stages
+of ~1.9 us on one block, 304 us a call). MoE grows with T as more experts are touched:
+data, not overhead. GemmQ8rF16 sums every output over K in the same order for any tile,
+so new tiles are exact.
+
+gemm_bench study (T 1 / 64, cold and after 96 MB of writes) picked 256-wide K stages on
+32-row tiles below 4096 rows and 64-row tiles from 4096 (320 x 10240: `_mb` 0.305 ->
+0.061 ms cold; 2560 x 6144: `_l` 0.487 -> 0.135; 12288 x 2560: lr8 0.309 -> 0.157).
+128-wide stages and the other tile per shape were slower; T 64 gains shrink on the
+largest shapes.
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| `halo_gemm_q8r_f16_t{32,64}k256[b,h]` for FP16-route dense GEMMs at T <= 64 (`--short-gemm 64`, cols % 256 == 0; K-blocked input for the mixer down, fp16 out for the DeltaNet qkv / z) | bit-identical; dense 89 -> 30..50 ms at T 1; -35..-60 ms a call at T 1 / 16 / 64; 2048 unchanged | Property test bitwise vs `_l` (all nine tiles, ragged rows / tokens, blocked and fp16 forms); logits byte-identical at T 1 / 16 / 64 / 256 / 2048; dense 87.6 -> 40.6 ms at T 1. ab_bench 4 x 3 pinned (prose_1, warm prose_8888, --context 16384): T 1 105.8 -> 58.0 (-47.8, spreads 1.3 / 0.3), T 16 146.6 -> 98.9 (-47.7), T 64 180.9 -> 138.1 (-42.8), T 2048 1244.4 -> 1250.4 within noise (same path) | yes (default 64) |
+
+Not yet tried: the short tiles at 64 < T <= 256 (dense still 122 ms at T 256), and the
+remaining ~41 ms at T 1 (the 2560-row `t32k256` 131 us a call, the fp16 lr8h shapes
+94..140 us) against a decode step's ~37 ms for all of its weights.

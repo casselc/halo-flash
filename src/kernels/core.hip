@@ -7519,8 +7519,9 @@ HALO_GDN_SKEL(halo_gdnskel_c64_n32_pf_seq, 64, 32, 256, 4, true, true)
 // With rs and nw, xn is the residual and xn[t][s h + i] is rebuilt as
 // (res * rs[t * 4 + s]) * nw[s h + i] (combine_norm's arithmetic).
 template <std::uint32_t BM, std::uint32_t BN, std::uint32_t WM, std::uint32_t WN, std::uint32_t KS, bool kMix = false,
-          bool kRowsFast = false, std::uint32_t RG = 1, bool kBlockedX = false, bool kMixH = false, bool kMixLo = false>
-__device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, float* y,
+          bool kRowsFast = false, std::uint32_t RG = 1, bool kBlockedX = false, bool kMixH = false, bool kMixLo = false,
+          typename OT = float>
+__device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, OT* y,
                            std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens,
                            const float* xn = nullptr, _Float16* y16 = nullptr, const float* rs = nullptr,
                            const float* nw = nullptr, const _Float16* xh = nullptr, _Float16* ylo = nullptr) {
@@ -7566,10 +7567,12 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
 #pragma unroll
     for (std::uint32_t p = 0; p < BP; ++p) {
       const std::uint32_t i = tid + p * NT, tok = i / BPR, part = i % BPR;  // part: 8 values
-      // kBlockedX: x stored [cols / KS][tokens][KS], a stage's tokens contiguous.
+      // kBlockedX: x stored [cols / 64][tokens][64], a 64-value block's tokens contiguous
+      // (a stage of KS > 64 reads KS / 64 blocks).
+      const std::uint32_t k = k0 + part * 8;
       rb[p] = *reinterpret_cast<const halo_v4i*>(
-          x + (kBlockedX ? (static_cast<std::size_t>(k0 / KS) * tokens + min(t0 + tok, tokens - 1)) * KS + part * 8
-                         : static_cast<std::size_t>(min(t0 + tok, tokens - 1)) * cols + k0 + part * 8));
+          x + (kBlockedX ? (static_cast<std::size_t>(k / 64) * tokens + min(t0 + tok, tokens - 1)) * 64 + k % 64
+                         : static_cast<std::size_t>(min(t0 + tok, tokens - 1)) * cols + k));
     }
   };
   const auto store = [&] {
@@ -7731,7 +7734,7 @@ __device__ void GemmQ8rF16(const std::int8_t* qs, const std::uint16_t* d, const 
       for (std::uint32_t idx = lane; idx < 16 * TM * 16; idx += 32) {
         const std::uint32_t tt = idx / (TM * 16), rr = idx % (TM * 16);
         const std::uint32_t t = t0 + (wt * TN + n) * 16 + tt, r = r0 + wr * TM * 16 + rr;
-        if (t < tokens && r < rows) y[static_cast<std::size_t>(t) * rows + r] = slice[tt * (TM * 16) + rr];
+        if (t < tokens && r < rows) y[static_cast<std::size_t>(t) * rows + r] = static_cast<OT>(slice[tt * (TM * 16) + rr]);
       }
     }
     __builtin_amdgcn_wave_barrier();
@@ -8067,6 +8070,30 @@ extern "C" __global__ void __launch_bounds__(256)
                          std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {
   GemmQ8rF16<320, 64, 4, 2, 64, false, false, 1, true>(qs, d, x, y, rows, cols, qstride, tokens);
 }
+
+// Short calls (T <= 64): at one token the large tiles run 1..48 workgroups, each a
+// chain of latency-bound K stages (_mb: 160 stages of ~1.9 us on one block). These
+// cover the same shapes with more row tiles and wider K stages. GemmQ8rF16
+// accumulates every output over K in the same order whatever the tile, so the
+// results are the same bits as _l / _s / _mb / lr8 / lr8h.
+//   grid (ceil(T / BN), ceil(rows / BM)), block 256; cols % KS == 0
+#define HALO_GEMM_SHORT(NAME, BM, BN, WM, WN, KS, BLOCKED, OT)                                                    \
+  extern "C" __global__ void __launch_bounds__(256)                                                              \
+      NAME(const std::int8_t* qs, const std::uint16_t* d, const _Float16* x, OT* y, std::uint32_t rows,           \
+           std::uint32_t cols, std::uint32_t qstride, std::uint32_t tokens) {                                     \
+    GemmQ8rF16<BM, BN, WM, WN, KS, false, false, 1, BLOCKED, false, false, OT>(qs, d, x, y, rows, cols, qstride, \
+                                                                               tokens);                           \
+  }
+HALO_GEMM_SHORT(halo_gemm_q8r_f16_t32k128, 32, 64, 2, 4, 128, false, float)
+HALO_GEMM_SHORT(halo_gemm_q8r_f16_t32k256, 32, 64, 2, 4, 256, false, float)
+HALO_GEMM_SHORT(halo_gemm_q8r_f16_t64k128, 64, 32, 4, 2, 128, false, float)
+HALO_GEMM_SHORT(halo_gemm_q8r_f16_t64k256, 64, 32, 4, 2, 256, false, float)
+HALO_GEMM_SHORT(halo_gemm_q8r_f16_t32k256h, 32, 64, 2, 4, 256, false, _Float16)
+HALO_GEMM_SHORT(halo_gemm_q8r_f16_t64k256h, 64, 32, 4, 2, 256, false, _Float16)
+HALO_GEMM_SHORT(halo_gemm_q8r_f16_t32k256b, 32, 64, 2, 4, 256, true, float)
+HALO_GEMM_SHORT(halo_gemm_q8r_f16_t64k256b, 64, 32, 4, 2, 256, true, float)
+HALO_GEMM_SHORT(halo_gemm_q8r_f16_t32k128b, 32, 64, 2, 4, 128, true, float)
+#undef HALO_GEMM_SHORT
 
 #ifdef HALO_TRACE
 // Turns span recording on or off, in stream order (src/kernels/span_trace.h). grid 1, block 1

@@ -269,6 +269,19 @@ bool FlashNextGpu::MixH(const model::HcMixer& m) const {
          m.up.rows % 256 == 0;
 }
 
+const char* FlashNextGpu::ShortGemm(std::uint32_t rows, std::uint32_t cols, std::uint32_t T, bool blocked_x,
+                                    bool half_out, std::uint32_t* bm, std::uint32_t* bn) {
+  // gemm_bench study, T 1 / 64, cold and after 96 MB of writes: 64-row tiles win from 4096 rows
+  // (12288 x 2560: lr8 0.309 -> 0.157 ms cold), 32-row tiles below (320 x 10240: _mb 0.305 -> 0.061).
+  if (T == 0 || T > prefill_short_gemm_ || cols % 256 != 0) return nullptr;
+  const bool wide = rows >= 4096;
+  *bm = wide ? 64 : 32;
+  *bn = wide ? 32 : 64;
+  if (half_out) return blocked_x ? nullptr : wide ? "halo_gemm_q8r_f16_t64k256h" : "halo_gemm_q8r_f16_t32k256h";
+  if (blocked_x) return wide ? "halo_gemm_q8r_f16_t64k256b" : "halo_gemm_q8r_f16_t32k256b";
+  return wide ? "halo_gemm_q8r_f16_t64k256" : "halo_gemm_q8r_f16_t32k256";
+}
+
 bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt::Buffer& y, std::uint32_t T,
                         std::string* error, const rt::Buffer* x16, bool x16_blocked) {
   const auto& d = tensors_.at(t.data);
@@ -280,6 +293,12 @@ bool FlashNextGpu::Gemm(const model::TensorRef& t, const rt::Buffer& x, const rt
   const std::uint32_t bm = tall ? 320 : small ? 64 : 256, bn = tall ? 64 : 128;
   if (F16Route(t)) {
     if (!x16 && !Half(x, ck_.xh, T * cols, error)) return false;
+    std::uint32_t sm = 0, sn = 0;
+    if (const char* sk = ShortGemm(rows, cols, T, x16 && x16_blocked, false, &sm, &sn))
+      return Launch(sk, {(T + sn - 1) / sn, (rows + sm - 1) / sm}, {256},
+                    {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(x16 ? *x16 : ck_.xh), rt::Arg::Buf(y),
+                     rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride), rt::Arg::Val(T)},
+                    error);
     // Large tiles walk in bands of 8 row tiles when they divide evenly.
     const bool banded = !tall && !small && prefill_banded_gemm_ && (rows / 256) % 8 == 0 && rows % 256 == 0;
     const char* name = tall    ? (x16 && x16_blocked ? "halo_gemm_q8r_f16_mb" : "halo_gemm_q8r_f16_m")
@@ -517,6 +536,12 @@ bool FlashNextGpu::LinearChunk(const model::LayerWeights& l, LinearState& s, std
   const auto gemm_h = [&](const model::TensorRef& t, const rt::Buffer& y) {
     const auto& d = tensors_.at(t.data);
     const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
+    std::uint32_t sm = 0, sn = 0;
+    if (const char* sk = ShortGemm(rows, cols, T, false, true, &sm, &sn))
+      return Launch(sk, {(T + sn - 1) / sn, (rows + sm - 1) / sm}, {256},
+                    {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(ck_.mh), rt::Arg::Buf(y), rt::Arg::Val(rows),
+                     rt::Arg::Val(cols), rt::Arg::Val(d.qstride), rt::Arg::Val(T)},
+                    error);
     return Launch("halo_gemm_q8r_f16_lr8h", {(T + 127) / 128, rows / 256}, {256},
                   {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(ck_.mh), rt::Arg::Buf(y), rt::Arg::Val(rows),
                    rt::Arg::Val(cols), rt::Arg::Val(d.qstride), rt::Arg::Val(T)},
