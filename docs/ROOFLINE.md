@@ -1537,3 +1537,15 @@ largest shapes.
 
 Not yet tried: the remaining ~41 ms at T 1 (the 2560-row `t32k256` 131 us a call, the fp16 lr8h shapes
 94..140 us) against a decode step's ~37 ms for all of its weights.
+
+## 19. 2026-10-10 (stream DX, on `stream/short-t`): decode probes
+
+Fresh baseline (pinned, short context): graph 36.86 ms/step; eager kernels 39.72 (the 0.68 ms
+`halo_broadcast` row is the inter-step host gap: the sync-free stamps charge it to the step's
+first stamped kernel). Leaders: qkv + z dual GEMV 7.19 (223 GB/s), 2560 x 6144 GEMVs 5.05
+(162 GB/s), routed gate/up 4.89 (177), down 3.15 (168), LM head 2.79 (242), mixers 2.66 + 2.54
+(132), attention q 1.83 (219).
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| 2560-row Q8 GEMVs on 2 rows a wave (160 blocks) or 1 (320) instead of 4 (80); same per-row sums (`--decode-ab`, 5 rounds) | -0.6..-1.2 ms/step if blocks in flight were the limit; 0 plausible | r2 -0.02 (noise), r1 +0.66; logits equal | no (block count is not the limit) |
