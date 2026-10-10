@@ -1,0 +1,106 @@
+{
+  "baseline_engine": "0810614",
+  "shape": "documented Qwen Config",
+  "mode": "cold-server-no-checkpoint",
+  "base": 2048,
+  "long_chunk": 8192,
+  "context": 262144,
+  "tail_limit": 256,
+  "timings_measured": false,
+  "rows": [
+    {
+      "prefill_tokens": 8191,
+      "chunks": [
+        8191
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        8191
+      ],
+      "candidate_capacity": 8192,
+      "chunk_passes_saved": 0,
+      "cancellation_polls_removed": 0,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 0,
+      "extra_host_bytes": 0,
+      "input_tokens": 8192
+    },
+    {
+      "prefill_tokens": 8192,
+      "chunks": [
+        8192
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        8192
+      ],
+      "candidate_capacity": 8192,
+      "chunk_passes_saved": 0,
+      "cancellation_polls_removed": 0,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 0,
+      "extra_host_bytes": 0,
+      "input_tokens": 8193
+    },
+    {
+      "prefill_tokens": 8193,
+      "chunks": [
+        8192,
+        1
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        8193
+      ],
+      "candidate_capacity": 8193,
+      "chunk_passes_saved": 1,
+      "cancellation_polls_removed": 1,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 814468,
+      "extra_host_bytes": 10304,
+      "input_tokens": 8194
+    },
+    {
+      "prefill_tokens": 8448,
+      "chunks": [
+        8192,
+        256
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        8448
+      ],
+      "candidate_capacity": 8448,
+      "chunk_passes_saved": 1,
+      "cancellation_polls_removed": 1,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 181444064,
+      "extra_host_bytes": 2637824,
+      "input_tokens": 8449
+    },
+    {
+      "prefill_tokens": 8449,
+      "chunks": [
+        8192,
+        257
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        8192,
+        257
+      ],
+      "candidate_capacity": 8192,
+      "chunk_passes_saved": 0,
+      "cancellation_polls_removed": 0,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 0,
+      "extra_host_bytes": 0,
+      "input_tokens": 8450
+    }
+  ]
+}
