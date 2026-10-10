@@ -428,3 +428,22 @@ eh_proj's FMAs, predicted ~0.046 ms a row); (2) recalibrate the depth chooser's 
 catch-up (its c = 1.37 is stale; the preserved mixed-context fit gives ~0.26-0.27).
 
 Next GPU experiments are queued, with dependencies and deciding gates, in [KYOJIN-QUEUE.md](KYOJIN-QUEUE.md).
+
+## Recalibration (2026-10-10, main 9acbec4; working files `/data/halo-work/streams/MC/`)
+
+Round 3's protocol (fixed depths 0..5, 9 prompts x 256 greedy, pinned, `--spec-trace`, `fit_costs.py` on the trace's
+prompt / cycle / depth / accepted / tokens / ms columns), after DP's state-only catch-up. Joint fit over 7,579 cycles:
+
+| | k 0 | 1 | 2 | 3 | 4 | 5 | c (catch-up) | r (rollback) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| round 3 (e102375) | 37.3 | 54.15 | 69.73 | 84.75 | 102.25 | 113.14 | 1.37 | 1.46 |
+| now | 37.05 | 53.25 | 68.45 | 83.21 | 99.70 | 110.95 | **0.312** | 1.331 |
+| fixed-depth total tok/s now (round 3) | 26.77 (25.88) | 33.48 (32.40) | **34.92** (33.55) | 33.68 (32.32) | 32.21 (30.69) | 30.79 (29.51) | | |
+
+AR 26.95 tok/s. Every prediction held (c 0.20..0.40, C[k] -4..+1 ms, fixed depths +2..+6%).
+Depth chooser with the old vs the new costs, one binary (`halo_run --mtp-costs`), two interleaved runs each: old 35.99 /
+36.04, new 36.01 / 36.08 tok/s (+0.08%: predicted +0..+3%, at its low edge); greedy output identical to AR on all nine
+in every run. Per prompt the choices move both ways (he1 +1.25, raw code +0.64; gsm3 -2.4, raw doc -0.7 tok/s, the same
+in both runs): a cheaper catch-up lowers every depth's cost alike, so the ranking barely changes. The new costs are
+the defaults because they describe the engine; the chooser on main runs **36.0 tok/s = 1.33x AR** (round 3: 34.70,
+1.29x), the gain being DP's catch-up.

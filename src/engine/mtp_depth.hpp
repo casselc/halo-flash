@@ -36,12 +36,12 @@ struct MtpCosts {
   float rollback_ms = 0;                           ///< recurrent-state copy when a draft is rejected
 };
 
-/// halo-flash measured costs (main e102375 + round 3, pinned, 9 prompts x 256 at fixed depths 0..5, trimmed 32K
-/// draft head; docs/MTP.md round 3): joint least squares over 4284 cycles of ms = C[k] + c * accepted
-/// + r * [accepted < k]; C[0] is the AR step (38.65 ms measured with the draft block's follow step, minus c);
-/// k = 6, 7 extrapolated at +14.5 ms a draft.
+/// halo-flash measured costs (main 9acbec4: DP's state-only catch-up; pinned, 9 prompts x 256 at fixed depths 0..5,
+/// trimmed 32K draft head; docs/MTP.md "Recalibration"): joint least squares over 7579 cycles of ms = C[k]
+/// + c * accepted + r * [accepted < k]; C[0] is the AR step (37.36 ms measured with the draft block's follow step,
+/// minus c); k = 6, 7 extrapolated at +14.4 ms a draft. (Round 3 at e102375: c 1.37, C[1] 54.15.)
 inline MtpCosts MtpMeasuredCosts() noexcept {
-  return {{37.3F, 54.15F, 69.73F, 84.75F, 102.25F, 113.14F, 127.6F, 142.1F}, 1.37F, 1.46F};
+  return {{37.05F, 53.25F, 68.45F, 83.21F, 99.70F, 110.95F, 125.4F, 139.8F}, 0.312F, 1.331F};
 }
 
 struct MtpDepthOptions {

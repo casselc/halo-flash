@@ -1565,3 +1565,9 @@ first stamped kernel). Leaders: qkv + z dual GEMV 7.19 (223 GB/s), 2560 x 6144 G
 | Change | Predicted | Measured | Kept |
 |---|---|---|---|
 | 2560-row Q8 GEMVs on 2 rows a wave (160 blocks) or 1 (320) instead of 4 (80); same per-row sums (`--decode-ab`, 5 rounds) | -0.6..-1.2 ms/step if blocks in flight were the limit; 0 plausible | r2 -0.02 (noise), r1 +0.66; logits equal | no (block count is not the limit) |
+
+## 21. 2026-10-10 (stream MC, branch `stream/mtp-costs`): MTP depth-chooser costs
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| Chooser costs refit after DP (c 1.37 -> 0.312, C[k] -0.9..-2.6 ms; docs/MTP.md "Recalibration") | +0..+3% chooser tok/s, greedy == AR | 36.02 -> 36.05 tok/s (+0.08%, two runs each); identical to AR | yes (accurate costs; speed-neutral) |
