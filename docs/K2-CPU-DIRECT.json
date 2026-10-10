@@ -1,0 +1,360 @@
+{
+  "baseline_engine": "0810614",
+  "shape": "documented Qwen Config",
+  "mode": "direct-Prefill",
+  "base": 2048,
+  "long_chunk": 8192,
+  "context": 262144,
+  "tail_limit": 256,
+  "timings_measured": false,
+  "rows": [
+    {
+      "prefill_tokens": 2048,
+      "chunks": [
+        2048
+      ],
+      "capacity": 2048,
+      "candidate_chunks": [
+        2048
+      ],
+      "candidate_capacity": 2048,
+      "chunk_passes_saved": 0,
+      "cancellation_polls_removed": 0,
+      "device_bytes": 1592531764,
+      "host_bytes": 21102592,
+      "extra_device_bytes": 0,
+      "extra_host_bytes": 0,
+      "input_tokens": 2048
+    },
+    {
+      "prefill_tokens": 2049,
+      "chunks": [
+        2049
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        2049
+      ],
+      "candidate_capacity": 8192,
+      "chunk_passes_saved": 0,
+      "cancellation_polls_removed": 0,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 0,
+      "extra_host_bytes": 0,
+      "input_tokens": 2049
+    },
+    {
+      "prefill_tokens": 2304,
+      "chunks": [
+        2304
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        2304
+      ],
+      "candidate_capacity": 8192,
+      "chunk_passes_saved": 0,
+      "cancellation_polls_removed": 0,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 0,
+      "extra_host_bytes": 0,
+      "input_tokens": 2304
+    },
+    {
+      "prefill_tokens": 4096,
+      "chunks": [
+        4096
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        4096
+      ],
+      "candidate_capacity": 8192,
+      "chunk_passes_saved": 0,
+      "cancellation_polls_removed": 0,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 0,
+      "extra_host_bytes": 0,
+      "input_tokens": 4096
+    },
+    {
+      "prefill_tokens": 4097,
+      "chunks": [
+        4097
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        4097
+      ],
+      "candidate_capacity": 8192,
+      "chunk_passes_saved": 0,
+      "cancellation_polls_removed": 0,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 0,
+      "extra_host_bytes": 0,
+      "input_tokens": 4097
+    },
+    {
+      "prefill_tokens": 8192,
+      "chunks": [
+        8192
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        8192
+      ],
+      "candidate_capacity": 8192,
+      "chunk_passes_saved": 0,
+      "cancellation_polls_removed": 0,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 0,
+      "extra_host_bytes": 0,
+      "input_tokens": 8192
+    },
+    {
+      "prefill_tokens": 8193,
+      "chunks": [
+        8192,
+        1
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        8193
+      ],
+      "candidate_capacity": 8193,
+      "chunk_passes_saved": 1,
+      "cancellation_polls_removed": 1,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 814468,
+      "extra_host_bytes": 10304,
+      "input_tokens": 8193
+    },
+    {
+      "prefill_tokens": 8194,
+      "chunks": [
+        8192,
+        2
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        8194
+      ],
+      "candidate_capacity": 8194,
+      "chunk_passes_saved": 1,
+      "cancellation_polls_removed": 1,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 1516296,
+      "extra_host_bytes": 20608,
+      "input_tokens": 8194
+    },
+    {
+      "prefill_tokens": 8448,
+      "chunks": [
+        8192,
+        256
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        8448
+      ],
+      "candidate_capacity": 8448,
+      "chunk_passes_saved": 1,
+      "cancellation_polls_removed": 1,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 181444064,
+      "extra_host_bytes": 2637824,
+      "input_tokens": 8448
+    },
+    {
+      "prefill_tokens": 16385,
+      "chunks": [
+        8192,
+        8192,
+        1
+      ],
+      "capacity": 8192,
+      "candidate_chunks": [
+        8192,
+        8193
+      ],
+      "candidate_capacity": 8193,
+      "chunk_passes_saved": 1,
+      "cancellation_polls_removed": 1,
+      "device_bytes": 5947164724,
+      "host_bytes": 84410368,
+      "extra_device_bytes": 814468,
+      "extra_host_bytes": 10304,
+      "input_tokens": 16385
+    }
+  ],
+  "log_histogram": {
+    "sample": "preserved benchmark lengths projected onto selected chunk settings; not production traffic",
+    "records": [
+      {
+        "file": "agent_dp_w128.jsonl.server.log",
+        "prompt": 12969,
+        "reused": 0,
+        "prefilled": 12968,
+        "checkpoint": true,
+        "eligible_single_call": null
+      },
+      {
+        "file": "agent_dp_w128.jsonl.server.log",
+        "prompt": 13367,
+        "reused": 12928,
+        "prefilled": 438,
+        "checkpoint": true,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 105,
+        "reused": 0,
+        "prefilled": 104,
+        "checkpoint": true,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 105,
+        "reused": 64,
+        "prefilled": 40,
+        "checkpoint": false,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 98,
+        "reused": 0,
+        "prefilled": 97,
+        "checkpoint": true,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 98,
+        "reused": 64,
+        "prefilled": 33,
+        "checkpoint": false,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 92,
+        "reused": 0,
+        "prefilled": 91,
+        "checkpoint": true,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 92,
+        "reused": 64,
+        "prefilled": 27,
+        "checkpoint": false,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 186,
+        "reused": 0,
+        "prefilled": 185,
+        "checkpoint": true,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 186,
+        "reused": 128,
+        "prefilled": 57,
+        "checkpoint": false,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 178,
+        "reused": 0,
+        "prefilled": 177,
+        "checkpoint": true,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 178,
+        "reused": 128,
+        "prefilled": 49,
+        "checkpoint": false,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 147,
+        "reused": 0,
+        "prefilled": 146,
+        "checkpoint": true,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 147,
+        "reused": 128,
+        "prefilled": 18,
+        "checkpoint": false,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 118,
+        "reused": 0,
+        "prefilled": 117,
+        "checkpoint": true,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 118,
+        "reused": 64,
+        "prefilled": 53,
+        "checkpoint": false,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 12969,
+        "reused": 0,
+        "prefilled": 12968,
+        "checkpoint": true,
+        "eligible_single_call": null
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 12969,
+        "reused": 12928,
+        "prefilled": 40,
+        "checkpoint": false,
+        "eligible_single_call": false
+      },
+      {
+        "file": "bench_full_r1.jsonl.server.log",
+        "prompt": 13367,
+        "reused": 12928,
+        "prefilled": 438,
+        "checkpoint": true,
+        "eligible_single_call": false
+      }
+    ],
+    "total": 19,
+    "checkpoint_records": 11,
+    "checkpoint_split_unknown": 2,
+    "known_eligible": 0,
+    "known_ineligible": 17
+  }
+}

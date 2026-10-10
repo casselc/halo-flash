@@ -1,6 +1,7 @@
 # Kyojin-inspired GPU experiment queue
 
-Queued 2026-10-08. Status: planning queue, no experiments launched or speedups claimed.
+Queued 2026-10-08. Status: K0 classification and K2 unchanged-baseline calibration complete;
+no merged/kernel variants tested or speedups claimed.
 Audience: the next halo-flash performance stream and its coordinator.
 
 ## Baseline and evidence
@@ -22,11 +23,15 @@ Audience: the next halo-flash performance stream and its coordinator.
 
 | ID | Experiment | State | Dependency | Next deciding action |
 |---|---|---|---|---|
-| K0 | Freeze baseline and classify the tolerance failure | queued | none | Capture a deterministic failing case, compare baseline/variant, record precision mode and known test gaps |
+| K0 | Freeze baseline and classify the tolerance failure | bounded classification complete; test still fails | none | See K0-KV-CLASSIFICATION.md; preserve strict bound and open precision investigation |
 | K1 | History-copy proposals alongside MTP | queued | K0 before GPU work | CPU shadow analysis of actual token histories; proceed only on projected end-to-end benefit |
-| K2 | Merge a short prefill tail | queued | K0 before GPU work | Boundary-length timing/routing analysis and scratch-size estimate |
+| K2 | Merge a short prefill tail | closed: not worth a runtime variant | — | The tail's cost was the short-call GEMM overhead; exact short tiles (main 9acbec4) took the 1-token tail 114 -> 63 ms for every short call. See K2-BASELINE-CALIBRATION.md |
 | K3 | Single-wave QSA attention | queued | K0 before GPU work | Bank/register/traffic analysis against the current union-attention path |
 | K4 | Expert-multiplicity-specific MoE dispatch | queued | K0 before GPU work | Expert multiplicity histogram and compiler resource comparison |
+
+K0 reproduced both archived failures on main 61e3df0 and DP 0810614, with MTP off and
+stable repeats. [K0-KV-CLASSIFICATION.md](K0-KV-CLASSIFICATION.md) records controls, provenance
+and the limits of the pre-existing precision-interaction classification. This does not make the full suite green.
 
 CPU analyses K1–K4 may proceed independently. First GPU deciding probe: K2's
 small boundary-length sweep. K1's prototype follows if its shadow analysis wins;
@@ -105,8 +110,10 @@ largest chunk for every request. This differs from the already tried optional
 8192-token chunk. Halo does not share every Kyojin last-page split, so first
 verify that the proposed extra pass is actually present here.
 
-First action: inspect timing and expert routing at lengths 2049, 2304, 4097 and
-8193, with aligned-neighbor controls and existing chunk settings. Price the
+CPU preflight at engine baseline 0810614 found that long chunks already default to 8192:
+direct 2049/2304/4097 are single-chunk promotion controls. Probe direct 8192/8193/8208/8448/8449/16385;
+the cold server holds back one token, shifting request boundaries by one. Inspect timing and actual routing
+with aligned-neighbor controls and existing chunk settings. Price the
 extra scratch and maximum context impact. Preserve canonical checkpoint/slice
 boundaries; a tail optimization may not remove a scheduler cancellation point
 or alter the prefix-cache exactness contract.
@@ -117,6 +124,15 @@ blocks, cache reuse, cancellation, spill and DP catch-up hashes.
 
 Deliverable: boundary-length A/B, ordinary-prompt negative controls, scratch
 high-water mark, exactness results and a bounded tail policy if kept.
+
+CPU results and GLM review disposition: [K2-TAIL-ANALYSIS.md](K2-TAIL-ANALYSIS.md).
+Hypothetical merges add 814,468 device bytes for a one-token tail and 181,444,064 for 256 tokens,
+but remove an inter-chunk cancellation poll. They are not approved runtime policies.
+The CPU preflight alone produced no GPU result; the unchanged-baseline calibration below is now complete.
+
+Update: [K2-BASELINE-CALIBRATION.md](K2-BASELINE-CALIBRATION.md) records the completed
+unchanged-baseline sweep. One-token/256-token tail spans are112.3/347.7ms; no merge
+variant or speedup was tested. Next deciding work is routing/marginal-cost analysis and cancellation design.
 
 ## K3 — Single-wave sparse attention
 
