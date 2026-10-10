@@ -18,7 +18,7 @@ if [ -z "$D" ]; then
   done
 fi
 [ -n "$D" ] || { echo "no amdgpu card under /sys/class/drm" >&2; exit 1; }
-w() { echo "$2" | sudo -n tee "$D/$1" >/dev/null || { echo "sudo refused $D/$1 (the sudoers rule must name this path)" >&2; exit 1; }; }
+w() { echo "$2" | sudo -n tee "$D/$1" >/dev/null || { echo "write to $D/$1 failed (sudo refused it, or the driver rejected the value)" >&2; exit 1; }; }
 case "${1:-status}" in
   pin) w power_dpm_force_performance_level manual; w pp_od_clk_voltage "s 0 2900"; w pp_od_clk_voltage c; w pp_dpm_fclk 7 ;;
   unpin) w pp_od_clk_voltage r; w pp_od_clk_voltage c; w power_dpm_force_performance_level auto ;;

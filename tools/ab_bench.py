@@ -92,7 +92,7 @@ KERNEL_LINE = re.compile(r"^  (\S.*?)\s{2,}([0-9.]+) ms\s+[0-9.]+%\s+(\d+) calls
 def run_once(cmd, args, env):
     kernels = not args.no_kernels
     full = shlex.split(cmd) + ["--model", args.model, "--prefill-bench", str(args.tokens), "--max-context",
-                               str(args.tokens), "--reps", str(args.reps + (1 if kernels else 0)),
+                               str(args.context or args.tokens), "--reps", str(args.reps + (1 if kernels else 0)),
                                "--prefill-file", args.prompt]
     if kernels:
         full += ["--kernel-timing", "1"]
@@ -139,6 +139,8 @@ def main():
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--tokens", type=int, default=2048)
+    ap.add_argument("--context", type=int, default=None,
+                    help="--max-context (default --tokens; short --tokens runs need room for the warm-up)")
     ap.add_argument("--chunks", type=int, default=1,
                     help="device lines per rep to sum (whole-prefill device time; 0: from each arm's --prefill-chunk; "
                          "default 1: the last chunk only)")
