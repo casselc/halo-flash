@@ -131,15 +131,32 @@ void ExpectSame(const std::map<TokenId, double>& got, const std::map<TokenId, do
 
 // Chi-square goodness of fit with a bound loose enough to be deterministic
 // in practice for the sample sizes used, tight enough to catch a biased draw.
+// Tokens expected fewer than 5 times are pooled into one cell (the usual
+// validity rule): one draw of a token with expected count 0.02 is a 2% event,
+// not a bias, but alone it would add ~40 to the statistic.
 void ExpectFollows(const std::map<TokenId, int>& counts, const std::map<TokenId, double>& p, int n) {
-  double chi2 = 0;
+  double chi2 = 0, rare_expected = 0, rare_observed = 0;
+  std::size_t cells = 0;
   for (const auto& [t, pt] : p) {
     const double expected = pt * n;
     const double observed = counts.contains(t) ? counts.at(t) : 0;
-    if (expected > 0) chi2 += (observed - expected) * (observed - expected) / expected;
+    if (expected < 5) {
+      rare_expected += expected;
+      rare_observed += observed;
+    } else {
+      chi2 += (observed - expected) * (observed - expected) / expected;
+      ++cells;
+    }
+  }
+  if (rare_expected >= 5) {
+    chi2 += (rare_observed - rare_expected) * (rare_observed - rare_expected) / rare_expected;
+    ++cells;
+  } else {  // too rare for chi-square: bound the pooled count (Poisson mean rare_expected; P(> mean + 12) is tiny)
+    ASSERT_LE(rare_observed, rare_expected + 12) << "rare tokens drawn " << rare_observed << " times, expected "
+                                                 << rare_expected;
   }
   for (const auto& [t, c] : counts) ASSERT_TRUE(p.contains(t) && p.at(t) > 0) << "drew token " << t << " outside the support";
-  const double df = std::max<double>(1, p.size() - 1);
+  const double df = std::max<double>(1, static_cast<double>(cells) - 1);
   ASSERT_LT(chi2, df + 8 * std::sqrt(2 * df) + 25) << "chi-square " << chi2 << " with " << df << " dof";
 }
 
@@ -279,6 +296,18 @@ TEST(Sampling, SeededStreamsAreDeterministicAndCopiesContinueIdentically) {
       }
     }
   }, {.test_cases = 300});
+}
+
+// The goodness-of-fit check itself: the Hegel case that broke the unpooled
+// statistic (two tokens, p = 5.9e-7 drawn once in 40000: chi-square 40.3 > 37.3)
+// passes, and biased counts still fail (positive controls).
+TEST(Sampling, GoodnessOfFitPoolsRareTokensAndStillCatchesBias) {
+  const int n = 40000;
+  EXPECT_NO_FATAL_FAILURE(ExpectFollows({{0, 1}, {1, n - 1}}, {{0, 5.9e-7}, {1, 1 - 5.9e-7}}, n));
+  // A 2% token drawn 2.5x too often (expected 800, drew 2000).
+  EXPECT_FATAL_FAILURE(ExpectFollows({{0, 2000}, {1, n - 2000}}, {{0, 0.02}, {1, 0.98}}, n), "chi-square");
+  // A rare token (expected 0.024) drawn 40 times.
+  EXPECT_FATAL_FAILURE(ExpectFollows({{0, 40}, {1, n - 40}}, {{0, 5.9e-7}, {1, 1 - 5.9e-7}}, n), "rare tokens");
 }
 
 TEST(Sampling, DrawsFollowTheDistribution) {
