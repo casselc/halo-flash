@@ -104,6 +104,13 @@ and 99.95-99.97% are exact in fp16 (the rest have fp16-subnormal magnitudes): ro
 loses (almost) nothing. The plain-fp16 router's long-set loss came from rounding the activations; keeping them
 as an fp16 hi/lo pair (`--router-f16 3`) removes it (`/data/halo-work/streams/P/f16exact.py`).
 
+**Cumulative check, main 0c30d0c (2026-10-10; after merging DP's batched draft catch-up, the exact short-call
+GEMMs and 16 other merges since 6f3a1cf).** `halo_score --prefill 1`, defaults, `streams/P/scores/main0c30d0c`.
+Against the original baseline: short 0.285022 / 92.60% (paired -0.00102 +- 0.00106, 51/47, agreement +0.02 pp),
+long 0.122013 / 97.65% (paired +0.00074 +- 0.00052, 9/3, worst +0.0043): passes. Against stream C's scoring of main
+6f3a1cf defaults (`streams/C/scores/kv0`): every one of the 110 cases identical, so the merges since were exact on
+the scored path, as each claimed.
+
 ### Chunked-prefill test outliers on the small model (stream F), 2026-10-06
 
 `FlashNextGpu.ChunkedPrefillMatchesStepping` reported fp16-mode worst drift from stepping of 0.104 on main 19d80bb,
