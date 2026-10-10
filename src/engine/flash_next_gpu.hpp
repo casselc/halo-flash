@@ -148,6 +148,7 @@ class FlashNextGpu {
   // Short calls (T <= prefill_short_gemm_): FP16-route dense GEMMs on more row tiles with 256-wide K
   // stages (halo_gemm_q8r_f16_t*), the same bits as the large tiles (-43..-48 ms a call at T 1..64). 0 turns it off.
   static inline std::uint32_t prefill_short_gemm_ = 64;
+  static inline std::uint32_t prefill_short_gemm_narrow_ = 256;  // the limit for shapes under 4096 rows (not below prefill_short_gemm_)
   // The short-call kernel for a shape, or nullptr; *bm and *bn get its tile.
   static const char* ShortGemm(std::uint32_t rows, std::uint32_t cols, std::uint32_t T, bool blocked_x, bool half_out,
                                std::uint32_t* bm, std::uint32_t* bn);

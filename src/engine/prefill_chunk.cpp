@@ -273,8 +273,9 @@ const char* FlashNextGpu::ShortGemm(std::uint32_t rows, std::uint32_t cols, std:
                                     bool half_out, std::uint32_t* bm, std::uint32_t* bn) {
   // gemm_bench study, T 1 / 64, cold and after 96 MB of writes: 64-row tiles win from 4096 rows
   // (12288 x 2560: lr8 0.309 -> 0.157 ms cold), 32-row tiles below (320 x 10240: _mb 0.305 -> 0.061).
-  if (T == 0 || T > prefill_short_gemm_ || cols % 256 != 0) return nullptr;
   const bool wide = rows >= 4096;
+  const std::uint32_t limit = wide ? prefill_short_gemm_ : std::max(prefill_short_gemm_, prefill_short_gemm_narrow_);
+  if (T == 0 || T > limit || cols % 256 != 0) return nullptr;
   *bm = wide ? 64 : 32;
   *bn = wide ? 32 : 64;
   if (half_out) return blocked_x ? nullptr : wide ? "halo_gemm_q8r_f16_t64k256h" : "halo_gemm_q8r_f16_t32k256h";

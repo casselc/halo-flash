@@ -1533,6 +1533,7 @@ largest shapes.
 |---|---|---|---|
 | `halo_gemm_q8r_f16_t{32,64}k256[b,h]` for FP16-route dense GEMMs at T <= 64 (`--short-gemm 64`, cols % 256 == 0; K-blocked input for the mixer down, fp16 out for the DeltaNet qkv / z) | bit-identical; dense 89 -> 30..50 ms at T 1; -35..-60 ms a call at T 1 / 16 / 64; 2048 unchanged | Property test bitwise vs `_l` (all nine tiles, ragged rows / tokens, blocked and fp16 forms); logits byte-identical at T 1 / 16 / 64 / 256 / 2048; dense 87.6 -> 40.6 ms at T 1. ab_bench 4 x 3 pinned (prose_1, warm prose_8888, --context 16384): T 1 105.8 -> 58.0 (-47.8, spreads 1.3 / 0.3), T 16 146.6 -> 98.9 (-47.7), T 64 180.9 -> 138.1 (-42.8), T 2048 1244.4 -> 1250.4 within noise (same path) | yes (default 64) |
 
-Not yet tried: the short tiles at 64 < T <= 256 (dense still 122 ms at T 256), and the
-remaining ~41 ms at T 1 (the 2560-row `t32k256` 131 us a call, the fp16 lr8h shapes
+| Short tiles past T 64: shapes under 4096 rows up to T 256 (`--short-gemm-narrow 256`), wide shapes stay at 64 | T 128 -20..-40 ms, T 256 0..-25; crossover per shape between 128 and 512; bit-identical | study (after writes): narrow shapes still win at 128 / 256 (mixer down 0.17 vs 0.44 ms), wide shapes mixed at 128 and lose at 256. ab_bench 4 x 3 pinned, three arms: T 128 210.2 -> 180.4 (-29.8; all shapes -23.8), T 256 278.9 -> 263.5 (-15.4; all shapes +7.4). Narrow limit 1024 vs 256: T 512 +7.2, T 1024 +32.1 ms (worse). Logits byte-identical at T 128 / 256 with every shape short | yes (narrow 256, wide 64) |
+
+Not yet tried: the remaining ~41 ms at T 1 (the 2560-row `t32k256` 131 us a call, the fp16 lr8h shapes
 94..140 us) against a decode step's ~37 ms for all of its weights.
