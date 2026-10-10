@@ -384,6 +384,7 @@ int main(int argc, char** argv) {
   // prefill (equal across modes: the catch-up modes are bit-identical).
   bool spec = false, spec_skip_ar = false, mtp_state_hash = false;
   std::string spec_trace, spec_windows = "-1", mtp_catchup;
+  std::string mtp_costs;  // --mtp-costs C0,..,C7:c:r: the depth chooser's costs instead of MtpMeasuredCosts()
   // --spec-audit N (with --spec 1, --spec-depth K >= 1, --mtp-temp T, --audit-top-p P, --audit-top-k K,
   // --audit-scan S): distribution-exactness audit of sampled SpecStep. Per prompt, the context is the prompt plus
   // its greedy continuation up to the scanned step (of S) whose first-token distribution has the most entropy;
@@ -505,6 +506,7 @@ int main(int argc, char** argv) {
     else if (a == "--spec-trace") spec_trace = argv[i + 1];
     else if (a == "--mtp-window") spec_windows = argv[i + 1];
     else if (a == "--mtp-catchup") mtp_catchup = argv[i + 1];
+    else if (a == "--mtp-costs") mtp_costs = argv[i + 1];
     else if (a == "--mtp-batch-min") engine::FlashNextGpu::mtp_batch_min_ = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--mtp-state-hash") mtp_state_hash = std::string(argv[i + 1]) == "1";
     else if (a == "--spec-audit") spec_audit = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
@@ -1108,7 +1110,21 @@ int main(int argc, char** argv) {
         }
         double first_ms = 0;
         engine::MtpLengthController policy(engine::kMaxMtpDraftTokens);
-        engine::MtpDepthChooser chooser(engine::MtpMeasuredCosts(), {.limit = mtp_depth});
+        engine::MtpCosts costs = engine::MtpMeasuredCosts();
+        if (!mtp_costs.empty()) {  // --mtp-costs C0,..,C7:c:r
+          std::size_t p = 0;
+          for (std::uint32_t k = 0; k <= engine::kMtpDepthMax; ++k) {
+            costs.cycle_ms[k] = std::strtof(mtp_costs.c_str() + p, nullptr);
+            p = mtp_costs.find_first_of(",:", p) + 1;
+          }
+          costs.catchup_ms = std::strtof(mtp_costs.c_str() + p, nullptr);
+          p = mtp_costs.find(':', p) + 1;
+          costs.rollback_ms = std::strtof(mtp_costs.c_str() + p, nullptr);
+          std::printf("chooser costs:");
+          for (const float v : costs.cycle_ms) std::printf(" %.2f", v);
+          std::printf(" catch-up %.3f rollback %.3f\n", costs.catchup_ms, costs.rollback_ms);
+        }
+        engine::MtpDepthChooser chooser(costs, {.limit = mtp_depth});
         std::FILE* trace = spec_trace.empty() ? nullptr : std::fopen(spec_trace.c_str(), "a");
         std::int32_t t = toks.back();
         std::size_t drafted = 0, accepted = 0, cycles = 0, timed = 0;
