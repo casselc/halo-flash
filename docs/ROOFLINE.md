@@ -1503,3 +1503,19 @@ docs/SESSIONS.md section 11. Correctness, not speed: the rows record what each e
 | VMM settle (no GPU work until 1 ms after a map / unmap) + fork maps before copies, fix off, W 0 | 0 of 4; TTFT +1 ms a fork | 0 of 4; final defaults, no diagnostics (E10): 0 of 4; TTFT and decode within run-to-run noise (+-5%) | yes (default 1000 us) |
 | Range pool (6240e69) | - | removed the fault by keeping forks off freshly freed addresses, but kept every pooled range's high-water pages charged (4 GB probe: freed only with the range); 128K OOM on main (stream SE) | no (removed; `HALO_DIAG_RANGE=pool` for A/B) |
 | Ranges freed + VMM settle, 128K spill bench (SE's B0) | restores like SR4 (2.56 s) | restore 2571 ms, logits bit-identical | yes |
+
+## 18. 2026-10-07 (stream DP, branch `stream/mtp-draft-prefill`): batched draft-block catch-up
+
+docs/MTP.md "Batched draft prefill". Pinned; real model + Q8_0 sidecar, 32K draft head; catch-up wall time per
+prompt row after each prefill chunk. Draft state, drafts and acceptance bit-identical across every row (state
+hashes, per-cycle traces); trunk prefill / decode logits byte-identical to main.
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| State-only catch-up steps (attention cache-row launches only; also the decode-time catch-up) | 0.62 ms a row (0.55-0.70) vs 1.37 | 0.32-0.38 ms a row (doc 8K / 2K); decode catch-up per accepted draft 0.26-0.27 ms (preserved closeout fit); paper greedy serving 1.25x -> 1.28x vs main | yes (below 8 rows, and in decode) |
+| Batched exact-column catch-up, plain batched GEMVs, 8 columns a group | 0.05 ms a row (0.03-0.10) | 0.10-0.12 ms a row (doc 8K 785 ms / 7,962 rows); G 4: 0.10, G 2: 0.105; `_p` 0.10, `_ps` 0.083 | no (variant) |
+| Same, `_s` GEMVs (16 KB LDS) | same | **0.064 ms a row** (2K 127 ms, 8K 510 ms, ~8% of the trunk prefill); G 4 `_s` 0.068 | yes (default from 8 rows) |
+| Hidden rows normalized straight from the 16-bit prefill residual (no fp32 copy of the rows) | (not predicted: a fix after the kernel table showed the copy) | doc 8K, plain GEMVs: 943-995 -> 772-797 ms | yes |
+| Scratch allocated and touched at LoadMtp | removes the first prompt's ~140 ms | first catch-up (ctx 2K, W 128) 145 -> 7.5 ms | yes |
+| Draft history W = all in serving (with the batched catch-up) | full best on doc / code, within 5% on ctx; bench: full | bench greedy end to end 68.9 s vs W 128 69.4 (3 runs each); agent cold decode 1.27x -> 1.56x; doc / code 8K 256-token requests -0.7 s, ctx 8K +0.3 s | yes (default) |
+| Overlap of the catch-up with the trunk prefill | <= the catch-up's 8% | not built (one runtime stream; the chunk's rows are needed first) | no |

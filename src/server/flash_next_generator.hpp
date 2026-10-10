@@ -36,10 +36,13 @@ struct SpecOptions {
   /// with SpecStep and a per-request MtpDepthChooser: greedy (temperature 0) and sampled requests without
   /// repeat / frequency / presence penalties; requests with penalties step as without MTP.
   bool enabled = false;
-  /// Draft-block history: it catches up on the last `window` prompt positions the request prefills (its cost is
-  /// one eager draft step, ~1.4 ms, a position); reused prefix positions are not replayed. 0: none.
-  /// Default 128, measured (docs/MTP.md "Server integration"): 2% faster than 0 end to end on the serving bench.
-  std::uint32_t window = 128;
+  /// Draft-block history: it catches up on the last `window` prompt positions the request prefills (batched:
+  /// ~0.064 ms a position, ~8% of the trunk's prefill; reused prefix positions are not replayed). 0: none.
+  /// Default all (kAllPositions), measured (docs/MTP.md "Batched draft prefill"): long doc / code / agent
+  /// prompts accept far more drafts with the whole prompt (doc 8K 1.23x -> 1.45x, agent 13K 1.27x -> 1.56x);
+  /// the serving bench ties with 128 (68.9 vs 69.4 s greedy end to end).
+  static constexpr std::uint32_t kAllPositions = 0xffffffffu;
+  std::uint32_t window = kAllPositions;
   engine::MtpDepthOptions depth{};
   /// Test hook: one speculative cycle in place of FlashNextGpu::SpecStep (the generator then leaves the draft
   /// block's tracking alone), e.g. SpecStepDrafts with an oracle's drafts on a model without a draft block.

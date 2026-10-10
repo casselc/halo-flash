@@ -1625,3 +1625,95 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "SessionCache.RemappedPageSeesTheNewPageAtOnce"
 why = "GPU work right after a mapping change: a write to a remapped page lands in the old, released page (and a fresh mapping can fault)"
+
+# ---- Draft-block catch-up modes (src/engine/mtp_catchup.cpp; docs/MTP.md "Batched draft prefill") ----------
+
+[[mutant]]
+name = "mtp-batch-rope-position"
+file = "src/engine/mtp_catchup.cpp"
+find = 'rt::Arg::Val(c.rotary_dim), rt::Arg::Val(pos0),'
+replace = 'rt::Arg::Val(c.rotary_dim), rt::Arg::Val(pos0 + 1),'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "MtpCatchUp.*"
+why = "the batched K rows rotate at the draft block's own positions, as its steps do"
+
+[[mutant]]
+name = "mtp-batch-hidden-own-row"
+file = "src/engine/mtp_catchup.cpp"
+find = '{rt::Arg::Buf(ck_.res, std::size_t{t0 + lead - 1} * res_row),'
+replace = '{rt::Arg::Buf(ck_.res, std::size_t{t0 + lead} * res_row),'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "MtpCatchUp.*"
+why = "a base step pairs token t with the trunk hidden of t - 1, not of t"
+
+[[mutant]]
+name = "mtp-batch-pool-skips-first-block"
+file = "src/engine/mtp_catchup.cpp"
+find = '{rt::Arg::Buf(mtp_attn_.index_k), rt::Arg::Buf(mtp_attn_.block_k), rt::Arg::Val(b0),'
+replace = '{rt::Arg::Buf(mtp_attn_.index_k), rt::Arg::Buf(mtp_attn_.block_k), rt::Arg::Val(b0 + 1),'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "MtpCatchUp.*"
+why = "every pooled block the rows touch must be rewritten, the first (continued from the last group) included"
+
+[[mutant]]
+name = "mtp-batch-mixer-other-path"
+file = "src/engine/mtp_catchup.cpp"
+find = 'const bool fused = MtpMixFused();'
+replace = 'const bool fused = !MtpMixFused();'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "MtpCatchUp.*"
+why = "the batched mixer must be the column form of the path HcMix takes (fused and unfused round differently)"
+
+[[mutant]]
+name = "mtp-batch-pending-hidden-stale"
+file = "src/engine/mtp_catchup.cpp"
+find = ': CopyFloats(mtp_hpend_, View(ck_.res, std::size_t{T - 1} * res_row, res_row), D, error);'
+replace = ': CopyFloats(mtp_hpend_, View(ck_.res, std::size_t{T - 2} * res_row, res_row), D, error);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "MtpCatchUp.*"
+why = "after the rows the pending hidden is the chunk's last row (exact-projection / fp32 residual mode only)"
+
+[[mutant]]
+name = "mtp-batch-pending-hidden-stale-r16"
+file = "src/engine/mtp_catchup.cpp"
+find = '{rt::Arg::Buf(mtp_hpend_), rt::Arg::Buf(ck_.res, std::size_t{T - 1} * res_row), rt::Arg::Val(D)},'
+replace = '{rt::Arg::Buf(mtp_hpend_), rt::Arg::Buf(ck_.res, std::size_t{T - 2} * res_row), rt::Arg::Val(D)},'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "MtpCatchUp.*"
+why = "after the rows the pending hidden is the chunk's last row (16-bit residual, the default)"
+
+[[mutant]]
+name = "mtp-dual-y-column-input"
+file = "src/kernels/batch_decode.hip"
+find = '  x += static_cast<std::size_t>(blockIdx.y) * xstride;'
+replace = '  x += 0;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "MtpCatchUp.*"
+why = "each column of the batched indexer projection reads its own input row"
+
+[[mutant]]
+name = "mtp-cat-rows-stream"
+file = "src/kernels/batch_decode.hip"
+find = 'hn[static_cast<std::size_t>(col) * h + (i - h)]'
+replace = 'hn[static_cast<std::size_t>(t) * hc * h + (i - h)]'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "MtpCatchUp.*"
+why = "stream s of row t takes hnorm(h)'s stream s, not stream 0"
+
+[[mutant]]
+name = "mtp-state-only-skips-k-rope"
+file = "src/engine/flash_next_gpu.cpp"
+find = '(so || rope(q_, nh, hd, kHaloPosition, 1)) && rope(k_, nkv, hd, kHaloPosition, 1) &&'
+replace = '(so || rope(q_, nh, hd, kHaloPosition, 1)) && (so || rope(k_, nkv, hd, kHaloPosition, 1)) &&'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "MtpCatchUp.*"
+why = "a state-only catch-up step keeps every launch that writes a cache row (the K rope)"

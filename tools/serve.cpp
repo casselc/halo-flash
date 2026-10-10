@@ -18,7 +18,7 @@
 // [--scope-project NAME] [--scope-capture off|digest|full] [--scope-wal PATH].
 // MTP speculative decoding (docs/MTP.md, off by default): --mtp-model SIDECAR (the shared-* MTP gguf) loads the
 // draft block; --mtp-vocab IDS (int32 token ids, e.g. a 32K trimmed draft head) restricts its head; --mtp-window W
-// (default 128, measured: docs/MTP.md) is how many of a request's last prefilled prompt positions the draft block
+// (default all, measured: docs/MTP.md) is how many of a request's last prefilled prompt positions the draft block
 // catches up on; --mtp-depth N (default 4) the deepest draft. Greedy requests, and sampled ones without penalties,
 // decode speculatively (greedy output identical to MTP off); requests with penalties decode as without it.
 // Datasets, evaluators and experiments are served under /v1/scope/
@@ -174,7 +174,7 @@ int main(int argc, char** argv) {
           "  --spill-dir DIR       session spill files (default /data/halo-work/spill; 0700 dir, 0600 files)\n"
           "  --spill-evict 0|1     cache eviction spills to DIR instead of dropping (default 0). Admin routes:\n"
           "                        GET /admin/sessions, POST /admin/sessions/{key}/spill | /restore\n"
-          "  --mtp-model SIDECAR [--mtp-vocab IDS] [--mtp-window W (128)] [--mtp-depth N (4)]\n"
+          "  --mtp-model SIDECAR [--mtp-vocab IDS] [--mtp-window W|all (all)] [--mtp-depth N (4)]\n"
           "                        MTP speculative decoding (off without --mtp-model)\n"
           "  --ngram-cache-gb G --moe-topk N --decider-dir DIR --decider-device hip|hrx|cpu --variant MANIFEST\n"
           "  --scope-dir DIR --scope-project NAME --scope-capture off|digest|full --scope-wal PATH\n"
@@ -216,7 +216,9 @@ int main(int argc, char** argv) {
     else if (a == "--model-id") model_id = v;
     else if (a == "--mtp-model") mtp_model = v;
     else if (a == "--mtp-vocab") mtp_vocab = v;
-    else if (a == "--mtp-window") spec.window = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+    else if (a == "--mtp-window")
+      spec.window = v == "all" ? server::SpecOptions::kAllPositions
+                               : static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--mtp-depth") {
       spec.depth.limit = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
       if (spec.depth.limit < 1 || spec.depth.limit > engine::FlashNextGpu::kMaxDrafts)
@@ -239,7 +241,6 @@ int main(int argc, char** argv) {
   if (cache.spill_dir.empty()) cache.spill_dir = "/data/halo-work/spill";  // SR4 default: not /tmp (docs/SESSIONS.md 10)
   if (!mtp_model.empty() && model.empty()) return std::fprintf(stderr, "--mtp-model needs --model (Flash-Next)\n"), 2;
   std::string error;
-  std::unique_ptr<server::TextGenerator> generator;
   server::FlashNextGenerator* flash_generator = nullptr;  // SR4 admin routes
   // Flash-Next (--model) or a Qwen3.5 dense model with variants (--qwen35-model).
   std::unique_ptr<core::GgufReader> reader, q35_reader, q35_tok_reader;
@@ -252,6 +253,9 @@ int main(int argc, char** argv) {
   std::optional<model::MtpWeights> mtp_weights;
   std::unique_ptr<engine::FlashNextGpu> engine;
   std::unique_ptr<engine::Qwen35Gpu> q35_engine;
+  // Generators own session caches that call their engines during destruction.
+  // Declare them last so normal exit and every early return preserve that lifetime.
+  std::unique_ptr<server::TextGenerator> generator;
   server::Qwen35Generator* q35_generator = nullptr;
   if (!model.empty()) {
     reader = core::GgufReader::OpenFile(model, &error);
@@ -309,10 +313,12 @@ int main(int argc, char** argv) {
       const auto gb = [](std::size_t a, std::size_t b) { return a > b ? double(a - b) / (1ull << 30) : 0.0; };
       std::fprintf(stderr,
                    "mtp: draft block %s (%.2f GB file) loaded in %.1f s, %.2f GB device (weights and its %u-position "
-                   "cache); draft head %s in %.1f s, %.3f GB device; window %u, depth limit %u\n",
+                   "cache); draft head %s in %.1f s, %.3f GB device; window %s, depth limit %u\n",
                    mtp_model.c_str(), double(file_bytes) / (1ull << 30), s(t0, t1), gb(free0, free1), max_context,
                    ids_n ? (std::to_string(ids_n) + " ids (" + mtp_vocab + ")").c_str() : "full vocabulary", s(t1, t2),
-                   gb(free1, free2), spec.window, spec.depth.limit);
+                   gb(free1, free2),
+                   spec.window == server::SpecOptions::kAllPositions ? "all" : std::to_string(spec.window).c_str(),
+                   spec.depth.limit);
       spec.enabled = true;
     }
     auto fg = std::make_unique<server::FlashNextGenerator>(*engine, *tok, max_context, cache, spec);

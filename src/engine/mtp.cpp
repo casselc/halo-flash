@@ -1,6 +1,7 @@
 // P5 measurement stage: the MTP draft block on the GPU (ReferenceModel::MtpStep's graph), eager launches, the
 // trunk's helpers (HcMix, Attention, Moe) on the draft block's weights. No verify path: the trunk is unchanged.
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -49,6 +50,15 @@ bool FlashNextGpu::LoadMtp(const model::MtpWeights& m, std::string* error) {
     return false;
   mtp_ = &m;
   mtp_pos_ = 0;
+  // The batched catch-up's scratch, touched once here: its first use in a request then costs no allocation or
+  // first-touch page faults (measured ~140 ms on the first prompt otherwise).
+  if (!AllocMtpBatch(mtp_batch_rows_, error) ||
+      !AllocChunkParams(std::max({prefill_chunk_, prefill_long_chunk_, 1u}), error))
+    return false;
+  for (const rt::Buffer* b : {&mb_.params, &mb_.embd, &mb_.en, &mb_.hn, &mb_.cat, &mb_.res, &mb_.xn, &mb_.lo, &mb_.gate,
+                              &mb_.mixed, &mb_.scale, &mb_.lo_part, &mb_.inject_part, &mb_.inject, &mb_.k, &mb_.v,
+                              &mb_.iq, &mb_.ik})
+    if (!dev_.Fill(*b, 0, error)) return false;
   return dev_.Synchronize(error);
 }
 
@@ -92,7 +102,8 @@ bool FlashNextGpu::MtpStep(std::int32_t token, bool from_trunk, std::span<float>
   return MtpRun(token, from_trunk ? &res_ : nullptr, logits, error);
 }
 
-bool FlashNextGpu::MtpRun(std::int32_t token, const rt::Buffer* hidden, std::span<float> logits, std::string* error) {
+bool FlashNextGpu::MtpRun(std::int32_t token, const rt::Buffer* hidden, std::span<float> logits, std::string* error,
+                          bool state_only) {
   const auto& c = w_.config;
   if (!mtp_) {
     if (error) *error = "MTP block not loaded";
@@ -151,8 +162,15 @@ bool FlashNextGpu::MtpRun(std::int32_t token, const rt::Buffer* hidden, std::spa
                     H, error) ||
         !MatVec(l.nextn_eh_proj, 0, mtp_cat_, res_, error, 0, std::size_t{s} * H * 4))
       return false;
-  if (!HcMix(l.hc_attn, true, error) || !Attention(l, mtp_attn_, error) || !combine() ||
-      !HcMix(l.hc_ffn, true, error) || !Moe(l, error) || !combine())
+  // A catch-up step (state_only) keeps the cache rows the attention writes; the rest of the block feeds only
+  // this step's output (the next draft's hidden), which a catch-up does not use.
+  state_only = state_only && logits.empty();
+  attn_state_only_ = state_only;
+  const bool attn_ok = HcMix(l.hc_attn, true, error) && Attention(l, mtp_attn_, error);
+  attn_state_only_ = false;
+  if (!attn_ok) return false;
+  if (!state_only &&
+      (!combine() || !HcMix(l.hc_ffn, true, error) || !Moe(l, error) || !combine()))
     return false;
   const bool trimmed = draft_rows_ > 0 && logits.size() == draft_rows_;
   const auto head = [&]() {

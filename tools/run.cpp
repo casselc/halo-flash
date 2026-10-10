@@ -20,6 +20,7 @@
 // then the decoded text and timing.
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -377,8 +378,12 @@ int main(int argc, char** argv) {
   // prompt, cycle, drafted, accepted, emitted, ms.
   // --mtp-window W[,W...]: the draft block's prompt history window (MtpTrackFrom(prompt - W); -1: the whole prompt,
   // the default). Each W runs the speculative pass again and reports its prefill (trunk + draft catch-up) and TTFT.
-  bool spec = false, spec_skip_ar = false;
-  std::string spec_trace, spec_windows = "-1";
+  // --mtp-catchup M[,M...] (full | state | batched; default: the engine's): how the draft block catches up on the
+  // prompt's rows (FlashNextGpu::mtp_catchup_); each mode runs every window again. --mtp-batch-min N: rows below
+  // which batched steps instead. --mtp-state-hash 1: prints a hash of the draft block's cache rows after each
+  // prefill (equal across modes: the catch-up modes are bit-identical).
+  bool spec = false, spec_skip_ar = false, mtp_state_hash = false;
+  std::string spec_trace, spec_windows = "-1", mtp_catchup;
   // --spec-audit N (with --spec 1, --spec-depth K >= 1, --mtp-temp T, --audit-top-p P, --audit-top-k K,
   // --audit-scan S): distribution-exactness audit of sampled SpecStep. Per prompt, the context is the prompt plus
   // its greedy continuation up to the scanned step (of S) whose first-token distribution has the most entropy;
@@ -497,6 +502,9 @@ int main(int argc, char** argv) {
     else if (a == "--spec-skip-ar") spec_skip_ar = std::string(argv[i + 1]) == "1";
     else if (a == "--spec-trace") spec_trace = argv[i + 1];
     else if (a == "--mtp-window") spec_windows = argv[i + 1];
+    else if (a == "--mtp-catchup") mtp_catchup = argv[i + 1];
+    else if (a == "--mtp-batch-min") engine::FlashNextGpu::mtp_batch_min_ = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--mtp-state-hash") mtp_state_hash = std::string(argv[i + 1]) == "1";
     else if (a == "--spec-audit") spec_audit = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--audit-scan") audit_scan = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--audit-top-k") audit_top_k = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
@@ -1056,17 +1064,46 @@ int main(int argc, char** argv) {
           windows.push_back(std::atol(spec_windows.substr(p, q == std::string::npos ? std::string::npos : q - p).c_str()));
           p = q == std::string::npos ? spec_windows.size() : q + 1;
         }
-        for (std::size_t wi = 0; wi < windows.size(); ++wi) {
+        std::vector<int> modes;
+        for (std::size_t p = 0; p < mtp_catchup.size();) {
+          const auto q = mtp_catchup.find(',', p);
+          const std::string m = mtp_catchup.substr(p, q == std::string::npos ? std::string::npos : q - p);
+          modes.push_back(m == "full" ? engine::FlashNextGpu::kMtpCatchUpFull
+                          : m == "state" ? engine::FlashNextGpu::kMtpCatchUpState
+                                         : engine::FlashNextGpu::kMtpCatchUpBatched);
+          p = q == std::string::npos ? mtp_catchup.size() : q + 1;
+        }
+        if (modes.empty()) modes.push_back(engine::FlashNextGpu::mtp_catchup_);
+        static const char* kModeName[] = {"full", "state", "batched"};
+        if (file == sfiles.front()) {
+          const auto why = gpu->MtpBatchUnsupported();
+          std::printf("mtp catch-up: batched %s\n", why.empty() ? "supported" : ("unsupported: " + why).c_str());
+        }
+        for (std::size_t wm = 0; wm < windows.size() * modes.size(); ++wm) {
+        const std::size_t wi = wm / modes.size();
         const long window = windows[wi];
+        engine::FlashNextGpu::mtp_catchup_ = modes[wm % modes.size()];
+        const char* mode_name = kModeName[engine::FlashNextGpu::mtp_catchup_];
         sp.clear();
         double sp_ms = 0;  // per window (one timer across windows divided window k's tokens by k windows' time)
         // Speculative: the draft block follows the last `window` prompt positions (all: -1).
         const auto plen = static_cast<long>(prompt.size());
         const auto start = static_cast<std::uint32_t>(window < 0 ? 0 : std::max(0L, plen - window));
         const auto pst = clk::now();
+        const double cu_ms0 = engine::FlashNextGpu::mtp_catchup_ms_;
+        const auto cu_rows0 = engine::FlashNextGpu::mtp_catchup_rows_;
         if (!gpu->Reset(&error) || !gpu->MtpTrackFrom(start, &error) || !gpu->Prefill(prompt, {}, &error))
           return std::fprintf(stderr, "%s\n", error.c_str()), 1;
         const double prefill_ms = std::chrono::duration<double, std::milli>(clk::now() - pst).count();
+        const double cu_ms = engine::FlashNextGpu::mtp_catchup_ms_ - cu_ms0;
+        const auto cu_rows = engine::FlashNextGpu::mtp_catchup_rows_ - cu_rows0;
+        std::uint64_t state_hash = 0;
+        if (mtp_state_hash) {
+          std::vector<float> st;
+          if (!gpu->MtpStateBytes(&st, &error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+          state_hash = 0xcbf29ce484222325ull;
+          for (const float v : st) state_hash = (state_hash ^ std::bit_cast<std::uint32_t>(v)) * 0x100000001b3ull;
+        }
         double first_ms = 0;
         engine::MtpLengthController policy(engine::kMaxMtpDraftTokens);
         engine::MtpDepthChooser chooser(engine::MtpMeasuredCosts(), {.limit = mtp_depth});
@@ -1085,9 +1122,13 @@ int main(int argc, char** argv) {
           const double ms = std::chrono::duration<double, std::milli>(clk::now() - st).count();
           if (cycles == 0) first_ms = ms;
           if (sp.size() >= 4) sp_ms += ms, timed += r.tokens.size();
-          if (trace)
-            std::fprintf(trace, "%s %zu %u %u %zu %.3f\n", file.substr(file.find_last_of('/') + 1).c_str(), cycles,
-                         r.drafted, r.accepted, r.tokens.size(), ms);
+          if (trace) {
+            std::string ds;
+            for (const auto x : r.drafts) ds += (ds.empty() ? "" : ",") + std::to_string(x);
+            std::fprintf(trace, "%s %ld %s %zu %u %u %zu %.3f %s\n", file.substr(file.find_last_of('/') + 1).c_str(),
+                         window, mode_name, cycles, r.drafted, r.accepted, r.tokens.size(), ms,
+                         ds.empty() ? "-" : ds.c_str());
+          }
           chooser.Observe(r.accepted, r.drafted);
           if (r.drafted) policy.Observe(r.accepted, r.drafted), drafted += r.drafted, accepted += r.accepted, ++hist_acc[r.accepted];
           else policy.ObserveArToken();
@@ -1109,10 +1150,14 @@ int main(int argc, char** argv) {
                     spec_skip_ar ? "AR skipped" : (exact ? "IDENTICAL to AR" : ("DIFFERS at " + std::to_string(same)).c_str()),
                     ar_tok, sp_tok, ar_tok > 0 ? sp_tok / ar_tok : 0.0, cycles, drafted, accepted,
                     drafted ? double(accepted) / drafted : 0.0, double(n) / cycles);
-        std::printf("spec window %s %ld: prefill %.1f ms (draft from %u), TTFT %.1f ms, tokens/cycle %.3f, MTP %.2f tok/s\n",
-                    name.c_str(), window, prefill_ms, start, prefill_ms + first_ms, double(n) / cycles, sp_tok);
+        std::printf("spec window %s %ld %s: prefill %.1f ms (draft from %u; catch-up %.1f ms for %llu rows), TTFT %.1f ms, "
+                    "tokens/cycle %.3f, MTP %.2f tok/s, drafted %zu accepted %zu%s\n",
+                    name.c_str(), window, mode_name, prefill_ms, start, cu_ms, static_cast<unsigned long long>(cu_rows),
+                    prefill_ms + first_ms, double(n) / cycles, sp_tok,
+                    drafted, accepted,
+                    mtp_state_hash ? (", state " + std::to_string(state_hash)).c_str() : "");
         std::fflush(stdout);
-        if (wi == 0) ar_ms_all += ar_ms, ar_n_all += n - 4;
+        if (wm == 0) ar_ms_all += ar_ms, ar_n_all += n - 4;
         sp_ms_all += sp_ms, sp_n_all += timed;
         }
       }

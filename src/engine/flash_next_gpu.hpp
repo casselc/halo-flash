@@ -410,6 +410,24 @@ class FlashNextGpu {
   /// rows and steps before `start` do not feed it, so a prompt costs draft steps only for its last positions.
   /// Drafting resumes once the draft block holds the hidden of the position before the one being run.
   [[nodiscard]] bool MtpTrackFrom(std::uint32_t start, std::string* error);
+  /// How the draft block catches up on prefilled prompt rows (docs/MTP.md "Batched draft prefill"). Every mode
+  /// leaves the same cache rows bit for bit; they differ only in cost:
+  ///   kMtpCatchUpFull: eager full draft steps (the whole block, as a drafting step runs it);
+  ///   kMtpCatchUpState: eager steps of only the launches that write the draft block's cache rows;
+  ///   kMtpCatchUpBatched: those launches over many rows at once, each column through the single kernel's
+  ///   arithmetic (the batched-decode kernels), from mtp_batch_min_ rows (fewer: kMtpCatchUpState).
+  enum MtpCatchUp : int { kMtpCatchUpFull = 0, kMtpCatchUpState = 1, kMtpCatchUpBatched = 2 };
+  static inline int mtp_catchup_ = kMtpCatchUpBatched;
+  static inline std::uint32_t mtp_batch_min_ = 8;     ///< rows below which the batched mode steps
+  static inline std::uint32_t mtp_batch_rows_ = 256;  ///< rows per batched launch sequence (scratch bound)
+  /// Wall time and rows of the draft block's prompt catch-up since start (diagnostics; prefill only).
+  static inline double mtp_catchup_ms_ = 0;
+  static inline std::uint64_t mtp_catchup_rows_ = 0;
+  /// Why the batched catch-up cannot run on this engine (empty: it can); it then steps.
+  [[nodiscard]] std::string MtpBatchUnsupported() const;
+  /// Test hook: the draft block's cache rows [0, MtpPosition()), its complete pooled blocks and the pending hidden,
+  /// downloaded (k, v, index_k, block_k, hidden concatenated) for bitwise comparison of catch-up modes.
+  [[nodiscard]] bool MtpStateBytes(std::vector<float>* out, std::string* error);
   [[nodiscard]] bool MtpTracking() const noexcept { return mtp_track_; }
   /// Trunk position where the tracked draft history starts (kMtpNever: not following).
   [[nodiscard]] std::uint32_t MtpBase() const noexcept { return mtp_base_; }
@@ -736,6 +754,7 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   /// Points the per-token scratch members at entry b's slices of bb_ and binds its session (recording only).
   void BatchEntryScope(std::uint32_t b, std::span<const SessionId> sessions, bool enter);
   bool skip_attn_proj_ = false;  // Attention(): projections done by the batched caller
+  bool attn_state_only_ = false;  // Attention(): cache rows only (draft-block catch-up)
   rt::Buffer probe_x_, probe_part_, probe_y_, probe_h_, probe_ep_, probe_tab_;
   std::uint32_t probe_B_ = 0;
   std::size_t probe_tab_stride_ = 0;
@@ -753,7 +772,22 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   AttnState mtp_attn_;
   rt::Buffer mtp_res_, mtp_in_, mtp_hn_, mtp_cat_;
   std::uint32_t mtp_pos_ = 0;
-  bool MtpRun(std::int32_t token, const rt::Buffer* hidden, std::span<float> logits, std::string* error);
+  /// state_only: the launches that write the cache rows only (the output residual is not computed).
+  bool MtpRun(std::int32_t token, const rt::Buffer* hidden, std::span<float> logits, std::string* error,
+              bool state_only = false);
+  // Batched catch-up (mtp_catchup.cpp): rows [a, T) of the prefilled chunk tokens; row t's base step takes the
+  // hidden of row t - 1 (row a - 1, or mtp_hpend_ when a == 0).
+  bool MtpCatchUpBatched(std::span<const std::int32_t> tokens, std::uint32_t a, std::string* error);
+  bool AllocMtpBatch(std::uint32_t rows, std::string* error);
+  bool AllocChunkParams(std::uint32_t rows, std::string* error);
+  bool MtpMixFused() const;  // HcMix's fused path for the draft block's attention mixer
+  struct MtpBatchBuffers {
+    rt::Buffer params, embd, en, hn, cat, res, xn, lo, gate, mixed, scale, lo_part, inject_part, inject, k, v,
+        iq, ik;
+    std::uint32_t cap = 0;
+    std::vector<std::uint32_t> host;
+  };
+  MtpBatchBuffers mb_;
   // Speculative state: tracking flag, the session it tracks, the last trunk position's hidden (pending), and the
   // per-row recurrent snapshots of a verify pass (verify_snap_[row]: one buffer per DeltaNet layer's state and
   // conv, then the PLE history).
