@@ -40,10 +40,22 @@ import subprocess
 import sys
 import time
 
-# Through the DRM class link, which survives PCI bus renumbering (adding an
-# NVMe moved the GPU from c6:00.0 to c7:00.0). The sudoers rule must name
-# this exact path.
-DEV = "/sys/class/drm/card0/device"
+def gpu_sysfs():
+    """The amdgpu card's sysfs device directory: $HALO_GPU_SYSFS, else the first
+    /sys/class/drm/cardN bound to amdgpu. The card number is not stable (it was
+    card0 before an NVMe was added, card1 after), so it is looked up on every run;
+    the sudoers rule must still name the path found here (tools/gpu_clock.sh status
+    prints it)."""
+    if os.environ.get("HALO_GPU_SYSFS"):
+        return os.environ["HALO_GPU_SYSFS"]
+    for n in range(16):
+        d = f"/sys/class/drm/card{n}/device"
+        if os.path.basename(os.path.realpath(d + "/driver")) == "amdgpu":
+            return d
+    return "/sys/class/drm/card0/device"
+
+
+DEV = gpu_sysfs()
 CLOCK = DEV + "/power_dpm_force_performance_level"
 
 
@@ -155,7 +167,7 @@ def main():
     env = dict(os.environ, HALO_PREFILL_TIMING="1")
     pinned = not args.no_pin and set_clock("pin")
     if not args.no_pin and not pinned:
-        print(f"warning: could not pin the GPU clock ({CLOCK}); measuring at auto", file=sys.stderr, flush=True)
+        print(f"warning: could not pin the GPU clock ({CLOCK}; does the sudoers rule name this path?); measuring at auto", file=sys.stderr, flush=True)
 
     def restore(*_):
         if pinned:
