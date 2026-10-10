@@ -21,6 +21,11 @@ LPDDR5X-8000 256-bit unified memory, 32 MB MALL. ROCm 7.2.3.
   ~2.88 GHz, prefill 1.557-1.558 s (1 ms spread over 5 warm reps; auto: 4 ms). `ab_bench` uses
   this. On this APU `pp_dpm_sclk` and `pp_dpm_mclk` reject writes; `pp_dpm_fclk`, `pp_dpm_socclk`
   and `pp_od_clk_voltage` accept them.
+- Pinning needs passwordless `sudo tee` on those sysfs files, and a sudoers rule names an
+  exact path. The card number is not stable (card0 became card1 when a second NVMe was
+  added), so `gpu_clock.sh` and `ab_bench` find the card bound to amdgpu on each run
+  (`HALO_GPU_SYSFS` overrides it), `gpu_clock.sh status` prints the path, and a refused write
+  says which path the rule must name.
 
 ## Execution
 

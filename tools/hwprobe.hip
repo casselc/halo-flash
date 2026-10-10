@@ -1046,9 +1046,13 @@ struct PlCfg {
 };
 
 std::uint64_t SysfsU64(const char* f) {
+  // The first card with this file (the amdgpu card's number is not stable).
   char path[256];
-  std::snprintf(path, sizeof path, "/sys/class/drm/card0/device/%s", f);
-  FILE* h = std::fopen(path, "r");
+  FILE* h = nullptr;
+  for (int card = 0; card < 8 && !h; ++card) {
+    std::snprintf(path, sizeof path, "/sys/class/drm/card%d/device/%s", card, f);
+    h = std::fopen(path, "r");
+  }
   unsigned long long v = 0;
   if (h) {
     if (std::fscanf(h, "%llu", &v) != 1) v = 0;

@@ -112,12 +112,14 @@ for ph in "${phases[@]}"; do
         echo "cmdline: $(cat /proc/cmdline)"
         echo "iommu_groups: $(ls /sys/kernel/iommu_groups | wc -l)"
         echo "iommu_types:"; cat /sys/kernel/iommu_groups/*/type | sort | uniq -c
-        echo "gpu_iommu_group_type: $(cat /sys/class/drm/card0/device/iommu_group/type 2>/dev/null)"
+        GPU=$(for c in /sys/class/drm/card[0-9]*; do case $c in *-*) ;; *) [ "$(basename "$(readlink -f "$c/device/driver")")" = amdgpu ] && echo "$c/device" && break ;; esac; done)
+        echo "gpu_sysfs: $GPU"
+        echo "gpu_iommu_group_type: $(cat $GPU/iommu_group/type 2>/dev/null)"
         for n in /sys/class/nvme/nvme*; do
           echo "nvme $(basename $n): $(cat $n/model 2>/dev/null | xargs) speed $(cat $n/device/current_link_speed) width $(cat $n/device/current_link_width) (max $(cat $n/device/max_link_speed) x$(cat $n/device/max_link_width)) group_type $(cat $n/device/iommu_group/type 2>/dev/null)"
         done
-        echo "gpu_link: $(cat /sys/class/drm/card0/device/current_link_speed) x$(cat /sys/class/drm/card0/device/current_link_width)"
-        echo "vram_total: $(cat /sys/class/drm/card0/device/mem_info_vram_total) gtt_total: $(cat /sys/class/drm/card0/device/mem_info_gtt_total)"
+        echo "gpu_link: $(cat $GPU/current_link_speed) x$(cat $GPU/current_link_width)"
+        echo "vram_total: $(cat $GPU/mem_info_vram_total) gtt_total: $(cat $GPU/mem_info_gtt_total)"
         grep -E "MemTotal|MemAvailable" /proc/meminfo
         echo "model_df: $(df -T /data | tail -1)"
       } > $OUT/sys.txt 2>&1
