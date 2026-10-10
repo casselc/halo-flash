@@ -145,6 +145,13 @@ class FlashNextGpu {
   static inline bool prefill_blocked_xh_ = true;  // the mixers' fp16 streams K-blocked for the down GEMM
   static inline bool prefill_banded_gemm_ = true;  // large dense GEMMs in bands of 8 row tiles
   static inline bool prefill_reg_gemm_ = true;  // banded GEMMs with weights in registers (halo_gemm_q8r_f16_lr8)
+  // Short calls (T <= prefill_short_gemm_): FP16-route dense GEMMs on more row tiles with 256-wide K
+  // stages (halo_gemm_q8r_f16_t*), the same bits as the large tiles (-43..-48 ms a call at T 1..64). 0 turns it off.
+  static inline std::uint32_t prefill_short_gemm_ = 64;
+  static inline std::uint32_t prefill_short_gemm_narrow_ = 256;  // the limit for shapes under 4096 rows (not below prefill_short_gemm_)
+  // The short-call kernel for a shape, or nullptr; *bm and *bn get its tile.
+  static const char* ShortGemm(std::uint32_t rows, std::uint32_t cols, std::uint32_t T, bool blocked_x, bool half_out,
+                               std::uint32_t* bm, std::uint32_t* bn);
   static inline bool prefill_fused_moe_combine_ = true;  // routed combine + shared expert in one pass
   /// combine_norm with one block per token (all four streams; halo_hc_combine_norm_tok, bit-identical).
   static inline bool prefill_tok_combine_ = false;  // attention half: 56.9 vs 55.3 ms per prefill, not kept

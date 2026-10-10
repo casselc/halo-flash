@@ -1519,3 +1519,49 @@ hashes, per-cycle traces); trunk prefill / decode logits byte-identical to main.
 | Scratch allocated and touched at LoadMtp | removes the first prompt's ~140 ms | first catch-up (ctx 2K, W 128) 145 -> 7.5 ms | yes |
 | Draft history W = all in serving (with the batched catch-up) | full best on doc / code, within 5% on ctx; bench: full | bench greedy end to end 68.9 s vs W 128 69.4 (3 runs each); agent cold decode 1.27x -> 1.56x; doc / code 8K 256-token requests -0.7 s, ctx 8K +0.3 s | yes (default) |
 | Overlap of the catch-up with the trunk prefill | <= the catch-up's 8% | not built (one runtime stream; the chunk's rows are needed first) | no |
+
+## 19. 2026-10-10 (stream ST, branch `stream/short-t`): short Prefill calls
+
+Every Prefill call takes the chunk path whatever its length, so a short call (an agent
+turn's new tokens, a one-token remainder past an 8192-token chunk) paid ~89 ms of dense
+GEMMs for any T up to 64 (`halo_run --kernel-timing 1`, depth 0, pinned; K2 stream sweep):
+
+| T | wall | kernels | dense GEMMs | routed MoE |
+|---:|---:|---:|---:|---:|
+| 1 | 111 ms | 110.5 | 89.1 | 11.4 |
+| 16 | 150 ms | 149.2 | 87.7 | 50.9 |
+| 64 | 185 ms | 184.1 | 89.9 | 80.5 |
+| 256 | 280 ms | 279.3 | 122.5 | 125.0 |
+
+The large tiles' grids are ceil(T / 128) x rows / 256 (the tall 320 x 10240 shape one
+block), so 1..48 workgroups ran, each a chain of latency-bound K stages (`_mb`: 160 stages
+of ~1.9 us on one block, 304 us a call). MoE grows with T as more experts are touched:
+data, not overhead. GemmQ8rF16 sums every output over K in the same order for any tile,
+so new tiles are exact.
+
+gemm_bench study (T 1 / 64, cold and after 96 MB of writes) picked 256-wide K stages on
+32-row tiles below 4096 rows and 64-row tiles from 4096 (320 x 10240: `_mb` 0.305 ->
+0.061 ms cold; 2560 x 6144: `_l` 0.487 -> 0.135; 12288 x 2560: lr8 0.309 -> 0.157).
+128-wide stages and the other tile per shape were slower; T 64 gains shrink on the
+largest shapes.
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| `halo_gemm_q8r_f16_t{32,64}k256[b,h]` for FP16-route dense GEMMs at T <= 64 (`--short-gemm 64`, cols % 256 == 0; K-blocked input for the mixer down, fp16 out for the DeltaNet qkv / z) | bit-identical; dense 89 -> 30..50 ms at T 1; -35..-60 ms a call at T 1 / 16 / 64; 2048 unchanged | Property test bitwise vs `_l` (all nine tiles, ragged rows / tokens, blocked and fp16 forms); logits byte-identical at T 1 / 16 / 64 / 256 / 2048; dense 87.6 -> 40.6 ms at T 1. ab_bench 4 x 3 pinned (prose_1, warm prose_8888, --context 16384): T 1 105.8 -> 58.0 (-47.8, spreads 1.3 / 0.3), T 16 146.6 -> 98.9 (-47.7), T 64 180.9 -> 138.1 (-42.8), T 2048 1244.4 -> 1250.4 within noise (same path) | yes (default 64) |
+
+| Short tiles past T 64: shapes under 4096 rows up to T 256 (`--short-gemm-narrow 256`), wide shapes stay at 64 | T 128 -20..-40 ms, T 256 0..-25; crossover per shape between 128 and 512; bit-identical | study (after writes): narrow shapes still win at 128 / 256 (mixer down 0.17 vs 0.44 ms), wide shapes mixed at 128 and lose at 256. ab_bench 4 x 3 pinned, three arms: T 128 210.2 -> 180.4 (-29.8; all shapes -23.8), T 256 278.9 -> 263.5 (-15.4; all shapes +7.4). Narrow limit 1024 vs 256: T 512 +7.2, T 1024 +32.1 ms (worse). Logits byte-identical at T 128 / 256 with every shape short | yes (narrow 256, wide 64) |
+
+Not yet tried: the remaining ~41 ms at T 1 (the 2560-row `t32k256` 131 us a call, the fp16 lr8h shapes
+94..140 us) against a decode step's ~37 ms for all of its weights.
+
+## 20. 2026-10-10 (stream DX, on `stream/short-t`): decode probes
+
+Fresh baseline (pinned, short context): graph 36.86 ms/step; eager kernels 39.72 (the 0.68 ms
+`halo_broadcast` row is the inter-step host gap: the sync-free stamps charge it to the step's
+first stamped kernel). Leaders: qkv + z dual GEMV 7.19 (223 GB/s), 2560 x 6144 GEMVs 5.05
+(162 GB/s), routed gate/up 4.89 (177), down 3.15 (168), LM head 2.79 (242), mixers 2.66 + 2.54
+(132), attention q 1.83 (219).
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| 2560-row Q8 GEMVs on 2 rows a wave (160 blocks) or 1 (320) instead of 4 (80); same per-row sums (`--decode-ab`, 5 rounds) | -0.6..-1.2 ms/step if blocks in flight were the limit; 0 plausible | r2 -0.02 (noise), r1 +0.66; logits equal | no (block count is not the limit) |

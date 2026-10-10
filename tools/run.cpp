@@ -465,6 +465,8 @@ int main(int argc, char** argv) {
     else if (a == "--gate-in-place") engine::FlashNextGpu::prefill_gate_in_place_ = std::string(argv[i + 1]) == "1";
     else if (a == "--banded-gemm") engine::FlashNextGpu::prefill_banded_gemm_ = std::string(argv[i + 1]) == "1";
     else if (a == "--reg-gemm") engine::FlashNextGpu::prefill_reg_gemm_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--short-gemm") engine::FlashNextGpu::prefill_short_gemm_ = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--short-gemm-narrow") engine::FlashNextGpu::prefill_short_gemm_narrow_ = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--blocked-xh") engine::FlashNextGpu::prefill_blocked_xh_ = std::string(argv[i + 1]) == "1";
     else if (a == "--gdn-chunked") {
       engine::FlashNextGpu::prefill_gdn_chunked_ = std::string(argv[i + 1]) != "0";
