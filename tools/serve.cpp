@@ -206,6 +206,8 @@ int main(int argc, char** argv) {
           "                        admission, Idempotency-Key replay / adopt. off: one request at a time (FIFO)\n"
           "  --sched-slice N (2048) --sched-slice-alone N (8192) --sched-plimit N (1) --sched-capacity-gb G\n"
           "  --sched-decider-burst N (4) --sched-decider-refill R (2/s)\n"
+          "  --sched-keyed-grace S (30): a request with an Idempotency-Key whose client left runs on S seconds for a\n"
+          "      retry with the key to adopt (or replay) it; 0: fenced at the next boundary like any other\n"
           "  --decider-mode concurrent|scheduled  decider evaluations beside Flash-Next (default) or as scheduler units\n"
           "  --ngram-cache-gb G --moe-topk N --decider-dir DIR --decider-device hip|hrx|cpu --variant MANIFEST\n"
           "  --scope-dir DIR --scope-project NAME --scope-capture off|digest|full --scope-wal PATH\n"
@@ -264,6 +266,7 @@ int main(int argc, char** argv) {
     else if (a == "--sched-capacity-gb") sched_capacity_gb = std::atof(v.c_str());
     else if (a == "--sched-decider-burst") sched.sched.decider_burst = std::atof(v.c_str());
     else if (a == "--sched-decider-refill") sched.sched.decider_refill_per_s = std::atof(v.c_str());
+    else if (a == "--sched-keyed-grace") sched.sched.keyed_grace_s = std::atof(v.c_str());
     else if (a == "--decider-dir") decider_dir = v;
     else if (a == "--decider-device") decider_device = v;
     else if (a == "--decider-mode") {
@@ -376,8 +379,9 @@ int main(int argc, char** argv) {
                                                 : std::max(0.0, avail - (4.5 + 1.5) * (1ull << 30));
       sched.sched.capacity = static_cast<std::uint64_t>(cap);
       std::fprintf(stderr, "scheduler: on (slices %u / %u alone, %u in flight per principal, ledger %.1f GB, decider "
-                   "credit %.0f + %.1f/s)\n", sched.sched.slice_contended, sched.sched.slice_alone, sched.sched.plimit,
-                   cap / (1ull << 30), sched.sched.decider_burst, sched.sched.decider_refill_per_s);
+                   "credit %.0f + %.1f/s, keyed grace %.0f s)\n", sched.sched.slice_contended, sched.sched.slice_alone,
+                   sched.sched.plimit, cap / (1ull << 30), sched.sched.decider_burst, sched.sched.decider_refill_per_s,
+                   sched.sched.keyed_grace_s);
       auto sg = server::MakeScheduledFlashNext(*engine, tok.get(), {}, max_context, cache, spec, sched, &flash_backend);
       sched_generator = sg.get();
       generator = std::move(sg);

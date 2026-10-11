@@ -2013,3 +2013,23 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "Scheduler.KeyedDeparture*:SchedulerReplay.*"
 why = "a keyed departure is fenced at once: a non-streaming caller's retry finds its attempt gone and the turn is decoded again (noRedoWithinGrace)"
+
+[[mutant]]
+name = "sg-detached-reader-counts-tokens"
+file = "src/server/scheduled_generator.cpp"
+find = 'if (job->keyed && opt_.sched.keyed_grace_s > 0) res.detached = res.uncounted = true;'
+replace = 'if (job->keyed && opt_.sched.keyed_grace_s > 0) res.detached = true;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ScheduledGenerator.*"
+why = "a reader that leaves a keyed request counts the tokens it saw, and the reader that takes the answer counts them again"
+
+[[mutant]]
+name = "sg-departure-taken-for-stop"
+file = "src/server/scheduled_generator.cpp"
+find = '    if (!more && gone()) more = true;  // the callback found the client gone: a departure (below), not a stop'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ScheduledGenerator.*"
+why = "a client the text callback found gone is taken for a stop string: the request completes truncated and its key's retry replays the truncated answer as finished (P1 K2: 266 tokens, finish stop)"

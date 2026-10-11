@@ -1366,6 +1366,66 @@ TEST(ScheduledDecider, CreditedDecidersRunAtTheNextBoundaryOnTheEngineThread) {
 // Non-streaming: a 500 naming the store; streaming: an error event in place of response.completed. Nothing is
 // kept, the observer records an error, and continuing from the id is a 404; once the store works again the same
 // request succeeds (a retry is safe: every attempt is a new immutable response).
+// G3 keyed grace + the departure/stop distinction (cordis's non-streaming retries): a client found gone by the text
+// callback (as the service finds it: a failed write) is a departure, not a stop string. The keyed request runs on
+// through its grace, and the retry with the same key gets the whole answer (adopted, or replayed once finished), as
+// the request served alone; never a truncated answer marked finished. The generation's tokens count once.
+TEST(ScheduledGenerator, ARetryWithTheKeyGetsTheWholeAnswerAfterTheCallbackFoundTheClientGone) {
+  const std::string prompt = "a review m77x";
+  std::string want;
+  {
+    SteppedGenerator alone_gen;
+    alone_gen.Plan("m77x", -1, 120);
+    ScheduledGenerator alone(std::make_unique<FakeBackend>(alone_gen), 1u << 20);
+    TextGenerator::Params p;
+    p.prompt = prompt;
+    p.max_tokens = 1000;
+    const auto r = alone.Generate(p, [&](std::string_view piece) { return want.append(piece), true; });
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    ASSERT_FALSE(r.cancelled);
+  }
+  SteppedGenerator gen;
+  // The engine holds mid-decode (the fake's hold, with no departure hook: it waits for the release only), so the
+  // client leaves while the answer is still being generated.
+  auto plan = gen.Plan("m77x", SteppedGenerator::kChunks + 4, 120);
+  gen.Plan("m77x", -1, 120);  // only used if the retry were (wrongly) a new request
+  ScheduledGenerator sg(std::make_unique<FakeBackend>(gen), 1u << 20);
+  TextGenerator::Params p;
+  p.prompt = prompt;
+  p.max_tokens = 1000;
+  p.idempotency_key = "review-1";
+  std::atomic<bool> gone{false}, leaving{false};
+  p.cancelled = [&] { return gone.load(); };
+  std::string first;
+  auto leave = std::async(std::launch::async, [&] {
+    while (!plan->held) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    leaving = true;
+    plan->release = true;
+  });
+  const auto r1 = sg.Generate(p, [&](std::string_view piece) {
+    first.append(piece);
+    if (!leaving) return true;
+    gone = true;  // the next write failed: the client left
+    return false;
+  });
+  leave.get();
+  EXPECT_TRUE(r1.cancelled);
+  EXPECT_TRUE(r1.detached);
+  EXPECT_TRUE(r1.uncounted);
+  EXPECT_LT(first.size(), want.size());
+  TextGenerator::Params retry = p;
+  retry.cancelled = [] { return false; };
+  std::string second;
+  const auto r2 = sg.Generate(retry, [&](std::string_view piece) { return second.append(piece), true; });
+  EXPECT_TRUE(r2.error.empty()) << r2.error;
+  EXPECT_FALSE(r2.cancelled);
+  EXPECT_FALSE(r2.uncounted);  // this reader counts the generation's tokens
+  EXPECT_EQ(second, want);
+  const auto c = sg.scheduler().counters();
+  EXPECT_EQ(c.adopted + c.replayed, 1u);
+  EXPECT_EQ(c.admitted, 1u);  // one generation
+}
+
 TEST(OpenAiService, AFailedStoreWriteIsAnErrorAndKeepsNothing) {
   ServingRig rig;
   const int port = rig.server.port();

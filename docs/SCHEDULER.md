@@ -417,3 +417,56 @@ A scheduled decider waits for the slice in progress, whole (the next call arrive
 its latency is the slice length; concurrent, the two models share the GPU at kernel granularity with little real
 overlap. Decision rule fixed before measuring: concurrent, since its p90 beside a prefill (421 ms) is below a
 unit's wait.
+
+## 13. Keyed grace, and a departure that is not a stop (stream GM, 2026-10-11)
+
+G3 forward onto main e4cabdc (merge 667d4d4), then two changes found by a cordis-shaped client: a non-streaming
+chat completion with an `Idempotency-Key`, a 10 s client timeout, retried with the same key. Its answer (1200 tokens,
+~45 s of decode) outlasts every attempt.
+
+**The gap.** Section 7's adoption only works while the departed attempt is still in flight, and a departure is
+fenced at the next unit boundary (~0.3 s). A client that retries at once was adopted (4 times; answered at attempt
+5, one generation). A client that backs off 2 s (the OpenAI SDKs back off 0.5-8 s) found its attempt fenced every
+time: 6 admissions, the decode redone 5 times, and no answer unless a restart happened to fit in 10 s.
+
+**Keyed grace** (`Options::keyed_grace_s`, `--sched-keyed-grace`, default 30 s): a departed request with a key is
+fenced only at the first boundary after the grace, measured from when the server learned of the departure. Until
+then it runs on: a retry with the key adopts it, or replays it once it finished (`halo:sched_grace_finished_total`).
+Keyless departures are fenced at once, as before. The price is the late-effect bound: work for a client that
+never comes back grows from `GONE_BOUND` to `GONE_BOUND + GRACE` (model: `goneBound`).
+
+**A departure is not a stop.** The service's text callback returns false both for a stop string and when a write
+fails (the client left); `ScheduledGenerator::Wait` took every false for a consumer stop, so the engine finished the
+request *completed* at its next token, stored the truncated text for replay and marked the key finished. A retry with
+the key then got the truncated answer as a finished one (`finish_reason: stop`): one of the probe's runs got 266 of
+1200 tokens this way. Which path saw the departure first (the callback, or `Wait`'s 20 ms poll) was a race. Now the
+service reports its own departure through `Params::cancelled`, and `Wait` checks it before taking a false for a stop.
+Main (no replay store) is not affected.
+
+**Counting.** With adoption, every reader that left was recorded as a cancelled request with the tokens it had seen
+(one 1200-token generation counted 3825). A reader that leaves a keyed request, or is taken over by a retry, is now
+`detached` (finish reason) and counts no tokens; the first reader to receive the whole answer (directly, by adoption
+or by replay) counts them once.
+
+**Model** (`spec/scheduler/`): rule `keyedGrace`; caller kind `ns` (sandbox C may be a non-streaming caller whose
+answer, `NS_TOK = CT + 1` decode units, outlasts its timeout); property `noRedoWithinGrace` (a retry that reaches the
+server within `GRACE` of its attempt's departure never finds it fenced with decoding done); mutant `noKeyedGrace`
+breaks it; witnesses `wNsTimeout`, `wNsDone`, `wFinishedDetached`. `workAfterGoneBounded` uses `goneBound`. The
+replay traces were regenerated (24 traces, 1154 compared steps; 42 of their 43 adoptions come after the server knew
+the client had left).
+
+**Tests.** `Scheduler.KeyedDepartureRunsOnThroughItsGrace`, `Scheduler.KeyedDepartureFinishedWithinItsGraceIsReplayed`;
+`ScheduledGenerator.ARetryWithTheKeyGetsTheWholeAnswerAfterTheCallbackFoundTheClientGone` (fails without the fix with
+the truncated answer, 3 of 3 runs); the Hegel machine runs with the model's grace; mutants `sched-no-keyed-grace`,
+`sg-detached-reader-counts-tokens`, `sg-departure-taken-for-stop`.
+
+**Measured** (`retry_probe.py`, 8 attempts, 10 s timeout, greedy, reference answer sha 41d06cc6df42):
+
+| Client | G3 as merged | + keyed grace and the fix |
+|---|---|---|
+| key, retry at once | answered at attempt 5, 47.6 s; 1 generation; counted 3825 tokens, 4 "cancelled" | attempt 5, 47.4 s; 1 generation; 1200 tokens, 4 "detached"; = reference |
+| key, retry after 2 s | 6 generations (5 fenced), answered at 74 s with a truncated replayed answer (266 tokens, `stop`) | attempt 4, 47.2 s; 1 generation (3 adoptions); = reference |
+| no key, retry after 2 s | never answered (8 generations) | unchanged |
+
+Restarting after a fenced mid-decode departure is exact: three cuts at 5 s (300 tokens) and six keyed cuts at 10 s
+(1200 tokens) both answered byte-identically to the uninterrupted reference, on this branch and on main.

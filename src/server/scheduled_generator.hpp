@@ -171,6 +171,7 @@ class ScheduledGenerator : public TextGenerator {
     std::string text;
     std::vector<std::int32_t> tokens;
     Result result;
+    std::shared_ptr<std::atomic<bool>> counted;  ///< the job's: whether its completion tokens were counted
   };
   std::map<Scheduler::Id, Stored> replay_;  // finished answers (kept while their keys may replay)
   std::deque<Scheduler::Id> replay_order_;

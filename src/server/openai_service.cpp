@@ -320,8 +320,14 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
         builder.Add(parsed, events);
       }
     };
-    TextGenerator::Params params{run->prompt, run->req.variant, run->req.sampling, run->req.max_tokens, poll,
-                                 run->req.principal, run->req.chain_root, run->req.idempotency_key, ticket};
+    bool client_gone = false;  // a write to the client failed: it left, or stopped reading past the send timeout
+    // The generator must tell a client gone from a stop string: both end the callback with false, but only a stop
+    // completes the answer (G3: a completed answer is stored and replayed to the key's retry). So a departure the
+    // callback found is also what Params::cancelled reports.
+    const auto cancelled_or_gone = [&client_gone, poll] { return client_gone || (poll && poll()); };
+    TextGenerator::Params params{run->prompt, run->req.variant, run->req.sampling, run->req.max_tokens,
+                                 cancelled_or_gone, run->req.principal, run->req.chain_root, run->req.idempotency_key,
+                                 ticket};
     if (opt_.on_activity) opt_.on_activity(true);
     struct Done {
       const std::function<void(bool)>& f;
@@ -332,7 +338,6 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
     GenerationRecord rec;
     rec.start_ns = NowNs();
     std::int64_t last_ns = 0;
-    bool client_gone = false;  // a write to the client failed: it left, or stopped reading past the send timeout
     auto result = gen_.Generate(params, [&](std::string_view piece) {
       if (opt_.observer) {
         const std::int64_t now = NowNs();
@@ -397,8 +402,9 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
       rec.model = run->req.model;
       rec.prompt_tokens = result.prompt_tokens;
       rec.cached_tokens = result.cached_tokens;
-      rec.completion_tokens = result.completion_tokens;
+      rec.completion_tokens = result.uncounted ? 0 : result.completion_tokens;
       rec.finish_reason = !result.error.empty()                                ? "error"
+                          : result.detached                                    ? "detached"
                           : cancelled                                          ? "cancelled"
                           : result.length_limited && !stops.stopped()          ? "length"
                           : builder.has_tool_calls()                           ? "tool_calls"

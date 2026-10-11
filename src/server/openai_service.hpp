@@ -81,6 +81,12 @@ class TextGenerator {
     std::int64_t retry_after_s = 0;
     std::string refused_why;
     bool replayed = false;  // the stored answer of an earlier attempt with the same idempotency key
+    /// G3: this reader left a request that runs on for its idempotency key (a retry adopted it, or it is within its
+    /// keyed grace): not an end of the generation.
+    bool detached = false;
+    /// G3: another reader of the same generation counts its completion tokens (adoption and replay hand one
+    /// generation to several readers; the first to receive the whole answer counts it).
+    bool uncounted = false;
   };
   virtual ~TextGenerator() = default;
   /// Generates, calling `on_text` with each new piece of text (whole UTF-8

@@ -37,6 +37,9 @@ struct ScheduledGenerator::Job {
   bool done = false, consumer_stop = false;
   std::uint64_t gen = 0;  // attachment: an adopting retry bumps it, and the earlier reader leaves
   Result result;
+  bool keyed = false;  // has an idempotency key: a departed reader leaves it running (keyed grace)
+  // its completion tokens were counted (by the reader that took the whole answer, or a replay of it)
+  std::shared_ptr<std::atomic<bool>> counted = std::make_shared<std::atomic<bool>>(false);
 };
 
 namespace {
@@ -113,6 +116,7 @@ TextGenerator::Admission ScheduledGenerator::AdmitIds(std::span<const std::int32
   job->sampling = params.sampling;
   job->budget = std::min<std::uint32_t>(params.max_tokens, max_context_ - static_cast<std::uint32_t>(prompt.size()));
   job->spec_ok = backend_->CanSpeculate() && !params.sampling.penalties_enabled();
+  job->keyed = !params.idempotency_key.empty();
   job->result.prompt_tokens = prompt.size();
   Scheduler::Turn t;
   t.principal = params.principal;
@@ -164,6 +168,7 @@ TextGenerator::Admission ScheduledGenerator::AdmitIds(std::span<const std::int32
       ticket->tokens = it->second.tokens;
       ticket->result = it->second.result;
       ticket->result.replayed = true;
+      ticket->result.uncounted = it->second.counted->exchange(true);
       break;
     }
     case O::kDuplicate:
@@ -264,7 +269,7 @@ TextGenerator::Result ScheduledGenerator::Wait(const std::shared_ptr<Job>& job, 
       });
       if (job->gen != gen) {  // a retry with the same key took this request over
         res = job->result;
-        res.cancelled = true;
+        res.cancelled = res.detached = res.uncounted = true;
         return res;
       }
       chunk = job->text.substr(off_text);
@@ -281,9 +286,11 @@ TextGenerator::Result ScheduledGenerator::Wait(const std::shared_ptr<Job>& job, 
     } else if (on_text && !chunk.empty()) {
       more = (*on_text)(chunk);
     }
+    if (!more && gone()) more = true;  // the callback found the client gone: a departure (below), not a stop
     if (!more) {
-      // The consumer stopped (a stop string, or its client could not take more): the answer ends here. The engine
-      // thread finishes the request at its next token.
+      // The consumer stopped (a stop string): the answer ends here, complete. The engine thread finishes the request
+      // at its next token. (A client that left is a departure, never this: its key would replay a truncated answer
+      // as finished.)
       std::lock_guard<std::mutex> lk(job->mu);
       job->consumer_stop = true;
       Result r = job->result;
@@ -291,10 +298,15 @@ TextGenerator::Result ScheduledGenerator::Wait(const std::shared_ptr<Job>& job, 
       r.cancelled = false;
       return r;
     }
-    if (done) return res;
+    if (done) {
+      res.uncounted = job->counted->exchange(true);
+      return res;
+    }
     if (gone()) {
       sched_.Depart(job->id, NowMs());
       res.cancelled = true;
+      // A keyed request runs on through its grace for a retry to adopt or replay; whoever takes the answer counts it.
+      if (job->keyed && opt_.sched.keyed_grace_s > 0) res.detached = res.uncounted = true;
       return res;
     }
   }
@@ -356,6 +368,8 @@ void ScheduledGenerator::RenderMetrics(std::string& out, const std::string& labe
   counter("halo:sched_refused_memory_total", "429s: no ledger room.", c.memory429);
   counter("halo:sched_evictions_total", "Retained prefixes evicted by admission.", c.evictions);
   counter("halo:sched_fenced_total", "Requests fenced after their client left.", c.fenced);
+  counter("halo:sched_grace_finished_total", "Keyed requests that finished while their client was away (replayable).",
+          c.grace_finished);
   counter("halo:sched_parked_total", "Fenced prefills whose progress was parked.", c.parked);
   counter("halo:sched_units_total", "Scheduler units run.", c.units);
   counter("halo:sched_slices_total", "Prefill slices.", c.slices);
@@ -412,7 +426,7 @@ void ScheduledGenerator::FinishJob(Job& job, const std::string& error) {
     Stored s;
     {
       std::lock_guard<std::mutex> jl(job.mu);
-      s = {job.text, job.tokens, job.result};
+      s = {job.text, job.tokens, job.result, job.counted};
     }
     std::lock_guard<std::mutex> lk(mu_);
     replay_[job.id] = std::move(s);
