@@ -861,3 +861,47 @@ TEST(Scheduler, AdmissionEvictsLruAndRefusesOnlyWhenShort) {
   (void)s.Next(0);
   EXPECT_EQ(evicted, (std::vector<Scheduler::Key>{1, 2, 3}));
 }
+
+// Requests of one principal share its turns (the third fairness level). The anonymous pool is one principal with
+// up to 8 in flight: under FIFO within the principal a newcomer's prefill waited for the oldest request's whole decode,
+// so its requests ran one at a time and never batched (8 concurrent anonymous chats: 59.0 s, 0 batched units; with a
+// principal each: 25.2 s). Now the newcomer's slice runs next, and then both decode in one batch.
+TEST(Scheduler, AnonymousRequestsShareTurnsAndBatch) {
+  Scheduler s(Scheduler::Options{});
+  const auto a = s.Arrive(Agent("", "", "", 64, 400), 0);
+  ASSERT_EQ(a.outcome, Scheduler::Outcome::kQueued);
+  std::int64_t now = 0;
+  auto u = s.Next(now);  // a's prefill
+  ASSERT_EQ(u.ids, std::vector<Scheduler::Id>{a.id});
+  ASSERT_EQ(u.kind, Scheduler::Kind::kSlice);
+  s.Done(u, {{a.id, 64, 1, true, false, false}}, now += 10, 10);
+  u = s.Next(now);  // a decodes
+  ASSERT_EQ(u.kind, Scheduler::Kind::kBatch);
+  s.Done(u, {{a.id, 0, u.steps, true, false, false}}, now += 100, 100);
+  const auto b = s.Arrive(Agent("", "", "", 64, 400), now);
+  ASSERT_EQ(b.outcome, Scheduler::Outcome::kQueued);
+  u = s.Next(now);
+  EXPECT_EQ(u.kind, Scheduler::Kind::kSlice) << "the newcomer's prefill, not the older request's next decode unit";
+  EXPECT_EQ(u.ids, std::vector<Scheduler::Id>{b.id});
+  s.Done(u, {{b.id, 64, 1, true, false, false}}, now += 10, 10);
+  u = s.Next(now);
+  EXPECT_EQ(u.kind, Scheduler::Kind::kBatch);
+  EXPECT_EQ(u.ids.size(), 2u) << "both decode in one unit";
+  EXPECT_GE(s.counters().batched, 1u);
+  // Two long prompts of one principal take their slices in turn (each slice charged to its request), not the older
+  // one's whole prefill first.
+  Scheduler t(Scheduler::Options{});
+  const std::uint64_t prompt = 3 * static_cast<std::uint64_t>(Scheduler::Options{}.slice_contended);
+  const auto c = t.Arrive(Agent("", "", "", prompt, 10), 0);
+  const auto d = t.Arrive(Agent("", "", "", prompt, 10), 0);
+  std::vector<Scheduler::Id> order;
+  std::int64_t at = 0;
+  for (int i = 0; i < 4; ++i) {
+    auto v = t.Next(at);
+    ASSERT_EQ(v.kind, Scheduler::Kind::kSlice);
+    ASSERT_EQ(v.ids.size(), 1u);
+    order.push_back(v.ids[0]);
+    t.Done(v, {{v.ids[0], v.slice_tokens, 0, false, false, false}}, at += 10, 10);
+  }
+  EXPECT_EQ(order, (std::vector<Scheduler::Id>{c.id, d.id, c.id, d.id}));
+}

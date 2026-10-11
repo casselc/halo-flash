@@ -3559,3 +3559,23 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "ServingReplay.*:OpenAiService.AnAdoptedReaderCountsNoTokens"
 why = "the reader an adoption took over counts the generation's tokens too"
+
+[[mutant]]
+name = "sched-fifo-within-principal"
+file = "src/server/scheduler.cpp"
+find = '          (!pick || std::make_tuple(r->vreq, r->prefill_done, r->id) < std::make_tuple(pick->vreq, pick->prefill_done, pick->id)))'
+replace = '          (!pick || r->id < pick->id))'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Scheduler.AnonymousRequestsShareTurnsAndBatch"
+why = "requests of one principal run FIFO: the anonymous pool's requests run one at a time and never batch"
+
+[[mutant]]
+name = "sched-request-not-charged"
+file = "src/server/scheduler.cpp"
+find = '  for (Req* r : in) r->vreq += u.charged;'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Scheduler.AnonymousRequestsShareTurnsAndBatch"
+why = "a request's own turns are not charged: within a principal the oldest request keeps every turn"

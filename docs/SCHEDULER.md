@@ -88,7 +88,13 @@ measured duration; a batched decode unit charges each participant a whole unit),
    deliveries and forwarded by the callee's broker); a sandbox outside any chain is its own root, so lone agents
    see no change;
 2. within a root, over its **sandbox principals** (`X-Halo-Principal`; unknown callers are one shared principal);
-3. within a principal, FIFO.
+3. within a principal, over its **requests** (2026-10-11): each request has a virtual time, charged for every unit it
+   takes part in; a newcomer starts at its principal's least; on a tie a request still prefilling goes first (it then
+   batches with the decoding ones), then the oldest. A principal with one request in flight (every sandbox, plimit 1,
+   and every model trace) is unaffected. The anonymous pool (up to 8 in flight, one principal) was FIFO here, so a
+   newcomer's prefill waited for the oldest request's whole decode: its requests ran one at a time and never batched
+   (8 concurrent anonymous chats, 200 tokens each: 59.0 s and 0 batched decode units, against 25.2 s with a principal
+   each). Not in the model (spec/scheduler has one request a principal); `Scheduler.AnonymousRequestsShareTurnsAndBatch`.
 Each root and principal has a virtual time; the pick takes the root with the least, then its principal with the
 least. A root that was idle **joins at the system virtual time** (the least tag among the backlogged roots at the
 last pick: it banks no credit while idle), and a principal joins at its root's own system virtual time. Joining at

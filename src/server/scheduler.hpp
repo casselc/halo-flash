@@ -201,6 +201,10 @@ class Scheduler {
     Key planned = 0, bound = 0;
     std::int64_t admitted_at = 0, last_served = 0;
     std::int64_t departed_at = 0;  ///< when the server learned its client left (departed)
+    /// Virtual time within its principal (the third fairness level): the principal's requests share its turns, so a
+    /// newcomer's prefill is not queued behind an older request's whole decode (the anonymous pool shares one
+    /// principal: under FIFO its requests ran one at a time and never batched).
+    std::int64_t vreq = 0;
     bool completed = false;
   };
   struct KeyState {

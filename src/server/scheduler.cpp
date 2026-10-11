@@ -245,6 +245,11 @@ Scheduler::Admission Scheduler::Arrive(const Turn& turn, std::int64_t now, bool 
   for (auto& [id, x] : reqs_)
     if (Active(x) && !x.decider && x.root == r.root && x.principal != r.principal) x.chained = r.chained = true;
   Join(r, now);
+  // A newcomer starts at its principal's least virtual time: it shares the principal's turns from now on.
+  bool first = true;
+  for (const auto& [id, x] : reqs_)
+    if (!x.decider && x.principal == r.principal && Runnable(x, now))
+      r.vreq = first ? x.vreq : std::min(r.vreq, x.vreq), first = false;
   reqs_[r.id] = r;
   if (!r.key.empty()) keys_[r.key] = {r.id, false, now};
   ++counters_.admitted;
@@ -339,8 +344,12 @@ Scheduler::Unit Scheduler::Next(std::int64_t now) {
       if (r->root == root && (prin.empty() || std::make_pair(vprin_[r->principal], prin_first[r->principal]) <
                                                   std::make_pair(vprin_[prin], prin_first[prin])))
         prin = r->principal;
+    // Within the principal: the least virtual time, a request still prefilling first on a tie (its prefill, then it
+    // batches with the others), then the oldest (FIFO when the principal has one request at a time).
     for (Req* r : run)
-      if (r->root == root && r->principal == prin && (!pick || r->id < pick->id)) pick = r;
+      if (r->root == root && r->principal == prin &&
+          (!pick || std::make_tuple(r->vreq, r->prefill_done, r->id) < std::make_tuple(pick->vreq, pick->prefill_done, pick->id)))
+        pick = r;
   }
 
   std::vector<Req*> in;
@@ -393,6 +402,7 @@ Scheduler::Unit Scheduler::Next(std::int64_t now) {
   }
   for (const auto& q : roots) vroot_[q] += u.charged;
   for (const auto& q : prins) vprin_[q] += u.charged;
+  for (Req* r : in) r->vreq += u.charged;
   ++counters_.units;
   return u;
 }
