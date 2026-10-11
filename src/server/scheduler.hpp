@@ -56,6 +56,10 @@ class Scheduler {
     std::int64_t retry_after_memory_s = 5;  ///< Retry-After of a memory 429
     std::int64_t retry_after_cap_s = 30;     ///< cap of a limit 429's Retry-After
     std::int64_t replay_ttl_s = 600;        ///< a finished key is replayed for this long
+    /// A departed request with an idempotency key keeps running this long after the server learns its client left
+    /// before it is fenced: a retry with the same key adopts it, or replays it if it finished meanwhile (a
+    /// non-streaming caller whose answer outlasts its timeout). 0: fenced at the next boundary like any other.
+    double keyed_grace_s = 30;
     std::size_t max_keys = 4096;            ///< finished keys remembered (oldest forgotten first)
     // Cost estimates in time units (the charge at a unit's start; Done() corrects it to the measured length).
     double slice_cost_per_token = 0.61;    ///< ms per prefill token (BENCHMARKS)
@@ -136,8 +140,9 @@ class Scheduler {
   }
 
   Admission Arrive(const Turn& turn, std::int64_t now, bool connected = true);
-  /// The client of `id` is known gone (FIN, a failed write, the send deadline): fenced at the next boundary.
-  void Depart(Id id);
+  /// The client of `id` is known gone at `now` (FIN, a failed write, the send deadline): fenced at the next
+  /// boundary, or, for a keyed request, at the first boundary after its grace (Options::keyed_grace_s).
+  void Depart(Id id, std::int64_t now);
   /// Engine thread: fence, evict, pick. kNone: nothing runnable (wait for an arrival).
   Unit Next(std::int64_t now);
   /// A boundary with no pick: fences and evictions as Next() does them; returns the requests fenced. (The trace
@@ -175,7 +180,7 @@ class Scheduler {
   [[nodiscard]] std::int64_t vtime_principal(const std::string& principal) const;
   struct Counters {
     std::uint64_t admitted = 0, replayed = 0, adopted = 0, duplicates = 0, limit429 = 0, memory429 = 0,
-                  evictions = 0, fenced = 0, parked = 0, units = 0, slices = 0, batches = 0, batched = 0, decides = 0,
+                  evictions = 0, fenced = 0, parked = 0, grace_finished = 0, units = 0, slices = 0, batches = 0, batched = 0, decides = 0,
                   preemptions = 0, decider_out_of_credit = 0;
   };
   [[nodiscard]] Counters counters() const;
@@ -195,6 +200,7 @@ class Scheduler {
     std::uint64_t fixed_bytes = 0;
     Key planned = 0, bound = 0;
     std::int64_t admitted_at = 0, last_served = 0;
+    std::int64_t departed_at = 0;  ///< when the server learned its client left (departed)
     bool completed = false;
   };
   struct KeyState {
@@ -208,12 +214,13 @@ class Scheduler {
   };
 
   bool Active(const Req& r) const { return r.phase == Phase::kQueued || r.phase == Phase::kRunning; }
-  bool Runnable(const Req& r) const;
+  bool Runnable(const Req& r, std::int64_t now) const;
+  bool InGrace(const Req& r, std::int64_t now) const;
   std::uint64_t Reserved() const;
   std::uint64_t RetainedBytes() const;
   std::uint64_t Free() const;
   Key Plan(const Turn& turn, std::uint64_t* tokens) const;
-  void Join(const Req& r);
+  void Join(const Req& r, std::int64_t now);
   void Refill(std::int64_t now);
   void Finish(Req& r, bool completed, std::int64_t now);
   void Fence(std::int64_t now, Unit* unit);

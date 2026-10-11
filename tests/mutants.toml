@@ -2003,3 +2003,13 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "SchedulerReplay.*"
 why = "G3 M5: Boundary() fences as Next() does (the replay's fence steps); without it a retry adopts a request the model already fenced"
+
+[[mutant]]
+name = "sched-no-keyed-grace"
+file = "src/server/scheduler.cpp"
+find = 'return r.departed && !r.decider && !r.key.empty() && opt_.keyed_grace_s > 0 &&'
+replace = 'return false && r.departed && !r.decider && !r.key.empty() && opt_.keyed_grace_s > 0 &&'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Scheduler.KeyedDeparture*:SchedulerReplay.*"
+why = "a keyed departure is fenced at once: a non-streaming caller's retry finds its attempt gone and the turn is decoded again (noRedoWithinGrace)"

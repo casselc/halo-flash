@@ -37,10 +37,11 @@ wit() { # main witnesses...
 }
 
 # ---- the design ----
-sim design safety "$SAMPLES" ok "(all 12 properties)"
-SEED=0xbeef sim design safety "$SAMPLES" ok "(all 12 properties, second seed 0xbeef)"
+sim design safety "$SAMPLES" ok "(all 13 properties)"
+SEED=0xbeef sim design safety "$SAMPLES" ok "(all 13 properties, second seed 0xbeef)"
 wit design wPreempted wBatched wDeciderBetweenSlices wDeciderFair wParkedOnCancel wEvicted wMem429 \
-  wRetryAfter429 wTimeout wFencedFin wFencedVanished wLateArrival wReplayed wAdopted wTurn2Done wChainFanout
+  wRetryAfter429 wTimeout wFencedFin wFencedVanished wLateArrival wReplayed wAdopted wTurn2Done wChainFanout \
+  wNsTimeout wNsDone wFinishedDetached
 # keyless clients (no idempotency key): the rest of the design still holds what does not need keys
 sim noIdempotency noRecompute "$MSAMPLES" ok "(keyless: park on cancel + bind at start still avoid recompute)"
 sim noIdempotency boundedWait "$MSAMPLES" ok "(keyless)"
@@ -58,6 +59,7 @@ sim noFence              workAfterGoneBounded "$MSAMPLES" VIOLATED
 sim noDeadPeerProbe      workAfterGoneBounded "$MSAMPLES" VIOLATED "a peer gone without FIN"
 sim noHeartbeat          noSpuriousTimeout    "$MSAMPLES" VIOLATED "AUDIT D3"
 sim dropOnCancel         noRecompute          "$MSAMPLES" VIOLATED
+sim noKeyedGrace         noRedoWithinGrace    "$MSAMPLES" VIOLATED "a non-streaming caller's retry decodes its turn again"
 sim bindAtAdmission      noRecompute          "$MSAMPLES" VIOLATED "(keyless; with keys it is equivalent)"
 sim memoryReadingOnly    noOvercommit         "$MSAMPLES" VIOLATED "AUDIT D1/E3"
 sim releasedStaysCharged refuseOnlyIfShort    "$MSAMPLES" VIOLATED "AUDIT F3"

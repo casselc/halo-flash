@@ -32,6 +32,9 @@ module scheduler {
                            // answer; a retry of an in-flight one adopts it (false: every retry is a new request)
     twoLevel: bool,        // fair queuing over chain roots first, then over the sandboxes of a root (A2A-MCP D9)
                            // (false: one level, over sandbox principals; a chain that fans out takes several shares)
+    keyedGrace: bool,      // a departed request with a key keeps running for GRACE ticks before it is fenced, so a
+                           // retry with the same key adopts it, or replays it if it finished meanwhile (false: a
+                           // keyed departure is fenced at the next boundary like any other)
   }
   const RULES: Rules
 
@@ -66,6 +69,8 @@ module scheduler {
   pure val LAG_BOUND = 2 * MAXUNIT + MAXUNIT + DECODE
   pure val DEC_BOUND = MAXUNIT + 2 * DEC_COST  // in service + one credited decider ahead
   pure val GONE_BOUND = ACK_TO + MAXUNIT      // work started for a departed client
+  pure val GRACE = 4        // a departed keyed request runs this long before it is fenced (keyedGrace)
+  pure val NS_TOK = CT + 1  // a non-streaming turn's answer: its decoding alone outlasts the caller's timeout
 
   pure val CONVS = Set(1, 3, 5)                 // conversations of sandboxes A, B and C
   pure def principalOf(c: int): str = if (c == 1) "A" else if (c == 3) "B" else "C"
@@ -85,9 +90,11 @@ module scheduler {
     reused: int, done: int, decoded: int, inherited: int, need: int,
     ph: Phase, conn: bool, fin: bool, leftAt: int, heard: int, admittedAt: int, lastServed: int,
     started: bool, goneWork: int, ans: Ans, prio: bool, served: bool, spurious: bool,
-    root: str, chained: bool, seq: int,
+    root: str, chained: bool, seq: int, ns: bool,
   }
-  type Client = { turn: int, busy: bool, attempts: int, retryAt: int, lastAns: Ans, root: str }
+  // ns: a non-streaming caller (cordis's outbox, an SDK without stream=true): it hears nothing until the answer, so
+  // its timeout fires while the server still holds its request, and it retries the turn with the same key
+  type Client = { turn: int, busy: bool, attempts: int, retryAt: int, lastAns: Ans, root: str, ns: bool }
   type Engine = { kind: Kind, until: int, rs: Set[int] }
   // vtime/vnow: virtual time per chain root and the root-level system virtual time; pvt/pvnow: virtual time per
   // principal and each root's own system virtual time (the second level)
@@ -97,7 +104,7 @@ module scheduler {
   // svc: GPU ticks started for each agent chain root; co: the ordered pairs of agent roots both backlogged at the
   // last pick; base: their service difference when they became backlogged together
   type Ghost = { computed: int -> int, maxPrompt: int -> int, evicted: int -> int, falseRefusals: int, faults: int, selfLimit: int,
-                 events: Set[str], svc: str -> int, co: Set[(str, str)], base: (str, str) -> int }
+                 events: Set[str], svc: str -> int, co: Set[(str, str)], base: (str, str) -> int, redo: int }
 
   // ---------------------------------------------------------------- state
   var time: int
@@ -119,9 +126,15 @@ module scheduler {
   def knownGone(r: Req): bool =
     not(r.conn) and (r.fin or (RULES.deadPeerProbe and time >= r.leftAt + ACK_TO))
   def hasWork(r: Req): bool = r.dec or r.done < r.prompt or r.decoded < r.maxTok
-  def runnable(r: Req): bool = isActive(r) and hasWork(r) and not(RULES.fenceDeparture and knownGone(r))
+  // a departed keyed request within its grace keeps running (keyedGrace); fencing waits for the grace to run out
+  // the grace starts when the server learns of the departure (FIN at once; a vanished peer ACK_TO later)
+  // (a request that reaches the server after its client left: at its admission)
+  pure def goneAt(r: Req): int = max(r.admittedAt, if (r.fin) r.leftAt else r.leftAt + ACK_TO)
+  def inGrace(r: Req): bool = RULES.keyedGrace and RULES.idempotency and not(r.dec) and time < goneAt(r) + GRACE
+  def fenceDue(r: Req): bool = knownGone(r) and not(inGrace(r))
+  def runnable(r: Req): bool = isActive(r) and hasWork(r) and not(RULES.fenceDeparture and fenceDue(r))
   val runSet: Set[Req] = actives.filter(r => runnable(r))
-  val fencePending: bool = RULES.fenceDeparture and actives.exists(r => knownGone(r))
+  val fencePending: bool = RULES.fenceDeparture and actives.exists(r => fenceDue(r))
   pure def minId(s: Set[Req]): int = s.fold(1000000, (a, r) => if (r.id < a) r.id else a)
   // the id of the request admitted first (FIFO is by arrival at the server, not by when the client sent it)
   pure def firstIn(s: Set[Req]): int =
@@ -141,7 +154,7 @@ module scheduler {
   pure def freeOf(h: int -> int, rs: Set[Req], charged: int, phys: int): int =
     if (RULES.reserveLedger) CAP - ledgerUsed(h, rs, charged)
     else CAP - phys - (if (RULES.evictSeesFreed) 0 else charged)
-  def lastByte(r: Req): int = if (RULES.heartbeat and isActive(r)) time else r.heard
+  def lastByte(r: Req): int = if (RULES.heartbeat and isActive(r) and not(r.ns)) time else r.heard
 
   // ---------------------------------------------------------------- init
   // each conversation's sandbox serves either its own chain (the default root: itself) or the chain X
@@ -149,28 +162,31 @@ module scheduler {
     nondet ra = Set("A", "X").oneOf()
     nondet rb = Set("B", "X").oneOf()
     nondet rc = Set("C", "X").oneOf()
+    // sandbox C's caller may be non-streaming (the cordis outbox shape)
+    nondet nsC = Set(false, true).oneOf()
     val rootOfConv = Map(1 -> ra, 3 -> rb, 5 -> rc)
     all {
       time' = 0,
       reqs' = Map(),
       nextId' = 1,
-      clients' = CONVS.mapBy(c => { turn: 1, busy: false, attempts: 0, retryAt: 0, lastAns: NoAns, root: rootOfConv.get(c) }),
+      clients' = CONVS.mapBy(c => { turn: 1, busy: false, attempts: 0, retryAt: 0, lastAns: NoAns, root: rootOfConv.get(c),
+                                    ns: c == 5 and nsC }),
       decSent' = 0,
       eng' = { kind: Idle, until: 0, rs: Set() },
       srv' = { held: CONVS.mapBy(c => 0), charged: 0, vtime: ROOTS.mapBy(q => 0), vnow: 0,
                pvt: PRINCIPALS.mapBy(q => 0), pvnow: ROOTS.mapBy(q => 0), credit: DEC_BURST, seq: 0 },
       gh' = { computed: CONVS.mapBy(c => 0), maxPrompt: CONVS.mapBy(c => 0), evicted: CONVS.mapBy(c => 0),
               falseRefusals: 0, faults: 0, selfLimit: 0, events: Set(),
-              svc: AGENT_ROOTS.mapBy(q => 0), co: Set(), base: tuples(AGENT_ROOTS, AGENT_ROOTS).mapBy(q => 0) },
+              svc: AGENT_ROOTS.mapBy(q => 0), co: Set(), base: tuples(AGENT_ROOTS, AGENT_ROOTS).mapBy(q => 0), redo: 0 },
     }
   }
 
-  pure def newReq(id: int, p: str, c: int, turn: int, dec: bool, prompt: int, maxTok: int, t: int, root: str): Req = {
+  pure def newReq(id: int, p: str, c: int, turn: int, dec: bool, prompt: int, maxTok: int, t: int, root: str, ns: bool): Req = {
     id: id, p: p, conv: c, turn: turn, dec: dec, prompt: prompt, maxTok: maxTok,
     reused: 0, done: 0, decoded: 0, inherited: 0, need: 0,
     ph: Waiting, conn: true, fin: true, leftAt: 0, heard: t, admittedAt: 0, lastServed: 0,
     started: false, goneWork: 0, ans: NoAns, prio: false, served: false, spurious: false,
-    root: root, chained: false, seq: 0,
+    root: root, chained: false, seq: 0, ns: ns,
   }
   def ev(e: str): Ghost = { ...gh, events: gh.events.union(Set(e)) }
   // a client-side fault (lost request, abort, vanished peer, lost answer): at most MAXFAULTS a run, so that runs
@@ -184,7 +200,8 @@ module scheduler {
     nondet mt = Set(1, 2).oneOf()
     all {
       not(cl.busy), cl.turn <= 2, cl.attempts < MAXATT, time >= cl.retryAt,
-      reqs' = reqs.put(nextId, newReq(nextId, principalOf(c), c, cl.turn, false, promptOf(cl.turn), mt, time, cl.root)),
+      reqs' = reqs.put(nextId, newReq(nextId, principalOf(c), c, cl.turn, false, promptOf(cl.turn),
+                                      if (cl.ns) NS_TOK else mt, time, cl.root, cl.ns)),
       nextId' = nextId + 1,
       clients' = clients.set(c, { ...cl, busy: true, attempts: cl.attempts + 1 }),
       decSent' = decSent, eng' = eng, srv' = srv, time' = time,
@@ -195,7 +212,7 @@ module scheduler {
   // a decider call (/v1/systemone; non-streaming, short)
   action deciderSend: bool = all {
     decSent < NDEC,
-    reqs' = reqs.put(nextId, newReq(nextId, "D", 0, 0, true, 0, 0, time, "D")),
+    reqs' = reqs.put(nextId, newReq(nextId, "D", 0, 0, true, 0, 0, time, "D", false)),
     nextId' = nextId + 1, decSent' = decSent + 1,
     clients' = clients, eng' = eng, srv' = srv, time' = time, gh' = gh,
   }
@@ -225,8 +242,8 @@ module scheduler {
     val r = reqs.get(id)
     all {
       waitingOn(r), time - lastByte(r) >= CT,
-      leave(id, true, isActive(r)),
-      gh' = if (isActive(r)) ev("spuriousTimeout") else ev("timeout"),
+      leave(id, true, isActive(r) and not(r.ns)),
+      gh' = if (r.ns) ev("nsTimeout") else if (isActive(r)) ev("spuriousTimeout") else ev("timeout"),
     }
   }
   // the user aborts (Ctrl-C), at any point
@@ -250,7 +267,8 @@ module scheduler {
         clients.set(r.conv, { ...cl, busy: false, turn: cl.turn + 1, lastAns: Got })
       },
       nextId' = nextId, decSent' = decSent, eng' = eng, srv' = srv, time' = time,
-      gh' = if (r.turn == 2) ev("turn2Done") else gh,
+      gh' = { ...gh, events: gh.events.union(if (r.turn == 2) Set("turn2Done") else Set())
+                                      .union(if (r.ns) Set("nsDone") else Set()) },
     }
   }
   action loseAnswer(id: int): bool = {
@@ -330,7 +348,7 @@ module scheduler {
       // attempt now lives or dies with the adopting connection (which may itself be a peer that vanished).
       val x = reqs.get(minId(inflight))
       all {
-        reqs' = reqs.set(x.id, { ...x, conn: r.conn, fin: r.fin, leftAt: r.leftAt, heard: time })
+        reqs' = reqs.set(x.id, { ...x, conn: r.conn, fin: r.fin, leftAt: r.leftAt, heard: time, goneWork: 0 })
                     .set(r.id, { ...r, ph: Merged, conn: false }),
         nextId' = nextId, clients' = clients, decSent' = decSent, eng' = eng, srv' = srv, time' = time,
         gh' = ev("adopted"),
@@ -338,6 +356,11 @@ module scheduler {
     } else admitNew(r)
   }
   action admitNew(r: Req): bool = {
+    // ghost: a retry that reaches the server within GRACE of its earlier attempt's departure, and finds that attempt
+    // fenced with decoding done, will decode again what was already decoded (the redo keyedGrace prevents)
+    val redone = RULES.idempotency and allReqs.exists(x => sameKey(x, r) and x.ph == Cancelled and x.decoded > 0 and
+                                                       time < x.leftAt + GRACE)
+    val gr = if (redone) { ...gh, redo: gh.redo + 1 } else gh
     val mine = actives.filter(x => x.p == r.p and not(x.dec) and not(knownGone(x)))
     val reuse0 = reuseOf(srv.held, r.conv, r.prompt)
     val need = r.prompt - reuse0 + r.maxTok
@@ -365,7 +388,7 @@ module scheduler {
     // truth: what fits if every evictable prefix went (pins and other reservations are real)
     val trueFree = CAP - sumHeld(if (canEvict) h2 else srv.held) -
       all2.filter(x => isActive(x) and not(x.dec) and x.id != r.id).fold(0, (a, x) => a + x.need + x.inherited)
-    val g1 = { ...gh, maxPrompt: gh.maxPrompt.set(r.conv, max(gh.maxPrompt.get(r.conv), r.prompt)) }
+    val g1 = { ...gr, maxPrompt: gh.maxPrompt.set(r.conv, max(gh.maxPrompt.get(r.conv), r.prompt)) }
     val gEvict = { ...g1, evicted: CONVS.mapBy(o => gh.evicted.get(o) + (if (ev0.contains(o)) srv.held.get(o) else 0)),
                    events: gh.events.union(Set("evicted")) }
     // a request that shares its chain root with another sandbox's request is chained (its wait bound is the
@@ -376,7 +399,7 @@ module scheduler {
       else m.keys().mapBy(i => { val x = m.get(i)  if (mates.contains(i) or i == r.id) { ...x, chained: true } else x })
     if (mine.size() >= PLIMIT) all {
       // a refusal caused only by the client's own earlier attempt of this turn is self-inflicted
-      refuse(r, "limit429", { ...gh, selfLimit: gh.selfLimit + (if (r.conn and mine.forall(x => sameKey(x, r))) 1 else 0) }),
+      refuse(r, "limit429", { ...gr, selfLimit: gh.selfLimit + (if (r.conn and mine.forall(x => sameKey(x, r))) 1 else 0) }),
       srv' = srv,
     }
     else if (need <= free0) all {
@@ -408,7 +431,7 @@ module scheduler {
   // is parked as its conversation's retained prefix (design)
   def parks(r: Req): bool = RULES.parkOnCancel and not(r.dec) and r.started and r.done > srv.held.get(r.conv)
   action fence: bool = {
-    val gone = actives.filter(r => knownGone(r))
+    val gone = actives.filter(r => fenceDue(r))
     val parked = gone.filter(r => parks(r))
     all {
       eng.kind == Idle, RULES.fenceDeparture, gone.size() > 0,
@@ -547,7 +570,7 @@ module scheduler {
         if (not(rs.contains(i))) x
         else if (eng.kind == Slice) { ...x, done: x.done + 1, lastServed: time }
         else if (eng.kind == Batch) {
-          val y = { ...x, decoded: x.decoded + 1, lastServed: time, heard: if (x.conn) time else x.heard }
+          val y = { ...x, decoded: x.decoded + 1, lastServed: time, heard: if (x.conn and not(x.ns)) time else x.heard }
           if (fin.contains(i)) { ...y, ph: Finished, ans: Pending } else y
         }
         else { ...x, ph: Finished, ans: Pending, lastServed: time }
@@ -561,7 +584,8 @@ module scheduler {
       gh' = if (eng.kind == Slice) {
         val c = reqs.get(rs.fold(0, (a, i) => i)).conv
         { ...gh, computed: gh.computed.set(c, gh.computed.get(c) + 1) }
-      } else gh,
+      } else if (fin.exists(i => not(reqs.get(i).dec) and not(reqs.get(i).conn))) ev("finishedDetached")
+      else gh,
       eng' = { kind: Idle, until: time, rs: Set() },
       nextId' = nextId, clients' = clients, decSent' = decSent, time' = time,
     }
@@ -614,7 +638,10 @@ module scheduler {
   // a credited decider starts within DEC_BOUND of its admission
   val deciderLatency: bool = actives.forall(r => not(r.dec and r.prio and r.ph == Queued) or time - r.admittedAt <= DEC_BOUND)
   // late effect bounded: work started for a client that left is at most GONE_BOUND ticks
-  val workAfterGoneBounded: bool = allReqs.forall(r => r.goneWork <= GONE_BOUND)
+  // (a keyed request's departure is fenced only after its grace: its bound grows by GRACE, the price of keyedGrace;
+  // the ghost restarts when a retry adopts the request, since that work is collected)
+  val goneBound: int = if (RULES.keyedGrace and RULES.idempotency) GONE_BOUND + GRACE else GONE_BOUND
+  val workAfterGoneBounded: bool = allReqs.forall(r => r.goneWork <= goneBound)
   // a streaming client never times out while the server holds its request (the D3 retry trigger)
   val noSpuriousTimeout: bool = allReqs.forall(r => not(r.spurious))
   // memory: mapped pages never exceed what the sessions may hold
@@ -630,11 +657,15 @@ module scheduler {
     not(a.ph == Finished and a.served and b.ph == Finished and b.served)))
   // a memory 429 only when evicting every evictable prefix would not make room (F3)
   val refuseOnlyIfShort: bool = gh.falseRefusals == 0
+  // a caller that retries with the same key within GRACE of leaving never makes the server decode its turn again
+  // (cordis's outbox and SDK retries: a non-streaming answer longer than the caller's timeout)
+  val noRedoWithinGrace: bool = gh.redo == 0
   // retries do not recompute: prefill slices per conversation <= its longest prompt + prefixes evicted
   val noRecompute: bool = CONVS.forall(c => gh.computed.get(c) <= gh.maxPrompt.get(c) + gh.evicted.get(c))
   val safety: bool = and {
     rejectedNeverRuns, boundedWait, deciderLatency, workAfterGoneBounded, noSpuriousTimeout, noOvercommit,
     withinReservation, refuseOnlyIfShort, noRecompute, noSelfInflicted429, generatedOnce, chainFair,
+    noRedoWithinGrace,
   }
 
   // ---------------------------------------------------------------- witnesses
@@ -657,4 +688,7 @@ module scheduler {
   val wAdopted: bool = gh.events.contains("adopted")
   val wTurn2Done: bool = gh.events.contains("turn2Done")
   val wChainFanout: bool = gh.events.contains("chainFanout")
+  val wNsTimeout: bool = gh.events.contains("nsTimeout")
+  val wNsDone: bool = gh.events.contains("nsDone")
+  val wFinishedDetached: bool = gh.events.contains("finishedDetached")
 }

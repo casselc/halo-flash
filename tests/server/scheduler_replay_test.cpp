@@ -50,6 +50,7 @@ Scheduler::Options ReplayOptions() {  // the model's numbers (scheduler.qnt), as
   o.decider_refill_per_s = 1;
   o.capacity = 14;             // CAP
   o.replay_ttl_s = 1000;
+  o.keyed_grace_s = 0.5;      // GRACE: 4 ticks
   return o;
 }
 
@@ -116,7 +117,7 @@ class Replay {
     const std::int64_t t = I(e, "t");
     if (kind == "arrive") return Arrive(e, t);
     if (kind == "depart") {
-      if (auto it = cid_.find(I(e, "id")); it != cid_.end()) s_->Depart(it->second);
+      if (auto it = cid_.find(I(e, "id")); it != cid_.end()) s_->Depart(it->second, t);
       return "";
     }
     if (kind == "fence") return Fence(e, t);

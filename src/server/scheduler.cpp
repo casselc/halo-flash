@@ -17,7 +17,13 @@ Scheduler::Scheduler(Options options, Hooks hooks) : opt_(options), hooks_(std::
 
 // ---------------------------------------------------------------- helpers (under mu_)
 
-bool Scheduler::Runnable(const Req& r) const { return Active(r) && !r.departed; }
+// A departed request is not runnable, except a keyed one within its grace: it runs on so that a retry with its key
+// can adopt it (or replay it once it finished).
+bool Scheduler::InGrace(const Req& r, std::int64_t now) const {
+  return r.departed && !r.decider && !r.key.empty() && opt_.keyed_grace_s > 0 &&
+         now < r.departed_at + static_cast<std::int64_t>(opt_.keyed_grace_s * static_cast<double>(opt_.per_second));
+}
+bool Scheduler::Runnable(const Req& r, std::int64_t now) const { return Active(r) && (!r.departed || InGrace(r, now)); }
 
 std::uint64_t Scheduler::Reserved() const {
   std::uint64_t s = 0;
@@ -56,10 +62,10 @@ Scheduler::Key Scheduler::Plan(const Turn& turn, std::uint64_t* tokens) const {
 // Start-time fair queuing, two levels: a root that becomes backlogged joins at the system virtual time `vnow_` (the
 // least tag among the backlogged roots at the last pick: it banks no credit while idle), and a principal joins at
 // its root's own system virtual time.
-void Scheduler::Join(const Req& r) {
+void Scheduler::Join(const Req& r, std::int64_t now) {
   bool root_busy = false, prin_busy = false;
   for (const auto& [id, x] : reqs_) {
-    if (x.id == r.id || !Runnable(x)) continue;
+    if (x.id == r.id || !Runnable(x, now)) continue;
     root_busy = root_busy || x.root == r.root;
     prin_busy = prin_busy || x.principal == r.principal;
   }
@@ -117,6 +123,7 @@ void Scheduler::ForgetKeys(std::int64_t now) {
 void Scheduler::Finish(Req& r, bool completed, std::int64_t now) {
   r.phase = Phase::kFinished;
   r.completed = completed;
+  if (r.departed && completed) ++counters_.grace_finished;
   if (r.key.empty()) return;
   auto it = keys_.find(r.key);
   if (it == keys_.end() || it->second.id != r.id) return;
@@ -141,6 +148,7 @@ Scheduler::Admission Scheduler::Arrive(const Turn& turn, std::int64_t now, bool 
   r.fixed_bytes = turn.fixed_bytes;
   r.admitted_at = r.last_served = now;
   r.departed = !connected;
+  r.departed_at = now;
   Admission a;
   if (r.decider) {
     // A decider with credit runs at the next unit boundary; out of credit it is the decider principal's turn in
@@ -149,7 +157,7 @@ Scheduler::Admission Scheduler::Arrive(const Turn& turn, std::int64_t now, bool 
     if (r.prio) --credit_;
     else ++counters_.decider_out_of_credit;
     r.id = next_id_++;
-    Join(r);
+    Join(r, now);
     reqs_[r.id] = r;
     ++counters_.admitted;
     return a.id = r.id, a;
@@ -236,23 +244,26 @@ Scheduler::Admission Scheduler::Arrive(const Turn& turn, std::int64_t now, bool 
   // A request that shares its chain root with another sandbox's request is chained (both ways).
   for (auto& [id, x] : reqs_)
     if (Active(x) && !x.decider && x.root == r.root && x.principal != r.principal) x.chained = r.chained = true;
-  Join(r);
+  Join(r, now);
   reqs_[r.id] = r;
   if (!r.key.empty()) keys_[r.key] = {r.id, false, now};
   ++counters_.admitted;
   return a.id = r.id, a;
 }
 
-void Scheduler::Depart(Id id) {
+void Scheduler::Depart(Id id, std::int64_t now) {
   std::lock_guard<std::mutex> lk(mu_);
-  if (auto it = reqs_.find(id); it != reqs_.end() && Active(it->second)) it->second.departed = true;
+  auto it = reqs_.find(id);
+  if (it == reqs_.end() || !Active(it->second) || it->second.departed) return;
+  it->second.departed = true;
+  it->second.departed_at = now;
 }
 
 // ---------------------------------------------------------------- the engine thread
 
 void Scheduler::Fence(std::int64_t now, Unit* unit) {
   for (auto& [id, r] : reqs_) {
-    if (!Active(r) || !r.departed) continue;
+    if (!Active(r) || !r.departed || InGrace(r, now)) continue;
     if (r.started && !r.decider) {
       std::optional<Retained> parked;
       if (hooks_.park) parked = hooks_.park(id);
@@ -267,7 +278,6 @@ void Scheduler::Fence(std::int64_t now, Unit* unit) {
     unit->fenced.push_back(id);
     ++counters_.fenced;
   }
-  (void)now;
 }
 
 void Scheduler::FenceAndEvict(std::int64_t now, Unit* u) {
@@ -293,7 +303,7 @@ Scheduler::Unit Scheduler::Next(std::int64_t now) {
 
   std::vector<Req*> run;
   for (auto& [id, r] : reqs_)
-    if (Runnable(r)) run.push_back(&r);
+    if (Runnable(r, now)) run.push_back(&r);
   if (run.empty()) return u;
 
   // The system virtual times, before this pick's charge: the least tag among the backlogged roots, and within

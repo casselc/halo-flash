@@ -293,7 +293,7 @@ TextGenerator::Result ScheduledGenerator::Wait(const std::shared_ptr<Job>& job, 
     }
     if (done) return res;
     if (gone()) {
-      sched_.Depart(job->id);
+      sched_.Depart(job->id, NowMs());
       res.cancelled = true;
       return res;
     }

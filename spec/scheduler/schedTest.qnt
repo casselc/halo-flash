@@ -6,7 +6,7 @@ module schedRules {
   pure val DESIGN: Rules = {
     preempt: true, deciderPrio: true, deciderBudget: true, fenceDeparture: true, deadPeerProbe: true,
     heartbeat: true, parkOnCancel: true, bindAtStart: true, reserveLedger: true, evictSeesFreed: true,
-    pinPlanned: true, atomic429: true, idempotency: true, twoLevel: true,
+    pinPlanned: true, atomic429: true, idempotency: true, twoLevel: true, keyedGrace: true,
   }
 }
 module design { import schedRules.*  import scheduler(RULES = DESIGN).* from "./scheduler" }
@@ -31,3 +31,6 @@ module noIdempotency { import schedRules.*  import scheduler(RULES = { ...DESIGN
 // one-level fair queuing over sandbox principals (G3 as first designed): a chain that fans out to several sandboxes
 // takes several shares
 module oneLevelSfq { import schedRules.*  import scheduler(RULES = { ...DESIGN, twoLevel: false }).* from "./scheduler" }
+// a keyed departure fenced at the next boundary (G3 as first built): a non-streaming caller whose answer outlasts its
+// timeout retries with its key, finds its attempt fenced, and the server decodes the turn again
+module noKeyedGrace { import schedRules.*  import scheduler(RULES = { ...DESIGN, keyedGrace: false }).* from "./scheduler" }

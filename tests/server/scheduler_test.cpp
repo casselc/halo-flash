@@ -39,7 +39,9 @@ constexpr std::int64_t kCT = 5, kAckTo = 2, kRA = 3, kCap = 14, kMaxAtt = 4, kMa
 constexpr std::int64_t kWaitBound = kMaxUnit + 3 + 3 + 3 + 2;
 constexpr std::int64_t kWaitChain = 2 * kWaitBound - kMaxUnit;
 constexpr std::int64_t kDecBound = kMaxUnit + 2 * kDecCost;
-constexpr std::int64_t kGoneBound = kAckTo + kMaxUnit;
+constexpr std::int64_t kGrace = 4;  // GRACE: a departed keyed request runs this long before it is fenced
+// GONE_BOUND + GRACE: every agent request here carries a key, so its departure is fenced after its grace
+constexpr std::int64_t kGoneBound = kAckTo + kMaxUnit + kGrace;
 constexpr std::int64_t kLagBound = 2 * kMaxUnit + kMaxUnit + kDecode;
 
 Scheduler::Options ModelOptions() {
@@ -57,6 +59,7 @@ Scheduler::Options ModelOptions() {
   o.decider_refill_per_s = 1;
   o.capacity = kCap;
   o.replay_ttl_s = 1000;
+  o.keyed_grace_s = static_cast<double>(kGrace) / 8;  // GRACE ticks
   return o;
 }
 
@@ -403,7 +406,7 @@ class Machine {
         a.told = true;
         // Only the attempt the request is attached to speaks for it (an adopter took it over).
         if (AttemptOf(a.id) == &a) {
-          sched_->Depart(a.id);
+          sched_->Depart(a.id, now_);
           told_[a.id] = true;
         }
       }
@@ -681,9 +684,55 @@ TEST(Scheduler, PrincipalLimitAnswers429WithRetryAfter) {
   ASSERT_EQ(huge.outcome, Scheduler::Outcome::kQueued);
   EXPECT_EQ(s.Arrive(Agent("C", "", "k4"), 0).retry_after_s, 30);
   EXPECT_EQ(s.Arrive(Agent("B", "", "k5"), 0).outcome, Scheduler::Outcome::kQueued);
-  // A departed request no longer holds the principal's slot (it is fenced at the next boundary).
-  s.Depart(a.id);
+  // A departed request no longer holds the principal's slot (it is fenced at the next boundary, or after its grace).
+  s.Depart(a.id, 0);
   EXPECT_EQ(s.Arrive(Agent("A", "", "k6"), 0).outcome, Scheduler::Outcome::kQueued);
+}
+
+// Keyed grace (cordis's non-streaming retries): a departed request with a key keeps running through its grace, so a
+// retry with the same key adopts it; once the grace runs out it is fenced. A keyless departure is fenced at once.
+TEST(Scheduler, KeyedDepartureRunsOnThroughItsGrace) {
+  Scheduler::Options o;
+  o.keyed_grace_s = 2;  // 2000 ms
+  Scheduler s(o);
+  const auto k = s.Arrive(Agent("A", "", "k1", 64, 100), 0);
+  const auto n = s.Arrive(Agent("B", "", "", 64, 100), 0);
+  ASSERT_EQ(k.outcome, Scheduler::Outcome::kQueued);
+  ASSERT_EQ(n.outcome, Scheduler::Outcome::kQueued);
+  s.Depart(k.id, 100);
+  s.Depart(n.id, 100);
+  auto u = s.Next(200);
+  EXPECT_EQ(u.fenced, std::vector<Scheduler::Id>{n.id});  // the keyless one goes at once
+  ASSERT_EQ(u.ids, std::vector<Scheduler::Id>{k.id});      // the keyed one still runs
+  // Its retry within the grace adopts it.
+  const auto r = s.Arrive(Agent("A", "", "k1", 64, 100), 1500);
+  EXPECT_EQ(r.outcome, Scheduler::Outcome::kAdopted);
+  EXPECT_EQ(r.target, k.id);
+  // The adopter leaves too, and nobody comes back: fenced at the first boundary after its own grace.
+  s.Depart(k.id, 1600);
+  EXPECT_TRUE(s.Boundary(3599).empty());
+  EXPECT_EQ(s.Boundary(3600), std::vector<Scheduler::Id>{k.id});
+  EXPECT_EQ(s.Arrive(Agent("A", "", "k1", 64, 100), 3700).outcome, Scheduler::Outcome::kQueued);  // a new request
+}
+
+// Keyed grace, the other ending: the departed request finishes within its grace and a retry replays its answer.
+TEST(Scheduler, KeyedDepartureFinishedWithinItsGraceIsReplayed) {
+  Scheduler::Options o;
+  o.keyed_grace_s = 2;
+  Scheduler s(o);
+  const auto k = s.Arrive(Agent("A", "", "k1", 64, 1), 0);
+  s.Depart(k.id, 10);
+  const auto u = s.Next(20);
+  ASSERT_EQ(u.ids, std::vector<Scheduler::Id>{k.id});
+  Scheduler::Progress p;
+  p.id = k.id;
+  p.prefilled = 64;
+  p.decoded = 1;
+  p.prefill_done = p.finished = p.completed = true;
+  s.Done(u, {p}, 60, 40);
+  const auto r = s.Arrive(Agent("A", "", "k1", 64, 1), 900);
+  EXPECT_EQ(r.outcome, Scheduler::Outcome::kReplayed);
+  EXPECT_EQ(s.counters().grace_finished, 1u);
 }
 
 // D4: decider credit, burst 4, refill 2/s: the fifth decider in a burst waits for a fair turn, and the credit
