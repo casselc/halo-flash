@@ -6,6 +6,12 @@
 // as if the client had left (a client that stops reading cannot hold the engine for longer).
 // --sse-keepalive S (default 15; 0: off): a streamed request writes an SSE comment after S seconds without a write
 // (queued, prefilling), so a client's idle-read timeout does not fire before its first token.
+// --scheduler on|off (default on; G3, docs/SCHEDULER.md): one engine thread runs prefill slices (2048 tokens while
+// another request is runnable, 8192 alone) and batched decode units, picked by fair queuing over chain roots
+// (X-Halo-Chain-Id) and then sandboxes (X-Halo-Principal); admission answers 429 + Retry-After (one turn in flight
+// per principal, the memory ledger); Idempotency-Key (default: a digest for principal-stamped requests) replays a
+// finished turn or adopts an in-flight one. The broker / yard-relay strips these headers from sandboxes and sets
+// them. off: today's generator (one request at a time, FIFO).
 // With halo-scope built in (HALO_SCOPE=ON): --scope-dir DIR records every
 // generation as a GENERATION observation in DIR/chdb and keeps stored
 // /v1/responses in DIR/metadata.sqlite, so they survive restarts; harnesses
@@ -27,7 +33,9 @@
 // --scope-eval-endpoint URL points them elsewhere.
 // --decider-dir serves POST /v1/systemone with strands-decider-2B (the
 // directory holds Qwen3.5-2B-Base-BF16.gguf and the strands-decider-*.gguf
-// files, as the decider tests expect).
+// files, as the decider tests expect). --decider-mode concurrent|scheduled (G3 M4, D2; default concurrent):
+// evaluations run one at a time beside Flash-Next's work, or as scheduler units on the engine thread (credited:
+// at the next unit boundary; needs --scheduler on). /metrics adds halo:decider_* and, scheduled, halo:sched_*.
 // Endpoints: GET /health, /metrics (Prometheus, vLLM names), /v1/models, /v1/responses/{id};
 //            POST /v1/completions, /v1/chat/completions, /v1/responses.
 // P10 variants: --qwen35-model GGUF --qwen35-tokenizer GGUF serves the OpenAI
@@ -64,6 +72,8 @@
 #include "server/metrics.hpp"
 #include "server/openai_service.hpp"
 #include "server/qwen35_generator.hpp"
+#include "server/flash_next_backend.hpp"
+#include "server/scheduled_generator.hpp"
 #include "server/systemone_service.hpp"
 #include "text/tokenizer.hpp"
 #if HALO_WITH_SCOPE
@@ -102,7 +112,18 @@ class StrandsEngine : public server::DecisionEngine {
 
 // SR4 admin routes over the session cache (docs/SESSIONS.md section 10): list retained states, spill one to the
 // spill directory, restore one. Each runs between generations (the generation lock).
-static void RegisterSpillRoutes(halo::server::HttpServer& http, halo::server::FlashNextGenerator& g) {
+// The scheduled generator's session cache, used on its engine thread (between units).
+struct OnEngineCache {
+  halo::server::ScheduledGenerator& g;
+  halo::server::FlashNextBackend& b;
+  template <class F>
+  auto WithCache(F&& f) {
+    return g.OnEngineThread([&] { return f(b.cache()); });
+  }
+};
+
+template <class G>
+static void RegisterSpillRoutes(halo::server::HttpServer& http, G& g) {
   using halo::server::HttpRequest;
   using halo::server::HttpResponse;
   using halo::server::SessionCache;
@@ -157,6 +178,10 @@ int main(int argc, char** argv) {
   server::KvChoiceOptions kv;         // --kv-f16 / --kv-f16-above (server/kv_choice.hpp)
   std::string mtp_model, mtp_vocab;   // --mtp-model / --mtp-vocab (docs/MTP.md)
   server::SpecOptions spec;           // --mtp-window / --mtp-depth
+  bool scheduled = true;              // --scheduler on|off (G3, docs/SCHEDULER.md)
+  server::ScheduledOptions sched;     // --sched-*
+  double sched_capacity_gb = -1;      // ledger capacity (-1: what the device has left after loading, less margins)
+  bool decider_scheduled = false;     // --decider-mode (G3 M4, D2)
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--help" || a == "-h") {
@@ -176,6 +201,12 @@ int main(int argc, char** argv) {
           "                        GET /admin/sessions, POST /admin/sessions/{key}/spill | /restore\n"
           "  --mtp-model SIDECAR [--mtp-vocab IDS] [--mtp-window W|all (all)] [--mtp-depth N (4)]\n"
           "                        MTP speculative decoding (off without --mtp-model)\n"
+          "  --scheduler on|off    G3 fair scheduler (default on): prefill slices, batched decode, fair queuing over\n"
+          "                        chain roots (X-Halo-Chain-Id) and sandboxes (X-Halo-Principal), 429 + Retry-After\n"
+          "                        admission, Idempotency-Key replay / adopt. off: one request at a time (FIFO)\n"
+          "  --sched-slice N (2048) --sched-slice-alone N (8192) --sched-plimit N (1) --sched-capacity-gb G\n"
+          "  --sched-decider-burst N (4) --sched-decider-refill R (2/s)\n"
+          "  --decider-mode concurrent|scheduled  decider evaluations beside Flash-Next (default) or as scheduler units\n"
           "  --ngram-cache-gb G --moe-topk N --decider-dir DIR --decider-device hip|hrx|cpu --variant MANIFEST\n"
           "  --scope-dir DIR --scope-project NAME --scope-capture off|digest|full --scope-wal PATH\n"
           "  --scope-eval-endpoint URL\n");
@@ -224,8 +255,22 @@ int main(int argc, char** argv) {
       if (spec.depth.limit < 1 || spec.depth.limit > engine::FlashNextGpu::kMaxDrafts)
         return std::fprintf(stderr, "--mtp-depth must be 1..%u\n", engine::FlashNextGpu::kMaxDrafts), 2;
     }
+    else if (a == "--scheduler") {
+      if (v != "on" && v != "off") return std::fprintf(stderr, "--scheduler must be on or off\n"), 2;
+      scheduled = v == "on";
+    } else if (a == "--sched-slice") sched.sched.slice_contended = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+    else if (a == "--sched-slice-alone") sched.sched.slice_alone = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+    else if (a == "--sched-plimit") sched.sched.plimit = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+    else if (a == "--sched-capacity-gb") sched_capacity_gb = std::atof(v.c_str());
+    else if (a == "--sched-decider-burst") sched.sched.decider_burst = std::atof(v.c_str());
+    else if (a == "--sched-decider-refill") sched.sched.decider_refill_per_s = std::atof(v.c_str());
     else if (a == "--decider-dir") decider_dir = v;
     else if (a == "--decider-device") decider_device = v;
+    else if (a == "--decider-mode") {
+      if (v != "concurrent" && v != "scheduled")
+        return std::fprintf(stderr, "--decider-mode must be concurrent or scheduled\n"), 2;
+      decider_scheduled = v == "scheduled";
+    }
     else if (a == "--scope-dir") scope_dir = v;
     else if (a == "--scope-project") scope_project = v;
     else if (a == "--scope-capture") scope_capture = v;
@@ -242,6 +287,8 @@ int main(int argc, char** argv) {
   if (!mtp_model.empty() && model.empty()) return std::fprintf(stderr, "--mtp-model needs --model (Flash-Next)\n"), 2;
   std::string error;
   server::FlashNextGenerator* flash_generator = nullptr;  // SR4 admin routes
+  server::ScheduledGenerator* sched_generator = nullptr;
+  server::FlashNextBackend* flash_backend = nullptr;  // its cache, for the SR4 admin routes
   // Flash-Next (--model) or a Qwen3.5 dense model with variants (--qwen35-model).
   std::unique_ptr<core::GgufReader> reader, q35_reader, q35_tok_reader;
   std::optional<model::ModelWeights> weights;
@@ -321,9 +368,25 @@ int main(int argc, char** argv) {
                    spec.depth.limit);
       spec.enabled = true;
     }
-    auto fg = std::make_unique<server::FlashNextGenerator>(*engine, *tok, max_context, cache, spec);
-    flash_generator = fg.get();
-    generator = std::move(fg);
+    if (scheduled) {
+      // The ledger's capacity: what the device has left once the weights (and draft block) are in, less the
+      // 8192-token chunk buffers a long prefill allocates (~4.3 GB, ROOFLINE 11) and a 1.5 GB margin.
+      const double avail = static_cast<double>(dev->AvailableBytes());
+      const double cap = sched_capacity_gb >= 0 ? sched_capacity_gb * (1ull << 30)
+                                                : std::max(0.0, avail - (4.5 + 1.5) * (1ull << 30));
+      sched.sched.capacity = static_cast<std::uint64_t>(cap);
+      std::fprintf(stderr, "scheduler: on (slices %u / %u alone, %u in flight per principal, ledger %.1f GB, decider "
+                   "credit %.0f + %.1f/s)\n", sched.sched.slice_contended, sched.sched.slice_alone, sched.sched.plimit,
+                   cap / (1ull << 30), sched.sched.decider_burst, sched.sched.decider_refill_per_s);
+      auto sg = server::MakeScheduledFlashNext(*engine, tok.get(), {}, max_context, cache, spec, sched, &flash_backend);
+      sched_generator = sg.get();
+      generator = std::move(sg);
+    } else {
+      std::fprintf(stderr, "scheduler: off (one request at a time)\n");
+      auto fg = std::make_unique<server::FlashNextGenerator>(*engine, *tok, max_context, cache, spec);
+      flash_generator = fg.get();
+      generator = std::move(fg);
+    }
   } else {
     q35_reader = core::GgufReader::OpenFile(qwen35_model, &error);
     if (!q35_reader) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
@@ -412,8 +475,18 @@ int main(int argc, char** argv) {
                            .send_timeout_ms = static_cast<int>(std::min(send_timeout_s * 1000, 3.6e6)),
                            .api_key = api_key});
   service.Register(http);
+  if (sched_generator)
+    metrics.AddSection([sched_generator](std::string& out, const std::string& labels) {
+      sched_generator->RenderMetrics(out, labels);
+    });
   metrics.Register(http);
   if (flash_generator) RegisterSpillRoutes(http, *flash_generator);
+  // Scheduled: the admin routes run on the engine thread between units.
+  std::optional<OnEngineCache> on_engine;
+  if (sched_generator) {
+    on_engine.emplace(OnEngineCache{*sched_generator, *flash_backend});
+    RegisterSpillRoutes(http, *on_engine);
+  }
 #if HALO_WITH_SCOPE
   if (scope) {
     scope::RegisterAnnotationRoutes(http, scope::AnnotatorOf(scope));  // harnesses in other processes
@@ -423,6 +496,7 @@ int main(int argc, char** argv) {
   }
 #endif
   std::unique_ptr<StrandsEngine> decider;
+  std::unique_ptr<server::DeciderGate> decider_gate;
   if (!decider_dir.empty()) {
     const std::string& d = decider_dir;
     auto sd = decide::StrandsDecider::Open({d + "/Qwen3.5-2B-Base-BF16.gguf", d + "/strands-decider-lora-f32.gguf",
@@ -447,7 +521,16 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "decider variant %s loaded\n", v->manifest.name.c_str());
     }
     decider = std::make_unique<StrandsEngine>(std::move(sd));
-    server::RegisterSystemOne(http, *decider);
+    if (decider_scheduled && !sched_generator) std::fprintf(stderr, "decider: --decider-mode scheduled needs --scheduler on; concurrent\n");
+    server::DeciderGate::Runner run;
+    if (decider_scheduled && sched_generator)
+      run = [sched_generator](const std::function<void()>& work, std::string* err) {
+        return sched_generator->RunDecider(work, err);
+      };
+    decider_gate = std::make_unique<server::DeciderGate>(server::DeciderGate::Mode::kScheduled, std::move(run));
+    std::fprintf(stderr, "decider: %s\n", server::DeciderGate::Name(decider_gate->mode()));
+    metrics.AddSection([g = decider_gate.get()](std::string& out, const std::string& labels) { g->Render(out, labels); });
+    server::RegisterSystemOne(http, *decider, decider_gate.get());
   }
   if (!http.Start(&error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
   std::fprintf(stderr, "serving %s on http://%s:%d\n", model_id.c_str(), host.c_str(), http.port());

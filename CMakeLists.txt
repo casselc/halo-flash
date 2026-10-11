@@ -49,11 +49,14 @@ target_link_libraries(halo_text PUBLIC halo_core)
 # --- server: OpenAI request and response formats -----------------------------
 add_library(halo_server STATIC
   src/server/decode_loop.cpp
+  src/server/scheduler.cpp
+  src/server/scheduled_generator.cpp
   src/server/openai_request.cpp
   src/server/openai_response.cpp
   src/server/http.cpp
   src/server/openai_service.cpp
   src/server/systemone_service.cpp
+  src/server/decider_gate.cpp
   src/server/metrics.cpp
   src/server/kv_choice.cpp
 )
@@ -229,8 +232,12 @@ if(HALO_BUILD_TESTS)
     tests/server/systemone_service_test.cpp
     tests/server/metrics_test.cpp
     tests/server/kv_choice_test.cpp
-    tests/server/decode_loop_test.cpp)
+    tests/server/decode_loop_test.cpp
+    tests/server/scheduler_test.cpp
+    tests/server/scheduler_replay_test.cpp)
   target_link_libraries(server_tests PRIVATE halo_server)
+  target_compile_definitions(server_tests PRIVATE
+    HALO_SERVER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/server/data")
   halo_test(decide_tests
     tests/decide/systemone_test.cpp
     tests/decide/decider_test.cpp)
@@ -247,7 +254,8 @@ if(HALO_BUILD_TESTS)
     target_link_libraries(halo_step_stats PRIVATE halo_gpu)
     add_executable(halo_sample_bench tools/sample_bench.cpp)
     target_link_libraries(halo_sample_bench PRIVATE halo_gpu)
-    add_library(halo_server_engine STATIC src/server/flash_next_generator.cpp src/server/session_cache.cpp)
+    add_library(halo_server_engine STATIC src/server/flash_next_generator.cpp src/server/session_cache.cpp
+                src/server/flash_next_backend.cpp)
     target_link_libraries(halo_server_engine PUBLIC halo_server halo_gpu)
     add_executable(halo_gemm_bench tools/gemm_bench.cpp)
     target_link_libraries(halo_gemm_bench PRIVATE halo_gpu)

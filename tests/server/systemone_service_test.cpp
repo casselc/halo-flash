@@ -9,6 +9,8 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <functional>
 #include <string>
 
 #include "core/json.hpp"
@@ -86,4 +88,55 @@ TEST(SystemOneService, AnswersAndRefusalsInTheDeciderShape) {
   EXPECT_EQ(J(b3).find("detail")->str(), "at most 2 questions in this test");
   EXPECT_EQ(engine.calls, 2);
   server.Stop();
+}
+
+// G3 M4: the route evaluates through a DeciderGate: concurrent (its own mutex) or scheduled (the runner, i.e.
+// ScheduledGenerator::RunDecider); the gate counts and times each evaluation for /metrics, and a runner that
+// could not run the evaluation is a 503, never an answer.
+TEST(SystemOneService, EvaluationsGoThroughTheDeciderGate) {
+  const std::string ok = R"({"state": "s", "questions": {"q": {"type": "noul", "instructions": "x"}}})";
+  {
+    FakeEngine engine;
+    DeciderGate gate;
+    HttpServer server({});
+    RegisterSystemOne(server, engine, &gate);
+    std::string err;
+    ASSERT_TRUE(server.Start(&err)) << err;
+    EXPECT_EQ(Post(server.port(), ok).first, 200);
+    EXPECT_EQ(Post(server.port(), ok).first, 200);
+    server.Stop();
+    EXPECT_EQ(gate.mode(), DeciderGate::Mode::kConcurrent);
+    EXPECT_EQ(gate.stats().runs, 2u);
+    EXPECT_EQ(gate.stats().eval.count, 2u);
+    std::string m;
+    gate.Render(m, "model_name=\"t\"");
+    EXPECT_NE(m.find("halo:decider_requests_total{model_name=\"t\",mode=\"concurrent\",outcome=\"ran\"} 2\n"),
+              std::string::npos) << m;
+    EXPECT_NE(m.find("halo:decider_wait_seconds_count{model_name=\"t\",mode=\"concurrent\"} 2\n"), std::string::npos);
+  }
+  {
+    FakeEngine engine;
+    std::atomic<int> runs{0};
+    std::atomic<bool> fail{false};
+    DeciderGate gate(DeciderGate::Mode::kScheduled, [&](const std::function<void()>& work, std::string* e) {
+      ++runs;
+      if (fail) return *e = "stopped", false;
+      work();
+      return true;
+    });
+    HttpServer server({});
+    RegisterSystemOne(server, engine, &gate);
+    std::string err;
+    ASSERT_TRUE(server.Start(&err)) << err;
+    EXPECT_EQ(Post(server.port(), ok).first, 200);
+    fail = true;
+    auto [s, b] = Post(server.port(), ok);
+    EXPECT_EQ(s, 503) << b;
+    server.Stop();
+    EXPECT_EQ(gate.mode(), DeciderGate::Mode::kScheduled);
+    EXPECT_EQ(runs.load(), 2);
+    EXPECT_EQ(engine.calls, 1);
+    EXPECT_EQ(gate.stats().runs, 1u);
+    EXPECT_EQ(gate.stats().failed, 1u);
+  }
 }

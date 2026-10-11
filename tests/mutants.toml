@@ -17,6 +17,11 @@ env = ["HALO_TINY_HF_DIR", "HALO_TINY_QWEN35_DIR", "HALO_SMALL_QUANT_DIR", "HALO
 [suite.cpu]
 build_dir = "build/cpu-debug"
 
+# The small quantized model only (session / slice exactness; take the GPU lock).
+[suite.gpu-small]
+build_dir = "build/gpu"
+env = ["HALO_SMALL_QUANT_DIR"]
+
 # The real model and its MTP sidecar (one model instance: take the GPU lock).
 [suite.gpu-real]
 build_dir = "build/gpu"
@@ -1717,3 +1722,284 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "MtpCatchUp.*"
 why = "a state-only catch-up step keeps every launch that writes a cache row (the K rope)"
+
+# ---- G3 scheduler (src/server/scheduler.cpp): one mutant per policy rule; the Hegel machine against the model's
+# properties (SchedulerModel) or a directed check (Scheduler.*) kills each. spec/scheduler/schedTest.qnt has the
+# model's mutant of the same rule. ----------------------------------------------
+
+[[mutant]]
+name = "sched-one-level-sfq"
+file = "src/server/scheduler.cpp"
+find = 'turn.root.empty() ? r.principal : turn.root;'
+replace = 'r.principal;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Scheduler.FanOutChainHoldsOneShare:SchedulerModel.*"
+why = "A2A D9 (model oneLevelSfq): queued per sandbox, a chain fanned out to two sandboxes takes two shares (chainFair)"
+
+[[mutant]]
+name = "sched-no-decider-prio"
+file = "src/server/scheduler.cpp"
+find = 'if (r->decider && r->prio && (!pick'
+replace = 'if (false && r->decider && r->prio && (!pick'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Scheduler.CreditedDeciderRunsAtTheNextBoundary:SchedulerModel.*"
+why = "model noDeciderPrio: a credited decider waits for fair turns behind slices (deciderLatency)"
+
+[[mutant]]
+name = "sched-strict-decider-prio"
+file = "src/server/scheduler.cpp"
+find = 'r.prio = credit_ > 0;'
+replace = 'r.prio = true;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Scheduler.DeciderCreditBurstAndRefill:SchedulerModel.*"
+why = "model strictDeciderPrio (D4): unlimited decider priority starves the sandboxes (boundedWait)"
+
+[[mutant]]
+name = "sched-departure-ignored"
+file = "src/server/scheduler.cpp"
+find = 'Active(it->second)) it->second.departed = true;'
+replace = 'Active(it->second)) {}'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SchedulerModel.*"
+why = "model noFence: a request whose client left runs on (workAfterGoneBounded)"
+
+[[mutant]]
+name = "sched-drop-on-cancel"
+file = "src/server/scheduler.cpp"
+find = 'if (hooks_.park) parked = hooks_.park(id);'
+replace = 'if (false) parked = hooks_.park(id);'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SchedulerModel.*"
+why = "model dropOnCancel: a departed prefill's progress is dropped, so its retry re-prefills it (noRecompute)"
+
+[[mutant]]
+name = "sched-evict-planned"
+file = "src/server/scheduler.cpp"
+find = 'if (Active(x) && !x.started && x.planned) pinned.insert(x.planned);'
+replace = 'if (false) pinned.insert(x.planned);'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SchedulerModel.*"
+why = "model evictPlanned: the prefix an admitted request planned on is evicted under it (withinReservation)"
+
+[[mutant]]
+name = "sched-memory-reading-only"
+file = "src/server/scheduler.cpp"
+find = 's += r.need + r.inherited;'
+replace = 's += r.started ? r.prefilled + r.decoded + r.inherited : 0;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SchedulerModel.*"
+why = "model memoryReadingOnly (AUDIT D1/E3): admission against what is mapped now, two admissions grow into the same memory (noOvercommit)"
+
+[[mutant]]
+name = "sched-released-stays-charged"
+file = "src/server/scheduler.cpp"
+find = 'const std::uint64_t used = RetainedBytes() + Reserved();'
+replace = 'const std::uint64_t used = RetainedBytes() + Reserved() + evicting_bytes_;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Scheduler.AdmissionEvictsLruAndRefusesOnlyWhenShort:SchedulerModel.*"
+why = "model releasedStaysCharged (AUDIT F3): eviction cannot see what it freed and refuses with room left (refuseOnlyIfShort)"
+
+[[mutant]]
+name = "sched-queued-429"
+file = "src/server/scheduler.cpp"
+find = '''      a.retry_after_s = opt_.retry_after_memory_s;
+      return a;'''
+replace = '''      a.retry_after_s = opt_.retry_after_memory_s;'''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SchedulerModel.*"
+why = "model queued429 (AUDIT N4): a request answered 429 stays queued and runs (rejectedNeverRuns)"
+
+[[mutant]]
+name = "sched-no-idempotency"
+file = "src/server/scheduler.cpp"
+find = '''  if (!r.key.empty()) {
+    if (auto it = keys_.find(r.key)'''
+replace = '''  if (false) {
+    if (auto it = keys_.find(r.key)'''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Scheduler.FinishedKeyReplaysWithinItsTtl:SchedulerModel.*"
+why = "model noIdempotency (D5): a retry after a lost answer generates the turn again (generatedOnce)"
+
+[[mutant]]
+name = "sched-no-adopt"
+file = "src/server/scheduler.cpp"
+find = 'if (rit != reqs_.end() && Active(rit->second)) {'
+replace = 'if (false) {'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SchedulerModel.*"
+why = "model noIdempotency: a retry is refused by its own in-flight attempt's limit slot (noSelfInflicted429)"
+
+[[mutant]]
+name = "sched-join-banks-credit"
+file = "src/server/scheduler.cpp"
+find = 'if (!root_busy) vroot_[r.root] = std::max(vroot_[r.root], vnow_);'
+replace = 'if (false) vroot_[r.root] = std::max(vroot_[r.root], vnow_);'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SchedulerModel.*"
+why = "SFQ join rule: a root back from idle keeps its old tag and monopolizes the GPU until it catches up (boundedWait)"
+
+[[mutant]]
+name = "sched-no-principal-limit"
+file = "src/server/scheduler.cpp"
+find = 'if (mine >= (r.principal == kAnonymous ? opt_.anonymous_plimit : opt_.plimit)) {'
+replace = 'if (false) {'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Scheduler.PrincipalLimitAnswers429WithRetryAfter"
+why = "D3: one in-flight turn per sandbox principal; without it a sandbox's sub-agents multiply its share"
+
+[[mutant]]
+name = "sched-fork-eviction-frees"
+file = "src/server/scheduler.cpp"
+find = '          x.inherited = bytes;'
+replace = '          (void)bytes;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SchedulerModel.*"
+why = "evicting a prefix a started fork shares frees nothing: the ledger must keep its pages as the fork's (noOvercommit)"
+
+[[mutant]]
+name = "sched-slice-always-long"
+file = "src/server/scheduler.cpp"
+find = 'u.slice_tokens = alone ? opt_.slice_alone : opt_.slice_contended;'
+replace = 'u.slice_tokens = opt_.slice_alone;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Scheduler.SliceIsShortOnlyWhenContended"
+why = "D1: 2048-token slices under contention (an 8192 slice is a 5-8 s preemption bound)"
+
+[[mutant]]
+name = "fn-slice-chunk-unaligned"
+file = "src/engine/flash_next_gpu.cpp"
+find = '      chunk_tokens > 0 ? chunk_tokens'
+replace = '      chunk_tokens > 0 ? chunk_tokens + 8'
+suite = "gpu-small"
+binary = "gpu_tests"
+filter = "Sessions.InterleavedSlicesMatchAlone"
+why = "G3 M1: a scheduler slice's chunks must split the prompt at multiples of 16 positions (the DeltaNet scan's piece) to stay byte-identical to an unsplit prefill"
+
+# ---- G3 M3: the scheduled generator (src/server/scheduled_generator.cpp), its service path and the cache leases ----
+
+[[mutant]]
+name = "sg-answer-before-done"
+file = "src/server/scheduled_generator.cpp"
+find = '  unpublished_.push_back(&job);'
+replace = '  Publish(job);'
+suite = "gpu-small"
+binary = "gpu_tests"
+filter = "ScheduledGenerator.ConcurrentRequestsEqualEachServedAlone"
+why = "G3 M3: a request is answered only after Scheduler::Done let it go, else the sandbox's next turn finds its previous one in flight and gets a limit 429 (found while building)"
+
+[[mutant]]
+name = "sg-batch-token-mixup"
+file = "src/server/scheduled_generator.cpp"
+find = '        items[i] = {live[i]->id, live[i]->run->token(), &live[i]->sampling, live[i]->state.get(), 0};'
+replace = '        items[i] = {live[i]->id, live[0]->run->token(), &live[i]->sampling, live[i]->state.get(), 0};'
+suite = "gpu-small"
+binary = "gpu_tests"
+filter = "ScheduledGenerator.ConcurrentRequestsEqualEachServedAlone"
+why = "G3 M3: a batched decode unit steps each request with its own next token (StepBatch entries are byte-identical to stepping alone only then)"
+
+[[mutant]]
+name = "cache-lease-slice-not-rounded"
+file = "src/server/session_cache.cpp"
+find = '    max_tokens = max_tokens / opt_.align * opt_.align;'
+replace = '    max_tokens = max_tokens;'
+suite = "gpu-small"
+binary = "gpu_tests"
+filter = "SessionCache.LeaseSlicesSplitOnTheAlignment"
+why = "G3 M3: exact mode rounds a lease's slice to the alignment, so a scheduler slice of any size keeps every split aligned"
+
+[[mutant]]
+name = "svc-429-ignored"
+file = "src/server/openai_service.cpp"
+find = '  if (admission.refused) {'
+replace = '  if (false) {'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.ScheduledSecondTurnOfASandboxIsRefused429"
+why = "G3: a refused admission is answered 429 + Retry-After before the stream starts (never a 200 with nothing in it)"
+
+[[mutant]]
+name = "svc-no-principal-header"
+file = "src/server/openai_service.cpp"
+find = '  if (const std::string* v = http.Header("x-halo-principal")) req.principal = *v;'
+replace = '  if (const std::string* v = http.Header("x-halo-principal-unused")) req.principal = *v;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.ScheduledSecondTurnOfASandboxIsRefused429"
+why = "G3: the principal comes from the broker's X-Halo-Principal header (else every caller is the anonymous principal)"
+
+[[mutant]]
+name = "sg-decider-work-skipped"
+file = "src/server/scheduled_generator.cpp"
+find = '        if (j->work) j->work();'
+replace = '        (void)0;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ScheduledDecider.*"
+why = "G3 M4: a scheduled decider unit must run its evaluation (on the engine thread) before the decider is answered"
+
+[[mutant]]
+name = "sg-queue-wait-counts-deciders"
+file = "src/server/scheduled_generator.cpp"
+find = '        if (!j->waited && !j->work) {'
+replace = '        if (!j->waited) {'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ScheduledDecider.*"
+why = "G3 M4: halo:sched_queue_wait_seconds is agent requests' admission-to-first-unit; deciders have their own (halo:decider_wait_seconds)"
+
+[[mutant]]
+name = "gate-scheduled-falls-back"
+file = "src/server/decider_gate.cpp"
+find = '    : mode_(scheduled ? mode : Mode::kConcurrent), scheduled_(std::move(scheduled)) {}'
+replace = '    : mode_(Mode::kConcurrent), scheduled_(std::move(scheduled)) {}'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SystemOneService.*"
+why = "G3 M4: --decider-mode scheduled routes every evaluation through the scheduler's runner, not the gate's mutex"
+
+[[mutant]]
+name = "gate-runner-failure-answered"
+file = "src/server/systemone_service.cpp"
+find = '      return Detail(503, "the decider could not run: " + gate_error);'
+replace = '      return Detail(422, error);'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SystemOneService.*"
+why = "G3 M4: an evaluation the scheduler could not run is a 503 (retryable), not a validation 422"
+
+[[mutant]]
+name = "sched-tie-newest-root"
+file = "src/server/scheduler.cpp"
+find = 'if (root.empty() || std::make_pair(vroot_[q], first) < std::make_pair(vroot_[root], root_first[root])) root = q;'
+replace = 'if (root.empty() || std::make_pair(vroot_[q], -static_cast<std::int64_t>(first)) < std::make_pair(vroot_[root], -static_cast<std::int64_t>(root_first[root]))) root = q;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SchedulerReplay.*"
+why = "G3 M5: among roots with equal virtual time the one holding the request admitted first goes (the model's order since M5); the trace replay sees the other order"
+
+[[mutant]]
+name = "sched-boundary-fences-nothing"
+file = "src/server/scheduler.cpp"
+find = '''  Unit u;
+  FenceAndEvict(now, &u);
+  return u.fenced;'''
+replace = '''  return {};'''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "SchedulerReplay.*"
+why = "G3 M5: Boundary() fences as Next() does (the replay's fence steps); without it a retry adopts a request the model already fenced"

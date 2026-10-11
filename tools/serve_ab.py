@@ -10,6 +10,14 @@
       Requests whose "check" is "identical" must give the same text and finish reason in A and B.
   serve_ab.py table A.jsonl B.jsonl
       Per request: TTFT and decode tokens/s (completion_tokens - 1 over decode_s) of A and B, and B / A.
+  serve_ab.py conc --out R.json --text-dir DIR [--sessions 1,2,4] [--rounds 3] [--context 8192] [--new 500]
+                   [--output 300] [--cold PATH --cold-after 3 --decoder-output 1500] -- <halo_serve command line>
+      G3 (docs/SCHEDULER.md 9): N sandboxes (X-Halo-Principal s1..sN) each build an agent conversation of about
+      --context tokens (warm-up turn, not measured), then all N send their next turn at once (--new tokens of new
+      input continuing with previous_response_id, --output tokens): per round, each turn's TTFT and decode tok/s,
+      and the aggregate tok/s (all tokens over the time from the first send to the last token). With --cold: one
+      sandbox decodes a long answer (--decoder-output tokens) and --cold-after s later another sends PATH's text as
+      a cold prompt: its TTFT (the prefill beside the decoder) and the decoder's tok/s before, during and after it.
 
 Q.jsonl lines: {"name": ..., "path": "/v1/chat/completions" | "/v1/responses", "body": {...}, "check": "identical" |
 "none", "chain": NAME (optional: body.previous_response_id = the id of the earlier request NAME)}.
@@ -62,7 +70,7 @@ def sse_events(resp):
                     yield now, json.loads(data)
 
 
-def send(port: int, req: dict, ids: dict) -> dict:
+def send(port: int, req: dict, ids: dict, headers: dict | None = None, on_piece=None) -> dict:
     body = dict(req["body"])
     body["stream"] = True
     if req["path"].endswith("/completions"):
@@ -72,7 +80,7 @@ def send(port: int, req: dict, ids: dict) -> dict:
     payload = json.dumps(body).encode()
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
     t0 = time.perf_counter()
-    c.request("POST", req["path"], payload, {"Content-Type": "application/json"})
+    c.request("POST", req["path"], payload, {"Content-Type": "application/json", **(headers or {})})
     resp = c.getresponse()
     out = {"name": req["name"], "check": req.get("check", "none"), "status": resp.status, "text": "", "id": "",
            "finish_reason": None, "usage": None, "ttft_s": None, "decode_s": None}
@@ -115,8 +123,11 @@ def send(port: int, req: dict, ids: dict) -> dict:
             out["text"] += piece
             first = first if first is not None else now
             last = now
+            if on_piece:
+                on_piece(now)
     end = time.perf_counter()
     out["e2e_s"] = end - t0
+    out["t0"], out["t_first"], out["t_last"] = t0, first, last
     if first is not None:
         out["ttft_s"] = first - t0
         out["decode_s"] = last - first
@@ -203,6 +214,140 @@ def cmd_table(a) -> int:
     return 0
 
 
+def start_server(cmd: list, port: int, out: str):
+    log = open(out + ".server.log", "w")
+    proc = subprocess.Popen(cmd + ["--port", str(port)], stdout=log, stderr=subprocess.STDOUT)
+    with open(out + ".pid", "w") as f:  # the caller can stop it if this script is killed
+        f.write(str(proc.pid))
+    wait_health(port, proc)
+    return proc
+
+
+def stop_server(proc) -> None:
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def chunk_texts(text_dir: str, n: int, chars: int) -> list:
+    """n distinct texts of about `chars` characters from the files of text_dir (sorted, concatenated)."""
+    blob = ""
+    for name in sorted(os.listdir(text_dir)):
+        path = os.path.join(text_dir, name)
+        if os.path.isfile(path):
+            blob += open(path, errors="replace").read() + "\n"
+        if len(blob) >= n * chars + chars:
+            break
+    if len(blob) < n * chars:
+        raise SystemExit(f"{text_dir}: {len(blob)} chars, need {n * chars}")
+    return [blob[i * chars:(i + 1) * chars] for i in range(n)]
+
+
+def turn(content: str, max_out: int, prev: str | None = None) -> dict:
+    body = {"input": [{"role": "user", "content": content}], "max_output_tokens": max_out, "temperature": 0,
+            "store": True}
+    if prev:
+        body["previous_response_id"] = prev
+    return {"name": "t", "path": "/v1/responses", "body": body}
+
+
+def concurrently(fns: list) -> list:
+    import threading
+    out = [None] * len(fns)
+    start = threading.Barrier(len(fns))
+
+    def run(i):
+        start.wait()
+        out[i] = fns[i]()
+
+    ts = [threading.Thread(target=run, args=(i,)) for i in range(len(fns))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    return out
+
+
+def cmd_conc(a) -> int:
+    cmd = a.command[1:] if a.command and a.command[0] == "--" else a.command
+    sessions = [int(x) for x in a.sessions.split(",") if x]
+    nmax = max(sessions) if sessions else 1
+    # ~4 characters a token (prose and docs)
+    texts = chunk_texts(a.text_dir, nmax + a.rounds * nmax + 1, a.context * 4)
+    news = [t[: a.new * 4] for t in texts[nmax:]]
+    ask = ("\n\nRead the text above carefully. Then think step by step about what it says, and write a long, "
+           "detailed analysis of it.")
+    proc = start_server(cmd, a.port, a.out)
+    results = {"sessions": {}, "cold": None}
+    try:
+        for n in sessions:
+            rows = []
+            ids = {}
+            hdr = [{"X-Halo-Principal": f"s{n}-{i}"} for i in range(n)]
+            # warm-up turns, one after another (not measured): each sandbox's conversation of ~context tokens
+            for i in range(n):
+                r = send(a.port, turn(texts[i] + ask, 16), {}, hdr[i])
+                ids[i] = r["id"]
+                print(f"warm-up s{n}-{i}: {r['status']} prompt {(r.get('usage') or {}).get('prompt_tokens')}", flush=True)
+            for rnd in range(a.rounds):
+                reqs = [turn(news[(rnd * n + i) % len(news)] + ask, a.output, ids[i]) for i in range(n)]
+                res = concurrently([lambda i=i: send(a.port, reqs[i], {}, hdr[i]) for i in range(n)])
+                t0 = min(r["t0"] for r in res)
+                tend = max(r["t_last"] or r["t0"] for r in res)
+                toks = sum(((r.get("usage") or {}).get("completion_tokens") or 0) for r in res)
+                for i, r in enumerate(res):
+                    ids[i] = r["id"] or ids[i]
+                    u = r.get("usage") or {}
+                    rows.append({"round": rnd, "session": i, "status": r["status"], "ttft_s": r["ttft_s"],
+                                 "tok_s": tps(r), "tokens": u.get("completion_tokens"), "prompt": u.get("prompt_tokens"),
+                                 "cached": u.get("cached_tokens"), "error": r.get("error")})
+                agg = toks / (tend - t0) if tend > t0 else None
+                rows.append({"round": rnd, "aggregate_tok_s": agg, "tokens": toks, "wall_s": tend - t0})
+                print(f"N={n} round {rnd}: " + ", ".join(
+                    f"s{i} ttft {r['ttft_s'] or 0:.2f}s {tps(r) or 0:.1f} tok/s ({(r.get('usage') or {}).get('completion_tokens')} tok, "
+                    f"cached {(r.get('usage') or {}).get('cached_tokens')})" for i, r in enumerate(res)) +
+                      f"; aggregate {agg or 0:.1f} tok/s", flush=True)
+            results["sessions"][str(n)] = rows
+        if a.cold:
+            cold_text = open(a.cold, errors="replace").read()
+            dec_id = send(a.port, turn(texts[0] + ask, 16), {}, {"X-Halo-Principal": "dec"})["id"]
+            stamps = []
+            dec_req = turn(news[0] + ask, a.decoder_output, dec_id)
+            cold_req = turn(cold_text + "\n\nSummarize the text above in one sentence.", 16)
+
+            def decoder():
+                return send(a.port, dec_req, {}, {"X-Halo-Principal": "dec"}, on_piece=stamps.append)
+
+            def cold():
+                time.sleep(a.cold_after)
+                return send(a.port, cold_req, {}, {"X-Halo-Principal": "cold"})
+
+            dr, cr = concurrently([decoder, cold])
+            cs, cf = cr["t0"], cr["t_first"] or cr["t0"]
+            during = [t for t in stamps if cs <= t <= cf]
+            before = [t for t in stamps if t < cs]
+            after = [t for t in stamps if t > cf]
+            rate = lambda ts: (len(ts) - 1) / (ts[-1] - ts[0]) if len(ts) > 1 and ts[-1] > ts[0] else None
+            results["cold"] = {"cold_ttft_s": cr["ttft_s"], "cold_prompt": (cr.get("usage") or {}).get("prompt_tokens"),
+                               "decoder_tok_s_before": rate(before), "decoder_tok_s_during": rate(during),
+                               "decoder_pieces_during": len(during),
+                               "decoder_tok_s_during_wall": (len(during) / (cf - cs)) if cf > cs else None,
+                               "decoder_tok_s_after": rate(after), "decoder_tokens": (dr.get("usage") or {}).get("completion_tokens"),
+                               "decoder_e2e_s": dr["e2e_s"], "cold_status": cr["status"], "cold_error": cr.get("error")}
+            print("cold:", json.dumps(results["cold"]), flush=True)
+        c = http.client.HTTPConnection("127.0.0.1", a.port, timeout=30)
+        c.request("GET", "/metrics")
+        results["metrics"] = c.getresponse().read().decode(errors="replace")
+    finally:
+        stop_server(proc)
+        with open(a.out, "w") as f:
+            json.dump(results, f, indent=1)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -211,12 +356,25 @@ def main() -> int:
     r.add_argument("--requests", required=True)
     r.add_argument("--port", type=int, default=18089)
     r.add_argument("command", nargs=argparse.REMAINDER)
+    cc = sub.add_parser("conc")
+    cc.add_argument("--out", required=True)
+    cc.add_argument("--text-dir", required=True)
+    cc.add_argument("--sessions", default="1,2,4")
+    cc.add_argument("--rounds", type=int, default=3)
+    cc.add_argument("--context", type=int, default=8192)
+    cc.add_argument("--new", type=int, default=500)
+    cc.add_argument("--output", type=int, default=300)
+    cc.add_argument("--cold")
+    cc.add_argument("--cold-after", type=float, default=3)
+    cc.add_argument("--decoder-output", type=int, default=1500)
+    cc.add_argument("--port", type=int, default=18089)
+    cc.add_argument("command", nargs=argparse.REMAINDER)
     for name in ("compare", "table"):
         c = sub.add_parser(name)
         c.add_argument("a")
         c.add_argument("b")
     a = ap.parse_args()
-    return {"run": cmd_run, "compare": cmd_compare, "table": cmd_table}[a.cmd](a)
+    return {"run": cmd_run, "compare": cmd_compare, "table": cmd_table, "conc": cmd_conc}[a.cmd](a)
 
 
 if __name__ == "__main__":

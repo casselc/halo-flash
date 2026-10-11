@@ -103,6 +103,11 @@ struct GenerationRequest {
   std::string prompt_name;      // X-Halo-Prompt: name@version (a managed prompt)
   std::uint32_t prompt_version = 0;
   std::string variant_id;       // X-Halo-Variant-Id
+  // G3 scheduling (docs/SCHEDULER.md "Request headers"): set by yard-relay / the broker, which strip what a sandbox
+  // sends and stamp their own; halo_serve trusts them as it trusts the broker's other X-Halo-* headers.
+  std::string principal;        // X-Halo-Principal: the sandbox (fair-queuing principal; empty: anonymous)
+  std::string chain_root;       // X-Halo-Chain-Id: the agent chain it serves (empty: its own principal)
+  std::string idempotency_key;  // Idempotency-Key (empty: the default digest when a principal is set, else none)
 };
 
 struct RequestError {
