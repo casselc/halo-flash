@@ -38,6 +38,7 @@ struct ScheduledGenerator::Job {
   std::uint64_t gen = 0;  // attachment: an adopting retry bumps it, and the earlier reader leaves
   Result result;
   bool keyed = false;  // has an idempotency key: a departed reader leaves it running (keyed grace)
+  std::string key;     // the idempotency key (empty: none)
   // its completion tokens were counted (by the reader that took the whole answer, or a replay of it)
   std::shared_ptr<std::atomic<bool>> counted = std::make_shared<std::atomic<bool>>(false);
 };
@@ -117,6 +118,7 @@ TextGenerator::Admission ScheduledGenerator::AdmitIds(std::span<const std::int32
   job->budget = std::min<std::uint32_t>(params.max_tokens, max_context_ - static_cast<std::uint32_t>(prompt.size()));
   job->spec_ok = backend_->CanSpeculate() && !params.sampling.penalties_enabled();
   job->keyed = !params.idempotency_key.empty();
+  job->key = params.idempotency_key;
   job->result.prompt_tokens = prompt.size();
   Scheduler::Turn t;
   t.principal = params.principal;
@@ -144,6 +146,14 @@ TextGenerator::Admission ScheduledGenerator::AdmitIds(std::span<const std::int32
       backend_->Admitted(adm.id, job->ids);
       ticket->job = job;
       a.answer = "generated";
+      if (!t.key.empty()) {
+        a.discarded_tokens = 0;
+        if (auto it = discarded_.find(t.key); it != discarded_.end()) {
+          a.discarded_tokens = static_cast<std::int64_t>(it->second);
+          discarded_.erase(it);
+          std::erase(discarded_order_, t.key);
+        }
+      }
       kick_ = true;
       wake_.notify_all();
       break;
@@ -632,7 +642,8 @@ void ScheduledGenerator::Loop() {
       if (backend_->HasLease(id)) backend_->Abandon(id);
       backend_->Fenced(id);
       // Its prefill progress may be parked for a retry; its decoded tokens are discarded.
-      if (job->run) fenced_decoded_ += job->run->outcome().completion;
+      const std::uint64_t decoded = job->run ? job->run->outcome().completion : 0;
+      fenced_decoded_ += decoded;
       {
         std::lock_guard<std::mutex> lk(job->mu);
         job->result.cancelled = true;
@@ -642,6 +653,15 @@ void ScheduledGenerator::Loop() {
         std::lock_guard<std::mutex> lk(mu_);
         held_.push_back(job);
         jobs_.erase(id);
+        if (!job->key.empty()) {  // reported to the key's next generation
+          auto [it, fresh] = discarded_.try_emplace(job->key, 0);
+          it->second += decoded;
+          if (fresh) discarded_order_.push_back(job->key);
+          while (discarded_order_.size() > kMaxDiscardedKeys) {
+            discarded_.erase(discarded_order_.front());
+            discarded_order_.pop_front();
+          }
+        }
       }
     }
     PublishFinished();  // the scheduler already let them go

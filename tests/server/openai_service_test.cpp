@@ -818,7 +818,9 @@ struct FailableStore : InMemoryResponseStore {
 
 struct ServingRig {
   /// `scheduled`: the service runs on the G3 ScheduledGenerator over a FakeBackend serving `gen`'s plans.
-  explicit ServingRig(int sse_keepalive_ms = 0, bool scheduled = false) : server({.send_timeout_ms = 200}) {
+  /// `keyed_grace_s` (scheduled): how long a keyed request whose client left runs on before it is fenced.
+  explicit ServingRig(int sse_keepalive_ms = 0, bool scheduled = false, double keyed_grace_s = 30)
+      : server({.send_timeout_ms = 200}) {
     ServiceOptions o;
     o.sse_keepalive_ms = sse_keepalive_ms;
     o.observer = &observed;
@@ -831,7 +833,9 @@ struct ServingRig {
     if (scheduled) {
       auto fb = std::make_unique<FakeBackend>(gen);
       fake = fb.get();
-      sched = std::make_unique<ScheduledGenerator>(std::move(fb), 1u << 20);
+      ScheduledOptions so;
+      so.sched.keyed_grace_s = keyed_grace_s;
+      sched = std::make_unique<ScheduledGenerator>(std::move(fb), 1u << 20, engine::MtpDepthOptions{}, so);
       fake->departed = [s = sched.get()](Scheduler::Id id) {
         const auto v = s->scheduler().Request(id);
         return !v || v->departed;
@@ -1338,6 +1342,62 @@ TEST(OpenAiService, TokensDecodedByAFencedRequestAreCounted) {
   const double n = fenced_tokens();
   EXPECT_GE(n, 1.0) << "the fenced request had decoded tokens";
   EXPECT_LE(n, 2000.0);
+}
+
+// A keyed request fenced mid-decode (its grace ran out) discards what it decoded; the key's next request, generated
+// afresh, says how much in Halo-Discarded-Tokens (the fenced-tokens counter's delta), and a later one says 0.
+TEST(OpenAiService, AFreshGenerationReportsItsKeysDiscardedTokens) {
+  ServingRig rig(0, true, /*keyed_grace_s=*/0.05);
+  const int port = rig.server.port();
+  const auto header = [](const Conn& c, const std::string& name) -> std::string {
+    const auto head = c.raw.substr(0, c.raw.find("\r\n\r\n"));
+    const auto at = head.find(name + ": ");
+    return at == std::string::npos ? "-" : head.substr(at + name.size() + 2, head.find("\r\n", at) - at - name.size() - 2);
+  };
+  const auto fenced_tokens = [&] {
+    std::string out;
+    rig.sched->RenderMetrics(out, "");
+    const auto at = out.find("\nhalo:sched_fenced_decoded_tokens_total");
+    return at == std::string::npos ? -1.0 : std::atof(out.c_str() + out.find(' ', at + 1) + 1);
+  };
+  // One attempt with the key, fenced mid-decode; returns the tokens it discarded and the Conn's headers.
+  std::uint64_t fenced = 0;
+  const auto fenced_attempt = [&](const std::string& marker, std::string* discarded_header) {
+    const double before = fenced_tokens();
+    auto held = rig.gen.Plan(marker, SteppedGenerator::kChunks + 3, 2000);
+    {
+      Conn c(port, RequestBody(marker, true, 2000), 0, "Idempotency-Key: k941\r\n");
+      EXPECT_TRUE(Await([&] { return held->held.load(); }));
+      held->release = true;
+      // the stream's headers are out once it held: read them
+      char b[4096];
+      const ssize_t n = ::recv(c.fd, b, sizeof b, 0);
+      if (n > 0) c.raw.assign(b, static_cast<std::size_t>(n));
+      *discarded_header = header(c, "Halo-Discarded-Tokens");
+    }  // the client leaves mid-decode; its grace runs out
+    EXPECT_TRUE(Await([&] { return rig.sched->scheduler().counters().fenced >= fenced + 1; }));
+    ++fenced;
+    return static_cast<long long>(fenced_tokens() - before);
+  };
+  std::string h1, h2;
+  const long long d1 = fenced_attempt("m941x", &h1);
+  ASSERT_GE(d1, 1);
+  EXPECT_EQ(h1, "0") << "the key's first attempt discarded nothing before it";
+  const long long d2 = fenced_attempt("m941x", &h2);  // generated afresh, and fenced again
+  ASSERT_GE(d2, 1);
+  EXPECT_EQ(h2, std::to_string(d1)) << "the first attempt's tokens";
+  (void)rig.gen.Plan("m941x", -1, 3);
+  Conn again(port, RequestBody("m941x", false, 16), 0, "Idempotency-Key: k941\r\n");
+  again.ReadToEnd();
+  EXPECT_EQ(header(again, "Halo-Answer"), "generated");
+  EXPECT_EQ(header(again, "Halo-Discarded-Tokens"), std::to_string(d2)) << "only the attempt since the last report";
+  (void)rig.gen.Plan("m942x", -1, 3);
+  Conn other(port, RequestBody("m942x", false, 16), 0, "Idempotency-Key: k942\r\n");
+  other.ReadToEnd();
+  EXPECT_EQ(header(other, "Halo-Discarded-Tokens"), "0");
+  Conn keyless(port, RequestBody("m942x", false, 16));
+  keyless.ReadToEnd();
+  EXPECT_EQ(header(keyless, "Halo-Discarded-Tokens"), "-") << "only keyed requests report it";
 }
 
 // Halo-Answer says how a request was answered: "generated" (a new generation), "adopted" (the one running for its

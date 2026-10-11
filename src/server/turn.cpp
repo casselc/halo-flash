@@ -43,8 +43,15 @@ TextGenerator::Admission AdmitTurn(TextGenerator& gen, const GenerationRequest& 
                     req.idempotency_key, nullptr});
 }
 
+std::vector<std::pair<std::string, std::string>> AnswerHeaders(const TextGenerator::Admission& a) {
+  std::vector<std::pair<std::string, std::string>> h;
+  if (!a.answer.empty()) h.emplace_back("Halo-Answer", a.answer);
+  if (a.discarded_tokens >= 0) h.emplace_back("Halo-Discarded-Tokens", std::to_string(a.discarded_tokens));
+  return h;
+}
+
 void AddAnswerHeader(HttpResponse& r, const TextGenerator::Admission& a) {
-  if (!a.answer.empty()) r.headers.emplace_back("Halo-Answer", a.answer);
+  for (auto& h : AnswerHeaders(a)) r.headers.push_back(std::move(h));
 }
 
 TurnOutcome RunTurn(TextGenerator& gen, const ServiceOptions& opt, const GenerationRequest& req,

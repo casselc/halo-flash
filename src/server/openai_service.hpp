@@ -68,6 +68,9 @@ class TextGenerator {
     /// generation), "adopted" (the generation already running for its idempotency key), "replayed" (the stored
     /// answer of its key's finished generation). Empty: the generator keeps no keys (no header).
     std::string answer;
+    /// With answer "generated" for a request with an idempotency key: tokens decoded by earlier attempts with the
+    /// key that were fenced (discarded: in no answer's usage), sent as Halo-Discarded-Tokens. -1: not reported.
+    std::int64_t discarded_tokens = -1;
   };
   virtual Admission Admit(const Params& params) {
     (void)params;

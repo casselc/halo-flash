@@ -3456,7 +3456,7 @@ why = "a replayed answer claims a new generation"
 [[mutant]]
 name = "anth-answer-header-dropped"
 file = "src/server/anthropic_service.cpp"
-find = '  if (!admission.answer.empty()) headers.emplace_back("Halo-Answer", admission.answer);'
+find = '  for (auto& h : AnswerHeaders(admission)) headers.push_back(std::move(h));'
 replace = ''
 suite = "cpu-asan"
 binary = "server_tests"
@@ -3472,3 +3472,23 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "OpenAiService.TokensDecodedByAFencedRequestAreCounted"
 why = "tokens a fenced request decoded are in no metric: a client cannot measure work no answer reports"
+
+[[mutant]]
+name = "sg-discarded-not-reported"
+file = "src/server/scheduled_generator.cpp"
+find = '          it->second += decoded;'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.AFreshGenerationReportsItsKeysDiscardedTokens"
+why = "a key's fenced attempts' tokens are not reported to its next generation: the client charges blind"
+
+[[mutant]]
+name = "sg-discarded-not-cleared"
+file = "src/server/scheduled_generator.cpp"
+find = '          discarded_.erase(it);'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.AFreshGenerationReportsItsKeysDiscardedTokens"
+why = "discarded tokens are reported again to every later generation of the key"
