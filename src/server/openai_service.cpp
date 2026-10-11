@@ -9,8 +9,8 @@
 #include <random>
 #include <utility>
 
-#include "core/sha256.hpp"
 #include "server/openai_response.hpp"
+#include "server/turn.hpp"
 #include "text/tool_call_parser.hpp"
 
 namespace halo::server {
@@ -129,25 +129,6 @@ HttpResponse OpenAiService::Models(const HttpRequest&) {
 
 namespace {
 
-void SetContext(const HttpRequest& http, GenerationRequest& req) {
-  if (const std::string* t = http.Header("x-halo-trace-id")) req.trace_id = *t;
-  if (const std::string* s = http.Header("x-halo-session-id")) req.session_id = *s;
-  if (const std::string* p = http.Header("x-halo-prompt")) {
-    const auto at = p->rfind('@');
-    req.prompt_name = p->substr(0, at);
-    if (at != std::string::npos) req.prompt_version = static_cast<std::uint32_t>(std::strtoul(p->c_str() + at + 1, nullptr, 10));
-  }
-  if (const std::string* v = http.Header("x-halo-variant-id")) req.variant_id = *v;
-  if (const std::string* v = http.Header("x-halo-principal")) req.principal = *v;
-  if (const std::string* v = http.Header("x-halo-chain-id")) req.chain_root = *v;
-  if (const std::string* v = http.Header("idempotency-key")) req.idempotency_key = *v;
-}
-
-std::int64_t NowNs() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
-
 std::optional<Value> Body(const HttpRequest& req, RequestError* e) {
   std::string err;
   auto v = json::Parse(req.body, &err);
@@ -163,7 +144,7 @@ HttpResponse OpenAiService::Completions(const HttpRequest& http) {
   if (!body) return Error(400, e);
   auto req = ParseCompletionsRequest(*body, opt_.defaults, &e);
   if (!req) return Error(400, e);
-  SetContext(http, *req);
+  SetTurnContext(http, *req);
   return Generate(Api::kCompletions, std::move(*req), nullptr, http.connected);
 }
 
@@ -173,7 +154,7 @@ HttpResponse OpenAiService::Chat(const HttpRequest& http) {
   if (!body) return Error(400, e);
   auto req = ParseChatRequest(*body, opt_.defaults, &e);
   if (!req) return Error(400, e);
-  SetContext(http, *req);
+  SetTurnContext(http, *req);
   return Generate(Api::kChat, std::move(*req), nullptr, http.connected);
 }
 
@@ -183,7 +164,7 @@ HttpResponse OpenAiService::Responses(const HttpRequest& http) {
   if (!body) return Error(400, e);
   auto req = ParseResponsesRequest(*body, opt_.defaults, &e);
   if (!req) return Error(400, e);
-  SetContext(http, *req);
+  SetTurnContext(http, *req);
   std::optional<Value> prior;
   if (!req->previous_response_id.empty()) {
     auto stored = store_->Get(req->previous_response_id);
@@ -263,19 +244,11 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
   }
   const char* prefix = api == Api::kChat ? "chatcmpl-" : api == Api::kResponses ? "resp_" : "cmpl-";
   const std::string id = prefix + opt_.new_id();
-  // D5: a turn's default idempotency key is a digest of (principal, previous_response_id, input): a client's retry
-  // of the same turn carries the same key, so it replays or adopts instead of generating again. Only for requests a
-  // broker stamped with a principal (anonymous callers repeating a prompt mean it).
-  if (req.idempotency_key.empty() && !req.principal.empty()) {
-    const std::string material = req.principal + '\n' + req.previous_response_id + '\n' +
-                                 (api == Api::kCompletions ? prompt : CompactJson(req.messages)) + '\n' +
-                                 std::to_string(static_cast<int>(api));
-    req.idempotency_key = "d5:" + core::Sha256Hex(material);
-  }
+  // D5: a turn's key material is (previous_response_id, input): a client's retry of the same turn carries the same key.
+  DefaultIdempotencyKey(req, req.previous_response_id + '\n' + (api == Api::kCompletions ? prompt : CompactJson(req.messages)),
+                        api);
   const auto gone0 = [connected] { return connected && !connected(); };
-  TextGenerator::Params admit_params{prompt, req.variant, req.sampling, req.max_tokens, gone0,
-                                     req.principal, req.chain_root, req.idempotency_key, nullptr};
-  const auto admission = gen_.Admit(admit_params);
+  const auto admission = AdmitTurn(gen_, req, prompt, gone0);
   if (admission.refused) {
     // Not done, and never will be: the scheduler took it off the queue as it answered (docs/SCHEDULER.md 4).
     Value inner = Value::MakeObject();
@@ -313,7 +286,6 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
                                                           const std::function<bool()>& poll) {
     OutputBuilder builder(run->req, id, opt_.now_s(), opt_.new_id);
     text::ToolCallStreamParser parser(run->popt);
-    StopMatcher stops(run->req.stop);
     std::vector<text::StreamEvent> parsed;
     const auto emit = [&](const std::string& piece) {
       if (piece.empty()) return;
@@ -325,45 +297,18 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
         builder.Add(parsed, events);
       }
     };
-    bool client_gone = false;  // a write to the client failed: it left, or stopped reading past the send timeout
-    // The generator must tell a client gone from a stop string: both end the callback with false, but only a stop
-    // completes the answer (G3: a completed answer is stored and replayed to the key's retry). So a departure the
-    // callback found is also what Params::cancelled reports.
-    const auto cancelled_or_gone = [&client_gone, poll] { return client_gone || (poll && poll()); };
-    TextGenerator::Params params{run->prompt, run->req.variant, run->req.sampling, run->req.max_tokens,
-                                 cancelled_or_gone, run->req.principal, run->req.chain_root, run->req.idempotency_key,
-                                 ticket};
-    if (opt_.on_activity) opt_.on_activity(true);
-    struct Done {
-      const std::function<void(bool)>& f;
-      ~Done() {
-        if (f) f(false);
-      }
-    } done{opt_.on_activity};
     GenerationRecord rec;
-    rec.start_ns = NowNs();
-    std::int64_t last_ns = 0;
-    auto result = gen_.Generate(params, [&](std::string_view piece) {
-      if (opt_.observer) {
-        const std::int64_t now = NowNs();
-        if (last_ns == 0) rec.first_text_ns = now;
-        else rec.gaps_us.push_back(static_cast<std::uint32_t>(std::min<std::int64_t>((now - last_ns) / 1000, UINT32_MAX)));
-        last_ns = now;
-        rec.output += piece;
-      }
-      emit(stops.Push(piece));
-      if (stops.stopped()) return false;
-      if (!flush() || gone()) return client_gone = true, false;
-      return true;
-    });
-    emit(stops.Flush());
+    TurnOutcome turn = RunTurn(gen_, opt_, run->req, run->prompt, ticket,
+                               {[&](std::string_view text) { return emit(std::string(text)), true; }, flush, gone, poll},
+                               &rec);
+    TextGenerator::Result& result = turn.result;
     if (api != Api::kCompletions) {
       parsed.clear();
       parser.Finish(&parsed);
       builder.Add(parsed, events);
     }
     const Usage usage{result.prompt_tokens, result.cached_tokens, result.completion_tokens, 0};
-    builder.Finish(result.length_limited && !stops.stopped() ? FinishReason::kLength : FinishReason::kStop, usage,
+    builder.Finish(result.length_limited && !turn.stopped ? FinishReason::kLength : FinishReason::kStop, usage,
                    events);
     // A stored response is answered as finished (the terminal event, or the 200 object) only after its store
     // write succeeded: a failed write turns the answer into an error, so an id a client holds as finished always
@@ -377,7 +322,7 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
     // Delivered in full only if the client was there for every event, the terminal one included. Otherwise the
     // response was cut short or never received: it is cancelled, never "completed" or "stop" (a truncated
     // generation must not look like a finished one to the store, the trace or a training set).
-    bool cancelled = client_gone || result.cancelled || !flush() || gone();
+    bool cancelled = turn.client_gone || result.cancelled || !flush() || gone();
     const std::string store_error = storing && !cancelled ? Store(id, run->conversation, builder.Final()) : "";
     if (terminal && !cancelled && store_error.empty()) {
       events->push_back(std::move(*terminal));
@@ -391,40 +336,10 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
     if (!store_error.empty()) result.error = error;  // the observer records the request as failed, and why
     if (cancelled) builder.MarkCancelled();
     Value final = builder.Final();
-    if (opt_.observer) {
-      rec.end_ns = NowNs();
-      rec.api = api == Api::kChat ? "chat" : api == Api::kResponses ? "responses" : "completions";
-      rec.request_id = id;
-      rec.trace_id = run->req.trace_id;
-      rec.session_id = run->req.session_id;
-      rec.prompt_name = run->req.prompt_name;
-      rec.prompt_version = run->req.prompt_version;
-      // The variant that actually ran (the "variant" field or a
-      // "base:variant" alias) is authoritative; the X-Halo-Variant-Id
-      // header labels requests that name none.
-      rec.variant_id = run->req.variant.empty() ? run->req.variant_id : run->req.variant;
-      rec.user = run->req.user;
-      rec.model = run->req.model;
-      rec.prompt_tokens = result.prompt_tokens;
-      rec.cached_tokens = result.cached_tokens;
-      rec.completion_tokens = result.uncounted ? 0 : result.completion_tokens;
-      rec.finish_reason = !result.error.empty()                                ? "error"
-                          : result.detached                                    ? "detached"
-                          : cancelled                                          ? "cancelled"
-                          : result.length_limited && !stops.stopped()          ? "length"
-                          : builder.has_tool_calls()                           ? "tool_calls"
-                                                                               : "stop";
-      rec.sampling = run->req.sampling;
-      rec.max_tokens = run->req.max_tokens;
-      for (const auto& [call_id, name] : builder.tool_calls()) {
-        rec.tool_call_ids.push_back(call_id);
-        rec.tool_names.push_back(name);
-      }
-      rec.input = run->prompt;
-      rec.error = result.error;
-      rec.spec = result.spec;
-      opt_.observer->OnGeneration(rec);
-    }
+    ReportTurn(opt_, rec, api == Api::kChat ? "chat" : api == Api::kResponses ? "responses" : "completions", id, run->req,
+               run->prompt, turn, cancelled,
+               result.length_limited && !turn.stopped ? "length" : builder.has_tool_calls() ? "tool_calls" : "stop",
+               builder.tool_calls());
     if (storing && cancelled && run->req.stream) {
       // A streaming client may hold the id (response.created): GET answers with the cancelled object, and
       // continuing from it is refused (no conversation is kept for a turn that was not delivered). This replaces
@@ -445,36 +360,21 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
     return HttpResponse::Json(200, CompactJson(final));
   }
   return HttpResponse::EventStream([api, run, execute, gone, keepalive = opt_.sse_keepalive_ms](const BodyWriter& write) {
-    using Clock = std::chrono::steady_clock;
-    std::vector<Value> events;
-    bool alive = true;
-    auto last = Clock::now();  // the last write
-    const auto flush = [&] {
-      for (const auto& e : events)
-        if (alive) alive = write(Frame(api, e));
-      if (!events.empty()) last = Clock::now();
-      events.clear();
-      return alive;
-    };
     // Nothing else is written while the request is queued or prefilling (minutes at long context): with
     // sse_keepalive_ms, an SSE comment after that long without a write keeps a client's idle-read timer from
     // firing, and a client that left fails the write instead of waiting for its first token (audit D3).
-    const auto poll = [&] {
-      if (gone()) return true;
-      if (keepalive > 0 && alive && Clock::now() - last >= std::chrono::milliseconds(keepalive)) {
-        alive = write(": keepalive\n\n");
-        last = Clock::now();
-      }
-      return !alive;
-    };
-    auto [error, final, cancelled] = execute(&events, flush, poll);
-    flush();
-    if (!error.empty() && alive) {
+    SsePump pump(write, keepalive, [api](const Value& e) { return Frame(api, e); },
+                 [](SsePump& p) { p.Write(": keepalive\n\n"); });
+    const auto flush = [&pump] { return pump.Flush(); };
+    const auto poll = [&pump, &gone] { return pump.Poll(gone); };
+    auto [error, final, cancelled] = execute(&pump.events, flush, poll);
+    pump.Flush();
+    if (!error.empty() && pump.alive()) {
       Value e = ErrorBody({error, ""});
       if (api == Api::kResponses) e.set("type", Value::String("error"));
-      alive = write(Frame(api, e));
+      (void)pump.Write(Frame(api, e));
     }
-    if (alive && api != Api::kResponses) (void)write("data: [DONE]\n\n");
+    if (pump.alive() && api != Api::kResponses) (void)pump.Write("data: [DONE]\n\n");
   });
 }
 

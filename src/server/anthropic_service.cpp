@@ -1,14 +1,13 @@
 #include "server/anthropic_service.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cstdio>
 #include <random>
 #include <utility>
 
-#include "core/sha256.hpp"
 #include "server/anthropic_response.hpp"
 #include "server/openai_response.hpp"
+#include "server/turn.hpp"
 #include "text/chat_template.hpp"
 #include "text/tool_call_parser.hpp"
 
@@ -25,11 +24,6 @@ std::string RandomId() {
   std::snprintf(b, sizeof b, "%016llx%016llx", static_cast<unsigned long long>(rng()),
                 static_cast<unsigned long long>(rng()));
   return b;
-}
-
-std::int64_t NowNs() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
-      .count();
 }
 
 std::string Join(const std::vector<std::string>& v) {
@@ -91,12 +85,7 @@ std::shared_ptr<AnthropicService::Prepared> AnthropicService::Prepare(const Http
     return *error = MessagesErrorResponse({404, "not_found_error", "model: alias target " + p->served + " is not served here"}),
            nullptr;
   }
-  if (const std::string* t = http.Header("x-halo-trace-id")) g.trace_id = *t;
-  if (const std::string* s = http.Header("x-halo-session-id")) g.session_id = *s;
-  // G3 scheduling headers (docs/SCHEDULER.md), as on the OpenAI routes.
-  if (const std::string* v = http.Header("x-halo-principal")) g.principal = *v;
-  if (const std::string* v = http.Header("x-halo-chain-id")) g.chain_root = *v;
-  if (const std::string* v = http.Header("idempotency-key")) g.idempotency_key = *v;
+  SetTurnContext(http, g);
   auto rendered = text::RenderChat(opt_.template_kind, g.messages, g.tools.is(Kind::kNull) ? nullptr : &g.tools,
                                    g.template_options, &err);
   if (!rendered) return *error = MessagesErrorResponse({400, "invalid_request_error", "messages: the conversation cannot be rendered: " + err}), nullptr;
@@ -128,14 +117,10 @@ HttpResponse AnthropicService::Messages(const HttpRequest& http) {
   const std::function<bool()> connected = http.connected;
   const auto gone = [connected] { return connected && !connected(); };
   GenerationRequest& g = run->req.gen;
-  // D5: a request a broker stamped with a principal gets a default idempotency key, a digest of (principal, the
-  // rendered prompt, the API): a client's retry of the same request replays or adopts instead of generating again.
-  if (g.idempotency_key.empty() && !g.principal.empty())
-    g.idempotency_key = "d5:" + core::Sha256Hex(g.principal + '\n' + run->prompt + '\n' +
-                                                std::to_string(static_cast<int>(Api::kMessages)));
+  // D5: the key material is the rendered prompt (system, tools and messages).
+  DefaultIdempotencyKey(g, run->prompt, Api::kMessages);
   // G3: admitted before any response is sent (a streamed 429 is impossible once message_start went out).
-  const auto admission = gen_.Admit({run->prompt, g.variant, g.sampling, g.max_tokens, gone, g.principal,
-                                     g.chain_root, g.idempotency_key, nullptr});
+  const auto admission = AdmitTurn(gen_, g, run->prompt, gone);
   if (admission.refused) {
     HttpResponse r = MessagesErrorResponse({429, "rate_limit_error",
                                             "the server is busy (" + admission.why + "); retry after " +
@@ -153,13 +138,13 @@ HttpResponse AnthropicService::Messages(const HttpRequest& http) {
     bool cancelled = false;
   };
   // `events` null: not streaming. `flush` writes the events so far (false once the client is gone); `poll` is
-  // Params::cancelled (gone, plus the stream's pings); `started` ran message_start already.
+  // Params::cancelled (gone, plus the stream's pings).
   const auto execute = [this, id, run, gone, ticket](MessageBuilder& builder, std::vector<Value>* events,
-                                             const std::function<bool()>& flush, const std::function<bool()>& poll) {
+                                                     const std::function<bool()>& flush,
+                                                     const std::function<bool()>& poll) {
     const MessagesRequest& mr = run->req;
     const GenerationRequest& req = mr.gen;
     text::ToolCallStreamParser parser(run->popt);
-    StopMatcher stops(req.stop);
     std::vector<text::StreamEvent> parsed;
     const auto feed = [&](std::string_view piece) {
       if (piece.empty()) return;
@@ -168,79 +153,33 @@ HttpResponse AnthropicService::Messages(const HttpRequest& http) {
       builder.Add(parsed, events);
     };
     feed(mr.forced_prefix);  // the call the prompt opened (no event until it completes)
-    bool client_gone = false;  // a write to the client failed: it left, or stopped reading past the send timeout
-    // The generator must tell a client gone from a stop string (G3 stores and replays a completed answer to its
-    // key's retry), so a departure the callback found is also what Params::cancelled reports.
-    const auto cancelled_or_gone = [&client_gone, poll] { return client_gone || (poll && poll()); };
-    TextGenerator::Params params{run->prompt, req.variant, req.sampling, req.max_tokens, cancelled_or_gone,
-                                 req.principal, req.chain_root, req.idempotency_key, ticket};
-    if (opt_.on_activity) opt_.on_activity(true);
-    struct Done {
-      const std::function<void(bool)>& f;
-      ~Done() {
-        if (f) f(false);
-      }
-    } done{opt_.on_activity};
     GenerationRecord rec;
-    rec.start_ns = NowNs();
-    std::int64_t last_ns = 0;
-    bool parallel_cut = false;  // disable_parallel_tool_use: ended after the first call
-    auto result = gen_.Generate(params, [&](std::string_view piece) {
-      if (opt_.observer) {
-        const std::int64_t now = NowNs();
-        if (last_ns == 0) rec.first_text_ns = now;
-        else rec.gaps_us.push_back(static_cast<std::uint32_t>(std::min<std::int64_t>((now - last_ns) / 1000, UINT32_MAX)));
-        last_ns = now;
-        rec.output += piece;
-      }
-      feed(stops.Push(piece));
-      if (stops.stopped()) return false;
-      if (mr.disable_parallel_tool_use && builder.tool_uses() > 0) return parallel_cut = true, false;
-      if (!flush() || gone()) return client_gone = true, false;
-      return true;
-    });
-    feed(stops.Flush());
+    // disable_parallel_tool_use: the generation ends after the first call (a cut, not a departure).
+    const TurnOutcome turn = RunTurn(gen_, opt_, req, run->prompt, ticket,
+                                     {[&](std::string_view text) {
+                                        feed(text);
+                                        return !(mr.disable_parallel_tool_use && builder.tool_uses() > 0);
+                                      },
+                                      flush, gone, poll},
+                                     &rec);
+    const TextGenerator::Result& result = turn.result;
     parsed.clear();
     parser.Finish(&parsed);
     builder.Add(parsed, events);
-    const bool stop_seq = stops.stopped() && !parallel_cut;
-    const bool length = result.length_limited && !stops.stopped() && !parallel_cut;
+    const bool stop_seq = turn.stopped && !turn.cut;
+    const bool length = result.length_limited && !turn.stopped && !turn.cut;
     const StopReason reason =
         ChooseStopReason(length, length && result.completion_tokens < req.max_tokens, stop_seq, builder.tool_uses() > 0);
     const MessagesUsage usage{result.prompt_tokens, result.cached_tokens, result.cache_write_tokens,
                               result.completion_tokens};
-    if (result.error.empty()) builder.Finish(reason, stops.matched(), usage, events);
-    const bool cancelled = client_gone || result.cancelled || !flush() || gone();
+    if (result.error.empty()) builder.Finish(reason, turn.matched, usage, events);
+    const bool cancelled = turn.client_gone || result.cancelled || !flush() || gone();
     if (cancelled) builder.MarkCancelled();
-    if (opt_.observer) {
-      rec.end_ns = NowNs();
-      rec.api = "messages";
-      rec.request_id = id;
-      rec.trace_id = req.trace_id;
-      rec.session_id = req.session_id;
-      rec.variant_id = req.variant;
-      rec.user = req.user;
-      rec.model = req.model;
-      rec.prompt_tokens = result.prompt_tokens;
-      rec.cached_tokens = result.cached_tokens;
-      rec.completion_tokens = result.uncounted ? 0 : result.completion_tokens;
-      rec.finish_reason = !result.error.empty() ? "error"
-                          : result.detached     ? "detached"
-                          : cancelled           ? "cancelled"
-                          : reason == StopReason::kMaxTokens || reason == StopReason::kContextWindow ? "length"
-                          : reason == StopReason::kToolUse                                             ? "tool_calls"
-                                                                                                       : "stop";
-      rec.sampling = req.sampling;
-      rec.max_tokens = req.max_tokens;
-      for (const auto& [call_id, name] : builder.tool_calls()) {
-        rec.tool_call_ids.push_back(call_id);
-        rec.tool_names.push_back(name);
-      }
-      rec.input = run->prompt;
-      rec.error = result.error;
-      rec.spec = result.spec;
-      opt_.observer->OnGeneration(rec);
-    }
+    ReportTurn(opt_, rec, "messages", id, req, run->prompt, turn, cancelled,
+               reason == StopReason::kMaxTokens || reason == StopReason::kContextWindow ? "length"
+               : reason == StopReason::kToolUse                                         ? "tool_calls"
+                                                                                        : "stop",
+               builder.tool_calls());
     return Executed{result.error.empty() ? "" : "generation failed: " + result.error, builder.Final(), cancelled};
   };
 
@@ -260,35 +199,21 @@ HttpResponse AnthropicService::Messages(const HttpRequest& http) {
   }
   // The provisional input_tokens of message_start: the whole prompt (the cache is consulted when it runs).
   const std::uint64_t provisional = gen_.CountTokens(run->prompt).value_or(0);
-  HttpResponse r = HttpResponse::EventStream([bo, run, execute, gone, provisional,
+  HttpResponse r = HttpResponse::EventStream([bo, execute, gone, provisional,
                                               keepalive = opt_.sse_keepalive_ms](const BodyWriter& write) {
-    using Clock = std::chrono::steady_clock;
     MessageBuilder builder(bo);
-    std::vector<Value> events;
-    bool alive = true;
-    auto last = Clock::now();
-    const auto flush = [&] {
-      for (const auto& e : events)
-        if (alive) alive = write(MessagesFrame(e));
-      if (!events.empty()) last = Clock::now();
-      events.clear();
-      return alive;
-    };
-    builder.Start(provisional, &events);
-    flush();
     // Queued or prefilling (minutes at long context), or between tokens: a ping after `keepalive` ms without a
     // write keeps the client's idle timer from firing, and a client that left fails the write.
-    const auto poll = [&] {
-      if (gone()) return true;
-      if (keepalive > 0 && alive && Clock::now() - last >= std::chrono::milliseconds(keepalive)) {
-        builder.Ping(&events);
-        flush();
-      }
-      return !alive;
-    };
-    auto [err, final, cancelled] = execute(builder, &events, flush, poll);
-    flush();
-    if (!err.empty() && alive) alive = write(MessagesFrame(MessagesErrorBody({500, "api_error", err})));
+    SsePump pump(write, keepalive, [](const Value& e) { return MessagesFrame(e); }, [&builder](SsePump& p) {
+      builder.Ping(&p.events);
+      p.Flush();
+    });
+    builder.Start(provisional, &pump.events);
+    pump.Flush();
+    auto [err, final, cancelled] = execute(builder, &pump.events, [&pump] { return pump.Flush(); },
+                                           [&pump, &gone] { return pump.Poll(gone); });
+    pump.Flush();
+    if (!err.empty() && pump.alive()) (void)pump.Write(MessagesFrame(MessagesErrorBody({500, "api_error", err})));
   });
   for (auto& h : headers) r.headers.push_back(h);
   return r;

@@ -701,7 +701,8 @@ TEST(AnthropicService, StopSequencesLimitsAndCacheUsage) {
   rig.gen.piece = 2;
   rig.gen.cached = 40;
   rig.gen.written = 25;
-  rig.gen.scripts = {"\n</think>\n\nHello STOP world", "\n</think>\n\nabcdefghij", "\n</think>\n\nabcdefghij"};
+  rig.gen.scripts = {"\n</think>\n\nHello STOP world", "\n</think>\n\nabcdefghij", "\n</think>\n\nabcdefghij",
+                     "\n</think>\n\nHello ST"};
   const auto msg = [&](const std::string& extra) {
     return Post(rig.server.port(), "/v1/messages",
                 R"({"model": "claude-x", "messages": [{"role": "user", "content": "hi"}])" + extra + "}");
@@ -723,6 +724,11 @@ TEST(AnthropicService, StopSequencesLimitsAndCacheUsage) {
   rig.gen.context_cap = 3;  // the context ran out before max_tokens
   const auto r3 = msg(R"(, "max_tokens": 40)");
   EXPECT_EQ(J(r3.body).find("stop_reason")->str(), "model_context_window_exceeded");
+  // Ending on a prefix of a stop sequence: the text held back for it is delivered, and it is no stop.
+  rig.gen.context_cap = UINT64_MAX;
+  const Value v4 = J(msg(R"(, "max_tokens": 50, "stop_sequences": ["STOP"])").body);
+  EXPECT_EQ(v4.find("content")->items()[0].find("text")->str(), "Hello ST");
+  EXPECT_EQ(v4.find("stop_reason")->str(), "end_turn");
 }
 
 TEST(AnthropicService, DisableParallelToolUseStopsAfterTheFirstCall) {

@@ -225,7 +225,7 @@ TEST(OpenAiService, ChatWholeAndStreamed) {
 TEST(OpenAiService, StopSequencesAndLengthLimits) {
   Rig rig;
   rig.gen.piece = 2;  // "STOP" arrives split across pieces
-  rig.gen.scripts = {"Hello STOP world", "abcdefghij"};
+  rig.gen.scripts = {"Hello STOP world", "abcdefghij", "Hello ST"};
   auto [s1, t1] = Post(rig.server.port(), "POST", "/v1/completions", R"({"prompt": "x", "stop": ["STOP"], "max_tokens": 50})");
   ASSERT_EQ(s1, 200) << t1;
   const Value v1 = J(t1);
@@ -236,6 +236,10 @@ TEST(OpenAiService, StopSequencesAndLengthLimits) {
   const Value v2 = J(t2);
   EXPECT_EQ(v2.find("choices")->items()[0].find("text")->str(), "abcdef");
   EXPECT_EQ(v2.find("choices")->items()[0].find("finish_reason")->str(), "length");
+  // Ending on a prefix of a stop sequence: the text held back for it is delivered.
+  auto [s3, t3] = Post(rig.server.port(), "POST", "/v1/completions", R"({"prompt": "x", "stop": ["STOP"], "max_tokens": 50})");
+  EXPECT_EQ(J(t3).find("choices")->items()[0].find("text")->str(), "Hello ST");
+  EXPECT_EQ(J(t3).find("choices")->items()[0].find("finish_reason")->str(), "stop");
 }
 
 TEST(OpenAiService, StoredResponsesContinueTheConversation) {

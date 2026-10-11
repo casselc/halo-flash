@@ -1283,8 +1283,8 @@ why = "a client that stays connected but stops reading holds its handler (and th
 [[mutant]]
 name = "svc-departure-as-stop"
 file = "src/server/openai_service.cpp"
-find = 'const bool cancelled = client_gone || result.cancelled || !flush() || gone();'
-replace = 'const bool cancelled = false;'
+find = 'bool cancelled = turn.client_gone || result.cancelled || !flush() || gone();'
+replace = 'bool cancelled = result.cancelled;'
 suite = "cpu-asan"
 binary = "server_tests"
 filter = "OpenAiService.ADepartedStreamIsRecordedAndStoredAsCancelled:OpenAiService.ServingModelUnderDeparturesStallsAndRetries"
@@ -1453,8 +1453,8 @@ why = "an unreachable eval target or judge holds the runner for the kernel's SYN
 [[mutant]]
 name = "svc-keepalive-never-sent"
 file = "src/server/openai_service.cpp"
-find = 'alive = write(": keepalive\n\n");'
-replace = '(void)0;'
+find = '[](SsePump& p) { p.Write(": keepalive\n\n"); }'
+replace = '[](SsePump&) {}'
 suite = "cpu-asan"
 binary = "server_tests"
 filter = "OpenAiService.KeepaliveCommentsWhileAStreamWaitsAndClientsIgnoreThem"
@@ -3099,9 +3099,9 @@ why = "G3: a refused admission is answered 429 + Retry-After before the stream s
 
 [[mutant]]
 name = "svc-no-principal-header"
-file = "src/server/openai_service.cpp"
+file = "src/server/turn.cpp"
 find = '  if (const std::string* v = http.Header("x-halo-principal")) req.principal = *v;'
-replace = '  if (const std::string* v = http.Header("x-halo-principal-unused")) req.principal = *v;'
+replace = ''
 suite = "cpu-asan"
 binary = "server_tests"
 filter = "OpenAiService.ScheduledSecondTurnOfASandboxIsRefused429"
@@ -3334,7 +3334,7 @@ why = "any x-api-key is accepted"
 [[mutant]]
 name = "anth-departure-as-stop"
 file = "src/server/anthropic_service.cpp"
-find = 'const bool cancelled = client_gone || result.cancelled || !flush() || gone();'
+find = 'const bool cancelled = turn.client_gone || result.cancelled || !flush() || gone();'
 replace = 'const bool cancelled = result.cancelled;'
 suite = "cpu-asan"
 binary = "server_tests"
@@ -3361,9 +3361,9 @@ why = "a refused /v1/messages admission streams anyway instead of answering 429 
 
 [[mutant]]
 name = "anth-g3-no-default-key"
-file = "src/server/anthropic_service.cpp"
-find = '  if (g.idempotency_key.empty() && !g.principal.empty())'
-replace = '  if (false)'
+file = "src/server/turn.cpp"
+find = '  if (!req.idempotency_key.empty() || req.principal.empty()) return;'
+replace = '  return;'
 suite = "cpu-asan"
 binary = "server_tests"
 filter = "AnthropicService.SchedulingHeadersKeysAndRefusal"
@@ -3371,8 +3371,8 @@ why = "a broker-stamped /v1/messages request without Idempotency-Key gets no D5 
 
 [[mutant]]
 name = "anth-g3-headers-dropped"
-file = "src/server/anthropic_service.cpp"
-find = '  if (const std::string* v = http.Header("idempotency-key")) g.idempotency_key = *v;'
+file = "src/server/turn.cpp"
+find = '  if (const std::string* v = http.Header("idempotency-key")) req.idempotency_key = *v;'
 replace = ''
 suite = "cpu-asan"
 binary = "server_tests"
@@ -3381,9 +3381,9 @@ why = "the client's Idempotency-Key on /v1/messages is ignored"
 
 [[mutant]]
 name = "anth-g3-detached-counts-tokens"
-file = "src/server/anthropic_service.cpp"
-find = 'rec.completion_tokens = result.uncounted ? 0 : result.completion_tokens;'
-replace = 'rec.completion_tokens = result.completion_tokens;'
+file = "src/server/turn.cpp"
+find = 'rec.completion_tokens = r.uncounted ? 0 : r.completion_tokens;'
+replace = 'rec.completion_tokens = r.completion_tokens;'
 suite = "cpu-asan"
 binary = "server_tests"
 filter = "AnthropicService.ADepartureIsNotAStopAndADetachedReaderIsRecordedSo"
@@ -3408,3 +3408,25 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "FlashNextGenerator.CacheUsageCountsWhatIsReusedAndWhatIsRetained"
 why = "cache_creation_input_tokens is always 0 on the scheduled server"
+
+# ---- The shared generation turn (src/server/turn.cpp: every API route) --------------------------------------------
+
+[[mutant]]
+name = "turn-held-back-text-dropped"
+file = "src/server/turn.cpp"
+find = '  if (const std::string rest = stops.Flush(); !rest.empty()) (void)io.sink(rest);'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.StopSequencesAndLengthLimits:AnthropicService.StopSequencesLimitsAndCacheUsage"
+why = "text held back as a possible stop-sequence prefix is lost when the generation ends without a stop"
+
+[[mutant]]
+name = "turn-cut-runs-on"
+file = "src/server/turn.cpp"
+find = '    if (!more) return out.cut = true, false;'
+replace = '    if (!more) out.cut = true;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicService.DisableParallelToolUseStopsAfterTheFirstCall"
+why = "a route that ends the generation (disable_parallel_tool_use) is ignored: generation runs on past the first call"
