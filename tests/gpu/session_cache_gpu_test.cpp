@@ -35,6 +35,9 @@
 #include "rt/device.hpp"
 #include "server/flash_next_generator.hpp"
 #include "server/flash_next_backend.hpp"
+#include "server/spill_keys.hpp"
+#include "server/yard_keys.hpp"
+#include "../server/yard_test_util.hpp"
 #include "text/tokenizer.hpp"
 
 namespace gs = hegel::generators;
@@ -591,12 +594,19 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
   auto eb = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
   ASSERT_TRUE(ea && eb) << e;
   const auto V = static_cast<std::int32_t>(m->weights->config.vocab_size);
-  std::size_t restored = 0, restore_failed = 0, spilled = 0, reused = 0, corrupted = 0;
+  std::size_t restored = 0, restore_failed = 0, spilled = 0, reused = 0, corrupted = 0, rotations = 0;
   hegel::test([&](hegel::TestCase& tc) {
     server::SessionCacheOptions exact{.mode = server::SessionCacheOptions::Mode::kExact, .align = kAlign,
                                       .max_retained = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 2}))};
     exact.spill_dir = dir;
     exact.spill_on_evict = true;
+    // Encrypted spills (v2) under a master provider; admin 4 rotates its epoch (crypto-shredding).
+    core::crypt::SecretBytes master(32);
+    ASSERT_TRUE(core::crypt::RandomBytes({master.data(), 32}));
+    std::string ke;
+    auto keys = server::MasterSpillKeys::Create("test", std::move(master), "", &ke);
+    ASSERT_TRUE(keys) << ke;
+    exact.spill_keys = keys.get();
     exact.max_spilled = tc.draw(gs::integers<std::size_t>({.min_value = 1, .max_value = 6}));
     server::FlashNextGenerator a(*ea, std::vector<text::TokenId>{}, kCtx, exact);
     server::FlashNextGenerator b(*eb, std::vector<text::TokenId>{}, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
@@ -634,9 +644,18 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
         ASSERT_EQ(oa, ob);
       }
       // Admin between turns.
-      const int admin = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 3}));
+      const int admin = tc.draw(gs::integers<int>({.min_value = 0, .max_value = 4}));
       a.WithCache([&](server::SessionCache& c) {
         std::string why;
+        // Every file in the spill directory is encrypted (v2) (checked before this turn's bit flips; a file
+        // flipped earlier has been restored-and-refused or still holds a flip outside the magic's byte).
+        for (const auto& f : std::filesystem::directory_iterator(dir)) {
+          const std::string name = f.path().filename().string();
+          if (damaged.contains(std::strtoull(name.c_str() + name.find('-') + 1, nullptr, 10))) continue;
+          char magic[8] = {};
+          std::ifstream(f.path(), std::ios::binary).read(magic, 8);
+          EXPECT_EQ(std::string(magic, 8), "HALOSPL2") << f.path();
+        }
         for (const auto& en : c.List()) {
           if (admin == 1 && !en.spilled) EXPECT_TRUE(c.Spill(en.key, &why)) << why;
           if (admin == 2 && en.spilled) {
@@ -658,6 +677,14 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
             const std::string name = f.path().filename().string();  // s<pid>-<key>.spill
             damaged.insert(std::strtoull(name.c_str() + name.find('-') + 1, nullptr, 10));
           }
+        if (admin == 4) {  // a new epoch: every spilled entry is unreadable, erased, its file deleted
+          std::size_t had = 0;
+          for (const auto& en : c.List()) had += en.spilled;
+          EXPECT_TRUE(keys->FenceEpoch(&why));
+          EXPECT_EQ(c.DropUnreadable(), had);
+          for (const auto& en : c.List()) EXPECT_FALSE(en.spilled);
+          ++rotations;
+        }
         return true;
       });
       std::vector<std::int32_t> next(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(stable));
@@ -676,9 +703,156 @@ TEST(SessionCache, SpilledStatesServeByteIdenticalToColdPrefill) {
     spilled += k.spilled;
   }, {.test_cases = 40, .phases = {hegel::Phase::Explicit, hegel::Phase::Reuse, hegel::Phase::Generate}});
   std::filesystem::remove_all(dir);
-  std::printf("spill cache: %zu spilled, %zu restored, %zu restores failed (%zu bit flips), %zu prompt tokens reused\n",
-              spilled, restored, restore_failed, corrupted, reused);
+  std::printf("spill cache: %zu spilled, %zu restored, %zu restores failed (%zu bit flips, %zu rotations), %zu prompt "
+              "tokens reused\n", spilled, restored, restore_failed, corrupted, rotations, reused);
   EXPECT_GT(restored, 5u) << "spilled states were hardly ever restored: the comparison is close to vacuous";
+}
+
+namespace {
+// A provider whose seal and open keys can be withheld (a yard session without a registered key, a failing TPM).
+struct GateKeys final : server::SpillKeys {
+  explicit GateKeys(server::MasterSpillKeys& k) : inner(k) {}
+  server::MasterSpillKeys& inner;
+  bool seal = true, open = true;
+  std::string Describe() const override { return "gate:" + inner.Describe(); }
+  bool SealLease(std::string_view entry, std::string_view label, bool bound, server::SpillLease* out,
+                 std::string* why) override {
+    if (!seal) return *why = "key withheld", false;
+    return inner.SealLease(entry, label, bound, out, why);
+  }
+  bool OpenLease(std::string_view label, std::string_view id, server::SpillLease* out, std::string* why) override {
+    if (!open) return *why = "key withheld", false;
+    return inner.OpenLease(label, id, out, why);
+  }
+  bool MayOpen(std::string_view label, std::string_view id) override { return inner.MayOpen(label, id); }
+};
+std::size_t FilesIn(const std::string& dir) {
+  std::size_t n = 0;
+  std::error_code ec;
+  for (const auto& f : std::filesystem::directory_iterator(dir, ec)) n += f.is_regular_file();
+  return n;
+}
+}  // namespace
+
+// Spill keys in the cache (docs/SESSIONS.md section 10): a provider without a key refuses the spill and nothing is
+// written (never a plaintext fallback; eviction then drops); no provider refuses unless plaintext was chosen; a
+// plaintext v1 file restores only with spill_accept_v1; an entry whose open key is withheld stays spilled and
+// untouched until the key is there; a rotated epoch makes spilled files unreadable (DropUnreadable erases them and
+// the next request re-prefills, still equal to a cold engine's tokens).
+TEST(SessionCache, SpillKeysRefuseKeepAndShred) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  const char* d = std::getenv("HALO_SPILL_TEST_DIR");
+  const std::string dir = (d && *d ? std::filesystem::path(d) : std::filesystem::temp_directory_path() / "halo-spill-test") /
+                          ("keys-" + std::to_string(::getpid()));
+  constexpr std::uint32_t kCtx = 1024;
+  std::string e;
+  auto ea = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  auto eb = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(ea && eb) << e;
+  core::crypt::SecretBytes master(32);
+  ASSERT_TRUE(core::crypt::RandomBytes({master.data(), 32}));
+  auto master_keys = server::MasterSpillKeys::Create("test", std::move(master), "", &e);
+  ASSERT_TRUE(master_keys) << e;
+  GateKeys gate(*master_keys);
+  std::vector<std::int32_t> prompt(200);
+  for (std::size_t i = 0; i < prompt.size(); ++i) prompt[i] = static_cast<std::int32_t>((i * 7919 + 3) % 1000);
+  const auto collect = [](std::vector<std::int32_t>* out) {
+    return [out](text::TokenId t) { return out->push_back(static_cast<std::int32_t>(t)), true; };
+  };
+  server::FlashNextGenerator cold(*eb, std::vector<text::TokenId>{}, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
+  server::TextGenerator::Params p;
+  p.max_tokens = 4;
+  std::vector<std::int32_t> want;
+  ASSERT_TRUE(cold.GenerateIds(prompt, 190, p, collect(&want)).error.empty());
+  // One request parks a checkpoint (at 128: align 64); returns its key.
+  const auto run = [&](server::FlashNextGenerator& g, std::size_t* reused = nullptr) {
+    std::vector<std::int32_t> got;
+    const auto r = g.GenerateIds(prompt, 190, p, collect(&got));
+    EXPECT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(got, want) << "tokens differ from a cold engine's";
+    if (reused) *reused = r.cached_tokens;
+  };
+  const auto first_key = [](server::SessionCache& c) {
+    const auto l = c.List();
+    return l.empty() ? 0 : l.front().key;
+  };
+  for (int mode = 0; mode < 5; ++mode) {
+    std::filesystem::remove_all(dir);
+    server::SessionCacheOptions o{.mode = server::SessionCacheOptions::Mode::kExact, .align = 64, .max_retained = 4};
+    o.spill_dir = dir;
+    gate.seal = gate.open = true;
+    if (mode == 0) o.spill_keys = &gate;            // provider withholds the seal key
+    if (mode == 1) o.spill_keys = nullptr;          // no provider, plaintext not allowed
+    if (mode == 2 || mode == 3) o.spill_plaintext_ok = true, o.spill_accept_v1 = mode == 3;  // plaintext v1
+    if (mode == 4) o.spill_keys = &gate;            // encrypted; open key withheld, then granted, then rotated
+    server::FlashNextGenerator g(*ea, std::vector<text::TokenId>{}, kCtx, o);
+    run(g);
+    g.WithCache([&](server::SessionCache& c) {
+      const auto key = first_key(c);
+      EXPECT_NE(key, 0u);
+      std::string why;
+      bool kept = false;
+      if (mode == 0) {
+        gate.seal = false;
+        EXPECT_FALSE(c.Spill(key, &why)) << "spilled without a key";
+        EXPECT_EQ(FilesIn(dir), 0u) << "a file was written without a key (plaintext fallback?)";
+        EXPECT_EQ(c.spill_counters().no_key, 1u);
+        EXPECT_FALSE(c.List().front().spilled);
+      } else if (mode == 1) {
+        EXPECT_FALSE(c.Spill(key, &why));
+        EXPECT_EQ(FilesIn(dir), 0u);
+      } else if (mode == 2 || mode == 3) {
+        EXPECT_TRUE(c.Spill(key, &why)) << why;
+        EXPECT_EQ(c.List().front().key_id, "");
+        EXPECT_EQ(c.Restore(key, &why), mode == 3) << why;  // v1 only with accept_v1; refused: entry erased
+        EXPECT_EQ(c.List().size(), mode == 3 ? 1u : 0u);
+      } else {
+        EXPECT_TRUE(c.Spill(key, &why)) << why;
+        EXPECT_NE(c.List().front().key_id, "");
+        gate.open = false;
+        EXPECT_FALSE(c.Restore(key, &why, &kept));
+        EXPECT_TRUE(kept) << "an entry waiting for its key was dropped";
+        EXPECT_TRUE(c.List().front().spilled);
+        EXPECT_EQ(FilesIn(dir), 1u);
+        EXPECT_EQ(c.DropUnreadable(), 0u) << "a withheld key is not a rotated one";
+        gate.open = true;
+        EXPECT_TRUE(c.Restore(key, &why, &kept)) << why;
+        EXPECT_TRUE(c.Spill(key, &why)) << why;
+        EXPECT_TRUE(master_keys->FenceEpoch(&why));
+        EXPECT_FALSE(c.Restore(key, &why, &kept)) << "a file of the previous epoch restored";
+        EXPECT_FALSE(kept);
+        EXPECT_EQ(c.List().size(), 0u);
+        EXPECT_EQ(FilesIn(dir), 0u);
+      }
+      return true;
+    });
+    // Whatever happened, the next request's tokens equal a cold engine's.
+    std::size_t reused = 0;
+    run(g, &reused);
+    if (mode == 3) EXPECT_GT(reused, 0u) << "the restored v1 entry was not reused";
+  }
+  // Eviction with a provider that has no key: the entry is dropped, nothing is written.
+  {
+    std::filesystem::remove_all(dir);
+    server::SessionCacheOptions o{.mode = server::SessionCacheOptions::Mode::kExact, .align = 64, .max_retained = 1};
+    o.spill_dir = dir;
+    o.spill_on_evict = true;
+    o.spill_keys = &gate;
+    gate.seal = false;
+    server::FlashNextGenerator g(*ea, std::vector<text::TokenId>{}, kCtx, o);
+    run(g);
+    std::vector<std::int32_t> other(100, 5), got;
+    server::TextGenerator::Params q;
+    q.max_tokens = 2;
+    ASSERT_TRUE(g.GenerateIds(other, 99, q, collect(&got)).error.empty());
+    EXPECT_EQ(FilesIn(dir), 0u) << "eviction wrote a file without a key";
+    g.WithCache([&](server::SessionCache& c) {
+      EXPECT_GE(c.spill_counters().no_key, 1u);
+      return true;
+    });
+  }
+  std::filesystem::remove_all(dir);
 }
 
 namespace {
@@ -1383,6 +1557,156 @@ TEST(SessionCache, ReleasedRangesGiveTheirMemoryBack) {
       << "released ranges kept " << (before - after) / (1 << 20) << " MB";
 }
 
+namespace {
+// Delegates to the yard provider; when armed, a revoke arrives right after a restore took its open lease (a
+// restore in flight at the revoke).
+struct RevokeDuringRestore final : server::SpillKeys {
+  server::YardSpillKeys& y;
+  const yardtest::Signer& signer;
+  bool armed = false;
+  server::YardSpillKeys::Answer revoke;
+  RevokeDuringRestore(server::YardSpillKeys& yard, const yardtest::Signer& s) : y(yard), signer(s) {}
+  std::string Describe() const override { return y.Describe(); }
+  bool SealLease(std::string_view entry, std::string_view label, bool bound, server::SpillLease* out,
+                 std::string* why) override {
+    return y.SealLease(entry, label, bound, out, why);
+  }
+  bool OpenLease(std::string_view label, std::string_view id, server::SpillLease* out, std::string* why) override {
+    const bool ok = y.OpenLease(label, id, out, why);
+    if (ok && armed) {
+      armed = false;
+      revoke = yardtest::Register(y, signer, std::string(label), "revoke", 9, "");
+    }
+    return ok;
+  }
+  void Finish(const server::SpillLease& lease, Use use, Outcome outcome) override { y.Finish(lease, use, outcome); }
+  bool MayOpen(std::string_view label, std::string_view id) override { return y.MayOpen(label, id); }
+};
+}  // namespace
+
+// Phase B in the cache: an entry is sealed only under the key yard-ctl registered for that entry (the seal claim
+// names it; there is no ?session=), cannot be restored until yard registers the open key at the next epoch (the
+// entry waits, untouched), restores bit-exact then, needs a new seal registration for the next spill (keys are
+// one-shot) and never falls back to the master once yard-bound (custody); a revocation erases exactly the entries
+// at or below its fence; a restore in flight at a revoke completes and the revoke's cleanup then erases it.
+TEST(SessionCache, YardKeysAuthoriseResume) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  const char* d = std::getenv("HALO_SPILL_TEST_DIR");
+  const std::string dir = (d && *d ? std::filesystem::path(d) : std::filesystem::temp_directory_path() / "halo-spill-test") /
+                          ("yard-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
+  yardtest::Signer signer("kid-a");
+  yardtest::WriteFile(dir + "/jwks.json", yardtest::JwksJson({&signer}));
+  std::string e;
+  core::crypt::SecretBytes mk(32);
+  ASSERT_TRUE(core::crypt::RandomBytes({mk.data(), 32}));
+  auto master = server::MasterSpillKeys::Create("test", std::move(mk), "", &e);
+  ASSERT_TRUE(master) << e;
+  server::YardSpillKeys::Options yo;
+  yo.jwks_path = dir + "/jwks.json";
+  yo.issuer = "https://id.example.org/yard";
+  yo.fallback = master.get();  // --spill-yard-fallback master: still never for a yard-bound entry
+  yo.state_path = dir + "/yard-state";
+  yo.incarnation = yardtest::kInc;
+  auto yard = server::YardSpillKeys::Create(yo, &e);
+  ASSERT_TRUE(yard) << e;
+  RevokeDuringRestore keys(*yard, signer);
+  constexpr std::uint32_t kCtx = 1024;
+  auto ea = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  auto eb = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(ea && eb) << e;
+  std::vector<std::int32_t> prompt(200);
+  for (std::size_t i = 0; i < prompt.size(); ++i) prompt[i] = static_cast<std::int32_t>((i * 7919 + 3) % 1000);
+  const auto collect = [](std::vector<std::int32_t>* out) {
+    return [out](text::TokenId t) { return out->push_back(static_cast<std::int32_t>(t)), true; };
+  };
+  server::FlashNextGenerator cold(*eb, std::vector<text::TokenId>{}, kCtx, {.mode = server::SessionCacheOptions::Mode::kOff});
+  server::TextGenerator::Params p;
+  p.max_tokens = 4;
+  std::vector<std::int32_t> want;
+  ASSERT_TRUE(cold.GenerateIds(prompt, 190, p, collect(&want)).error.empty());
+  server::SessionCacheOptions o{.mode = server::SessionCacheOptions::Mode::kExact, .align = 64, .max_retained = 4};
+  o.spill_dir = dir + "/spill";
+  o.spill_keys = &keys;
+  o.incarnation = yardtest::kInc;  // halo_serve passes the provider's
+  server::FlashNextGenerator g(*ea, std::vector<text::TokenId>{}, kCtx, o);
+  std::vector<std::int32_t> got;
+  ASSERT_TRUE(g.GenerateIds(prompt, 190, p, collect(&got)).error.empty());
+  ASSERT_EQ(got, want);
+  const std::string k1 = yardtest::Key32(1), k2 = yardtest::Key32(2), k3 = yardtest::Key32(3);
+  g.WithCache([&](server::SessionCache& c) {
+    const auto key = c.List().front().key;
+    const auto entry = static_cast<std::int64_t>(key);
+    std::string why;
+    bool kept = false;
+    // A seal registration for another entry does not seal this one.
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "seal", 3, k1, entry + 100).status, 200);
+    EXPECT_TRUE(c.Spill(key, &why)) << why;  // never yard-bound: the master fallback seals it
+    EXPECT_EQ(c.List().front().key_id.rfind("test:", 0), 0u) << c.List().front().key_id;
+    EXPECT_TRUE(c.Restore(key, &why)) << why;
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "seal", 4, k1, entry).status, 200);
+    EXPECT_TRUE(c.Spill(key, &why)) << why;
+    EXPECT_EQ(c.List().front().key_id.rfind("yard:", 0), 0u) << c.List().front().key_id;
+    EXPECT_EQ(c.List().front().session, "sess-1");
+    EXPECT_TRUE(c.List().front().yard_bound);
+    EXPECT_EQ(c.List().front().entry_id, yardtest::Entry(entry));
+    EXPECT_FALSE(c.Restore(key, &why, &kept));
+    EXPECT_TRUE(kept) << "an entry waiting for yard's open key was dropped: " << why;
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "open", 4, k1).status, 409) << "open before the commit";
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "open", 5, k1).status, 200);
+    EXPECT_TRUE(c.Restore(key, &why, &kept)) << why;
+    // Custody: no seal registration now; the master fallback must not take a yard-bound entry.
+    EXPECT_FALSE(c.Spill(key, &why)) << "a yard-bound entry was sealed under the master (custody downgrade)";
+    EXPECT_EQ(FilesIn(o.spill_dir), 0u);
+    // A spill published but not durable (the directory fsync fails): not "not done": the key counts as used, the
+    // file is removed and the entry stays resident.
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "seal", 5, k2, entry).status, 200);
+    engine::FlashNextGpu::spill_fault_ = 3;
+    EXPECT_FALSE(c.Spill(key, &why));
+    engine::FlashNextGpu::spill_fault_ = 0;
+    EXPECT_FALSE(c.List().front().spilled);
+    EXPECT_EQ(FilesIn(o.spill_dir), 0u);
+    EXPECT_NE(yardtest::Register(*yard, signer, "sess-1", "seal", 5, k2, entry).body.find("consumed"), std::string::npos)
+        << "an uncertain spill left its key for another file";
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "seal", 6, k2, entry).status, 200);
+    EXPECT_TRUE(c.Spill(key, &why)) << why;
+    // A restore in flight when a revoke (through 5) lands: it completes with the key it holds; the revoke's
+    // cleanup, which the route runs under the generation lock after it, erases the restored entry.
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "open", 7, k2).status, 200);
+    keys.armed = true;
+    EXPECT_TRUE(c.Restore(key, &why, &kept)) << why;
+    EXPECT_EQ(keys.revoke.status, 200) << keys.revoke.body;
+    EXPECT_EQ(keys.revoke.revoked_through, 6u) << "the revoke's default fence is the last spilled epoch";
+    EXPECT_EQ(c.DropRevoked(keys.revoke.revoked_session, keys.revoke.revoked_through), 1u);
+    EXPECT_EQ(c.List().size(), 0u);
+    EXPECT_EQ(FilesIn(o.spill_dir), 0u);
+    return true;
+  });
+  got.clear();
+  std::size_t reused = 0;
+  {
+    const auto r = g.GenerateIds(prompt, 190, p, collect(&got));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    reused = r.cached_tokens;
+  }
+  EXPECT_EQ(got, want);
+  EXPECT_EQ(reused, 0u) << "a revoked entry was reused";
+  // The revoke's fence: a newer checkpoint (sealed at 10 > 9) survives a delayed cleanup of the old revoke.
+  g.WithCache([&](server::SessionCache& c) {
+    const auto key = c.List().front().key;
+    std::string why;
+    EXPECT_EQ(yardtest::Register(*yard, signer, "sess-1", "seal", 10, k3, static_cast<std::int64_t>(key)).status, 200);
+    EXPECT_TRUE(c.Spill(key, &why)) << why;
+    EXPECT_EQ(c.DropRevoked("sess-1", 9), 0u) << "a delayed revoke cleanup erased a newer checkpoint";
+    EXPECT_TRUE(c.List().front().spilled);
+    return true;
+  });
+  std::filesystem::remove_all(dir);
+}
+
 // rt::HipDevice holds GPU work back until the GPU has settled a mapping change (docs/SESSIONS.md section 11): on this
 // stack a write issued right after a page was unmapped and another mapped at the same address went to the OLD,
 // released page (stream RC's probe, ana/vmm_stale: 100 of 100 without the wait), and one right after a fresh
@@ -1475,3 +1799,75 @@ TEST(SessionCache, PoisonModeReportsAWriteIntoAReleasedRange) {
   dev->ReleaseRange(next);
 }
 
+
+// A restore that fails and whose cleanup cannot synchronize the device poisons the engine, and the cache's own
+// failure cleanup (give_up: DropSession of the half-restored session) then releases nothing: the session and its
+// device memory stay quarantined, every later engine call is refused.
+TEST(SessionCache, PoisonedRestoreQuarantinesItsMemory) {
+  auto m = OpenSmall();
+  if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  const char* d = std::getenv("HALO_SPILL_TEST_DIR");
+  const std::string dir = (d && *d ? std::filesystem::path(d) : std::filesystem::temp_directory_path() / "halo-spill-test") /
+                          ("poison-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(dir);
+  constexpr std::uint32_t kCtx = 1024;
+  std::string e;
+  auto ea = engine::FlashNextGpu::Create(*m->dev, *m->weights, m->ngram.get(), nullptr, kCtx, &e);
+  ASSERT_TRUE(ea) << e;
+  core::crypt::SecretBytes mk(32);
+  ASSERT_TRUE(core::crypt::RandomBytes({mk.data(), 32}));
+  auto keys = server::MasterSpillKeys::Create("test", std::move(mk), "", &e);
+  ASSERT_TRUE(keys) << e;
+  server::SessionCacheOptions o{.mode = server::SessionCacheOptions::Mode::kExact, .align = 64, .max_retained = 4};
+  o.spill_dir = dir;
+  o.spill_keys = keys.get();
+  std::uint64_t released_at_poison = 0;
+  {
+    server::FlashNextGenerator g(*ea, std::vector<text::TokenId>{}, kCtx, o);
+    std::vector<std::int32_t> prompt(300), got;
+    for (std::size_t i = 0; i < prompt.size(); ++i) prompt[i] = static_cast<std::int32_t>((i * 7919 + 3) % 1000);
+    server::TextGenerator::Params p;
+    p.max_tokens = 2;
+    ASSERT_TRUE(g.GenerateIds(prompt, 290, p, [&](text::TokenId t) { return got.push_back(t), true; }).error.empty());
+    const auto saved_piece = engine::FlashNextGpu::spill_piece_bytes_;
+    engine::FlashNextGpu::spill_piece_bytes_ = 64u << 10;
+    g.WithCache([&](server::SessionCache& c) {
+      const auto key = c.List().front().key;
+      std::string why;
+      EXPECT_TRUE(c.Spill(key, &why)) << why;
+      const std::string file = dir + "/s" + std::to_string(::getpid()) + "-" + std::to_string(key) + ".spill";
+      std::fstream io(file, std::ios::in | std::ios::out | std::ios::binary);
+      const auto size = std::filesystem::file_size(file);
+      for (std::uint64_t at = size * 3 / 4; at < size; at += 4096) {
+        char ch;
+        io.seekg(static_cast<std::streamoff>(at));
+        io.get(ch);
+        io.seekp(static_cast<std::streamoff>(at));
+        io.put(static_cast<char>(ch ^ 0x55));
+      }
+      io.close();
+      engine::FlashNextGpu::SessionId extra = 0;  // an unbound session: its drop must be refused once poisoned
+      EXPECT_TRUE(ea->NewSession(&extra, &why)) << why;
+      const std::size_t live = ea->LiveSessions();
+      engine::FlashNextGpu::restore_sync_fault_ = true;
+      EXPECT_FALSE(c.Restore(key, &why));
+      engine::FlashNextGpu::restore_sync_fault_ = false;
+      EXPECT_TRUE(ea->poisoned());
+      released_at_poison = engine::FlashNextGpu::kv_pages_released_.load();
+      EXPECT_EQ(ea->LiveSessions(), live + 1) << "the cache's cleanup released the half-restored session's memory";
+      EXPECT_FALSE(ea->DropSession(extra, &why)) << "a poisoned engine released a session for reuse";
+      EXPECT_EQ(ea->LiveSessions(), live + 1);
+      engine::FlashNextGpu::SessionId id = 0;
+      EXPECT_FALSE(ea->NewSession(&id, &why));
+      return true;
+    });
+    engine::FlashNextGpu::spill_piece_bytes_ = saved_piece;
+  }
+  // Tearing down the cache and the poisoned engine releases no KV page either (the destructor's early return leaves
+  // the members to their own destructors: the pages and sessions are leaked on purpose).
+  ASSERT_TRUE(ea->poisoned());
+  ea.reset();
+  EXPECT_EQ(engine::FlashNextGpu::kv_pages_released_.load(), released_at_poison)
+      << "the cache's or the poisoned engine's teardown released KV pages";
+  std::filesystem::remove_all(dir);
+}

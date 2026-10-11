@@ -409,6 +409,7 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
 }
 
 bool FlashNextGpu::StepBatch(std::span<const BatchEntry> entries, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   const auto& c = w_.config;
   const auto fail = [&](const char* what) {
     if (error) *error = what;

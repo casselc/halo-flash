@@ -416,7 +416,9 @@ int main(int argc, char** argv) {
   // (the old one dropped, as a resume does) --spill-reps times, each checked bitwise by the next step's logits.
   // --spill-roundtrip DIR (with --prefill-prompt): spill after the prompt's prefill, drop the session, restore it
   // into a new one, then decode as usual (compare --decode-logits-out with a run without it: cmp).
-  std::string spill_bench, spill_dir, spill_roundtrip;
+  // --spill-format 2 (default: encrypted v2 under a random in-memory key), 1 (plaintext v1) or 12 (both, from the
+  // same prefill, restores interleaved: the v1 / v2 A/B of SE's PREDICTIONS P1).
+  std::string spill_bench, spill_dir, spill_roundtrip, spill_format = "2";
   int spill_reps = 3;
   std::uint32_t prompt_tokens = 0;  // --prompt-tokens N: the prompt's tokens repeated / cut to N (long-context runs)
   std::uint32_t span_sample = 1;
@@ -551,6 +553,7 @@ int main(int argc, char** argv) {
     else if (a == "--spill-bench") spill_bench = argv[i + 1];
     else if (a == "--spill-dir") spill_dir = argv[i + 1];
     else if (a == "--spill-reps") spill_reps = std::atoi(argv[i + 1]);
+    else if (a == "--spill-format") spill_format = argv[i + 1];
     else if (a == "--spill-roundtrip") spill_roundtrip = argv[i + 1];
     else if (a == "--spill-threads") engine::FlashNextGpu::spill_threads_ = static_cast<unsigned>(std::atoi(argv[i + 1]));
     else if (a == "--prompt-tokens") prompt_tokens = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
@@ -745,6 +748,18 @@ int main(int argc, char** argv) {
     using clk = std::chrono::steady_clock;
     const auto ms = [](clk::time_point a) { return std::chrono::duration<double, std::milli>(clk::now() - a).count(); };
     const std::string file = spill_dir + "/bench.spill";
+    // A random in-memory master key (no provider: the bench measures the format, not key loading).
+    halo::core::crypt::SecretBytes master(32);
+    halo::core::crypt::Kek bench_kek;
+    if (!master.ok() || !halo::core::crypt::RandomBytes({master.data(), 32}) ||
+        !halo::core::crypt::DeriveKek(master.span(), "bench", 1, "bench", &bench_kek, &error))
+      return std::fprintf(stderr, "spill key: %s\n", error.c_str()), 1;
+    const auto spill_prot = [&](int fmt) {
+      engine::FlashNextGpu::SpillProtection p;
+      p.kek = fmt == 2 ? &bench_kek : nullptr;
+      p.accept_v1 = fmt == 1;
+      return p;
+    };
     engine::FlashNextGpu::SessionId cur = 0;
     // A new session bound, the previous one dropped (what a resume after a suspend has).
     const auto fresh_session = [&]() -> bool {
@@ -770,28 +785,35 @@ int main(int argc, char** argv) {
       if (!gpu->Prefill(toks, {}, &error) || !dev->Synchronize(&error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
       const double prefill_ms = ms(t);
       const auto mem = gpu->SessionMemory(cur);
-      engine::FlashNextGpu::SpillInfo si;
-      if (!gpu->SpillSession(file, {}, &si, &error)) return std::fprintf(stderr, "spill: %s\n", error.c_str()), 1;
-      if (!gpu->Step(next, want, &error)) return 1;  // the uninterrupted session's next logits
-      std::printf("spill bench N=%u kv=%s: prefill %.0f ms; KV mapped %.1f MB, recurrent %.1f MB; file %.1f MB "
-                  "(%.1f KB/token over the recurrent); spill %.1f ms (%.2f GB/s)\n",
-                  N, engine::FlashNextGpu::kv_f16_only_ ? "fp16" : "default", prefill_ms, mem.kv_mapped / 1e6,
-                  mem.recurrent / 1e6, si.file_bytes / 1e6, (double(si.file_bytes) - mem.recurrent) / N / 1e3, si.ms,
-                  si.file_bytes / si.ms / 1e6);
-      for (int r = 0; r < spill_reps; ++r) {
-        t = clk::now();
-        if (!fresh_session()) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
-        const double new_ms = ms(t);
-        engine::FlashNextGpu::SpillInfo ri;
-        if (!gpu->RestoreSession(file, nullptr, &ri, &error)) return std::fprintf(stderr, "restore: %s\n", error.c_str()), 1;
-        const double total = ms(t);
-        if (!gpu->Step(next, got, &error)) return 1;
-        const bool same = std::memcmp(got.data(), want.data(), want.size() * 4) == 0;
-        std::printf("  restore %d: new session %.1f ms + restore %.1f ms = %.1f ms (%.2f GB/s); next-step logits %s\n", r,
-                    new_ms, ri.ms, total, ri.file_bytes / ri.ms / 1e6, same ? "BIT-IDENTICAL" : "DIFFER");
-        if (!same) return 3;
+      std::vector<int> formats;
+      for (char ch : spill_format) formats.push_back(ch - '0');
+      for (int fmt : formats) {
+        engine::FlashNextGpu::SpillInfo si;
+        if (!gpu->SpillSession(file + std::to_string(fmt), spill_prot(fmt), {}, &si, &error))
+          return std::fprintf(stderr, "spill: %s\n", error.c_str()), 1;
+        std::printf("spill bench N=%u kv=%s v%d: prefill %.0f ms; KV mapped %.1f MB, recurrent %.1f MB; file %.1f MB "
+                    "(%.1f KB/token over the recurrent); spill %.1f ms (%.2f GB/s)\n",
+                    N, engine::FlashNextGpu::kv_f16_only_ ? "fp16" : "default", fmt, prefill_ms, mem.kv_mapped / 1e6,
+                    mem.recurrent / 1e6, si.file_bytes / 1e6, (double(si.file_bytes) - mem.recurrent) / N / 1e3, si.ms,
+                    si.file_bytes / si.ms / 1e6);
       }
-      std::filesystem::remove(file);
+      if (!gpu->Step(next, want, &error)) return 1;  // the uninterrupted session's next logits
+      for (int r = 0; r < spill_reps; ++r)
+        for (int fmt : formats) {
+          t = clk::now();
+          if (!fresh_session()) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+          const double new_ms = ms(t);
+          engine::FlashNextGpu::SpillInfo ri;
+          if (!gpu->RestoreSession(file + std::to_string(fmt), spill_prot(fmt), nullptr, &ri, &error))
+            return std::fprintf(stderr, "restore: %s\n", error.c_str()), 1;
+          const double total = ms(t);
+          if (!gpu->Step(next, got, &error)) return 1;
+          const bool same = std::memcmp(got.data(), want.data(), want.size() * 4) == 0;
+          std::printf("  restore %d v%d: new session %.1f ms + restore %.1f ms = %.1f ms (%.2f GB/s); next-step logits %s\n",
+                      r, fmt, new_ms, ri.ms, total, ri.file_bytes / ri.ms / 1e6, same ? "BIT-IDENTICAL" : "DIFFER");
+          if (!same) return 3;
+        }
+      for (int fmt : formats) std::filesystem::remove(file + std::to_string(fmt));
     }
     return 0;
   }
@@ -1501,8 +1523,14 @@ int main(int argc, char** argv) {
       engine::FlashNextGpu::SpillInfo si, ri;
       engine::FlashNextGpu::SessionId id;
       const auto from = gpu->BoundSession();
-      if (!gpu->SpillSession(file, {}, &si, &error) || !gpu->NewSession(&id, &error) || !gpu->BindSession(id, &error) ||
-          !gpu->DropSession(from, &error) || !gpu->RestoreSession(file, nullptr, &ri, &error))
+      halo::core::crypt::SecretBytes master(32);
+      halo::core::crypt::Kek kek;
+      if (!master.ok() || !halo::core::crypt::RandomBytes({master.data(), 32}) ||
+          !halo::core::crypt::DeriveKek(master.span(), "roundtrip", 1, "bench", &kek, &error))
+        return std::fprintf(stderr, "spill key: %s\n", error.c_str()), 1;
+      const engine::FlashNextGpu::SpillProtection prot{spill_format == "1" ? nullptr : &kek, spill_format == "1"};
+      if (!gpu->SpillSession(file, prot, {}, &si, &error) || !gpu->NewSession(&id, &error) || !gpu->BindSession(id, &error) ||
+          !gpu->DropSession(from, &error) || !gpu->RestoreSession(file, prot, nullptr, &ri, &error))
         return std::fprintf(stderr, "spill roundtrip: %s\n", error.c_str()), 1;
       std::printf("spill roundtrip: %.1f MB, spill %.1f ms, restore into a new session %.1f ms\n", si.file_bytes / 1e6,
                   si.ms, ri.ms);

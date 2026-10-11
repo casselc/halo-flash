@@ -1571,3 +1571,17 @@ first stamped kernel). Leaders: qkv + z dual GEMV 7.19 (223 GB/s), 2560 x 6144 G
 | Change | Predicted | Measured | Kept |
 |---|---|---|---|
 | Chooser costs refit after DP (c 1.37 -> 0.312, C[k] -0.9..-2.6 ms; docs/MTP.md "Recalibration") | +0..+3% chooser tok/s, greedy == AR | 36.02 -> 36.05 tok/s (+0.08%, two runs each); identical to AR | yes (accurate costs; speed-neutral) |
+
+## 22. 2026-10-07 (stream SE, branch `stream/spill-crypt`): encrypted spill files (format v2)
+
+Not a kernel change: the cost of AES-256-GCM on the SR4 spill path (docs/SESSIONS.md section 10). Real model,
+default KV, `halo_run --spill-bench --spill-format 12` (v1 and v2 from the same prefill, restores interleaved),
+unpinned, `/data` XFS on the SN5000 (Gen3 x4). Prediction (SE PREDICTIONS P1): within +-3% (GCM at 14.3 GB/s a core
+replaces CRC32C at ~13 GB/s, 4 I/O threads, disk-bound).
+
+| Change | Predicted | Measured (v1 -> v2) | Kept |
+|---|---|---|---|
+| v2: per-piece AES-256-GCM (VAES/AVX-512 path) instead of CRC32C, wrapped DEK, sealed meta | +-3% spill and restore | restore 2K 81.2 -> 79.7 ms (-1.8%), 12K 266.9 -> 267.1 ms (+0.1%), median of 3; spill (1 sample each) 2K 75 -> 68 ms, 12K 229 -> 213 ms, 128K 1984 -> 1962 ms and 1978 -> 2030 ms: noise, disk-bound. 128K restore not measured: `hipMemCreate` out of memory on main efaece7's own halo_run too (b0.txt), not SE's | yes (default; within noise) |
+| Fix round: GCM context reset after every call, fail-closed key memory, checkpoint id, restore sync on failure (SE P2) | 12K restore +-2% of 267.1 ms | restore 2K v1 80.0 / v2 80.6 ms, 12K v1 268.7 / v2 266.6 ms (medians of 5, b2.txt); spill 12K v1 227 / v2 242 ms (1 sample each: disk noise) | yes |
+| Round 3: poison flag at entry points, typed persistence (SE P3) | 12K restore +-2% of 266.6 ms | restore 12K v1 268.8 / v2 271.3 ms (medians of 5, b3.txt) | yes |
+| Round 4 on main 61e3df0 (VMM settle), quiet host (SE P4) | v2/v1 1.00 +- 0.02; 12K v2 265-285 ms | restore 12K v1 270.5 / v2 268.3 ms, 2K v1 80.5 / v2 80.8 (medians of 5, b4.txt) | yes |

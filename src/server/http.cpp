@@ -7,6 +7,8 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -17,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <string.h>
 #include <list>
 
 #include "core/json.hpp"
@@ -94,6 +97,39 @@ const std::string* HttpRequest::Header(std::string_view lower_name) const {
   return nullptr;
 }
 
+void SecretBuffer::Append(std::string_view bytes) {
+  if (bytes.empty()) return;
+  if (n_ + bytes.size() > cap_) {
+    const std::size_t cap = std::max({n_ + bytes.size(), cap_ * 2, std::size_t{4096}});
+    std::unique_ptr<char[]> q(new char[cap]());
+    const std::size_t n = n_;
+    if (n) std::memcpy(q.get(), p_.get(), n);
+    Wipe();  // the old storage is zeroed before it is freed
+    p_ = std::move(q);
+    cap_ = cap;
+    n_ = n;
+  }
+  std::memcpy(p_.get() + n_, bytes.data(), bytes.size());
+  n_ += bytes.size();
+}
+
+void SecretBuffer::Consume(std::size_t n) {
+  n = std::min(n, n_);
+  if (n == 0) return;
+  std::memmove(p_.get(), p_.get() + n, n_ - n);
+  explicit_bzero(p_.get() + (n_ - n), n);  // the tail the move vacated still held the moved bytes
+  n_ -= n;
+}
+
+void SecretBuffer::Wipe() noexcept {
+  if (p_) {
+    explicit_bzero(p_.get(), cap_);
+    if (on_free_for_test) on_free_for_test({p_.get(), cap_});
+  }
+  p_.reset();
+  cap_ = n_ = 0;
+}
+
 HttpParser::Status HttpParser::Fail(int status, std::string message) {
   error_status_ = status;
   error_ = std::move(message);
@@ -104,15 +140,17 @@ HttpParser::Status HttpParser::Next(HttpRequest* out) {
   if (error_status_) return Status::kError;
   // RFC 9112 2.2: ignore empty lines before the request line.
   std::size_t lead = 0;
-  while (lead + 1 < buf_.size() && buf_[lead] == '\r' && buf_[lead + 1] == '\n') lead += 2;
-  if (lead) buf_.erase(0, lead);
-  const auto end = buf_.find("\r\n\r\n");
+  const std::string_view b0 = buf_.view();
+  while (lead + 1 < b0.size() && b0[lead] == '\r' && b0[lead + 1] == '\n') lead += 2;
+  if (lead) buf_.Consume(lead);
+  const std::string_view buf = buf_.view();
+  const auto end = buf.find("\r\n\r\n");
   if (end == std::string::npos) {
     if (buf_.size() > limits_.max_head_bytes) return Fail(431, "request head too large");
     return Status::kNeedMore;
   }
   if (end + 4 > limits_.max_head_bytes) return Fail(431, "request head too large");
-  const std::string_view head(buf_.data(), end);
+  const std::string_view head(buf.data(), end);
   HttpRequest r;
   // Request line: method SP target SP version.
   const auto line_end = head.find("\r\n");
@@ -167,11 +205,11 @@ HttpParser::Status HttpParser::Next(HttpRequest* out) {
     have_length = true;
   }
   if (length > limits_.max_body_bytes) return Fail(413, "request body too large");
-  if (buf_.size() - (end + 4) < length) return Status::kNeedMore;
-  r.body = buf_.substr(end + 4, length);
+  if (buf.size() - (end + 4) < length) return Status::kNeedMore;
+  r.body = std::string(buf.substr(end + 4, length));
   const std::string* conn = r.Header("connection");
   r.keep_alive = http10 ? (conn && HasToken(*conn, "keep-alive")) : !(conn && HasToken(*conn, "close"));
-  buf_.erase(0, end + 4 + length);
+  buf_.Consume(end + 4 + length);  // the vacated bytes are zeroed (a request may carry a key)
   *out = std::move(r);
   return Status::kRequest;
 }
@@ -238,7 +276,75 @@ void HttpServer::RoutePrefix(std::string method, std::string prefix, HttpHandler
   prefix_routes_.push_back({{std::move(method), std::move(prefix)}, std::move(handler)});
 }
 
+bool HttpServer::StartUnix(std::string* error) {
+  // A Unix socket in a directory only this user can enter (0700, ours), the socket itself 0600; every connection's
+  // peer credentials are checked too (accept loop), so neither a loose umask nor a moved socket opens it up.
+  const std::string& path = opt_.unix_path;
+  sockaddr_un addr{};
+  if (path.size() >= sizeof addr.sun_path) return *error = "unix socket path too long: " + path, false;
+  const auto slash = path.rfind('/');
+  const std::string dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : path.substr(0, slash));
+  struct stat st {};
+  if (::lstat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != ::geteuid() || (st.st_mode & 077) != 0)
+    return *error = "unix socket directory " + dir + " must exist, be ours and mode 0700", false;
+  if (::lstat(path.c_str(), &st) == 0) {
+    if (!S_ISSOCK(st.st_mode)) return *error = path + " exists and is not a socket", false;
+    // Live, stale, or unknown: a bounded non-blocking connect. Only a refusal (nobody listens: ECONNREFUSED) or the
+    // path vanishing (ENOENT) proves it stale; a connect, a full backlog (EAGAIN), a timeout or any other error
+    // fails closed (the start is refused, nothing is unlinked).
+    sockaddr_un pa{};
+    pa.sun_family = AF_UNIX;
+    if (path.size() >= sizeof pa.sun_path) return *error = "unix socket path too long: " + path, false;  // also above
+    const int probe = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (probe < 0) return *error = "cannot probe " + path + ": " + std::strerror(errno), false;
+    std::memcpy(pa.sun_path, path.c_str(), path.size() + 1);
+    int rc = ::connect(probe, reinterpret_cast<sockaddr*>(&pa), sizeof pa);
+    int err = rc == 0 ? 0 : errno;
+    if (rc != 0 && (err == EINPROGRESS || err == EINTR)) {
+      pollfd pf{probe, POLLOUT, 0};
+      if (::poll(&pf, 1, 500) == 1) {
+        socklen_t len = sizeof err;
+        if (::getsockopt(probe, SOL_SOCKET, SO_ERROR, &err, &len) != 0) err = EIO;
+      } else {
+        err = ETIMEDOUT;
+      }
+    }
+    ::close(probe);
+    if (err != ECONNREFUSED && err != ENOENT)
+      return *error = path + (err == 0 ? " is served by another live process" : " could not be probed (" +
+                                                                                    std::string(std::strerror(err)) + ")") +
+                      ": refusing to take it over",
+             false;
+    ::unlink(path.c_str());
+  }
+  listen_fd_ = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (listen_fd_ < 0) return *error = std::string("socket: ") + std::strerror(errno), false;
+  addr.sun_family = AF_UNIX;
+  std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+  if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) < 0 || ::chmod(path.c_str(), 0600) != 0 ||
+      ::listen(listen_fd_, 128) < 0) {
+    *error = "bind/listen " + path + ": " + std::strerror(errno);
+    ::close(listen_fd_);
+    listen_fd_ = -1;
+    ::unlink(path.c_str());
+    return false;
+  }
+  unix_ = true;
+  if (::lstat(path.c_str(), &st) == 0) unix_ino_ = st.st_ino, unix_dev_ = st.st_dev;
+  acceptor_ = std::thread([this] { AcceptLoop(); });
+  return true;
+}
+
+bool HttpServer::PeerAllowed(int fd) const {
+  if (!unix_) return true;
+  ucred cr{};
+  socklen_t len = sizeof cr;
+  if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &len) != 0) return false;
+  return cr.uid == ::geteuid();
+}
+
 bool HttpServer::Start(std::string* error) {
+  if (!opt_.unix_path.empty()) return StartUnix(error);
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (listen_fd_ < 0) return *error = std::string("socket: ") + std::strerror(errno), false;
   const int one = 1;
@@ -286,6 +392,10 @@ void HttpServer::AcceptLoop() {
     const int fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
     if (fd < 0) continue;
     reap(false);
+    if (!PeerAllowed(fd)) {  // a Unix socket peer of another uid: closed without a word
+      ::close(fd);
+      continue;
+    }
     if (active_.load() >= opt_.max_connections) {
       // On the accept thread: a short deadline, so a client that does not read cannot hold up accepting.
       (void)SendAll(fd, SerializeResponse(HttpResponse::Json(503, ErrorJson("too many connections")), false),
@@ -368,6 +478,14 @@ void HttpServer::Serve(int fd) {
   int idle_ms = 0;
   while (!stopping_.load()) {
     HttpRequest req;
+    struct BodyWipe {  // every path out of this request (handled, refused at the API key, streamed, failed): the body
+      HttpRequest& r;  // and every header value (Authorization carries the API key) are zeroed
+      ~BodyWipe() {
+        if (!r.body.empty()) explicit_bzero(r.body.data(), r.body.size());
+        for (auto& [k, v] : r.headers)
+          if (!v.empty()) explicit_bzero(v.data(), v.size());
+      }
+    } body_wipe{req};
     const auto st = parser.Next(&req);
     if (st == HttpParser::Status::kError) {
       (void)SendAll(fd, SerializeResponse(HttpResponse::Json(parser.error_status(), ErrorJson(parser.error())), false),
@@ -429,6 +547,7 @@ void HttpServer::Serve(int fd) {
     const ssize_t n = ready < 0 ? -1 : ::recv(fd, buf, sizeof buf, 0);
     if (n <= 0) return;  // closed, reset or shut down by Stop()
     parser.Feed(std::string_view(buf, static_cast<std::size_t>(n)));
+    explicit_bzero(buf, static_cast<std::size_t>(n));
   }
 }
 
@@ -437,6 +556,11 @@ void HttpServer::Stop() {
   if (acceptor_.joinable()) acceptor_.join();
   if (listen_fd_ >= 0) ::close(listen_fd_);
   listen_fd_ = -1;
+  if (unix_) {  // only our own socket: a successor may have replaced a path we no longer serve
+    struct stat st {};
+    if (::lstat(opt_.unix_path.c_str(), &st) == 0 && st.st_ino == unix_ino_ && st.st_dev == unix_dev_)
+      ::unlink(opt_.unix_path.c_str());
+  }
 }
 
 }  // namespace halo::server

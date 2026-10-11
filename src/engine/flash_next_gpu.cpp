@@ -2,6 +2,7 @@
 #include "engine/flash_next_gpu.hpp"
 
 #include <algorithm>
+#include <type_traits>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -46,7 +47,24 @@ std::unique_ptr<FlashNextGpu> FlashNextGpu::Create(rt::Device& device, const mod
   return m;
 }
 
+// The early return of a poisoned engine's destructor leaves the members to their own destructors: none of them may
+// release device memory. Buffers and graphs are plain handles; KV pages (whose destructor releases the page) and the
+// sessions holding them are deliberately leaked there (see the destructor).
+static_assert(std::is_trivially_destructible_v<rt::Buffer> && std::is_trivially_destructible_v<rt::Graph>,
+              "engine members must not release device memory in their destructors (poison quarantine)");
+
 FlashNextGpu::~FlashNextGpu() {
+  // Poisoned: device work may still be queued against this engine's memory (a failed restore whose synchronize
+  // failed). Nothing goes back to the allocator for reuse; the process exit releases it with the device context.
+  if (poisoned_) {
+    // Leak, on purpose: a page released here could be handed to another engine on this device while queued writes
+    // still target it. The process exit releases everything with the device context.
+    for (auto& r : kv_)
+      for (auto& pg : r.pages)
+        if (pg) (void)new std::shared_ptr<KvPage>(std::move(pg));
+    for (auto& sp : sessions_) (void)sp.release();
+    return;
+  }
   (void)dev_.Synchronize(nullptr);
   for (auto& g : batch_graphs_) dev_.FreeGraph(g.graph);
   for (auto& sp : sessions_)
@@ -879,6 +897,7 @@ bool FlashNextGpu::Step(std::int32_t token, std::span<float> logits, std::string
 
 bool FlashNextGpu::StepSample(std::int32_t token, const SampleRequest& request, SampleResult* result,
                               std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   const auto fail = [&](const char* what) {
     if (error) *error = what;
     return false;
@@ -897,6 +916,7 @@ bool FlashNextGpu::StepSample(std::int32_t token, const SampleRequest& request, 
 
 bool FlashNextGpu::Run(std::int32_t token, Head head, const SampleRequest* request, std::span<float> logits,
                        SampleResult* result, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   const auto& c = w_.config;
   if (position_ >= max_context_ || token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size) {
     if (error) *error = position_ >= max_context_ ? "context is full" : "token out of range";
@@ -1031,7 +1051,10 @@ struct FlashNextGpu::KvPage {
   rt::Device& dev;
   void* handle = nullptr;
   KvPage(rt::Device& d, void* h) : dev(d), handle(h) {}
-  ~KvPage() { dev.ReleasePage(handle); }
+  ~KvPage() {
+    dev.ReleasePage(handle);
+    kv_pages_released_.fetch_add(1, std::memory_order_relaxed);
+  }
   KvPage(const KvPage&) = delete;
   KvPage& operator=(const KvPage&) = delete;
 };
@@ -1114,6 +1137,7 @@ bool FlashNextGpu::AllocSeq(SeqState& s, std::string* error) {
 }
 
 void FlashNextGpu::FreeSeq(SeqState& s) noexcept {
+  if (poisoned_) return;  // quarantine: no allocation of a poisoned engine is released for reuse
   (void)dev_.Synchronize(nullptr);
   for (auto& g : s.graphs) dev_.FreeGraph(g);
   for (auto& g : s.post_graphs) dev_.FreeGraph(g);
@@ -1176,6 +1200,7 @@ std::uint32_t FlashNextGpu::SessionPositionOf(SessionId id) const {
 }
 
 bool FlashNextGpu::NewSession(SessionId* id, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   auto s = std::make_unique<SeqState>();
   if (!AllocSeq(*s, error)) {
     FreeSeq(*s);
@@ -1187,6 +1212,7 @@ bool FlashNextGpu::NewSession(SessionId* id, std::string* error) {
 }
 
 bool FlashNextGpu::BindSession(SessionId id, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   if (!HasSession(id)) {
     if (error) *error = "no such session";
     return false;
@@ -1199,6 +1225,7 @@ bool FlashNextGpu::BindSession(SessionId id, std::string* error) {
 }
 
 bool FlashNextGpu::DropSession(SessionId id, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);  // quarantine: the session and its memory stay allocated
   if (!HasSession(id) || id == bound_) {
     if (error) *error = id == bound_ ? "cannot drop the bound session" : "no such session";
     return false;
@@ -1217,6 +1244,7 @@ bool FlashNextGpu::DropSession(SessionId id, std::string* error) {
 }
 
 bool FlashNextGpu::ForkSession(SessionId src, SessionId* id, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   if (!HasSession(src)) {
     if (error) *error = "no such session";
     return false;
@@ -1449,6 +1477,7 @@ bool FlashNextGpu::Save(Snapshot& snap, std::string* error) {
 }
 
 bool FlashNextGpu::Restore(const Snapshot& snap, std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   if (!snap.valid_ || &snap.dev_ != &dev_) {
     if (error) *error = "snapshot is empty or from another device";
     return false;
@@ -1471,6 +1500,7 @@ bool FlashNextGpu::Restore(const Snapshot& snap, std::string* error) {
 }
 
 bool FlashNextGpu::ReleaseKvPages(std::string* error) {
+  if (poisoned_) return PoisonedFail(error);  // quarantine: pages stay mapped
   if (!dev_.Synchronize(error)) return false;  // queued work may still read them
   const std::size_t pb = dev_.PageBytes();
   for (auto& r : kv_) {
@@ -1489,6 +1519,7 @@ bool FlashNextGpu::ReleaseKvPages(std::string* error) {
 }
 
 bool FlashNextGpu::Reset(std::string* error) {
+  if (poisoned_) return PoisonedFail(error);
   const auto& c = w_.config;
   // The bound session's shared KV pages go: a fork holds them, and the rewritten positions must not reach it
   // (sessions only append, so shared pages are otherwise never written). EnsureKv maps fresh ones as needed;

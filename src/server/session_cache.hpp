@@ -26,6 +26,7 @@
 // checkpoints (main's behaviour before the cache, for the extension case): fewer tokens prefilled, results equal
 // to a cold run only up to the prefill-vs-decode rounding.
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -36,6 +37,7 @@
 #include <vector>
 
 #include "engine/flash_next_gpu.hpp"
+#include "server/spill_keys.hpp"
 
 namespace halo::server {
 
@@ -57,6 +59,16 @@ struct SessionCacheOptions {
   bool spill_on_evict = false;              ///< eviction (count, budget, KvRoomFor) spills instead of dropping
   std::size_t max_spilled = 64;             ///< spilled entries kept (oldest file deleted beyond)
   std::size_t spill_budget_bytes = 64ull << 30;  ///< disk bytes they may hold
+  /// Spill encryption (format v2). `spill_keys` (not owned; must outlive the cache) seals every file; when it has
+  /// no key for an entry the spill is refused, never written in plaintext. Null: spills are refused unless
+  /// `spill_plaintext_ok` (then plaintext v1 files). `spill_accept_v1`: restore the plaintext v1 files this process
+  /// wrote (an entry recorded as v2 never accepts a v1 file).
+  SpillKeys* spill_keys = nullptr;
+  bool spill_plaintext_ok = false;
+  bool spill_accept_v1 = false;
+  /// This server incarnation's id: entry ids are "<incarnation>.<key>" (yard's seal claim names one), so an id
+  /// never names another conversation after a restart. Empty: 16 random hex digits (halo_serve passes yard's).
+  std::string incarnation;
 };
 
 class SessionCache {
@@ -161,18 +173,31 @@ class SessionCache {
     std::size_t device_bytes = 0;  ///< resident: recurrent + exclusive KV pages
     std::uint64_t file_bytes = 0;  ///< spilled: the file's size
     std::uint64_t used = 0;        ///< LRU clock
+    std::string session;           ///< the spill key's session label (a yard session, or "s<pid>-<key>")
+    std::string key_id;            ///< spilled: the id of the key that seals the file ("" plaintext)
+    bool yard_bound = false;       ///< sealed under a yard key once: never under a master key again
+    std::string entry_id;          ///< "<incarnation>.<key>": what a yard seal registration names
   };
   [[nodiscard]] std::vector<EntryInfo> List() const;
   /// Writes a resident entry's state to the spill directory and frees its device memory. Outcomes: true = done
   /// (file complete and durable, device state dropped); false with the entry still resident = not done (nothing
   /// changed but a removed temp file); the entry is never half-spilled.
+  /// The key: the provider's seal lease for this entry (yard: a seal registration naming this entry, which also
+  /// binds the entry to that yard session for good).
   [[nodiscard]] bool Spill(std::uint64_t key, std::string* error);
   /// Brings a spilled entry back onto the device (a resume ahead of its request). On false the entry is gone (its
-  /// file refused or damaged, or no memory): its next request re-prefills, which is exactly a cold prefill.
-  [[nodiscard]] bool Restore(std::uint64_t key, std::string* error);
+  /// file refused or damaged, or no memory): its next request re-prefills, which is exactly a cold prefill; except
+  /// when the key provider has no key for it yet (`*kept` true): then the entry and its file stay, untouched.
+  [[nodiscard]] bool Restore(std::uint64_t key, std::string* error, bool* kept = nullptr);
+  /// Erases spilled entries whose file the provider can never open again (an older master epoch after
+  /// FenceEpoch, a revoked yard epoch). Returns how many. Their files are deleted.
+  std::size_t DropUnreadable();
+  /// A yard revocation of `session` through file epoch `through`: erases that session's entries (spilled or
+  /// resident) whose key epoch is <= `through`, and deletes their files; newer ones stay. Returns how many.
+  std::size_t DropRevoked(std::string_view session, std::uint64_t through);
   /// Counters since construction (tests, metrics).
   struct SpillCounters {
-    std::size_t spilled = 0, spill_failed = 0, restored = 0, restore_failed = 0, files_deleted = 0;
+    std::size_t spilled = 0, spill_failed = 0, restored = 0, restore_failed = 0, files_deleted = 0, no_key = 0;
   };
   [[nodiscard]] const SpillCounters& spill_counters() const { return counters_; }
 
@@ -187,8 +212,17 @@ class SessionCache {
     bool spilled = false;              // SR4: state in `path`, no engine session (id meaningless)
     std::string path;
     std::uint64_t file_bytes = 0;
+    std::string session;               // spill key label (see EntryInfo::session); "" = the default
+    std::string key_id;                // spilled: the file's key id ("" plaintext v1)
+    bool yard_bound = false;           // sealed under a yard key once (sticky)
+    std::uint64_t key_epoch = 0;       // the file epoch of its last yard seal (revocation fences by it)
+    std::uint32_t version = 0;         // spilled: the format written (1 / 2): a v2 entry never takes a v1 file
+    std::array<std::uint8_t, 16> checkpoint_id{};  // spilled (v2): the file's random checkpoint id
   };
   struct Live;
+  enum class Restored : std::uint8_t { kDone, kRefused, kNoKey };
+  std::string Label(const Entry& en) const;
+  std::string EntryId(const Entry& en) const;
   bool Drop(Engine::SessionId id, std::string* error);
   bool RunTo(Live& lv, std::size_t to, std::uint32_t chunk, const std::function<bool()>& cancelled, Prepared* out,
              std::string* error);  // prefill the live session up to prompt position `to` (one engine call)
@@ -196,7 +230,7 @@ class SessionCache {
   void Evict();  // down to max_retained and budget_bytes
   bool EvictOne();  // the least recently used resident entry: spilled (spill_on_evict) or dropped
   bool SpillEntry(Entry& en, std::string* error);
-  bool RestoreEntry(Entry& en, std::string* error);  // on false the caller erases the entry
+  Restored RestoreEntry(Entry& en, std::string* error);  // kRefused: the caller erases the entry; kNoKey: keeps it
   void TrimSpilled();  // down to max_spilled and spill_budget_bytes (oldest files deleted)
   void EraseEntry(std::size_t index);  // drops its session or deletes its file
   std::size_t Bytes(const Entry& e) const;

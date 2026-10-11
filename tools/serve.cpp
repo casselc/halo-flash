@@ -51,6 +51,8 @@
 // pointer_head part, on /v1/systemone. A variant built for another base is
 // refused at startup.
 
+#include <sys/un.h>
+
 #include <algorithm>
 #include <chrono>
 #include <csignal>
@@ -80,6 +82,8 @@
 #include "server/qwen35_generator.hpp"
 #include "server/flash_next_backend.hpp"
 #include "server/scheduled_generator.hpp"
+#include "server/spill_keys.hpp"
+#include "server/yard_keys.hpp"
 #include "server/systemone_service.hpp"
 #include "text/tokenizer.hpp"
 #if HALO_WITH_SCOPE
@@ -116,8 +120,20 @@ class StrandsEngine : public server::DecisionEngine {
 }  // namespace
 
 
+// Printable ASCII without quotes or backslashes (labels and key ids are; anything else is dropped).
+static std::string JsonSafe(const std::string& s) {
+  std::string o;
+  for (char ch : s)
+    if (ch >= 0x20 && ch < 0x7f && ch != '"' && ch != '\\') o += ch;
+  return o;
+}
+
 // SR4 admin routes over the session cache (docs/SESSIONS.md section 10): list retained states, spill one to the
-// spill directory, restore one. Each runs between generations (the generation lock).
+// spill directory, restore one. Each runs between generations (the generation lock). `key_routes`: also the yard key
+// route (POST /admin/keys/{session}, GET /admin/keys); by default only on the admin Unix socket.
+// Lock order: the generation lock (WithCache) may take the key provider's lock (leases), never the reverse: a key
+// registration runs outside the generation lock and only its revoke cleanup enters it afterwards.
+// Scheduled, `g` is the scheduler's engine thread (OnEngineCache): every route runs there between units.
 // The scheduled generator's session cache, used on its engine thread (between units).
 struct OnEngineCache {
   halo::server::ScheduledGenerator& g;
@@ -129,7 +145,8 @@ struct OnEngineCache {
 };
 
 template <class G>
-static void RegisterSpillRoutes(halo::server::HttpServer& http, G& g) {
+static void RegisterSpillRoutes(halo::server::HttpServer& http, G& g, halo::server::MasterSpillKeys* master,
+                                halo::server::YardSpillKeys* yard, bool key_routes) {
   using halo::server::HttpRequest;
   using halo::server::HttpResponse;
   using halo::server::SessionCache;
@@ -138,13 +155,15 @@ static void RegisterSpillRoutes(halo::server::HttpServer& http, G& g) {
     g.WithCache([&](SessionCache& c) {
       bool first = true;
       for (const auto& e : c.List()) {
-        char b[320];
+        char b[700];  // labels and key ids are printable ASCII without quotes (spill_crypt.cpp, yard session ids)
         std::snprintf(b, sizeof(b),
                       "%s{\"key\":%llu,\"tokens\":%zu,\"checkpoint\":%s,\"canonical\":%s,\"spilled\":%s,"
-                      "\"device_bytes\":%zu,\"file_bytes\":%llu}",
+                      "\"device_bytes\":%zu,\"file_bytes\":%llu,\"session\":\"%s\",\"key_id\":\"%s\",\"yard_bound\":%s,"
+                      "\"entry_id\":\"%s\"}",
                       first ? "" : ",", static_cast<unsigned long long>(e.key), e.tokens, e.checkpoint ? "true" : "false",
                       e.canonical ? "true" : "false", e.spilled ? "true" : "false", e.device_bytes,
-                      static_cast<unsigned long long>(e.file_bytes));
+                      static_cast<unsigned long long>(e.file_bytes), JsonSafe(e.session).c_str(),
+                      JsonSafe(e.key_id).c_str(), e.yard_bound ? "true" : "false", JsonSafe(e.entry_id).c_str());
         body += b;
         first = false;
       }
@@ -156,17 +175,52 @@ static void RegisterSpillRoutes(halo::server::HttpServer& http, G& g) {
     const std::string rest = r.path.substr(std::string_view("/admin/sessions/").size());
     const auto slash = rest.find('/');
     const std::string op = slash == std::string::npos ? "" : rest.substr(slash + 1);
-    char* end = nullptr;
-    const unsigned long long key = std::strtoull(rest.c_str(), &end, 10);
-    if (slash == std::string::npos || end != rest.c_str() + slash || (op != "spill" && op != "restore"))
+    std::uint64_t key = 0;
+    if (slash == std::string::npos || !halo::server::ParseU64(std::string_view(rest).substr(0, slash), ~0ull, &key) ||
+        (op != "spill" && op != "restore"))
       return HttpResponse::Json(404, "{\"error\":\"POST /admin/sessions/{key}/spill or /restore\"}");
+    // No ?session=: which yard session (and key) seals an entry is named by the seal registration itself
+    // (halo_spill.entry), so an admin caller cannot relabel an entry or spend another session's registration.
+    if (!r.query.empty())
+      return HttpResponse::Json(400, "{\"error\":\"no query parameters (the seal registration names the entry)\"}");
     std::string why;
     const bool ok = g.WithCache([&](SessionCache& c) { return op == "spill" ? c.Spill(key, &why) : c.Restore(key, &why); });
-    std::string esc;
-    for (char ch : why) esc += ch == '"' || ch == '\\' ? std::string("\\") + ch : std::string(1, ch);
     return ok ? HttpResponse::Json(200, "{\"ok\":true}")
-              : HttpResponse::Json(409, "{\"ok\":false,\"error\":\"" + esc + "\"}");
+              : HttpResponse::Json(409, "{\"ok\":false,\"error\":\"" + JsonSafe(why) + "\"}");
   });
+  // Spill encryption, phase B: yard-ctl registers per-checkpoint keys (docs/SESSIONS.md section 10, "The key route").
+  if (yard && key_routes) {
+    http.Route("GET", "/admin/keys", [yard](const HttpRequest&) { return HttpResponse::Json(200, yard->ListJson()); });
+    http.RoutePrefix("POST", "/admin/keys/", [&g, yard](const HttpRequest& r) {
+      const std::string session = r.path.substr(std::string_view("/admin/keys/").size());
+      // The body holds the key and the token: Register overwrites it (the request is this connection's own copy).
+      auto a = yard->Register(session, const_cast<std::string&>(r.body));
+      std::size_t dropped = 0;
+      // A revoke's cleanup carries its fence: only that session's entries at key epochs <= through go.
+      if (a.status == 200 && !a.revoked_session.empty())
+        g.WithCache([&](SessionCache& c) { return dropped = c.DropRevoked(a.revoked_session, a.revoked_through), true; });
+      if (dropped) a.body.insert(a.body.size() - 1, ",\"dropped\":" + std::to_string(dropped));
+      return HttpResponse::Json(a.status, a.body);
+    });
+  }
+  // Spill encryption, phase A: fence the master's epoch. Files sealed before no longer open through this server and
+  // their entries are erased and files deleted. This is an access fence, not crypto-shredding: the master still
+  // derives the old KEKs (docs/SESSIONS.md section 10, "Epochs"). /admin/spill/rotate is the old name.
+  const auto fence = [&g, master](const HttpRequest&) {
+    std::string why;
+    if (!master) return HttpResponse::Json(409, "{\"ok\":false,\"error\":\"no master spill key provider\"}");
+    std::size_t dropped = 0;
+    const bool ok = g.WithCache([&](SessionCache& c) {
+      if (!master->FenceEpoch(&why)) return false;
+      dropped = c.DropUnreadable();
+      return true;
+    });
+    if (!ok) return HttpResponse::Json(409, "{\"ok\":false,\"error\":\"" + JsonSafe(why) + "\"}");
+    return HttpResponse::Json(200, "{\"ok\":true,\"keys\":\"" + JsonSafe(master->Describe()) +
+                                       "\",\"dropped\":" + std::to_string(dropped) + "}");
+  };
+  http.Route("POST", "/admin/spill/fence-epoch", fence);
+  http.Route("POST", "/admin/spill/rotate", fence);
 }
 
 int main(int argc, char** argv) {
@@ -189,6 +243,11 @@ int main(int argc, char** argv) {
   server::ScheduledOptions sched;     // --sched-*
   double sched_capacity_gb = -1;      // ledger capacity (-1: what the device has left after loading, less margins)
   bool decider_scheduled = false;     // --decider-mode (G3 M4, D2)
+  std::string spill_key = "none";     // --spill-key (server/spill_keys.hpp)
+  std::string admin_socket;           // --admin-socket (default $XDG_RUNTIME_DIR/halo-flash/admin.sock)
+  bool yard_keys_tcp = false;         // --yard-keys-tcp
+  server::YardSpillKeys::Options yard_opt;  // --yard-* (phase B)
+  bool yard_fallback_master = false;  // --spill-yard-fallback
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--help" || a == "-h") {
@@ -203,9 +262,32 @@ int main(int argc, char** argv) {
           "                        Default KV reliably holds ~150K positions; 262144 needs fp16-only KV.\n"
           "  --prefix-cache exact|fast|off  prompt-prefix reuse (default exact: byte-identical to a cold prefill)\n"
           "  --prefix-cache-sessions N --prefix-cache-gb G --prefix-cache-align N\n"
-          "  --spill-dir DIR       session spill files (default /data/halo-work/spill; 0700 dir, 0600 files)\n"
+          "  --spill-dir DIR       session spill files and key state (default /data/halo-work/spill; 0700 dir, 0600\n"
+          "                        files). Always required: halo_serve creates it and owns it (spill-dir.lock), also with\n"
+          "                        --spill-key none; a second halo_serve on it refuses to start\n"
           "  --spill-evict 0|1     cache eviction spills to DIR instead of dropping (default 0). Admin routes:\n"
-          "                        GET /admin/sessions, POST /admin/sessions/{key}/spill | /restore\n"
+          "                        GET /admin/sessions, POST /admin/sessions/{key}/spill | /restore,\n"
+          "                        POST /admin/spill/fence-epoch (master epoch + 1, persisted: older files are\n"
+          "                        fenced and deleted; an access fence, not erasure; old name /admin/spill/rotate)\n"
+          "  --spill-key tpm[:CRED]|file:PATH|none  spill encryption key (format v2, AES-256-GCM). tpm: the\n"
+          "                        TPM2-sealed systemd credential halo-spill-master (default CRED\n"
+          "                        $XDG_CONFIG_HOME/halo-flash/spill-master.cred; $CREDENTIALS_DIRECTORY first).\n"
+          "                        Default none: spills are REFUSED (eviction drops) unless --spill-plaintext-ok 1\n"
+          "  --spill-plaintext-ok 0|1  with no --spill-key, write plaintext v1 files (default 0)\n"
+          "  --spill-accept-v1 0|1 restore plaintext v1 files this process wrote as v1 (default 0; logged per file;\n"
+          "                        a migration aid only, to be removed with format v1)\n"
+          "                        The master's epoch is persisted in DIR/master-<key name>.epoch (never goes back)\n"
+          "  --yard-jwks PATH      phase B: yard-ctl registers per-checkpoint keys (POST /admin/keys/{session}, RS256 JWT\n"
+          "                        verified against this JWKS file, re-read when it changes and at least every 60 s);\n"
+          "                        --yard-issuer ISS (required) --yard-audience AUD (default halo_serve, non-empty)\n"
+          "                        --yard-key-ttl S (1..3600, default 600) --yard-state PATH (default DIR/yard-state)\n"
+          "                        --spill-yard-fallback master|refuse (default refuse: an entry without a seal\n"
+          "                        registration is not spilled; master: sealed under --spill-key unless yard-bound)\n"
+          "  --admin-socket PATH   admin routes on a Unix socket (dir 0700, socket 0600, peer uid checked); the yard\n"
+          "                        key route is served only there (default $XDG_RUNTIME_DIR/halo-flash/admin.sock)\n"
+          "                        Same uid only: a caller of another uid (yard-ctl) uses the tailnet route\n"
+          "  --yard-keys-tcp 0|1   also serve the key route on --host:--port (only behind an authenticated, encrypted\n"
+          "                        transport such as the tailnet's WireGuard: the key is in the body; default 0)\n"
           "  --mtp-model SIDECAR [--mtp-vocab IDS] [--mtp-window W|all (all)] [--mtp-depth N (4)]\n"
           "                        MTP speculative decoding (off without --mtp-model)\n"
           "  --scheduler on|off    G3 fair scheduler (default on): prefill slices, batched decode, fair queuing over\n"
@@ -254,6 +336,39 @@ int main(int argc, char** argv) {
     else if (a == "--prefix-cache-align") cache.align = static_cast<std::uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
     else if (a == "--spill-dir") cache.spill_dir = v;
     else if (a == "--spill-evict") cache.spill_on_evict = v == "1";
+    else if (a == "--spill-key") spill_key = v;
+    else if (a == "--spill-plaintext-ok") cache.spill_plaintext_ok = v == "1";
+    else if (a == "--spill-accept-v1") {
+      if (v != "0" && v != "1") return std::fprintf(stderr, "--spill-accept-v1 must be 0 or 1\n"), 2;
+      cache.spill_accept_v1 = v == "1";
+    } else if (a == "--spill-epoch") {
+      return std::fprintf(stderr, "--spill-epoch was removed: the master's epoch is persisted next to the spill files "
+                                  "and moves only by POST /admin/spill/fence-epoch\n"), 2;
+    }
+    else if (a == "--yard-jwks") yard_opt.jwks_path = v;
+    else if (a == "--yard-issuer") yard_opt.issuer = v;
+    else if (a == "--yard-audience") yard_opt.audience = v;
+    else if (a == "--yard-state") yard_opt.state_path = v;
+    else if (a == "--yard-key-ttl") {
+      std::uint64_t t = 0;
+      if (!server::ParseU64(v, 3600, &t) || t < 1) return std::fprintf(stderr, "--yard-key-ttl must be 1..3600 s\n"), 2;
+      yard_opt.key_ttl_s = static_cast<std::int64_t>(t);
+    } else if (a == "--admin-socket") {
+      if (v.empty() || v.size() > sizeof(sockaddr_un::sun_path) - 1)
+        return std::fprintf(stderr, "--admin-socket: a path of 1..%zu bytes\n", sizeof(sockaddr_un::sun_path) - 1), 2;
+      admin_socket = v;
+    }
+    else if (a == "--admin-socket-peer-uid") {
+      return std::fprintf(stderr, "--admin-socket-peer-uid was removed: the admin socket (0700 dir, 0600 socket) only "
+                                  "admits halo_serve's own uid; see IDENTITY.md \"Transport\"\n"), 2;
+    } else if (a == "--yard-keys-tcp") {
+      if (v != "0" && v != "1") return std::fprintf(stderr, "--yard-keys-tcp must be 0 or 1\n"), 2;
+      yard_keys_tcp = v == "1";
+    }
+    else if (a == "--spill-yard-fallback") {
+      if (v != "master" && v != "refuse") return std::fprintf(stderr, "--spill-yard-fallback must be master or refuse\n"), 2;
+      yard_fallback_master = v == "master";
+    }
     else if (a == "--model-id") model_id = v;
     else if (a == "--anthropic-alias") {
       const auto alias = server::ParseModelAliasSpec(v);
@@ -301,7 +416,43 @@ int main(int argc, char** argv) {
     return std::fprintf(stderr, "usage: halo_serve --model <gguf> | --qwen35-model <gguf> --qwen35-tokenizer <gguf> [options]\n"), 2;
   if (cache.spill_dir.empty()) cache.spill_dir = "/data/halo-work/spill";  // SR4 default: not /tmp (docs/SESSIONS.md 10)
   if (!mtp_model.empty() && model.empty()) return std::fprintf(stderr, "--mtp-model needs --model (Flash-Next)\n"), 2;
+  // Test hook (the poison integration test): every failed restore's cleanup synchronize "fails".
+  if (const char* f = std::getenv("HALO_TEST_RESTORE_SYNC_FAULT"); f && std::string(f) == "1")
+    engine::FlashNextGpu::restore_sync_fault_ = true;
   std::string error;
+  // Spill encryption keys: loaded before the cache exists and destroyed after it (masters zeroed on exit).
+  // The spill directory holds the spill files and the key state (master epoch, yard epochs): created 0700 here,
+  // and owned by this process for its lifetime (spill-dir.lock), before any key or the model loads: a second
+  // halo_serve on the same directory refuses to start, whatever its keys.
+  std::unique_ptr<server::StateDir> spill_state_dir;
+  std::unique_ptr<server::StateLock> spill_dir_lock;
+  {
+    std::error_code ec;
+    std::filesystem::create_directories(cache.spill_dir, ec);
+    if (!ec) std::filesystem::permissions(cache.spill_dir, std::filesystem::perms::owner_all, ec);
+    if (ec) return std::fprintf(stderr, "--spill-dir %s: %s\n", cache.spill_dir.c_str(), ec.message().c_str()), 1;
+    spill_state_dir = server::StateDir::Open(cache.spill_dir, &error);
+    if (spill_state_dir) spill_dir_lock = spill_state_dir->Lock("spill-dir", &error);
+    if (!spill_dir_lock) return std::fprintf(stderr, "--spill-dir: %s\n", error.c_str()), 1;
+  }
+  std::unique_ptr<server::MasterSpillKeys> spill_keys;
+  if (!server::MakeSpillKeys(spill_key, cache.spill_dir, &spill_keys, &error))
+    return std::fprintf(stderr, "--spill-key %s: %s\n", spill_key.c_str(), error.c_str()), 1;
+  cache.spill_keys = spill_keys.get();
+  std::unique_ptr<server::YardSpillKeys> yard_keys;
+  if (!yard_opt.jwks_path.empty()) {
+    if (yard_fallback_master && !spill_keys)
+      return std::fprintf(stderr, "--spill-yard-fallback master needs --spill-key tpm|file:PATH\n"), 2;
+    yard_opt.fallback = yard_fallback_master ? spill_keys.get() : nullptr;
+    if (yard_opt.state_path.empty()) yard_opt.state_path = cache.spill_dir + "/yard-state";
+    yard_keys = server::YardSpillKeys::Create(yard_opt, &error);  // refuses an empty issuer / audience, bad TTLs
+    if (!yard_keys) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    cache.spill_keys = yard_keys.get();
+    cache.incarnation = yard_keys->incarnation();  // entry ids "<incarnation>.<key>" (the seal claim names one)
+    std::fprintf(stderr, "spill: encrypted (v2), keys %s\n", yard_keys->Describe().c_str());
+  } else if (spill_keys) std::fprintf(stderr, "spill: encrypted (v2), key %s\n", spill_keys->Describe().c_str());
+  else if (cache.spill_plaintext_ok) std::fprintf(stderr, "spill: PLAINTEXT v1 files (--spill-plaintext-ok 1)\n");
+  else std::fprintf(stderr, "spill: refused (no --spill-key; eviction drops)\n");
   server::FlashNextGenerator* flash_generator = nullptr;  // SR4 admin routes
   server::ScheduledGenerator* sched_generator = nullptr;
   server::FlashNextBackend* flash_backend = nullptr;  // its cache, for the SR4 admin routes
@@ -500,12 +651,34 @@ int main(int argc, char** argv) {
     });
   anthropic.Register(http);
   metrics.Register(http);
-  if (flash_generator) RegisterSpillRoutes(http, *flash_generator);
-  // Scheduled: the admin routes run on the engine thread between units.
+  // Spill admin routes: under the generation lock, or (scheduled) on the engine thread between units.
   std::optional<OnEngineCache> on_engine;
-  if (sched_generator) {
-    on_engine.emplace(OnEngineCache{*sched_generator, *flash_backend});
-    RegisterSpillRoutes(http, *on_engine);
+  if (sched_generator) on_engine.emplace(OnEngineCache{*sched_generator, *flash_backend});
+  const auto register_spill = [&](server::HttpServer& h, bool key_routes) {
+    if (flash_generator) RegisterSpillRoutes(h, *flash_generator, spill_keys.get(), yard_keys.get(), key_routes);
+    else if (on_engine) RegisterSpillRoutes(h, *on_engine, spill_keys.get(), yard_keys.get(), key_routes);
+  };
+  register_spill(http, yard_keys_tcp);
+  // The admin Unix socket: the same admin routes, and the yard key route (its default and only same-host transport).
+  std::unique_ptr<server::HttpServer> admin;
+  if ((flash_generator || on_engine) && (yard_keys || !admin_socket.empty())) {
+    if (admin_socket.empty()) {
+      const char* rt = std::getenv("XDG_RUNTIME_DIR");
+      if (!rt || !*rt) return std::fprintf(stderr, "--admin-socket: no $XDG_RUNTIME_DIR; give a path\n"), 2;
+      const std::string dir = std::string(rt) + "/halo-flash";
+      std::error_code ec;
+      std::filesystem::create_directories(dir, ec);
+      std::filesystem::permissions(dir, std::filesystem::perms::owner_all, ec);
+      admin_socket = dir + "/admin.sock";
+    }
+    server::HttpServerOptions ao;
+    ao.max_connections = 4;
+    ao.api_key = api_key;
+    ao.unix_path = admin_socket;
+    admin = std::make_unique<server::HttpServer>(ao);
+    register_spill(*admin, true);
+    if (!admin->Start(&error)) return std::fprintf(stderr, "--admin-socket: %s\n", error.c_str()), 1;
+    std::fprintf(stderr, "admin routes on unix:%s%s\n", admin_socket.c_str(), yard_keys ? " (yard key route)" : "");
   }
 #if HALO_WITH_SCOPE
   if (scope) {
@@ -556,11 +729,28 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "serving %s on http://%s:%d\n", model_id.c_str(), host.c_str(), http.port());
   std::signal(SIGINT, OnSignal);
   std::signal(SIGTERM, OnSignal);
-  while (!g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  // A poisoned engine (a failed restore whose device synchronize failed: its memory is quarantined, every call
+  // refused) is not recovered in this device context: halo_serve stops serving and exits non-zero, so the supervisor
+  // restarts it with a fresh device context.
+  int exit_code = 0;
+  while (!g_stop) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (engine && engine->poisoned()) {
+      std::fprintf(stderr, "halo_serve: the engine is POISONED (device state unverifiable): stopping, exit status 3\n");
+      exit_code = 3;
+      break;
+    }
+  }
 #if HALO_WITH_SCOPE
   if (eval_service) eval_service->Shutdown();  // running experiments stop after their current item
 #endif
   http.Stop();
+  if (admin) admin->Stop();
+  // The generator (its session cache) uses the engine: it goes first. It is declared before the engine, so scope exit
+  // alone would destroy the engine under it (a use-after-free at every shutdown, which a poisoned engine's quarantine
+  // turned into a crash).
+  admin.reset();
+  generator.reset();
 #if HALO_WITH_SCOPE
   if (scope) {
     halo_scope_flush(scope);
@@ -572,4 +762,5 @@ int main(int argc, char** argv) {
     halo_scope_close(scope);
   }
 #endif
+  return exit_code;
 }
