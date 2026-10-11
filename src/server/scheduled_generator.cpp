@@ -143,6 +143,7 @@ TextGenerator::Admission ScheduledGenerator::AdmitIds(std::span<const std::int32
       jobs_[adm.id] = job;
       backend_->Admitted(adm.id, job->ids);
       ticket->job = job;
+      a.answer = "generated";
       kick_ = true;
       wake_.notify_all();
       break;
@@ -153,6 +154,7 @@ TextGenerator::Admission ScheduledGenerator::AdmitIds(std::span<const std::int32
         ticket->gen = ++it->second->gen;
         ticket->job = it->second;
         it->second->cv.notify_all();  // the earlier reader leaves
+        a.answer = "adopted";
         break;
       }
       [[fallthrough]];  // it finished meanwhile: its answer is stored
@@ -164,6 +166,7 @@ TextGenerator::Admission ScheduledGenerator::AdmitIds(std::span<const std::int32
         break;
       }
       ticket->replay = true;
+      a.answer = "replayed";
       ticket->text = it->second.text;
       ticket->tokens = it->second.tokens;
       ticket->result = it->second.result;

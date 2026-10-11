@@ -354,12 +354,15 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
 
   if (!run->req.stream) {
     auto [error, final, cancelled] = execute(nullptr, [] { return true; }, gone);
-    if (!error.empty()) return HttpResponse::Json(500, CompactJson(ErrorBody({error, ""})));
-    if (cancelled)  // nobody is there to read it, unless the server is stopping
-      return HttpResponse::Json(503, CompactJson(ErrorBody({"generation cancelled: the client left or the server is stopping", ""})));
-    return HttpResponse::Json(200, CompactJson(final));
+    HttpResponse r =
+        !error.empty() ? HttpResponse::Json(500, CompactJson(ErrorBody({error, ""})))
+        : cancelled  // nobody is there to read it, unless the server is stopping
+            ? HttpResponse::Json(503, CompactJson(ErrorBody({"generation cancelled: the client left or the server is stopping", ""})))
+            : HttpResponse::Json(200, CompactJson(final));
+    AddAnswerHeader(r, admission);
+    return r;
   }
-  return HttpResponse::EventStream([api, run, execute, gone, keepalive = opt_.sse_keepalive_ms](const BodyWriter& write) {
+  HttpResponse r = HttpResponse::EventStream([api, run, execute, gone, keepalive = opt_.sse_keepalive_ms](const BodyWriter& write) {
     // Nothing else is written while the request is queued or prefilling (minutes at long context): with
     // sse_keepalive_ms, an SSE comment after that long without a write keeps a client's idle-read timer from
     // firing, and a client that left fails the write instead of waiting for its first token (audit D3).
@@ -376,6 +379,8 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
     }
     if (pump.alive() && api != Api::kResponses) (void)pump.Write("data: [DONE]\n\n");
   });
+  AddAnswerHeader(r, admission);
+  return r;
 }
 
 }  // namespace halo::server

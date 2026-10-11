@@ -3430,3 +3430,35 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "AnthropicService.DisableParallelToolUseStopsAfterTheFirstCall"
 why = "a route that ends the generation (disable_parallel_tool_use) is ignored: generation runs on past the first call"
+
+# ---- Halo-Answer: how a request was answered (generated / adopted / replayed) -------------------------------------
+
+[[mutant]]
+name = "sg-answer-adopted-as-generated"
+file = "src/server/scheduled_generator.cpp"
+find = '        a.answer = "adopted";'
+replace = '        a.answer = "generated";'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.HaloAnswerSaysHowAKeyedRequestWasAnswered"
+why = "an adopted retry claims a new generation: a client would charge it as generated again"
+
+[[mutant]]
+name = "sg-answer-replayed-as-generated"
+file = "src/server/scheduled_generator.cpp"
+find = '      a.answer = "replayed";'
+replace = '      a.answer = "generated";'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.HaloAnswerSaysHowAKeyedRequestWasAnswered"
+why = "a replayed answer claims a new generation"
+
+[[mutant]]
+name = "anth-answer-header-dropped"
+file = "src/server/anthropic_service.cpp"
+find = '  if (!admission.answer.empty()) headers.emplace_back("Halo-Answer", admission.answer);'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.HaloAnswerSaysHowAKeyedRequestWasAnswered"
+why = "/v1/messages does not say how it answered"

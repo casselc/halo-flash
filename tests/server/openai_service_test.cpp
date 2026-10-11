@@ -1313,6 +1313,61 @@ TEST(OpenAiService, ScheduledSecondTurnOfASandboxIsRefused429) {
   EXPECT_EQ(again.Status(), 200) << again.raw.substr(0, 300);
 }
 
+// Halo-Answer says how a request was answered: "generated" (a new generation), "adopted" (the one running for its
+// idempotency key), "replayed" (its key's stored answer, no engine work); on /v1/messages too. A server whose
+// generator keeps no keys sends none.
+TEST(OpenAiService, HaloAnswerSaysHowAKeyedRequestWasAnswered) {
+  const auto answer = [](const Conn& c) -> std::string {
+    const auto head = c.raw.substr(0, c.raw.find("\r\n\r\n"));
+    const auto at = head.find("Halo-Answer: ");
+    return at == std::string::npos ? "" : head.substr(at + 13, head.find("\r\n", at) - at - 13);
+  };
+  {
+    ServingRig rig(0, true);
+    const int port = rig.server.port();
+    (void)rig.gen.Plan("m921x", -1, 3);
+    Conn a(port, RequestBody("m921x", false, 16), 0, "Idempotency-Key: k921\r\n");
+    a.ReadToEnd();
+    ASSERT_EQ(a.Status(), 200) << a.raw.substr(0, 300);
+    EXPECT_EQ(answer(a), "generated");
+    Conn b(port, RequestBody("m921x", false, 16), 0, "Idempotency-Key: k921\r\n");
+    b.ReadToEnd();
+    EXPECT_EQ(answer(b), "replayed");
+    EXPECT_EQ(Delivered(b, false).text, Delivered(a, false).text);
+    // In flight: the retry adopts the running generation (its first reader leaves).
+    auto held = rig.gen.Plan("m922x", 1, 3);
+    Conn c(port, RequestBody("m922x", true, 16), 0, "Idempotency-Key: k922\r\n");
+    std::thread rc([&] { c.ReadToEnd(); });
+    ASSERT_TRUE(Await([&] { return held->held.load(); }));
+    const auto adopted = rig.sched->scheduler().counters().adopted;
+    Conn d(port, RequestBody("m922x", true, 16), 0, "Idempotency-Key: k922\r\n");
+    std::thread rd([&] { d.ReadToEnd(); });
+    ASSERT_TRUE(Await([&] { return rig.sched->scheduler().counters().adopted > adopted; }));
+    held->release = true;
+    rc.join();
+    rd.join();
+    EXPECT_EQ(answer(c), "generated");
+    EXPECT_EQ(answer(d), "adopted");
+    EXPECT_TRUE(Delivered(d, true).full);
+    // /v1/messages.
+    (void)rig.gen.Plan("m923x", -1, 3);
+    Conn e(port, MessagesBody("m923x", false, 16), 0, "Idempotency-Key: k923\r\n");
+    e.ReadToEnd();
+    EXPECT_EQ(answer(e), "generated") << e.raw.substr(0, 300);
+    Conn f(port, MessagesBody("m923x", false, 16), 0, "Idempotency-Key: k923\r\n");
+    f.ReadToEnd();
+    EXPECT_EQ(answer(f), "replayed");
+  }
+  {
+    ServingRig rig;  // not scheduled: no keys kept
+    (void)rig.gen.Plan("m924x", -1, 3);
+    Conn a(rig.server.port(), RequestBody("m924x", false, 16), 0, "Idempotency-Key: k924\r\n");
+    a.ReadToEnd();
+    ASSERT_EQ(a.Status(), 200);
+    EXPECT_EQ(answer(a), "");
+  }
+}
+
 // The same through /v1/messages on the real scheduler: the second turn is refused 429 with Retry-After in the
 // Anthropic error shape and never reaches the engine; the scheduler counts tokens for count_tokens and
 // message_start without the engine thread.

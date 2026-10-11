@@ -43,6 +43,10 @@ TextGenerator::Admission AdmitTurn(TextGenerator& gen, const GenerationRequest& 
                     req.idempotency_key, nullptr});
 }
 
+void AddAnswerHeader(HttpResponse& r, const TextGenerator::Admission& a) {
+  if (!a.answer.empty()) r.headers.emplace_back("Halo-Answer", a.answer);
+}
+
 TurnOutcome RunTurn(TextGenerator& gen, const ServiceOptions& opt, const GenerationRequest& req,
                     const std::string& prompt, std::shared_ptr<void> ticket, const TurnIo& io, GenerationRecord* rec) {
   TurnOutcome out;

@@ -43,6 +43,9 @@ void DefaultIdempotencyKey(GenerationRequest& req, std::string_view material, Ap
 [[nodiscard]] TextGenerator::Admission AdmitTurn(TextGenerator& gen, const GenerationRequest& req,
                                                  const std::string& prompt, const std::function<bool()>& gone);
 
+/// The Halo-Answer header for an admitted request (none when the generator keeps no keys).
+void AddAnswerHeader(HttpResponse& r, const TextGenerator::Admission& a);
+
 struct TurnIo {
   /// Text after stop matching, in the API's events; false ends the generation here (a cut, not a departure).
   std::function<bool(std::string_view)> sink;

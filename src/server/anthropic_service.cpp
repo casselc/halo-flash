@@ -187,6 +187,7 @@ HttpResponse AnthropicService::Messages(const HttpRequest& http) {
                              run->req.gen.tool_choice.mode != ToolChoice::Mode::kNone, opt_.new_id};
   std::vector<std::pair<std::string, std::string>> headers = {{"request-id", "req_" + id.substr(4)}};
   if (!run->req.ignored.empty()) headers.emplace_back("x-halo-ignored", Join(run->req.ignored));
+  if (!admission.answer.empty()) headers.emplace_back("Halo-Answer", admission.answer);
 
   if (!run->req.gen.stream) {
     MessageBuilder builder(bo);

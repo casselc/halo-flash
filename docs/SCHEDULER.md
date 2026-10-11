@@ -232,6 +232,16 @@ retries, and the retry queues behind the dead attempt. Three rules break it, eac
 Caller rule: **retry only with the same idempotency key, after Retry-After or on a lost connection; never a fresh
 key for the same turn**. The unsafe rule, a fresh key per retry, is the mutant `noIdempotency`.
 
+**How a request was answered: `Halo-Answer`.** Every admitted response (OpenAI routes and `/v1/messages`,
+streamed or not, success or error) carries the response header `Halo-Answer` with one of:
+- `generated`: a new generation ran for it (with a key whose earlier attempt was fenced, this is a regeneration:
+  the fenced attempt's tokens were spent and are in no answer's usage);
+- `adopted`: it took over the generation already running for its idempotency key (within the keyed grace);
+- `replayed`: its key's generation had finished; the stored answer was sent, with no engine work.
+The usage an adopted or replayed answer reports is that one generation's. A server that keeps no keys (`--scheduler
+off`, or a build before G3) sends no `Halo-Answer` at all: a client can tell from its absence that keys are not
+honoured. A 429 carries none (nothing was admitted).
+
 ## 8. Q6: observability
 
 Per request (observer GENERATION attributes and `/metrics`, vLLM names where they exist): `queue_wait_ms` (arrival

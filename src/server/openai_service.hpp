@@ -64,6 +64,10 @@ class TextGenerator {
     std::int64_t retry_after_s = 0;
     std::string why;
     std::shared_ptr<void> ticket;  ///< passed back in Params::ticket
+    /// How an admitted request will be answered, sent as the Halo-Answer response header: "generated" (a new
+    /// generation), "adopted" (the generation already running for its idempotency key), "replayed" (the stored
+    /// answer of its key's finished generation). Empty: the generator keeps no keys (no header).
+    std::string answer;
   };
   virtual Admission Admit(const Params& params) {
     (void)params;
