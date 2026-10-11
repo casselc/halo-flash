@@ -1340,6 +1340,39 @@ TEST(OpenAiService, TokensDecodedByAFencedRequestAreCounted) {
   EXPECT_LE(n, 2000.0);
 }
 
+// A retry that adopts a generation already decoding (its first client looks connected: a vanished peer) takes the
+// whole answer; the reader it took over is recorded detached with no tokens, so the generation is counted once.
+TEST(OpenAiService, AnAdoptedReaderCountsNoTokens) {
+  ServingRig rig(0, true);
+  const int port = rig.server.port();
+  auto held = rig.gen.Plan("m941x", SteppedGenerator::kChunks + 3, 6);  // held after three decode steps
+  Conn a(port, RequestBody("m941x", true, 16), 0, "Idempotency-Key: k941\r\n");
+  std::thread ra([&] { a.ReadToEnd(); });
+  ASSERT_TRUE(Await([&] { return held->held.load(); }));
+  const auto adopted = rig.sched->scheduler().counters().adopted;
+  Conn b(port, RequestBody("m941x", true, 16), 0, "Idempotency-Key: k941\r\n");
+  std::thread rb([&] { b.ReadToEnd(); });
+  ASSERT_TRUE(Await([&] { return rig.sched->scheduler().counters().adopted > adopted; }));
+  held->release = true;
+  ra.join();
+  rb.join();
+  EXPECT_TRUE(Delivered(b, true).full);
+  ASSERT_TRUE(Await([&] {
+    std::lock_guard<std::mutex> lk(rig.observed.mu);
+    return rig.observed.records.size() >= 2;
+  }));
+  std::lock_guard<std::mutex> lk(rig.observed.mu);
+  std::uint64_t counted = 0;
+  int detached = 0;
+  for (const auto& r : rig.observed.records) {
+    counted += r.completion_tokens;
+    detached += r.finish_reason == "detached";
+    if (r.finish_reason == "detached") EXPECT_EQ(r.completion_tokens, 0u) << "the reader taken over counts nothing";
+  }
+  EXPECT_EQ(detached, 1);
+  EXPECT_EQ(counted, 7u) << "one generation: the whole answer, counted once";  // 6 words + the reasoning piece
+}
+
 // Halo-Answer says how a request was answered: "generated" (a new generation), "adopted" (the one running for its
 // idempotency key), "replayed" (its key's stored answer, no engine work); on /v1/messages too. A server whose
 // generator keeps no keys sends none.

@@ -76,7 +76,9 @@ ScheduledGenerator::~ScheduledGenerator() {
   if (thread_.joinable()) thread_.join();
 }
 
-std::int64_t ScheduledGenerator::NowMs() const { return static_cast<std::int64_t>(Ms(epoch_, Clock::now())); }
+std::int64_t ScheduledGenerator::NowMs() const {
+  return opt_.now_ms ? opt_.now_ms() : static_cast<std::int64_t>(Ms(epoch_, Clock::now()));
+}
 
 std::shared_ptr<ScheduledGenerator::Job> ScheduledGenerator::FindShared(Job& job) {
   auto j = Find(job.id);
@@ -505,6 +507,7 @@ void ScheduledGenerator::RunSlice(Job& job, std::uint32_t tokens, Scheduler::Pro
                                           job.spec ? &job.spec_stats : nullptr);
     // The first token belongs to the prefill's unit (~40 ms): TTFT is then the request's own prefill and the slices
     // fair queuing ordered before it, not every other request's prefill too.
+    if (!opt_.first_token_in_slice) return;
     std::vector<Scheduler::Progress> first;
     RunDecodeUnit({FindShared(job)}, 1, &first);
     p->decoded = first.empty() ? 0 : first[0].decoded;
@@ -611,6 +614,27 @@ void ScheduledGenerator::Sync() {
   sched_.SyncRetained(backend_->Retained());
 }
 
+void ScheduledGenerator::Fence(const std::vector<Scheduler::Id>& ids) {
+  for (auto id : ids) {
+    auto job = Find(id);
+    if (!job) continue;
+    if (backend_->HasLease(id)) backend_->Abandon(id);
+    backend_->Fenced(id);
+    // Its prefill progress may be parked for a retry; its decoded tokens are discarded.
+    if (job->run) fenced_decoded_ += job->run->outcome().completion;
+    {
+      std::lock_guard<std::mutex> lk(job->mu);
+      job->result.cancelled = true;
+    }
+    FinishJob(*job, "");
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      held_.push_back(job);
+      jobs_.erase(id);
+    }
+  }
+}
+
 void ScheduledGenerator::Loop() {
   while (!stop_) {
     std::deque<std::function<void()>> posts;
@@ -625,25 +649,17 @@ void ScheduledGenerator::Loop() {
     for (const auto& v : sched_.Requests())
       if (!v.started && v.planned) pins.insert(v.planned);
     backend_->SetPins(pins);
-    auto unit = sched_.Next(NowMs());
-    for (auto id : unit.fenced) {
-      auto job = Find(id);
-      if (!job) continue;
-      if (backend_->HasLease(id)) backend_->Abandon(id);
-      backend_->Fenced(id);
-      // Its prefill progress may be parked for a retry; its decoded tokens are discarded.
-      if (job->run) fenced_decoded_ += job->run->outcome().completion;
-      {
-        std::lock_guard<std::mutex> lk(job->mu);
-        job->result.cancelled = true;
+    if (opt_.before_next) {
+      while (!stop_ && !opt_.before_next()) {
+        Fence(sched_.Boundary(NowMs()));
+        PublishFinished();
+        held_.clear();
+        Sync();
       }
-      FinishJob(*job, "");
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        held_.push_back(job);
-        jobs_.erase(id);
-      }
+      if (stop_) break;
     }
+    auto unit = sched_.Next(NowMs());
+    Fence(unit.fenced);
     PublishFinished();  // the scheduler already let them go
     held_.clear();
     Sync();
@@ -655,6 +671,7 @@ void ScheduledGenerator::Loop() {
       kick_ = false;
       continue;
     }
+    const auto t0_ms = NowMs();  // the test clock's unit start (it may move while before_unit holds the unit)
     if (opt_.before_unit) opt_.before_unit(unit);
     if (kTrace) {
       std::fprintf(stderr, "sched %lld: unit %d [", static_cast<long long>(NowMs()), static_cast<int>(unit.kind));
@@ -680,7 +697,7 @@ void ScheduledGenerator::Loop() {
         ps.push_back({j->id, 0, 0, false, true, static_cast<bool>(j->work)});
       }
     }
-    const auto elapsed = static_cast<std::int64_t>(Ms(t0, Clock::now()));
+    const auto elapsed = opt_.now_ms ? NowMs() - t0_ms : static_cast<std::int64_t>(Ms(t0, Clock::now()));
     {
       std::lock_guard<std::mutex> lk(stats_mu_);
       const double sec = static_cast<double>(elapsed) * 1e-3;
