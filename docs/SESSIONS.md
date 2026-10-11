@@ -141,6 +141,21 @@ n-gram host 2.7) ~0.9 -> ~20.
    reordered sums), a numerics change for the single path that would need the precision gate and the user's
    decision.
 
+### Relaxing exactness for B >= 2 (user decision, 2026-10-11)
+
+The contract above (a batched entry byte-identical to the session stepped alone) is what keeps B = 8 at 59.6 tok/s
+against gufo's 101.6. Measured before relaxing it (`halo_score`, main 2aa35f5, ds4 alibaba fixtures; streams/BQ):
+- **Batch-shaped arithmetic costs no quality.** Scoring every continuation token as a one-token Prefill (the chunk
+  path's batch-shaped GEMMs) instead of a decode step changes every case's sum and passes the gate: short dNLL
+  -0.00088 +- 0.00035 (0.2850 -> 0.2841, agreement 92.60 -> 92.65%), long -0.00020 +- 0.00052; the greedy argmax
+  changes at 0.79% (short) and 0.65% (long) of positions, near-ties both ways.
+- **The single path keeps its kernels.** A batch-shaped B = 1 step measured 60-66 ms against 37 (ROOFLINE, "batch-shaped
+  WMMA verify path"), so only B >= 2 takes relaxed kernels. Consequence: a session's greedy output may differ (at about
+  that rate) depending on whether it shared a batch.
+- **The gate for relaxed kernels:** `halo_score --prefill 1 --batch 8` scores the fixtures through StepBatch. On
+  today's exact kernels it reproduces the single-token scores case for case (98/98, 12/12), the control; a relaxed
+  kernel must pass `streams/P/compare.py` against the single-token scores.
+
 ## 4. Tests
 
 - `Sessions.SwarmMatchesFreshReplay` (Hegel, swarm: each run enables a random subset of the rules): new / fork /
