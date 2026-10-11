@@ -189,6 +189,157 @@ HALO_FOR_NB(HALO_DUAL_B)
 #undef HALO_DUAL_B
 #undef HALO_DUAL_BV
 
+// ---- Relaxed batched dense kernels (B >= 2, docs/SESSIONS.md 3 "Relaxing exactness") ------------------------------
+// The columns' activations quantized to int8 per 32 values (as the routed experts' Q8Act); each lane's 16 weights of a
+// row one v_dot4 chain per column, scaled per 32-block by weight scale x activation scale. Not byte-identical to the
+// single-token kernels: gated by halo_score --batch against the single-token scores.
+
+// Quantizes B columns of x (column stride xstride floats; cols % 32 == 0) to int8 xq (column stride cols bytes) and
+// per-32 scales xs (column stride cols / 32). Grid (ceil(cols / 256), B), 256 threads: a warp per 32 values.
+// With xq2 / xs2 (the residual plane, same layout): the residual x - q * s quantized again, so that
+// x ~ q * s + q2 * s2 (two int8 levels, ~15 bits).
+extern "C" __global__ void __launch_bounds__(256)
+    halo_q8x_cols(const float* x, std::uint32_t xstride, std::uint32_t cols, std::int8_t* xq, float* xs,
+                  std::int8_t* xq2, float* xs2) {
+  const std::uint32_t b = blockIdx.y, lane = threadIdx.x % kWarp, nblk = cols / 32;
+  const std::uint32_t blk = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp;
+  if (blk >= nblk) return;
+  const float v = x[static_cast<std::size_t>(b) * xstride + blk * 32 + lane];
+  float amax = fabsf(v);
+  for (int o = kWarp / 2; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o, kWarp));
+  const float scale = amax / 127.0f;
+  const int qv = scale > 0.0f ? static_cast<int>(rintf(v / scale)) : 0;
+  xq[static_cast<std::size_t>(b) * cols + blk * 32 + lane] = static_cast<std::int8_t>(qv);
+  if (lane == 0) xs[static_cast<std::size_t>(b) * nblk + blk] = scale;
+  if (!xq2) return;
+  const float r = v - static_cast<float>(qv) * scale;
+  float rmax = fabsf(r);
+  for (int o = kWarp / 2; o > 0; o >>= 1) rmax = fmaxf(rmax, __shfl_xor(rmax, o, kWarp));
+  const float s2 = rmax / 127.0f;
+  const int q2 = s2 > 0.0f ? static_cast<int>(rintf(r / s2)) : 0;
+  xq2[static_cast<std::size_t>(b) * cols + blk * 32 + lane] = static_cast<std::int8_t>(q2);
+  if (lane == 0) xs2[static_cast<std::size_t>(b) * nblk + blk] = s2;
+}
+
+namespace {
+template <int kRows, int NB, bool kResid = false>
+__device__ inline void Q8RowsDotI8B(const std::int8_t* qs, const std::uint16_t* d, const std::int8_t* xq,
+                                    const float* xs, const std::int8_t* xq2, const float* xs2, std::uint32_t r0,
+                                    bool active, std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride,
+                                    float (&out)[NB][kRows]) {
+  const std::uint32_t lane = threadIdx.x % kWarp, nblk = cols / 32;
+  float acc[NB][kRows] = {};
+  if (active)
+    for (std::uint32_t c = lane * 16; c < cols; c += kWarp * 16) {
+      int4 q[kRows];
+      float sc[kRows];
+#pragma unroll
+      for (int k = 0; k < kRows; ++k) {
+        const std::uint32_t r = min(r0 + k, rows - 1);
+        q[k] = *reinterpret_cast<const int4*>(qs + static_cast<std::size_t>(r) * qstride + c);
+        sc[k] = F16(d[static_cast<std::size_t>(r) * nblk + c / 32]);
+      }
+#pragma unroll
+      for (int b = 0; b < NB; ++b) {
+        const int4 xv = *reinterpret_cast<const int4*>(xq + static_cast<std::size_t>(b) * cols + c);
+        const float s = xs[static_cast<std::size_t>(b) * nblk + c / 32];
+#pragma unroll
+        for (int k = 0; k < kRows; ++k) {
+          int i = __builtin_amdgcn_sudot4(true, q[k].x, true, xv.x, 0, false);
+          i = __builtin_amdgcn_sudot4(true, q[k].y, true, xv.y, i, false);
+          i = __builtin_amdgcn_sudot4(true, q[k].z, true, xv.z, i, false);
+          i = __builtin_amdgcn_sudot4(true, q[k].w, true, xv.w, i, false);
+          float part = s * static_cast<float>(i);
+          if constexpr (kResid) {
+            const int4 rv = *reinterpret_cast<const int4*>(xq2 + static_cast<std::size_t>(b) * cols + c);
+            int j = __builtin_amdgcn_sudot4(true, q[k].x, true, rv.x, 0, false);
+            j = __builtin_amdgcn_sudot4(true, q[k].y, true, rv.y, j, false);
+            j = __builtin_amdgcn_sudot4(true, q[k].z, true, rv.z, j, false);
+            j = __builtin_amdgcn_sudot4(true, q[k].w, true, rv.w, j, false);
+            part += xs2[static_cast<std::size_t>(b) * nblk + c / 32] * static_cast<float>(j);
+          }
+          acc[b][k] += sc[k] * part;
+        }
+      }
+    }
+#pragma unroll
+  for (int b = 0; b < NB; ++b)
+#pragma unroll
+    for (int k = 0; k < kRows; ++k) out[b][k] = WarpSum(acc[b][k]);
+}
+
+// `groups` column groups of NB interleaved with the row blocks (more blocks for few rows).
+template <int kRows, int NB, bool kResid>
+__device__ inline void GemvQ8rI8B(const std::int8_t* qs, const std::uint16_t* d, const std::int8_t* xq, const float* xs,
+                                  const std::int8_t* xq2, const float* xs2, float* y, std::uint32_t rows,
+                                  std::uint32_t cols, std::uint32_t qstride, std::uint32_t ystride,
+                                  std::uint32_t groups) {
+  const std::uint32_t bx = blockIdx.x / groups, g = blockIdx.x % groups;
+  xq += static_cast<std::size_t>(g) * NB * cols;
+  xs += static_cast<std::size_t>(g) * NB * (cols / 32);
+  if constexpr (kResid) {
+    xq2 += static_cast<std::size_t>(g) * NB * cols;
+    xs2 += static_cast<std::size_t>(g) * NB * (cols / 32);
+  }
+  y += static_cast<std::size_t>(g) * NB * ystride;
+  const std::uint32_t r0 = (bx * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
+  float out[NB][kRows];
+  Q8RowsDotI8B<kRows, NB, kResid>(qs, d, xq, xs, xq2, xs2, r0, r0 < rows, rows, cols, qstride, out);
+  if (r0 >= rows || threadIdx.x % kWarp != 0) return;
+#pragma unroll
+  for (int b = 0; b < NB; ++b)
+#pragma unroll
+    for (int k = 0; k < kRows; ++k)
+      if (r0 + k < rows) y[b * ystride + r0 + k] = out[b][k];
+}
+}  // namespace
+
+#define HALO_GEMV_I8_ROWS_V(NB, R, SUF, RES)                                                                        \
+  extern "C" __global__ void __launch_bounds__(256)                                                                  \
+      halo_gemv_q8r_i8##SUF##_r##R##_b##NB(const std::int8_t* qs, const std::uint16_t* d, const std::int8_t* xq,    \
+                                           const float* xs, const std::int8_t* xq2, const float* xs2, float* y,      \
+                                           std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride,            \
+                                           std::uint32_t ystride, std::uint32_t groups) {                            \
+    GemvQ8rI8B<R, NB, RES>(qs, d, xq, xs, xq2, xs2, y, rows, cols, qstride, ystride, groups);                        \
+  }
+#define HALO_GEMV_I8_ROWS(NB, R) HALO_GEMV_I8_ROWS_V(NB, R, , false) HALO_GEMV_I8_ROWS_V(NB, R, x, true)
+#define HALO_GEMV_I8_B(NB)                                                                                           \
+  HALO_GEMV_I8_ROWS(NB, 4) HALO_GEMV_I8_ROWS(NB, 2) HALO_GEMV_I8_ROWS(NB, 1)                                         \
+  HALO_GEMV_I8_DUAL(NB, 4) HALO_GEMV_I8_DUAL(NB, 2) HALO_GEMV_I8_DUAL(NB, 1)
+#define HALO_GEMV_I8_DUAL(NB, R) HALO_GEMV_I8_DUAL_V(NB, R, , false) HALO_GEMV_I8_DUAL_V(NB, R, x, true)
+#define HALO_GEMV_I8_DUAL_V(NB, R, SUF, RES)                                                                        \
+  extern "C" __global__ void __launch_bounds__(256) halo_gemv_q8r_i8##SUF##_dual_r##R##_b##NB(                       \
+      const std::int8_t* q1, const std::uint16_t* d1, float* y1, std::uint32_t rows1, std::uint32_t qstride1,        \
+      const std::int8_t* q2, const std::uint16_t* d2, float* y2, std::uint32_t rows2, std::uint32_t qstride2,        \
+      const std::int8_t* xq, const float* xs, const std::int8_t* xq2, const float* xs2, std::uint32_t cols,          \
+      std::uint32_t blocks1, std::uint32_t ystride1, std::uint32_t ystride2, std::uint32_t groups) {                 \
+    const std::uint32_t bxg = blockIdx.x / groups, g = blockIdx.x % groups;                                          \
+    xq += static_cast<std::size_t>(g) * NB * cols;                                                                   \
+    xs += static_cast<std::size_t>(g) * NB * (cols / 32);                                                            \
+    if (RES) {                                                                                                       \
+      xq2 += static_cast<std::size_t>(g) * NB * cols;                                                                \
+      xs2 += static_cast<std::size_t>(g) * NB * (cols / 32);                                                         \
+    }                                                                                                                \
+    const bool first = bxg < blocks1;                                                                                \
+    const std::uint32_t bx = first ? bxg : bxg - blocks1;                                                            \
+    const std::uint32_t rows = first ? rows1 : rows2;                                                                \
+    const std::uint32_t r0 = (bx * (blockDim.x / kWarp) + threadIdx.x / kWarp) * R;                                  \
+    float out[NB][R];                                                                                                \
+    Q8RowsDotI8B<R, NB, RES>(first ? q1 : q2, first ? d1 : d2, xq, xs, xq2, xs2, r0, r0 < rows, rows, cols,        \
+                        first ? qstride1 : qstride2, out);                                                           \
+    if (r0 >= rows || threadIdx.x % kWarp != 0) return;                                                              \
+    float* y = (first ? y1 : y2) + static_cast<std::size_t>(g) * NB * (first ? ystride1 : ystride2);                \
+    const std::uint32_t ystride = first ? ystride1 : ystride2;                                                       \
+    _Pragma("unroll") for (int b = 0; b < NB; ++b) _Pragma("unroll") for (int k = 0; k < R; ++k) if (r0 + k < rows) \
+        y[b * ystride + r0 + k] = out[b][k];                                                                         \
+  }
+HALO_FOR_NB(HALO_GEMV_I8_B)
+#undef HALO_GEMV_I8_B
+#undef HALO_GEMV_I8_DUAL
+#undef HALO_GEMV_I8_DUAL_V
+#undef HALO_GEMV_I8_ROWS
+#undef HALO_GEMV_I8_ROWS_V
+
 // halo_matvec_f32_rowblock2_u (DeltaNet alpha and beta): a block per row; y strides are the outputs' strides.
 #define HALO_ROWBLOCK2_B(NB)                                                                                         \
   extern "C" __global__ void __launch_bounds__(256) halo_matvec_f32_rowblock2_u_b##NB(                              \

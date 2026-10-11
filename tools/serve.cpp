@@ -295,6 +295,9 @@ int main(int argc, char** argv) {
           "                        admission, Idempotency-Key replay / adopt. off: one request at a time (FIFO)\n"
           "  --sched-slice N (2048) --sched-slice-alone N (8192) --sched-plimit N (1) --sched-capacity-gb G\n"
           "  --sched-decider-burst N (4) --sched-decider-refill R (2/s)\n"
+          "  --batch-relaxed 0|1 (1): concurrent sessions decode through the relaxed batched kernels (int8 activations,\n"
+          "      quality-gated; a session's greedy tokens may differ in ~0.8%% of positions from serving it alone);\n"
+          "      0: every batched session byte-identical to serving it alone\n"
           "  --sched-keyed-grace S (30): a request with an Idempotency-Key whose client left runs on S seconds for a\n"
           "      retry with the key to adopt (or replay) it; 0: fenced at the next boundary like any other\n"
           "  --decider-mode concurrent|scheduled  decider evaluations beside Flash-Next (default) or as scheduler units\n"
@@ -395,6 +398,7 @@ int main(int argc, char** argv) {
     else if (a == "--sched-decider-burst") sched.sched.decider_burst = std::atof(v.c_str());
     else if (a == "--sched-decider-refill") sched.sched.decider_refill_per_s = std::atof(v.c_str());
     else if (a == "--sched-keyed-grace") sched.sched.keyed_grace_s = std::atof(v.c_str());
+    else if (a == "--batch-relaxed") engine::FlashNextGpu::batch_relaxed_ = v == "1";
     else if (a == "--decider-dir") decider_dir = v;
     else if (a == "--decider-device") decider_device = v;
     else if (a == "--decider-mode") {

@@ -444,6 +444,12 @@ TEST(SessionCache, LeaseSlicesSplitOnTheAlignment) {
 // the same turn: the retry's tokens are the same too. Non-vacuous: requests overlapped, decode units batched,
 // prompts were reused.
 TEST(ScheduledGenerator, ConcurrentRequestsEqualEachServedAlone) {
+  // Equality with each request served alone holds for exact batching (the relaxed kernels are gated by halo_score).
+  struct Exact {
+    bool was = engine::FlashNextGpu::batch_relaxed_;
+    Exact() { engine::FlashNextGpu::batch_relaxed_ = false; }
+    ~Exact() { engine::FlashNextGpu::batch_relaxed_ = was; }
+  } exact;
   auto m = OpenSmall();
   if (!m) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
   constexpr std::uint32_t kCtx = 2048;

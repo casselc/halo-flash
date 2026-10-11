@@ -85,7 +85,15 @@ std::vector<float> Replay(engine::FlashNextGpu& oracle, const std::vector<Op>& o
 
 }  // namespace
 
+// Pins StepBatch's dense arithmetic for one test (FlashNextGpu::batch_relaxed_), restored after.
+struct BatchRelaxed {
+  bool was;
+  explicit BatchRelaxed(bool on) : was(engine::FlashNextGpu::batch_relaxed_) { engine::FlashNextGpu::batch_relaxed_ = on; }
+  ~BatchRelaxed() { engine::FlashNextGpu::batch_relaxed_ = was; }
+};
+
 TEST(Sessions, SwarmMatchesFreshReplay) {
+  const BatchRelaxed exact(false);  // the swarm checks byte equality with a fresh replay
   Small* s = LoadSmall();
   if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
   auto devices = Devices();
@@ -381,6 +389,7 @@ TEST(Sessions, ForkedSessionsDivergeIndependently) {
 // Directed: B sessions with different histories stepped together for many steps, every B from 2 to 8, logits
 // and device sampling; each entry against its own session stepped alone on a second engine (same ops).
 TEST(Sessions, BatchedStepsEqualSingleSteps) {
+  const BatchRelaxed exact(false);
   Small* s = LoadSmall();
   if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
   auto devices = Devices();
@@ -454,6 +463,78 @@ TEST(Sessions, BatchedStepsEqualSingleSteps) {
         ASSERT_TRUE(solo->BindSession(0, &error) && solo->DropSession(sids[b], &error)) << error;
       }
     }
+}
+
+// Relaxed batched kernels (B >= 2: int8 activations, v_dot4): each entry's logits stay close to the session stepped
+// alone (tolerances fixed before the first run: max |diff| <= 2% of the single step's max |logit|, greedy argmax equal
+// at >= 90% of entry steps), but are not identical (the relaxed path ran); B = 1 stays byte-identical.
+TEST(Sessions, RelaxedBatchedStepsStayCloseToSingleSteps) {
+  const BatchRelaxed relaxed(true);
+  Small* s = LoadSmall();
+  if (!s) GTEST_SKIP() << "set HALO_SMALL_QUANT_DIR";
+  auto devices = Devices();
+  if (devices.empty()) GTEST_SKIP() << "no GPU backend";
+  const std::size_t V = s->weights->config.vocab_size;
+  constexpr std::uint32_t kMaxContext = 128;
+  auto& dev = *devices[0];
+  std::string error;
+  auto gpu = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+  ASSERT_TRUE(gpu) << error;
+  auto solo = engine::FlashNextGpu::Create(dev, *s->weights, s->ngram.get(), nullptr, kMaxContext, &error);
+  ASSERT_TRUE(solo) << error;
+  ASSERT_TRUE(gpu->BatchSupported()) << gpu->BatchUnsupported();
+  std::uint32_t seed = 23;
+  const auto next = [&] { return static_cast<std::int32_t>((seed = seed * 1103515245u + 12345u) % V); };
+  std::size_t steps = 0, argmax_equal = 0, differ = 0;
+  double worst = 0;
+  for (std::uint32_t B = 1; B <= engine::FlashNextGpu::kMaxBatch; ++B) {
+    std::vector<engine::FlashNextGpu::SessionId> ids(B), sids(B);
+    for (std::uint32_t b = 0; b < B; ++b) {
+      ASSERT_TRUE(gpu->NewSession(&ids[b], &error)) << error;
+      ASSERT_TRUE(solo->NewSession(&sids[b], &error)) << error;
+      std::vector<std::int32_t> prompt(3 + 5 * b);
+      for (auto& t : prompt) t = next();
+      ASSERT_TRUE(gpu->BindSession(ids[b], &error) && gpu->Prefill(prompt, {}, &error)) << error;
+      ASSERT_TRUE(solo->BindSession(sids[b], &error) && solo->Prefill(prompt, {}, &error)) << error;
+    }
+    std::vector<std::int32_t> tok(B);
+    for (auto& t : tok) t = next();
+    for (int step = 0; step < 12; ++step) {
+      std::vector<std::vector<float>> outs(B, std::vector<float>(V));
+      std::vector<engine::FlashNextGpu::BatchEntry> entries(B);
+      for (std::uint32_t b = 0; b < B; ++b) entries[b] = {ids[b], tok[b], outs[b]};
+      ASSERT_TRUE(gpu->StepBatch(entries, &error)) << error;
+      for (std::uint32_t b = 0; b < B; ++b) {
+        std::vector<float> want(V);
+        ASSERT_TRUE(solo->BindSession(sids[b], &error) && solo->Step(tok[b], want, &error)) << error;
+        if (B == 1) {
+          ASSERT_EQ(std::memcmp(outs[b].data(), want.data(), V * 4), 0) << "B = 1 must keep the single kernels";
+        } else {
+          float big = 0, diff = 0;
+          for (std::size_t i = 0; i < V; ++i) {
+            big = std::max(big, std::fabs(want[i]));
+            diff = std::max(diff, std::fabs(outs[b][i] - want[i]));
+          }
+          const double rel = big > 0 ? diff / big : 0;
+          worst = std::max(worst, rel);
+          EXPECT_LE(rel, 0.02) << "B " << B << " entry " << b << " step " << step;
+          ++steps;
+          argmax_equal += std::max_element(outs[b].begin(), outs[b].end()) - outs[b].begin() ==
+                          std::max_element(want.begin(), want.end()) - want.begin();
+          differ += std::memcmp(outs[b].data(), want.data(), V * 4) != 0;
+        }
+        tok[b] = next();
+      }
+    }
+    for (std::uint32_t b = 0; b < B; ++b) {
+      ASSERT_TRUE(gpu->BindSession(0, &error) && gpu->DropSession(ids[b], &error)) << error;
+      ASSERT_TRUE(solo->BindSession(0, &error) && solo->DropSession(sids[b], &error)) << error;
+    }
+  }
+  std::printf("relaxed batched: %zu entry steps, worst max|diff| %.4f of max|logit|, argmax equal %zu, differ %zu\n",
+              steps, worst, argmax_equal, differ);
+  EXPECT_GE(argmax_equal * 10, steps * 9);
+  EXPECT_GT(differ, 0u) << "the relaxed kernels never ran (every entry byte-identical)";
 }
 
 // Stream C: with fp16-only KV the prefill reads the same fp16 K/V rows as with the fp32 store and its lazy fp16

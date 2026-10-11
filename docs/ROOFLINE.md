@@ -1585,3 +1585,16 @@ replaces CRC32C at ~13 GB/s, 4 I/O threads, disk-bound).
 | Fix round: GCM context reset after every call, fail-closed key memory, checkpoint id, restore sync on failure (SE P2) | 12K restore +-2% of 267.1 ms | restore 2K v1 80.0 / v2 80.6 ms, 12K v1 268.7 / v2 266.6 ms (medians of 5, b2.txt); spill 12K v1 227 / v2 242 ms (1 sample each: disk noise) | yes |
 | Round 3: poison flag at entry points, typed persistence (SE P3) | 12K restore +-2% of 266.6 ms | restore 12K v1 268.8 / v2 271.3 ms (medians of 5, b3.txt) | yes |
 | Round 4 on main 61e3df0 (VMM settle), quiet host (SE P4) | v2/v1 1.00 +- 0.02; 12K v2 265-285 ms | restore 12K v1 270.5 / v2 268.3 ms, 2K v1 80.5 / v2 80.8 (medians of 5, b4.txt) | yes |
+
+## 23. 2026-10-11 (stream BD, branch `stream/batch-relaxed`): relaxed batched dense kernels (B >= 2)
+
+docs/SESSIONS.md 3. The user relaxed batched exactness for B >= 2 after a quality check (the one-token Prefill proxy).
+Pinned, 4 prompts, device sampling; quality by `halo_score --prefill 1 --batch 8` against the single-token scores.
+
+| Change | Predicted | Measured | Kept |
+|---|---|---|---|
+| Dense Q8 GEMVs at B >= 2 as int8-activation v_dot4, all B columns a launch, rows a wave as before | B=8 137 -> 119-123 ms | 151.2 (worse): the 2560 x 6144 outputs at 80 blocks, 651 us a call | no (shape) |
+| Same, sweep rows a wave {4,2,1} x column groups {8,4,2} (B=8, eager) | | 1 row, 4 columns best for every shape: 2560-row 6.2 ms (exact 11.9), head 2.87 (4.8) | 1 x 4 |
+| 1 row, 4 columns everywhere incl. the DeltaNet dual | B=8 ~121, B=4 ~75, B=2 ~51 | 121.45 / 75.36 / 50.74; quality PASS, agreement -0.27 pp, argmax 0.90% | base |
+| LM head kept exact (ablation) | recovers part of the agreement | 124.24 ms; agreement -0.23 pp, argmax 0.95% | no |
+| Two int8 levels for the activations (x ~ q s + q2 s2) | argmax changes <= 0.3% | 123.46 ms; agreement +0.07 pp, dNLL -0.00012; argmax 0.79% (the arithmetic-change floor) | yes (default) |

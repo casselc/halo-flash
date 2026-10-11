@@ -525,6 +525,7 @@ int main(int argc, char** argv) {
     else if (a == "--wmma-probe-consec") wmma_consec = std::string(argv[i + 1]) == "1";
     else if (a == "--batch-check") batch_check = std::string(argv[i + 1]) == "1";
     else if (a == "--batch-decode") engine::FlashNextGpu::batch_decode_ = std::string(argv[i + 1]) == "1";
+    else if (a == "--batch-relaxed") engine::FlashNextGpu::batch_relaxed_ = std::string(argv[i + 1]) == "1";
     else if (a == "--decode-timing") decode_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--kernel-timing") kernel_timing = std::string(argv[i + 1]) == "1";
     else if (a == "--ngram-resident") ngram_resident = std::string(argv[i + 1]) == "1";

@@ -118,7 +118,11 @@ bool FlashNextGpu::AllocBatch(std::string* error) {
       a(b.pooled, c.indexer_head_dim) && a(b.router, c.num_experts) && a(b.ids, k) && a(b.wts, k) &&
       a(b.q8act, kQ8ActFloats) && a(b.ucount, 1) && a(b.uexp, k) && a(b.unum, k) && a(b.upair, k * 8) &&
       a(b.moe_h, k * c.expert_ff) && a(b.moe_part, k * H) && a(b.eg, sff) && a(b.sgate, 1) &&
-      a(b.logits, c.vocab_size) && a(b.sample_out, (sizeof(HaloSampleOut) + 3) / 4);
+      a(b.logits, c.vocab_size) && a(b.sample_out, (sizeof(HaloSampleOut) + 3) / 4) &&
+      a(b.xq, (std::max<std::size_t>({H, c.SsmValueDim(), c.AttentionQDim()}) + 3) / 4) &&
+      a(b.xs, std::max<std::size_t>({H, c.SsmValueDim(), c.AttentionQDim()}) / 32) &&
+      a(b.xq2, (std::max<std::size_t>({H, c.SsmValueDim(), c.AttentionQDim()}) + 3) / 4) &&
+      a(b.xs2, std::max<std::size_t>({H, c.SsmValueDim(), c.AttentionQDim()}) / 32);
   if (!ok) return false;
   bb_ready_ = true;
   return true;
@@ -203,11 +207,43 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
     }
     return true;
   };
+  // Relaxed (B >= 2, not a verify): the dense projections' inputs quantized once per call, then the int8-dot kernels.
+  const bool relaxed = batch_relaxed_ && !verify_ && B >= 2;
+  // A wave's rows and the column groups: one row a wave, 4 columns a group (the B = 8 sweep, streams/BD/sweep.txt:
+  // best for every dense shape); HALO_RELAXED_ROWS / HALO_RELAXED_G override for sweeps.
+  static const std::uint32_t env_rows = EnvOr("HALO_RELAXED_ROWS", 1), env_g = EnvOr("HALO_RELAXED_G", 4);
+  const std::uint32_t relaxed_rows = env_rows, relaxed_g = GroupCols(B, env_g);
+  // Activations as two int8 levels (x ~ q s + q2 s2), a second v_dot4 chain per column: the one-level arithmetic
+  // cost 0.27 pp of API agreement, this none, for 2 ms at B = 8 (streams/BD). HALO_RELAXED_RESID=0: one level.
+  static const bool resid = EnvOr("HALO_RELAXED_RESID", 1) != 0;
+  const std::string i8 = resid ? "halo_gemv_q8r_i8x" : "halo_gemv_q8r_i8";
+  const rt::Buffer none{};
+  const auto& xq2 = resid ? bb_.xq2 : none;
+  const auto& xs2 = resid ? bb_.xs2 : none;
+  const auto quantize = [&](const rt::Buffer& x, std::uint32_t xstride, std::uint32_t cols) {
+    return Launch("halo_q8x_cols", {(cols / 32 + 7) / 8, B}, {256},
+                  {rt::Arg::Buf(x), rt::Arg::Val(xstride), rt::Arg::Val(cols), rt::Arg::Buf(bb_.xq), rt::Arg::Buf(bb_.xs),
+                   rt::Arg::Buf(xq2), rt::Arg::Buf(xs2)},
+                  error);
+  };
   const auto gemv = [&](const model::TensorRef& t, const rt::Buffer& x, std::uint32_t xstride, const rt::Buffer& y,
                         std::uint32_t ystride) {
     const auto& d = tensors_.at(t.data);
     const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
     const bool r2 = rows < 2048;
+    // HALO_RELAXED_HEAD=0 (ablation): the LM head on the exact kernels.
+    static const bool relaxed_head = EnvOr("HALO_RELAXED_HEAD", 1) != 0;
+    if (relaxed && (relaxed_head || &t != &w_.output)) {
+      const std::uint32_t wr = relaxed_rows, gr = relaxed_g, ngr = B / gr;
+      return quantize(x, xstride, cols) &&
+             Launch((i8 + "_r" + std::to_string(wr) + "_b" + std::to_string(gr)).c_str(),
+                    {Blocks(rows, 8 * wr) * ngr}, {256},
+                    {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(bb_.xq), rt::Arg::Buf(bb_.xs), rt::Arg::Buf(xq2),
+                     rt::Arg::Buf(xs2), rt::Arg::Buf(y),
+                     rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride), rt::Arg::Val(ystride),
+                     rt::Arg::Val(ngr)},
+                    error);
+    }
     return Launch(((r2 ? "halo_gemv_q8r_r2" : "halo_gemv_q8r_r4") + ng + var).c_str(), {Blocks(rows, r2 ? 16 : 32) * NG},
                   {256},
                   {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows),
@@ -266,12 +302,24 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
       const auto& tz = tensors_.at(l.ssm_gate.data);
       const auto rq = static_cast<std::uint32_t>(l.ssm_qkv.rows), rz = static_cast<std::uint32_t>(l.ssm_gate.rows);
       const std::uint32_t b1 = Blocks(rq, 32), ch = c.SsmConvChannels(), kd = c.SsmKeyDim();
-      ok = Launch(("halo_gemv_q8r_dual" + ng + var).c_str(), {(b1 + Blocks(rz, 32)) * NG}, {256},
+      ok = (relaxed
+               ? quantize(bb_.mixed, H, H) &&
+                     Launch((i8 + "_dual_r" + std::to_string(relaxed_rows) + "_b" + std::to_string(relaxed_g))
+                                .c_str(),
+                            {(Blocks(rq, 8 * relaxed_rows) + Blocks(rz, 8 * relaxed_rows)) * (B / relaxed_g)}, {256},
+                            {rt::Arg::Buf(tq.qs), rt::Arg::Buf(tq.d), rt::Arg::Buf(bb_.qkv), rt::Arg::Val(rq),
+                             rt::Arg::Val(tq.qstride), rt::Arg::Buf(tz.qs), rt::Arg::Buf(tz.d), rt::Arg::Buf(bb_.z),
+                             rt::Arg::Val(rz), rt::Arg::Val(tz.qstride), rt::Arg::Buf(bb_.xq), rt::Arg::Buf(bb_.xs),
+                             rt::Arg::Buf(xq2), rt::Arg::Buf(xs2),
+                             rt::Arg::Val(H), rt::Arg::Val(Blocks(rq, 8 * relaxed_rows)), rt::Arg::Val(ch),
+                             rt::Arg::Val(c.SsmValueDim()), rt::Arg::Val(B / relaxed_g)},
+                            error)
+               : Launch(("halo_gemv_q8r_dual" + ng + var).c_str(), {(b1 + Blocks(rz, 32)) * NG}, {256},
                   {rt::Arg::Buf(tq.qs), rt::Arg::Buf(tq.d), rt::Arg::Buf(bb_.qkv), rt::Arg::Val(rq),
                    rt::Arg::Val(tq.qstride), rt::Arg::Buf(tz.qs), rt::Arg::Buf(tz.d), rt::Arg::Buf(bb_.z),
                    rt::Arg::Val(rz), rt::Arg::Val(tz.qstride), rt::Arg::Buf(bb_.mixed), rt::Arg::Val(H),
                    rt::Arg::Val(b1), rt::Arg::Val(H), rt::Arg::Val(ch), rt::Arg::Val(c.SsmValueDim()), rt::Arg::Val(NG)},
-                  error) &&
+                  error)) &&
            Launch(("halo_matvec_f32_rowblock2_u" + ngs).c_str(), {2 * c.ssm_num_v_heads * NGS}, {256},
                   {rt::Arg::Buf(tensors_.at(l.ssm_alpha.data).buf), rt::Arg::Buf(tensors_.at(l.ssm_beta.data).buf),
                    rt::Arg::Buf(bb_.mixed), rt::Arg::Buf(bb_.alpha), rt::Arg::Buf(bb_.beta),
@@ -524,7 +572,7 @@ bool FlashNextGpu::StepBatch(std::span<const BatchEntry> entries, std::string* e
   if (use_graphs_ && !timing_) {
     BatchGraph* g = nullptr;
     for (auto& bg : batch_graphs_)
-      if (bg.head == static_cast<int>(head) && !bg.verify && bg.sessions == ids) g = &bg;
+      if (bg.head == static_cast<int>(head) && !bg.verify && bg.relaxed == batch_relaxed_ && bg.sessions == ids) g = &bg;
     if (!g) {
       constexpr std::size_t kMaxGraphs = 16;
       if (batch_graphs_.size() >= kMaxGraphs) {  // least recently used out
@@ -536,6 +584,7 @@ bool FlashNextGpu::StepBatch(std::span<const BatchEntry> entries, std::string* e
       BatchGraph n;
       n.sessions = ids;
       n.head = static_cast<int>(head);
+      n.relaxed = batch_relaxed_;
       if (!dev_.BeginCapture(error)) return false;
       const bool recorded = RecordBatch(ids, head, error);
       std::string end_error;

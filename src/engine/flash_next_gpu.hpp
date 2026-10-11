@@ -552,6 +552,10 @@ class FlashNextGpu {
   [[nodiscard]] bool BatchSupported() const;
   [[nodiscard]] std::string BatchUnsupported() const;  ///< why not (empty: supported)
   static inline bool batch_decode_ = true;  ///< false: StepBatch always steps the entries in turn
+  /// StepBatch with B >= 2 sessions (never an MTP verify) runs the relaxed dense kernels: activations int8 per 32,
+  /// v_dot4 per column (docs/SESSIONS.md 3, "Relaxing exactness"). false: every entry byte-identical to the session
+  /// stepped alone.
+  static inline bool batch_relaxed_ = true;
   [[nodiscard]] bool RouteTrace(std::vector<std::uint32_t>* ids, std::string* error);
 
  private:
@@ -797,6 +801,8 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
     rt::Buffer qg, q, gate, k, v, ctx, iq, ik, pooled;
     rt::Buffer router, ids, wts, q8act, ucount, uexp, unum, upair, moe_h, moe_part, eg, sgate;
     rt::Buffer logits, sample_out, params;  // params: per entry, the single step's upload layout (entry_stride)
+    rt::Buffer xq, xs;    // relaxed kernels: the columns' activations as int8 and their per-32 scales
+    rt::Buffer xq2, xs2;  // ... and the residual's (HALO_RELAXED_RESID: two int8 levels)
     std::size_t entry_stride = 0;
     std::vector<std::uint8_t> host;
   };
@@ -808,6 +814,7 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
     std::vector<SessionId> sessions;
     int head = 0;
     bool verify = false;
+    bool relaxed = false;
     rt::Graph graph;
     std::uint64_t used = 0;
   };

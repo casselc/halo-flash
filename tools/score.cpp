@@ -90,6 +90,7 @@ int main(int argc, char** argv) {
     else if (a == "--targets-prefill") targets_prefill = std::string(argv[i + 1]) == "1";
     else if (a == "--argmax-out") argmax_out = argv[i + 1];
     else if (a == "--batch") batch = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--batch-relaxed") engine::FlashNextGpu::batch_relaxed_ = std::string(argv[i + 1]) == "1";
     else if (a == "--fa-attention") engine::FlashNextGpu::prefill_fa_attention_ = std::string(argv[i + 1]) == "1";
     else if (a == "--fused-moe-combine") engine::FlashNextGpu::prefill_fused_moe_combine_ = std::string(argv[i + 1]) == "1";
     else if (a == "--blocked-xh") engine::FlashNextGpu::prefill_blocked_xh_ = std::string(argv[i + 1]) == "1";

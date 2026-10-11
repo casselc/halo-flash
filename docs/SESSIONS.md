@@ -156,6 +156,27 @@ against gufo's 101.6. Measured before relaxing it (`halo_score`, main 2aa35f5, d
   today's exact kernels it reproduces the single-token scores case for case (98/98, 12/12), the control; a relaxed
   kernel must pass `streams/P/compare.py` against the single-token scores.
 
+### Relaxed dense kernels (B >= 2, default; `--batch-relaxed 0` for exact)
+StepBatch with 2-8 independent sessions (never an MTP verify, whose greedy equality with stepping needs exact rows)
+runs the dense Q8 projections (DeltaNet qkv + z, outputs, attention q / k / v / out, the LM head) as int8-activation
+v_dot4 GEMVs: each column's activations quantized per 32 values in two int8 levels (x ~ q s + q2 s2,
+`halo_q8x_cols`), a wave a row, 4 columns a launch group (the B = 8 sweep's best for every shape). Measured (pinned,
+4 prompts, device sampling; streams/BD):
+
+| B | exact ms/step | relaxed ms/step | tok/s aggregate (exact -> relaxed) |
+|---:|---:|---:|---:|
+| 2 | 53.48 | 50.84 | 37.4 -> 39.3 |
+| 4 | 82.80 | 75.80 | 48.3 -> 52.8 |
+| 8 | 136.94 | 123.46 | 58.4 -> 64.8 |
+
+B = 8 dense kernels 33.1 -> ~18 ms (DeltaNet dual 12.5 -> 7.0, 2560 x 6144 outputs 11.9 -> 6.1, LM head 4.8 -> 2.9).
+Quality (`halo_score --prefill 1 --batch 8` against the single-token scores): short dNLL -0.00012 +- 0.00037,
+agreement +0.07 pp; long +0.00074 +- 0.00048; the greedy argmax changes at 0.79% / 0.52% of positions, the floor any
+non-identical arithmetic showed (the one-token Prefill proxy: 0.79%). One int8 level was 2 ms faster at B = 8 but
+lost 0.27 pp of agreement (short dNLL +0.0004): two levels are the default (`HALO_RELAXED_RESID=0`: one). Keeping the
+LM head exact recovered nothing (argmax 0.95%) for +2.8 ms. Not yet relaxed: the mixers (22 ms at B = 8), the shared
+expert and router (7.5), the routed experts (51, bandwidth on the union), per-entry work (~20).
+
 ## 4. Tests
 
 - `Sessions.SwarmMatchesFreshReplay` (Hegel, swarm: each run enables a random subset of the rules): new / fork /

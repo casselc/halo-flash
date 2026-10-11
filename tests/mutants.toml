@@ -3579,3 +3579,45 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "Scheduler.AnonymousRequestsShareTurnsAndBatch"
 why = "a request's own turns are not charged: within a principal the oldest request keeps every turn"
+
+# ---- Relaxed batched dense kernels (src/kernels/batch_decode.hip; docs/SESSIONS.md 3, "Relaxing exactness") ---------
+
+[[mutant]]
+name = "br-activation-scale-of-block-0"
+file = "src/kernels/batch_decode.hip"
+find = '        const float s = xs[static_cast<std::size_t>(b) * nblk + c / 32];'
+replace = '        const float s = xs[static_cast<std::size_t>(b) * nblk];'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.RelaxedBatchedStepsStayCloseToSingleSteps"
+why = "every 32-value block of a column's activations scaled by the first block's scale"
+
+[[mutant]]
+name = "br-residual-dropped"
+file = "src/kernels/batch_decode.hip"
+find = '            part += xs2[static_cast<std::size_t>(b) * nblk + c / 32] * static_cast<float>(j);'
+replace = ''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.RelaxedBatchedStepsStayCloseToSingleSteps"
+why = "the second int8 level is computed and ignored: one-level precision (worst 8.8% of max|logit| on the small model)"
+
+[[mutant]]
+name = "br-column-group-offset"
+file = "src/kernels/batch_decode.hip"
+find = '  y += static_cast<std::size_t>(g) * NB * ystride;'
+replace = ''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.RelaxedBatchedStepsStayCloseToSingleSteps"
+why = "every column group writes the first group's outputs: sessions past the first group get another session's projection"
+
+[[mutant]]
+name = "br-verify-relaxed"
+file = "src/engine/batch_decode.cpp"
+find = '  const bool relaxed = batch_relaxed_ && !verify_ && B >= 2;'
+replace = '  const bool relaxed = batch_relaxed_ && B >= 2;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.SpecStepDraftsEqualsGreedyStepping"
+why = "an MTP verify takes the relaxed kernels: speculative decoding no longer equals greedy stepping"
