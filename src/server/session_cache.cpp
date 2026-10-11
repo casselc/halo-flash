@@ -389,6 +389,18 @@ void SessionCache::Ran(LeaseId lease, std::int32_t token) {
   if (lease == 0) last_live_tokens_ = it->second.e.tokens.size();
 }
 
+std::size_t SessionCache::RetainedPrefix(std::span<const std::int32_t> prompt) const {
+  std::size_t best = 0;
+  for (const auto& en : entries_) {
+    const std::size_t n = std::min(en.tokens.size(), prompt.size());
+    // A checkpoint counts only whole (a longer one diverges from this prompt); a finished session counts up to
+    // the prompt's length when it extends it.
+    if (n <= best || (en.checkpoint && en.tokens.size() > prompt.size())) continue;
+    if (std::equal(en.tokens.begin(), en.tokens.begin() + static_cast<std::ptrdiff_t>(n), prompt.begin())) best = n;
+  }
+  return best;
+}
+
 void SessionCache::Finish(LeaseId lease) {
   auto it = lives_.find(lease);
   if (it == lives_.end()) return;

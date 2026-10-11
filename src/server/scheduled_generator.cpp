@@ -220,6 +220,14 @@ TextGenerator::Result ScheduledGenerator::Generate(const Params& params,
   return Wait(std::static_pointer_cast<Job>(t->job), t->gen, p, nullptr, &on_text);
 }
 
+std::optional<std::uint64_t> ScheduledGenerator::CountTokens(std::string_view prompt) const {
+  if (!backend_->HasTokenizer()) return std::nullopt;
+  std::vector<std::int32_t> ids;
+  std::size_t stable = 0;
+  if (!backend_->Encode(std::string(prompt), &ids, &stable)) return std::nullopt;
+  return ids.size();
+}
+
 TextGenerator::Result ScheduledGenerator::GenerateIds(std::span<const std::int32_t> prompt, std::size_t stable,
                                                       const Params& params,
                                                       const std::function<bool(text::TokenId)>& on_token) {
@@ -578,6 +586,11 @@ void ScheduledGenerator::RunDecodeUnit(const std::vector<std::shared_ptr<Job>>& 
           job.result.length_limited = out.length_limited;
         }
         backend_->Finish(job.id);
+        {
+          const std::size_t retained = backend_->RetainedPrefix(job.ids);
+          std::lock_guard<std::mutex> lk(job.mu);
+          job.result.cache_write_tokens = retained > job.result.cached_tokens ? retained - job.result.cached_tokens : 0;
+        }
         FinishJob(job, "");
       }
     }

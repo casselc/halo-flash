@@ -85,6 +85,12 @@ class ScheduledBackend {
   virtual void Evict(Scheduler::Key key) = 0;
   [[nodiscard]] virtual bool HasLease(Id id) const = 0;
   [[nodiscard]] virtual std::uint64_t Generation() const = 0;  ///< bumped when the retained set changes
+  /// The longest prefix of `prompt` a retained state holds whole (SessionCache::RetainedPrefix); after Finish, minus
+  /// the request's reused tokens, what it added to the cache (Anthropic's cache_creation_input_tokens).
+  [[nodiscard]] virtual std::size_t RetainedPrefix(std::span<const std::int32_t> prompt) const {
+    (void)prompt;
+    return 0;
+  }
   [[nodiscard]] virtual std::vector<Scheduler::Retained> Retained() const = 0;
   virtual void SetPins(const std::set<std::uint64_t>& keys) = 0;
   /// Notifications (optional): `id` was admitted (an HTTP thread, under the generator's lock); `id` was fenced (its
@@ -115,6 +121,7 @@ class ScheduledGenerator : public TextGenerator {
 
   Admission Admit(const Params& params) override;
   Result Generate(const Params& params, const std::function<bool(std::string_view)>& on_text) override;
+  [[nodiscard]] std::optional<std::uint64_t> CountTokens(std::string_view prompt) const override;
   /// Token level: admits (unless `params.ticket` holds an admission) and generates; `on_token` gets each token.
   Result GenerateIds(std::span<const std::int32_t> prompt, std::size_t stable, const Params& params,
                      const std::function<bool(text::TokenId)>& on_token);

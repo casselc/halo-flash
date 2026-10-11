@@ -33,7 +33,7 @@
 
 namespace halo::server {
 
-enum class Api : std::uint8_t { kCompletions, kChat, kResponses };
+enum class Api : std::uint8_t { kCompletions, kChat, kResponses, kMessages };  // kMessages: Anthropic (anthropic_request.hpp)
 
 struct ToolChoice {
   enum class Mode : std::uint8_t { kAuto, kNone, kRequired, kFunction } mode = Mode::kAuto;

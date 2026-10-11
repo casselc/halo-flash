@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -74,6 +75,10 @@ class TextGenerator {
     std::uint64_t prompt_tokens = 0;
     std::uint64_t cached_tokens = 0;
     std::uint64_t completion_tokens = 0;
+    /// Prompt tokens prefilled by this request that a state the session cache retains afterwards holds (a
+    /// checkpoint parked during the prefill, or the live session fast mode keeps): what a later request can
+    /// reuse that it could not before. Anthropic's cache_creation_input_tokens.
+    std::uint64_t cache_write_tokens = 0;
     std::string error;  // non-empty: generation failed
     SpecDecodeStats spec;  // MTP speculative decoding (zero when off)
     /// G3: refused before any work (429, never ran and never will): `retry_after_s` and why ("limit", "memory").
@@ -93,6 +98,11 @@ class TextGenerator {
   /// characters); stops early when it returns false or Params::cancelled
   /// returns true.
   virtual Result Generate(const Params& params, const std::function<bool(std::string_view)>& on_text) = 0;
+  /// Tokens `prompt` (fully rendered) encodes to; nullopt when the generator cannot count (no tokenizer).
+  /// Callable while another request generates.
+  [[nodiscard]] virtual std::optional<std::uint64_t> CountTokens(std::string_view /*prompt*/) const {
+    return std::nullopt;
+  }
 };
 
 /// Holds back text that may be the start of a stop sequence; reports when
@@ -110,10 +120,12 @@ class StopMatcher {
   /// End of input: whatever is held back.
   std::string Flush();
   [[nodiscard]] bool stopped() const { return stopped_; }
+  /// The stop sequence that ended the output (once stopped()).
+  [[nodiscard]] const std::string& matched() const { return matched_; }
 
  private:
   std::vector<std::string> stops_;
-  std::string pending_;
+  std::string pending_, matched_;
   bool stopped_ = false;
 };
 

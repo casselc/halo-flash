@@ -2033,3 +2033,213 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "ScheduledGenerator.*"
 why = "a client the text callback found gone is taken for a stop string: the request completes truncated and its key's retry replays the truncated answer as finished (P1 K2: 266 tokens, finish stop)"
+
+# ---- Anthropic Messages API (src/server/anthropic_*.cpp, docs/ANTHROPIC.md) ---------------------------------
+
+[[mutant]]
+name = "anth-stop-context-as-max-tokens"
+file = "src/server/anthropic_response.cpp"
+find = 'context_limited ? StopReason::kContextWindow : StopReason::kMaxTokens'
+replace = 'StopReason::kMaxTokens'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicResponse.StopReasons:AnthropicService.StopSequencesLimitsAndCacheUsage"
+why = "a generation cut short by the context window reports max_tokens, so a client raises max_tokens and fails again"
+
+[[mutant]]
+name = "anth-stop-tool-use-over-stop-sequence"
+file = "src/server/anthropic_response.cpp"
+find = 'if (stop_sequence) return StopReason::kStopSequence;'
+replace = 'if (stop_sequence && !tool_use) return StopReason::kStopSequence;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicResponse.StopReasons:AnthropicService.StopSequencesLimitsAndCacheUsage"
+why = "a stop sequence that ended the output after a tool call reports tool_use (the client runs a call the stop cut off)"
+
+[[mutant]]
+name = "anth-tool-use-input-dropped"
+file = "src/server/anthropic_response.cpp"
+find = '"toolu_" + opt_.ids(), call.name, call.arguments}'
+replace = '"toolu_" + opt_.ids(), call.name, json::Value::MakeObject()}'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicResponse.*:AnthropicService.ToolUseRoundTrip"
+why = "the final Message's tool_use input is not the parsed arguments (and disagrees with the streamed input_json_delta)"
+
+[[mutant]]
+name = "anth-tool-use-input-not-rendered"
+file = "src/server/anthropic_request.cpp"
+find = 'fn.set("arguments", input && input->is(Kind::kObject) ? *input : Value::MakeObject());'
+replace = 'fn.set("arguments", Value::MakeObject());'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicRequest.ContentBlocksMapOntoTemplateMessages:AnthropicService.ToolUseRoundTrip"
+why = "a tool_use sent back renders without its input: the model sees a call with no arguments, and the prompt prefix breaks"
+
+[[mutant]]
+name = "anth-block-not-stopped"
+file = "src/server/anthropic_response.cpp"
+find = 'if (open_ && blocks_.back().kind != kind) Close(out);'
+replace = 'if (open_ && blocks_.back().kind != kind) open_ = false;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicResponse.*"
+why = "a block that changes kind (thinking to text) opens the next one without content_block_stop (and no signature)"
+
+[[mutant]]
+name = "anth-block-index-gap"
+file = "src/server/anthropic_response.cpp"
+find = 'e.set("index", U(blocks_.size() - 1));'
+replace = 'e.set("index", U(blocks_.size()));'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicResponse.*"
+why = "content_block_start indices are not the block's position in content (SDKs index content by it)"
+
+[[mutant]]
+name = "anth-ping-after-stop"
+file = "src/server/anthropic_response.cpp"
+find = 'if (out && started_ && !finished_)'
+replace = 'if (out)'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicResponse.EveryStreamFollowsTheGrammarAndAccumulatesToTheMessage"
+why = "a ping before message_start or after message_stop breaks the stream grammar"
+
+[[mutant]]
+name = "anth-usage-input-double-counts-cache"
+file = "src/server/anthropic_response.cpp"
+find = 'U(usage_.prompt_tokens > cached ? usage_.prompt_tokens - cached : 0)'
+replace = 'U(usage_.prompt_tokens)'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicResponse.*:AnthropicService.StopSequencesLimitsAndCacheUsage"
+why = "input_tokens counts cached tokens again: input + cache_read + cache_creation exceeds the prompt"
+
+[[mutant]]
+name = "anth-usage-read-write-swapped"
+file = "src/server/anthropic_service.cpp"
+find = 'result.cached_tokens, result.cache_write_tokens'
+replace = 'result.cache_write_tokens, result.cached_tokens'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicService.StopSequencesLimitsAndCacheUsage"
+why = "cache_read_input_tokens and cache_creation_input_tokens swapped: reuse is reported as a cache write"
+
+[[mutant]]
+name = "anth-cache-write-is-prefilled"
+file = "src/server/flash_next_generator.cpp"
+find = 'r.cache_write_tokens = retained > prep.reused ? retained - prep.reused : 0;'
+replace = 'r.cache_write_tokens = prep.prefilled;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGenerator.CacheUsageCountsWhatIsReusedAndWhatIsRetained"
+why = "cache_creation_input_tokens counts every prefilled token, not what a retained state holds afterwards"
+
+[[mutant]]
+name = "anth-thinking-signature-ignored"
+file = "src/server/anthropic_request.cpp"
+find = 'if (auto ours = DecodeThinkingSignature(sig->str())) r = std::move(*ours);'
+replace = 'if (auto ours = std::optional<std::string>()) r = std::move(*ours);'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicRequest.ContentBlocksMapOntoTemplateMessages"
+why = "an omitted thinking block sent back loses its reasoning: the next prompt differs from what was generated"
+
+[[mutant]]
+name = "anth-billing-header-kept"
+file = "src/server/anthropic_request.cpp"
+find = 'if (std::string_view(t).starts_with(kBillingHeader)) continue;'
+replace = 'if (false) continue;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicRequest.ContentBlocksMapOntoTemplateMessages"
+why = "Claude Code's per-session billing line reaches the system prompt"
+
+[[mutant]]
+name = "anth-x-api-key-any"
+file = "src/server/http.cpp"
+find = '!(key && *key == opt_.api_key)'
+replace = '!(key && !key->empty())'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicService.ErrorsAuthAliasesAndCountTokens"
+why = "any x-api-key is accepted"
+
+[[mutant]]
+name = "anth-departure-as-stop"
+file = "src/server/anthropic_service.cpp"
+find = 'const bool cancelled = client_gone || result.cancelled || !flush() || gone();'
+replace = 'const bool cancelled = result.cancelled;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicService.ADepartingStreamStopsGenerationAndIsRecordedCancelled:OpenAiService.ServingModelUnderDeparturesStallsAndRetries"
+timeout = 300
+why = "a /v1/messages client that left mid-stream is recorded as a finished generation"
+
+# ---- Anthropic Messages on the G3 scheduler (merge of stream/anthropic-messages onto G3) -------------------------
+
+# (No mutant drops client_gone from /v1/messages' Params::cancelled: there it is equivalent, since the stream's poll
+# is true once a write failed (!alive) or the connection closed (gone()), the only ways the callback finds it gone.
+# It stays for parity with the OpenAI routes; ADepartureIsNotAStopAndADetachedReaderIsRecordedSo checks the behaviour.)
+
+[[mutant]]
+name = "anth-g3-not-admitted"
+file = "src/server/anthropic_service.cpp"
+find = '  if (admission.refused) {'
+replace = '  if (false) {'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicService.SchedulingHeadersKeysAndRefusal:OpenAiService.ScheduledMessagesSecondTurnIsRefused429AndTokensAreCounted"
+timeout = 300
+why = "a refused /v1/messages admission streams anyway instead of answering 429 with Retry-After"
+
+[[mutant]]
+name = "anth-g3-no-default-key"
+file = "src/server/anthropic_service.cpp"
+find = '  if (g.idempotency_key.empty() && !g.principal.empty())'
+replace = '  if (false)'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicService.SchedulingHeadersKeysAndRefusal"
+why = "a broker-stamped /v1/messages request without Idempotency-Key gets no D5 key: its retry generates again"
+
+[[mutant]]
+name = "anth-g3-headers-dropped"
+file = "src/server/anthropic_service.cpp"
+find = '  if (const std::string* v = http.Header("idempotency-key")) g.idempotency_key = *v;'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicService.SchedulingHeadersKeysAndRefusal"
+why = "the client's Idempotency-Key on /v1/messages is ignored"
+
+[[mutant]]
+name = "anth-g3-detached-counts-tokens"
+file = "src/server/anthropic_service.cpp"
+find = 'rec.completion_tokens = result.uncounted ? 0 : result.completion_tokens;'
+replace = 'rec.completion_tokens = result.completion_tokens;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "AnthropicService.ADepartureIsNotAStopAndADetachedReaderIsRecordedSo"
+why = "a /v1/messages reader of a generation another reader counts records its tokens again"
+
+[[mutant]]
+name = "sg-count-tokens-none"
+file = "src/server/scheduled_generator.cpp"
+find = '  return ids.size();'
+replace = '  return std::nullopt;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.ScheduledMessagesSecondTurnIsRefused429AndTokensAreCounted"
+why = "count_tokens fails (500) and message_start reports 0 input tokens on the scheduled server"
+
+[[mutant]]
+name = "sg-cache-write-not-reported"
+file = "src/server/scheduled_generator.cpp"
+find = 'job.result.cache_write_tokens = retained > job.result.cached_tokens ? retained - job.result.cached_tokens : 0;'
+replace = 'job.result.cache_write_tokens = 0;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "FlashNextGenerator.CacheUsageCountsWhatIsReusedAndWhatIsRetained"
+why = "cache_creation_input_tokens is always 0 on the scheduled server"

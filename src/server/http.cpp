@@ -323,8 +323,12 @@ void HttpServer::AcceptLoop() {
 
 HttpResponse HttpServer::Dispatch(const HttpRequest& req) {
   if (!opt_.api_key.empty()) {
+    // The key as OpenAI clients send it ("Authorization: Bearer"), or as Anthropic's do ("x-api-key").
     const std::string* auth = req.Header("authorization");
-    if (!auth || *auth != "Bearer " + opt_.api_key) {
+    const std::string* key = req.Header("x-api-key");
+    if (!(auth && *auth == "Bearer " + opt_.api_key) && !(key && *key == opt_.api_key)) {
+      for (const auto& [prefix, body] : auth_errors_)
+        if (req.path.starts_with(prefix)) return HttpResponse::Json(401, body);
       auto r = HttpResponse::Json(401, ErrorJson("invalid or missing API key"));
       r.headers.emplace_back("WWW-Authenticate", "Bearer");
       return r;

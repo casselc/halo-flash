@@ -31,6 +31,9 @@ class Qwen35Generator : public TextGenerator {
   [[nodiscard]] std::vector<std::string> Variants() const;
 
   Result Generate(const Params& params, const std::function<bool(std::string_view)>& on_text) override;
+  [[nodiscard]] std::optional<std::uint64_t> CountTokens(std::string_view prompt) const override {
+    return tok_.Encode(prompt, true).size();
+  }
 
  private:
   engine::Qwen35Gpu& engine_;

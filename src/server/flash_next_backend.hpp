@@ -42,6 +42,9 @@ class FlashNextBackend : public ScheduledBackend {
   void Evict(Scheduler::Key key) override { (void)cache_.EvictKey(key); }
   [[nodiscard]] bool HasLease(Id id) const override { return cache_.HasLease(id); }
   [[nodiscard]] std::uint64_t Generation() const override { return cache_.generation(); }
+  [[nodiscard]] std::size_t RetainedPrefix(std::span<const std::int32_t> prompt) const override {
+    return cache_.RetainedPrefix(prompt);
+  }
   [[nodiscard]] std::vector<Scheduler::Retained> Retained() const override;
   void SetPins(const std::set<std::uint64_t>& keys) override { cache_.SetPins(keys); }
   /// The session cache (SR4 admin; on the engine thread only: ScheduledGenerator::OnEngineThread).
