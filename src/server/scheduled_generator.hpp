@@ -109,6 +109,14 @@ struct ScheduledOptions {
   std::uint64_t fixed_bytes = 320ull << 20;
   /// Test hook: the engine thread calls this before each unit.
   std::function<void(const Scheduler::Unit&)> before_unit;
+  /// Test hook: the engine thread calls this before each Scheduler::Next (a replay gates the engine with it); false:
+  /// run a boundary first (fence the requests known gone, as the scheduler model's own step) and call it again.
+  std::function<bool()> before_next;
+  /// Test clock (a replay's ticks): the scheduler's time and every unit's elapsed time; unset: steady ms.
+  std::function<std::int64_t()> now_ms;
+  /// The first decode step runs in the unit of the slice that completes the prefill (TTFT is the request's own
+  /// prefill). false: decoding starts in the next decode unit, as the scheduler model (spec/scheduler) has it.
+  bool first_token_in_slice = true;
 };
 
 class ScheduledGenerator : public TextGenerator {
@@ -149,6 +157,8 @@ class ScheduledGenerator : public TextGenerator {
   struct Job;
   void Post(std::function<void()> task);
   void Loop();
+  /// Fences `ids` (their clients are known gone): the live state goes, each request ends cancelled.
+  void Fence(const std::vector<Scheduler::Id>& ids);
   bool Begin(Job& job, std::string* error);
   void RunSlice(Job& job, std::uint32_t tokens, Scheduler::Progress* p);
   void RunDecodeUnit(const std::vector<std::shared_ptr<Job>>& jobs, std::uint32_t steps,

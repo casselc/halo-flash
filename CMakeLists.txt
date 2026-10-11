@@ -246,7 +246,8 @@ if(HALO_BUILD_TESTS)
     tests/server/kv_choice_test.cpp
     tests/server/decode_loop_test.cpp
     tests/server/scheduler_test.cpp
-    tests/server/scheduler_replay_test.cpp)
+    tests/server/scheduler_replay_test.cpp
+    tests/server/serving_replay_test.cpp)
   target_link_libraries(server_tests PRIVATE halo_server)
   target_compile_definitions(server_tests PRIVATE
     HALO_SERVER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/server/data")

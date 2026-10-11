@@ -3466,7 +3466,7 @@ why = "/v1/messages does not say how it answered"
 [[mutant]]
 name = "sg-fenced-tokens-uncounted"
 file = "src/server/scheduled_generator.cpp"
-find = '      if (job->run) fenced_decoded_ += job->run->outcome().completion;'
+find = '    fenced_decoded_ += decoded;'
 replace = ''
 suite = "cpu-asan"
 binary = "server_tests"
@@ -3476,7 +3476,7 @@ why = "tokens a fenced request decoded are in no metric: a client cannot measure
 [[mutant]]
 name = "sg-discarded-not-reported"
 file = "src/server/scheduled_generator.cpp"
-find = '          it->second += decoded;'
+find = '        it->second += decoded;'
 replace = ''
 suite = "cpu-asan"
 binary = "server_tests"
@@ -3492,3 +3492,70 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "OpenAiService.AFreshGenerationReportsItsKeysDiscardedTokens"
 why = "discarded tokens are reported again to every later generation of the key"
+
+# ---- The model's traces through the serving stack (tests/server/serving_replay_test.cpp) ---------------------------
+# Each must be killed by ServingReplay. Not kept, as they survive it for want of the case in the corpus: D5's default
+# key off (every trace request sends an Idempotency-Key; turn.cpp's D5 is covered by AnthropicService and OpenAiService
+# tests); every reader of a finished generation counting (Wait's done path: only one reader is ever attached at
+# completion, an earlier one is handed off and a replay counts at admission, so the flag cannot be set: equivalent).
+
+[[mutant]]
+name = "ih-answer-header-constant"
+file = "src/server/turn.cpp"
+find = '  if (!a.answer.empty()) h.emplace_back("Halo-Answer", a.answer);'
+replace = '  if (!a.answer.empty()) h.emplace_back("Halo-Answer", "generated");'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ServingReplay.*"
+why = "an adopted or replayed answer is announced as a new generation"
+
+[[mutant]]
+name = "ih-429-without-retry-after"
+file = "src/server/openai_service.cpp"
+find = '    r.headers.emplace_back("Retry-After", std::to_string(std::max<std::int64_t>(1, admission.retry_after_s)));'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ServingReplay.*"
+why = "a refused request is not told when to come back"
+
+[[mutant]]
+name = "ih-refusal-streams-anyway"
+file = "src/server/openai_service.cpp"
+find = '  if (admission.refused) {'
+replace = '  if (false) {'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ServingReplay.*"
+why = "a refused admission is answered 200 and streamed instead of 429"
+
+[[mutant]]
+name = "ih-departure-never-reported"
+file = "src/server/turn.cpp"
+find = '  const auto cancelled_or_gone = [&out, &io] { return out.client_gone || (io.poll && io.poll()); };'
+replace = '  const auto cancelled_or_gone = [&out, &io] { return (void)out, (void)io, false; };'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ServingReplay.*"
+timeout = 600
+why = "a client that left is never reported to the scheduler (Params::cancelled): it is never fenced"
+
+[[mutant]]
+name = "ih-departed-keyed-reader-counts"
+file = "src/server/scheduled_generator.cpp"
+find = '      if (job->keyed && opt_.sched.keyed_grace_s > 0) res.detached = res.uncounted = true;'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ServingReplay.*"
+why = "a reader that left a keyed request still running is recorded cancelled and counts its tokens"
+
+[[mutant]]
+name = "ih-adopted-reader-counts"
+file = "src/server/scheduled_generator.cpp"
+find = '        res.cancelled = res.detached = res.uncounted = true;'
+replace = '        res.cancelled = true;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ServingReplay.*:OpenAiService.AnAdoptedReaderCountsNoTokens"
+why = "the reader an adoption took over counts the generation's tokens too"

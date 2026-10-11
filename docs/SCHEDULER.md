@@ -325,6 +325,22 @@ fences every departed request at a boundary in one critical section (an arrival 
 ties in virtual time were a nondeterministic choice, now the root (then principal) holding the request admitted
 first, as the code breaks them.
 
+**The same traces through the serving stack** (`tests/server/serving_replay_test.cpp`, stream IH, 2026-10-11): each
+model request is an HTTP client (a streamed `/v1/completions` with `X-Halo-Principal`, `X-Halo-Chain-Id` and the model's
+key as `Idempotency-Key`; deciders through `RunDecider`), served by the OpenAI service, the shared turn
+(`server/turn.hpp`) and the real `ScheduledGenerator`, whose engine is lock-stepped to the trace by test options
+(`now_ms`: the model's ticks; `before_next`: a gate that can also ask for a fence-only boundary, as the model's fence
+step; `first_token_in_slice` off) and a backend that does what the model's unit ends say. It compares every step the
+Scheduler-level replay compares (1154 over 24 traces) and, at the HTTP surface: 429 with `Retry-After` and the
+rate-limit body for every refusal (86 memory 429s), `Halo-Answer` generated / adopted on every connected admission
+(210 heads), the whole stream for every client still there when its generation completed (63), refused requests
+never reaching the engine, one observer record per admitted reader (a departed or handed-off one detached), and
+completion tokens counted once per generation. Weaker than the Scheduler-level replay: deciders skip HTTP;
+first-token-in-slice, the production default, is off (with it on, `t0.jsonl:45` diverges at once: the model does not
+have it); a client that left before the server learned it is not modelled at the socket; the corpus has no replayed
+key, no limit 429 and no request without a key, so `Halo-Answer: replayed`, a limit 429's `Retry-After` and the D5
+default key are not reached here.
+
 **Rules** (`Rules` record; the design sets all; each mutant in `schedTest.qnt` turns one off): preempt,
 deciderPrio, deciderBudget, fenceDeparture, deadPeerProbe, heartbeat, parkOnCancel, bindAtStart, reserveLedger,
 evictSeesFreed, pinPlanned, atomic429, idempotency, twoLevel.
