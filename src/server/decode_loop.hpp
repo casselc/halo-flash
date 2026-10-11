@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "engine/mtp_depth.hpp"
@@ -46,6 +47,10 @@ struct DecodeOutcome {
   std::string error;
 };
 
+/// The longest prefix of `bytes` made of whole UTF-8 sequences (a trailing incomplete sequence is held back; invalid
+/// bytes pass through).
+[[nodiscard]] std::size_t CompleteUtf8Prefix(std::string_view bytes);
+
 /// Drafts for the next cycle: the chooser's depth, capped so the cycle emits at most `left` tokens.
 [[nodiscard]] inline std::uint32_t DraftCap(const engine::MtpDepthChooser& chooser, std::uint32_t left) {
   return left == 0 ? 0 : chooser.Choose(left - 1);
@@ -55,6 +60,30 @@ struct DecodeOutcome {
 /// drafting (every step ordinary). `stats` (optional) accumulates drafted / accepted / depth counts.
 DecodeOutcome RunDecode(std::int32_t first, std::uint32_t budget, engine::MtpDepthChooser* chooser,
                         const DecodeIo& io, SpecDecodeStats* stats);
+
+/// RunDecode one cycle at a time (G3: a scheduler runs a few cycles of a request per decode unit, and steps several
+/// requests together; RunDecode is `while (!done()) Cycle(io); return Finish();`).
+class DecodeRun {
+ public:
+  DecodeRun(std::int32_t first, std::uint32_t budget, engine::MtpDepthChooser* chooser, SpecDecodeStats* stats)
+      : token_(first), budget_(budget), chooser_(chooser), stats_(stats) {}
+  /// One step or speculative cycle. `draft` false: an ordinary step even with a chooser (a batched step).
+  void Cycle(const DecodeIo& io, bool draft = true);
+  [[nodiscard]] bool done() const { return done_ || o_.completion >= budget_; }
+  /// The token the next cycle runs.
+  [[nodiscard]] std::int32_t token() const { return token_; }
+  [[nodiscard]] const DecodeOutcome& outcome() const { return o_; }
+  /// The outcome once done (length_limited set).
+  DecodeOutcome Finish();
+
+ private:
+  std::int32_t token_;
+  std::uint32_t budget_;
+  engine::MtpDepthChooser* chooser_;
+  SpecDecodeStats* stats_;
+  DecodeOutcome o_;
+  bool done_ = false;
+};
 
 }  // namespace halo::server
 

@@ -28,6 +28,9 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <set>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -84,11 +87,60 @@ class SessionCache {
                              Prepared* out, std::string* error, const std::function<bool()>& cancelled = {},
                              const std::function<bool(std::size_t reused, std::string* error)>& before_prefill = {});
   /// The bound session ran `token` (a decode step).
-  void Ran(std::int32_t token);
+  void Ran(std::int32_t token) { Ran(0, token); }
   /// The generation ended: fast mode retains the live session, exact mode drops it.
-  void Finish();
+  void Finish() { Finish(0); }
   /// The generation failed: the live session's state is unknown; drop it.
-  void Abandon();
+  void Abandon() { Abandon(0); }
+
+  // ---- G3: several live sessions at once (docs/SCHEDULER.md M3), one per lease (a scheduled request) ----
+  // Prepare / Ran / Finish / Abandon above are lease 0. A scheduler begins a lease (bind: the longest usable retained
+  // prefix, forked; nothing prefilled), prefills it in slices (one engine call each; the checkpoint at `stable` is
+  // parked when a slice reaches it), steps it, and finishes, abandons or parks it. Leases alternate freely: each owns
+  // its engine session. Exact mode stays exact: every split sits on the alignment (slices of a multiple of `align`
+  // tokens from an aligned start), so the parked checkpoints are byte-identical to a cold prefill.
+  using LeaseId = std::uint64_t;
+  /// Binds lease `lease` (the engine's bound session afterwards) for `prompt`: reuse, memory check (evicting
+  /// unpinned entries until KvRoomFor passes), `before_prefill`. Nothing is prefilled yet (out->prefilled 0).
+  [[nodiscard]] bool Begin(LeaseId lease, std::span<const std::int32_t> prompt, std::size_t stable, std::uint32_t positions,
+                           Prepared* out, std::string* error,
+                           const std::function<bool(std::size_t reused, std::string* error)>& before_prefill = {});
+  /// One slice: binds the lease's session and prefills at most `max_tokens` prompt tokens in one engine call
+  /// (`chunk_tokens` per chunk, 0: the engine's default), stopping early at the checkpoint position (which is then
+  /// parked). `*ran` gets the tokens prefilled, `*done` whether the prompt (minus its last token) is all in.
+  [[nodiscard]] bool PrefillSlice(LeaseId lease, std::uint32_t max_tokens, std::uint32_t chunk_tokens, std::size_t* ran,
+                                  bool* done, std::string* error);
+  void Ran(LeaseId lease, std::int32_t token);
+  void Finish(LeaseId lease);
+  void Abandon(LeaseId lease);
+  /// The lease's client left: its live session goes, but a prefill's progress (slice-aligned, exact: every split
+  /// on the alignment) is kept as a checkpoint first, so a retry reuses it. Returns the parked entry's key (0: none).
+  std::uint64_t Park(LeaseId lease);
+  [[nodiscard]] bool HasLease(LeaseId lease) const { return lives_.count(lease) > 0; }
+  [[nodiscard]] Engine::SessionId LeaseSession(LeaseId lease) const;
+  [[nodiscard]] std::size_t LeasePosition(LeaseId lease) const;  ///< tokens its live session holds
+  /// The retained entry a Begin bound from (its key; 0: a fresh session or a taken-over live one).
+  [[nodiscard]] std::uint64_t LeaseBoundKey(LeaseId lease) const;
+  /// Entries a scheduler planned to reuse: never evicted by the cache's own memory loop while pinned.
+  void Pin(std::uint64_t key) { ++pins_[key]; }
+  void SetPins(const std::set<std::uint64_t>& keys) {
+    pins_.clear();
+    for (auto k : keys) pins_[k] = 1;
+  }
+  void Unpin(std::uint64_t key);
+  /// Evicts one entry (a scheduler's decision): spilled (spill_on_evict) or dropped. False: no such resident entry.
+  bool EvictKey(std::uint64_t key);
+  /// What the scheduler's ledger counts: resident entries, their tokens and device bytes (recurrent + every KV page
+  /// they map, shared ones included: an evicted parent's pages stay with its forks).
+  struct Resident {
+    std::uint64_t key = 0;
+    std::shared_ptr<const std::vector<std::int32_t>> tokens;
+    std::size_t bytes = 0;
+    bool usable = true;  ///< reusable in this mode (exact: canonical)
+  };
+  [[nodiscard]] std::vector<Resident> Residents() const;
+  /// Bumped whenever the retained set changes (a new checkpoint, an eviction, a finish): resync only then.
+  [[nodiscard]] std::uint64_t generation() const { return generation_; }
 
   [[nodiscard]] std::size_t retained() const { return entries_.size(); }
   /// Device bytes the retained states hold (recurrent buffers and KV pages no other session shares).
@@ -132,7 +184,11 @@ class SessionCache {
     std::string path;
     std::uint64_t file_bytes = 0;
   };
+  struct Live;
   bool Drop(Engine::SessionId id, std::string* error);
+  bool RunTo(Live& lv, std::size_t to, std::uint32_t chunk, const std::function<bool()>& cancelled, Prepared* out,
+             std::string* error);  // prefill the live session up to prompt position `to` (one engine call)
+  bool ParkCheckpoint(Live& lv, std::string* error);  // fork the live session at its checkpoint position
   void Evict();  // down to max_retained and budget_bytes
   bool EvictOne();  // the least recently used resident entry: spilled (spill_on_evict) or dropped
   bool SpillEntry(Entry& en, std::string* error);
@@ -141,11 +197,21 @@ class SessionCache {
   void EraseEntry(std::size_t index);  // drops its session or deletes its file
   std::size_t Bytes(const Entry& e) const;
 
+  // A lease's live session and its prefill plan.
+  struct Live {
+    Entry e;
+    std::vector<std::int32_t> prompt;
+    std::size_t n = 0, at = 0, ck = 0, reused = 0;
+    bool want_ck = false, extends = false, splits_aligned = true;
+    std::uint64_t bound_key = 0;
+  };
+
   Engine& e_;
   SessionCacheOptions opt_;
   std::vector<Entry> entries_;
-  Entry live_;
-  bool has_live_ = false;
+  std::map<LeaseId, Live> lives_;
+  std::map<std::uint64_t, int> pins_;
+  std::uint64_t generation_ = 0;
   std::uint64_t clock_ = 0;
   std::size_t last_live_tokens_ = 0;
   std::uint64_t next_key_ = 1;

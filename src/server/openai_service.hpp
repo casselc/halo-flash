@@ -49,7 +49,25 @@ class TextGenerator {
     /// polls it while queued, between prefill chunks and between decode steps, and gives up (Result::cancelled)
     /// rather than compute for nobody; a request abandoned so leaves no state that differs from a cold replay.
     std::function<bool()> cancelled;
+    /// G3 scheduling (docs/SCHEDULER.md; request headers, set by yard-relay / the broker, never by an untrusted
+    /// client): the sandbox principal (X-Halo-Principal), the chain root it serves (X-Halo-Chain-Id; empty: the
+    /// principal), and the idempotency key (Idempotency-Key, or the service's default digest; empty: none).
+    std::string principal, chain_root, idempotency_key;
+    /// What Admit() returned for this request (opaque to the service).
+    std::shared_ptr<void> ticket;
   };
+  /// G3: a request is admitted before any response is sent (a streamed 429 is impossible once the event stream
+  /// started). Refused: answered 429 with Retry-After, and it never runs. Default: always admitted.
+  struct Admission {
+    bool refused = false;
+    std::int64_t retry_after_s = 0;
+    std::string why;
+    std::shared_ptr<void> ticket;  ///< passed back in Params::ticket
+  };
+  virtual Admission Admit(const Params& params) {
+    (void)params;
+    return {};
+  }
   struct Result {
     bool length_limited = false;  // stopped at max_tokens
     bool cancelled = false;       // stopped because Params::cancelled said so (not an error)
@@ -58,6 +76,17 @@ class TextGenerator {
     std::uint64_t completion_tokens = 0;
     std::string error;  // non-empty: generation failed
     SpecDecodeStats spec;  // MTP speculative decoding (zero when off)
+    /// G3: refused before any work (429, never ran and never will): `retry_after_s` and why ("limit", "memory").
+    bool refused = false;
+    std::int64_t retry_after_s = 0;
+    std::string refused_why;
+    bool replayed = false;  // the stored answer of an earlier attempt with the same idempotency key
+    /// G3: this reader left a request that runs on for its idempotency key (a retry adopted it, or it is within its
+    /// keyed grace): not an end of the generation.
+    bool detached = false;
+    /// G3: another reader of the same generation counts its completion tokens (adoption and replay hand one
+    /// generation to several readers; the first to receive the whole answer counts it).
+    bool uncounted = false;
   };
   virtual ~TextGenerator() = default;
   /// Generates, calling `on_text` with each new piece of text (whole UTF-8
@@ -101,6 +130,8 @@ struct ServiceOptions {
   /// Called when a generation starts and ends (optional), e.g. for the
   /// requests-running gauge.
   std::function<void(bool started)> on_activity;
+  /// Called when a request is refused 429 before it runs (G3 admission), with why ("limit", "memory").
+  std::function<void(const std::string& why)> on_refused;
   /// P10 variants the generator serves. Listed by /v1/models as
   /// "<model_id>:<name>"; a request naming any other variant (the
   /// "variant" field or a "base:variant" model alias) is answered 404.

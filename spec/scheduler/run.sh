@@ -6,14 +6,14 @@
 #  - `wit` row: every witness of the design is reached in at least one trace.
 # One quint process at a time.
 #
-#   spec/scheduler/run.sh                       # SAMPLES=20000 MSAMPLES=5000 STEPS=120 SEED=0x5eed
+#   spec/scheduler/run.sh                       # SAMPLES=20000 MSAMPLES=5000 STEPS=160 SEED=0x5eed
 #   OUT=results.txt spec/scheduler/run.sh
 set -u
 OUT=${OUT:-/dev/stdout}
 SEED=${SEED:-0x5eed}
 SAMPLES=${SAMPLES:-20000}    # the design and its witnesses
 MSAMPLES=${MSAMPLES:-5000}   # mutants
-STEPS=${STEPS:-120}
+STEPS=${STEPS:-160}
 cd "$(dirname "$0")" || exit 1
 F=schedTest.qnt
 echo "quint $(quint --version), seed $SEED, steps $STEPS, samples $SAMPLES (design) / $MSAMPLES (mutants)" | tee "$OUT"
@@ -37,10 +37,11 @@ wit() { # main witnesses...
 }
 
 # ---- the design ----
-sim design safety "$SAMPLES" ok "(all 11 properties)"
-SEED=0xbeef sim design safety "$SAMPLES" ok "(all 11 properties, second seed 0xbeef)"
+sim design safety "$SAMPLES" ok "(all 13 properties)"
+SEED=0xbeef sim design safety "$SAMPLES" ok "(all 13 properties, second seed 0xbeef)"
 wit design wPreempted wBatched wDeciderBetweenSlices wDeciderFair wParkedOnCancel wEvicted wMem429 \
-  wRetryAfter429 wTimeout wFencedFin wFencedVanished wLateArrival wReplayed wAdopted wTurn2Done
+  wRetryAfter429 wTimeout wFencedFin wFencedVanished wLateArrival wReplayed wAdopted wTurn2Done wChainFanout \
+  wNsTimeout wNsDone wFinishedDetached
 # keyless clients (no idempotency key): the rest of the design still holds what does not need keys
 sim noIdempotency noRecompute "$MSAMPLES" ok "(keyless: park on cancel + bind at start still avoid recompute)"
 sim noIdempotency boundedWait "$MSAMPLES" ok "(keyless)"
@@ -58,13 +59,16 @@ sim noFence              workAfterGoneBounded "$MSAMPLES" VIOLATED
 sim noDeadPeerProbe      workAfterGoneBounded "$MSAMPLES" VIOLATED "a peer gone without FIN"
 sim noHeartbeat          noSpuriousTimeout    "$MSAMPLES" VIOLATED "AUDIT D3"
 sim dropOnCancel         noRecompute          "$MSAMPLES" VIOLATED
+sim noKeyedGrace         noRedoWithinGrace    "$MSAMPLES" VIOLATED "a non-streaming caller's retry decodes its turn again"
 sim bindAtAdmission      noRecompute          "$MSAMPLES" VIOLATED "(keyless; with keys it is equivalent)"
 sim memoryReadingOnly    noOvercommit         "$MSAMPLES" VIOLATED "AUDIT D1/E3"
 sim releasedStaysCharged refuseOnlyIfShort    "$MSAMPLES" VIOLATED "AUDIT F3"
 sim evictPlanned         withinReservation    "$MSAMPLES" VIOLATED
 sim queued429            rejectedNeverRuns    "$MSAMPLES" VIOLATED "AUDIT N4"
-sim noIdempotency        generatedOnce        "$MSAMPLES" VIOLATED "a retry after a lost answer"
+# a replay is rare with three sandboxes (0.02% of the design's traces): this row needs the design's samples
+sim noIdempotency        generatedOnce        "$SAMPLES" VIOLATED "a retry after a lost answer"
 sim noIdempotency        noSelfInflicted429   "$MSAMPLES" VIOLATED "a retry refused for its own attempt"
+sim oneLevelSfq          chainFair            "$MSAMPLES" VIOLATED "A2A D9: a fan-out chain takes a share per sandbox"
 
 echo "failures: $fails" | tee -a "$OUT"
 exit $((fails > 0))

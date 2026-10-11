@@ -1,8 +1,9 @@
 # G3: a fair GPU scheduler for halo_serve (design, 2026-10-07)
 
-Design and model only: nothing here is built. Model: `spec/scheduler/` (Quint 0.32, `quint run` only), checked by
+Design, model and build. Model: `spec/scheduler/` (Quint 0.32, `quint run` only), checked by
 `spec/scheduler/run.sh`, results in `spec/scheduler/results.txt`. Predictions (written before any G3 code):
-`/data/halo-work/streams/B/PREDICTIONS-G3.md`, summarised in section 9.
+`/data/halo-work/streams/B/PREDICTIONS-G3.md`, summarised in section 9. Fairness is two-level since A2A-MCP D9 (chain
+root, then sandbox: section 4). What is built and measured: section 12.
 
 ## 0. Recommendation in one paragraph
 
@@ -11,12 +12,14 @@ while anyone else is runnable, 8192 when alone), a **batched decode unit** (Step
 a short burst of steps), or a decider evaluation. Between units it **fences** departed requests (parking their
 slice-aligned progress as a retained prefix) and **picks** the next unit: a decider with **credit** first, then
 **start-time fair queuing by GPU time over sandbox principals** (the decider class is one more principal once out of
-credit). HTTP threads **admit** under the same lock against a **reservation ledger** (retained prefixes + every
+credit). The fair queue has **two levels** (A2A-MCP D9): the **chain root** a request serves first, then the sandbox
+principal within that root, so an agent chain that fans out to several sandboxes holds one share, not one per
+sandbox. HTTP threads **admit** under the same lock against a **reservation ledger** (retained prefixes + every
 admitted request's reservation; eviction counts what it frees), with a per-principal in-flight limit; a refusal is
 a **429 with Retry-After** that takes the request off the queue in the same critical section. Clients get **SSE
 heartbeats** while queued or prefilling, and every turn carries an **idempotency key**: a retry of a finished turn
-replays the stored answer, a retry of an in-flight one adopts it. The model holds all 11 properties for this design
-(two seeds, 20000 traces each); today's scheduling and each of 13 mutants (one rule off each) break the property
+replays the stored answer, a retry of an in-flight one adopts it. The model holds all 12 properties for this design
+(two seeds, 20000 traces each); today's scheduling and each of 14 mutants (one rule off each) break the property
 they are named for.
 
 ## 1. Today (main ac2ec31)
@@ -79,14 +82,41 @@ impossible without changing kernels.
 
 ## 4. Q2: policy, fairness and admission
 
-**Fairness.** Start-time fair queuing (SFQ) over **principals** (one per sandbox, from the broker's
-`X-Halo-*`/`X-Halo-Session-Id`; unknown callers are one shared principal), charged by **GPU time actually used**
-(the unit's measured duration; a batched decode unit charges each participant its share). Within a principal,
-FIFO. A principal that was idle **joins at the system virtual time** (the start tag of the last unit picked: it
-banks no credit while idle). Joining at the minimum over the *other runnable* principals is not enough: a principal
-briefly not runnable (departed, then adopted by its retry) is left out of that minimum and then waits for the
-joiner to catch up; the model found this at 20000 samples (`boundedWait` 11 > 10 ticks). This is what makes a cold 128K prompt coexist with other sandboxes: it gets its share, the
-others keep theirs.
+**Fairness: two levels (A2A-MCP D9).** Start-time fair queuing (SFQ) by **GPU time actually used** (the unit's
+measured duration; a batched decode unit charges each participant a whole unit), on two levels:
+1. over **chain roots**: a request carries the chain it serves (`X-Halo-Chain-Id`, stamped by yard-relay on
+   deliveries and forwarded by the callee's broker); a sandbox outside any chain is its own root, so lone agents
+   see no change;
+2. within a root, over its **sandbox principals** (`X-Halo-Principal`; unknown callers are one shared principal);
+3. within a principal, FIFO.
+Each root and principal has a virtual time; the pick takes the root with the least, then its principal with the
+least. A root that was idle **joins at the system virtual time** (the least tag among the backlogged roots at the
+last pick: it banks no credit while idle), and a principal joins at its root's own system virtual time. Joining at
+the minimum over the *other runnable* principals is not enough: a principal briefly not runnable (departed, then
+adopted by its retry) is left out of that minimum and then waits for the joiner to catch up; the model found this
+at 20000 samples (`boundedWait` 11 > 10 ticks). This is what makes a cold 128K prompt coexist with other
+sandboxes: it gets its share, the others keep theirs.
+
+Why two levels: with one level, a chain whose root calls B, C and D at once holds three shares (and a loop of
+agents calling each other crowds out an unrelated interactive sandbox). With two, the chain holds one share and
+its sandboxes split it: a request that shares its root with another sandbox waits about twice as long between
+units (`WAIT_CHAIN` = 2 x `WAIT_BOUND` - one unit, section 10), and an unrelated root's service stays within
+`LAG_BOUND` of the chain's (`chainFair`; the one-level mutant `oneLevelSfq` breaks it). Batching adds **rides**: a
+decoding request is in every decode unit, also one another root starts, and is charged for it; the lag bound
+counts one root's catch-up of rides.
+
+**Request headers** (set by the broker, never by a sandbox):
+| Header | Meaning | Default when absent |
+|---|---|---|
+| `X-Halo-Principal` | the sandbox principal (fair-queuing principal, D3 limit) | `anonymous` (one shared principal) |
+| `X-Halo-Chain-Id` | the chain root the request serves (A2A-MCP 5.7, 9) | the principal itself |
+| `Idempotency-Key` | the turn's key (section 7) | with a principal: `d5:` sha256(principal, previous_response_id, input, API); without one: none |
+yard-relay stamps `yard_chain` on deliveries and the callee's broker forwards it as `X-Halo-Chain-Id`; the broker
+sets `X-Halo-Principal` from the sandbox's tap identity (A2A-MCP 3: "headers from the VM never carry identity").
+halo_serve trusts these headers as it trusts the broker's other `X-Halo-*` headers: **the broker must strip any
+`X-Halo-*` and `Idempotency-Key` header a sandbox sends and set its own** (a sandbox that could pick its principal
+or chain could take another's share or its key's replay). The default key applies only to principal-stamped
+requests: an anonymous caller repeating a prompt (an eval sampling N answers) means it, and must not get a replay.
 
 **Decider priority with a budget.** A decider call carries the `systemone` class. While the class has **credit**
 (a token bucket: `DEC_BURST` evaluations, refilled one per `DEC_REFILL`), it runs at the next unit boundary ahead of
@@ -245,12 +275,19 @@ halo_serve were modelled together (the broker's token bucket and one-in-flight r
 
 **Durations.** Time is ticks (one tick ~0.6 s, half a 2048-token slice). A slice costs 2, a decode unit 1, a decider
 1; units run to their end; the client idle timeout is 5 ticks, a vanished peer is known gone after 2, Retry-After is
-3, the decider credit refills 1 per 8 ticks. Two conversations (sandboxes A, B), two turns each (3 and 5 slices,
-the second extends the first), up to 12 decider calls, 2 client faults a run, memory for 9 KV units. A unit maps
-the page it writes when it starts (EnsureKv before the chunk or step), so the memory properties see it.
+3, the decider credit refills 1 per 8 ticks. Three conversations (sandboxes A, B, C), two turns each (3 and 5
+slices, the second extends the first); each sandbox serves its own chain or the chain X (drawn at the start, so a
+run has a fan-out of two or three sandboxes under X, or none); up to 12 decider calls, 2 client faults a run, memory
+for 14 KV units, 48 ticks a run (160 steps: long enough for a second turn with three sandboxes). A unit maps the
+page it writes when it starts (EnsureKv before the chunk or step), so the memory properties see it.
 
-**Bounds the properties check.** `WAIT_BOUND` = the unit in service (2) + the other sandbox's catch-up after its
-join (3) + the decider principal's catch-up (3) + two credited deciders (2) = 10 ticks (~6 s); `DEC_BOUND` = the
+**Bounds the properties check.** `WAIT_BOUND` (a request alone in its chain root) = the unit in service (2) + the
+catch-up of the two other agent roots after their join (3 each) + the decider root's catch-up (3) + two credited
+deciders (2) = 13 ticks (~8 s); `WAIT_CHAIN` (a request whose root holds another sandbox's request too) = 2 x
+`WAIT_BOUND` - one unit = 24 ticks (~14 s): it gets half its root's turns, and its root-mate's decode rides in the
+other roots' batches are charged to the root; the simulation's worst case is this bound (22 breaks at 48 ticks with
+seed 0xbeef, 24 holds on both seeds). `LAG_BOUND` (two agent roots backlogged together: their GPU service since
+then stays within) = one unit of each (2 x 2) + one root's catch-up of rides (2 + 1) = 7 ticks. `DEC_BOUND` = the
 unit in service + one credited decider ahead = 4 ticks (~2.4 s); `GONE_BOUND` = `ACK_TO` + one unit = 4 ticks.
 The client idle timeout (5) is below `WAIT_BOUND` on purpose: without heartbeats a fairly served request can time
 out, which is the D3 trigger.
@@ -258,21 +295,34 @@ out, which is the D3 trigger.
 **Model bugs found while running it** (fixed before the table below): admission counted the arriving request in
 its own ledger (false memory 429s); the unit kind was chosen before the reused prefix was bound (an extra slice);
 a 429 sent to a late attempt released the client's newer request. The fourth was a design bug, not a model bug: the
-fair-queuing join rule above.
+fair-queuing join rule above. With two levels: the first `chainFair` bound (one unit of each, 4) broke in the design:
+a decoding root rides batches another root starts while catching up; and the first two `WAIT_CHAIN` derivations (18,
+then 20) undercounted the root-mate's tag ties and rides (found at 36 and 48 ticks).
+
+**Found by the M5 trace replay** (the code against the model's own traces, below), each a place where the model
+knew more or less than the server can, fixed in the model (the code was right): FIFO within a principal was by the
+order clients *sent* requests (model ids), but the server sees only arrival order (now `seq`, the admission order);
+admission decided "late duplicate" vs "adopt" on the client's true connection state, but the server knows only what
+it saw (FIN, or a failed probe): a peer that vanished a moment ago looks connected, so its retry adopts the
+in-flight attempt, which then lives or dies with that connection; fences were one request a step, but the code
+fences every departed request at a boundary in one critical section (an arrival cannot land between two fences);
+ties in virtual time were a nondeterministic choice, now the root (then principal) holding the request admitted
+first, as the code breaks them.
 
 **Rules** (`Rules` record; the design sets all; each mutant in `schedTest.qnt` turns one off): preempt,
 deciderPrio, deciderBudget, fenceDeparture, deadPeerProbe, heartbeat, parkOnCancel, bindAtStart, reserveLedger,
-evictSeesFreed, pinPlanned, atomic429, idempotency.
+evictSeesFreed, pinPlanned, atomic429, idempotency, twoLevel.
 
-**Properties**: `rejectedNeverRuns`, `boundedWait`, `deciderLatency`, `workAfterGoneBounded`,
-`noSpuriousTimeout`, `noOvercommit`, `withinReservation`, `refuseOnlyIfShort`, `noRecompute`,
-`noSelfInflicted429`, `generatedOnce` (and `safety`, their conjunction).
+**Properties**: `rejectedNeverRuns`, `boundedWait` (with groups: `WAIT_BOUND` / `WAIT_CHAIN`), `deciderLatency`,
+`workAfterGoneBounded`, `noSpuriousTimeout`, `noOvercommit`, `withinReservation`, `refuseOnlyIfShort`,
+`noRecompute`, `noSelfInflicted429`, `generatedOnce`, `chainFair` (and `safety`, their conjunction).
 
-**Results** (`spec/scheduler/results.txt`, seed 0x5eed, 120 steps; 20000 traces for the design, 5000 per mutant):
+**Results** (`spec/scheduler/results.txt`, seed 0x5eed, 160 steps; 20000 traces for the design, 5000 per mutant but
+`generatedOnce`'s, which needs 20000: a replay is rare with three sandboxes):
 
 | Instance | Property | Expect | Result | What breaks it |
 |---|---|---|---|---|
-| design (seeds 0x5eed, 0xbeef) | `safety` (all 11) | ok | ok, 2 x 20000 | |
+| design (seeds 0x5eed, 0xbeef) | `safety` (all 12) | ok | ok, 2 x 20000 | |
 | design, keyless clients (`noIdempotency`) | `noRecompute`, `boundedWait` | ok | ok | park on cancel + bind at start protect keyless retries |
 | today (one mutex, FIFO, to the end) | `boundedWait` / `deciderLatency` | VIOLATED | VIOLATED / VIOLATED | a turn or a decider waits for another sandbox's whole request |
 | `noPreempt` | `boundedWait` | VIOLATED | VIOLATED | whole requests as units |
@@ -288,31 +338,135 @@ evictSeesFreed, pinPlanned, atomic429, idempotency.
 | `evictPlanned` | `withinReservation` | VIOLATED | VIOLATED | a planned prefix evicted under an admitted request |
 | `queued429` | `rejectedNeverRuns` | VIOLATED | VIOLATED | AUDIT N4: a 429'd request still runs |
 | `noIdempotency` | `generatedOnce` / `noSelfInflicted429` | VIOLATED | VIOLATED / VIOLATED | a lost answer regenerated; a retry refused by its own attempt |
+| `oneLevelSfq` | `chainFair` | VIOLATED | VIOLATED | a chain fanned out to two sandboxes takes two shares (A2A-MCP D9) |
 
-Witnesses (design, 20000 traces): preempted 99.97%, batched 70.2%, decider between slices 99.8%, decider out of
-credit served fairly 100%, parked on cancel 13.0%, evicted 34.1%, memory 429 94.7%, retry after 429 75.3%, client
-timeout 40.9%, fenced after FIN 21.7% / after a vanished peer 6.1%, late arrival 44.1%, replayed 7 traces,
-adopted 36.6%, second turn done 0.9%; keyless instance (5000): limit 429 30.1%, prefix bound later 4.9%.
+Witnesses (design, 20000 traces, after M5's corrections): preempted 100%, batched 98.4%, decider between slices
+99.96%, decider out of credit served fairly 100%, parked on cancel 17.6%, evicted 88.5%, memory 429 94.4%, retry
+after 429 87.0%, client timeout 55.7%, fenced after FIN 35.3% / after a vanished peer 12.9%, late arrival 54.5%,
+replayed 8 traces, adopted 30.5%, second turn done 33.3%, chain fan-out (a root with two backlogged sandboxes beside
+another root) 35.2%; keyless instance (5000): limit 429 40.3%, prefix bound later 3.8%. A run takes ~10 min per 20000 traces.
 
-**Limits of the model.** Two principals and one conversation each; the eviction candidate is the other
-conversation's prefix only; decode units charge each participant a whole unit (the doc's rule charges shares);
-memory is in abstract units with no page rounding or fork constant; simulation, not exhaustive checking.
+**Limits of the model.** Three principals and one conversation each, one chain (X) besides the lone roots, a
+conversation's chain fixed for the run; an admission that needs room evicts every evictable prefix at once (the
+code evicts least recently used first until it fits); decode units charge each participant a whole unit (as the
+code does); memory is in abstract units with no page rounding or fork constant; simulation, not exhaustive
+checking; the bounds are the simulation's worst case, derived after the fact for `WAIT_CHAIN` and `LAG_BOUND`.
 
 ## 11. Decisions for the user
 
 **Decided 2026-10-07: the user accepted every recommendation below.** D1 2048 contended / 8192 alone; D2 measure
 the decider's GPU contention first (M4), flash-pointer deciders as units; D3 one in-flight turn per sandbox; D4
 burst 4, refill 2/s; D5 default key = digest of (principal, previous_response_id, input); D6 heartbeats on (main
-24cab4b: `halo_serve --sse-keepalive` defaults to 15 s).
+24cab4b: `halo_serve --sse-keepalive` defaults to 15 s). Also accepted (A2A-MCP.md D9): two-level fair queuing,
+chain root then sandbox (section 4; model re-checked, section 10).
 
 - **D1 slice size**: 2048-token slices under contention, 8192 alone (recommended), or always 8192 (7% faster
   contended prefill, 5-8 s preemption bound).
 - **D2 the 2B decider**: keep it concurrent on the GPU (today: no wait for a slice, unmeasured contention) or move
   it into the scheduler as units (bounded wait <= one slice + one decider, ~1.3-2.3 s). Recommended: measure
   contention first (HARNESS D1) in M4; flash-pointer deciders (P9, forks of Flash-Next sessions) must be units.
+  **Measured (section 12): keep it concurrent** (`--decider-mode concurrent`, the default): p90 421 ms beside a
+  prefill against 1.9 s as a unit with 2048-token slices (8.7 s with 8192 alone); its price at 2 deciders/s is
+  Flash-Next decode -20% and prefill ~1.5x. `--decider-mode scheduled` exists for flash-pointer deciders.
 - **D3 PLIMIT**: one in-flight turn per sandbox principal (recommended) or more (sub-agents in one sandbox would
   then share its fair share, not multiply it).
 - **D4 decider budget**: burst and refill rate (recommended: burst 4, refill 2/s, per the SYSTEMONE hot-path uses).
 - **D5 idempotency default key** when the client sends none: digest of (principal, previous_response_id, input)
   (recommended) or none (retries of keyless clients regenerate).
 - **D6 heartbeats default on** in halo_serve (recommended; the A2 branch has them opt-in).
+
+## 12. Implementation and measurements (stream G3, 2026-10-07)
+
+| # | Commit | What | Tests |
+|---|---|---|---|
+| model | a63f49e, M5 commit | two-level SFQ (chain root, then sandbox), `chainFair`, `oneLevelSfq`; M5's corrections (section 10) | `run.sh`: failures 0 |
+| M1 | 35406cd | `Prefill(..., chunk_tokens)`: a slice is one engine call on the bound session | `Sessions.InterleavedSlicesMatchAlone` (bitwise); mutant |
+| M2 | 123a3bc | `Scheduler` (host-only policy) | Hegel machine `SchedulerModel.PropertiesHoldUnderTheModelsActions` (12 properties) + 8 directed; 15 `sched-*` mutants |
+| M3 | ade4858, 18d3405 | `ScheduledGenerator` (engine thread, leases, StepBatch decode units, MTP only at B = 1), headers, 429 + Retry-After, D5 key; a completing slice runs the first decode step, a checkpoint inside a slice is parked on the way | `ScheduledGenerator.ConcurrentRequestsEqualEachServedAlone` (small model, tokens equal each request served alone), `OpenAiService.ServingModelUnderDeparturesStallsAndRetries` on the scheduler with 3 clients; 5 mutants |
+| M4 | 83f5899, 0fdb6a4 | `DeciderGate` (`--decider-mode concurrent|scheduled`), `RunDecider` units, `halo:sched_*` / `halo:decider_*` metrics; the idle engine wakes on an admission | `ScheduledDecider.*`, `SystemOneService.EvaluationsGoThroughTheDeciderGate`; 4 mutants |
+| M5 | M5 commit | `spec/scheduler/replay.sh` + `itf_events.py`: `quint run --mbt --out-itf` traces as server events; `SchedulerReplay.ModelTracesMatchTheCodeStepByStep` replays them against `Scheduler` (admission outcomes, fences, picks, every virtual time), `Scheduler::Boundary` | 24 checked-in traces (1143 compared steps), 300 more on 6 seeds all match; kills 12 of the 15 `sched-*` mutants alone, and 2 of its own |
+
+**Serving, real model** (unpinned clocks: `tools/gpu_clock.sh` cannot pin on this host; turns of 600-1100 new
+tokens on 12-15K contexts, 300 output tokens; `tools/serve_ab.py conc`):
+
+| Sandboxes | Today (`--scheduler off`) TTFT median / worst | G3 TTFT median / worst | G3 per-session tok/s | Aggregate tok/s today / G3 |
+|---:|---|---|---:|---|
+| 1 | 1.17 / 1.28 s | 1.21 / 1.30 s | 25.5 | 23.4 / 23.2 |
+| 2 | 7.2 / 14.9 s | 1.42 / 2.72 s | 17.0 | 22.3 / 30.7 |
+| 4 | 20.9 / 51.4 s | 2.89 / 5.22 s | 10.4 | 22.5 / 37.1 |
+
+B's P2 assumed 0.45 s turns; these turns take 1.0-1.3 s alone, and TTFT scales with them. Two fixes came out of the
+first runs: under GPU-time fairness the request whose prefill had just finished waited a round of everyone's slices
+for its first token (the first step now belongs to the completing slice), and a turn's prefill stopped at its
+exact-mode checkpoint, costing it a second round (the checkpoint is now parked inside the slice).
+
+**A cold 130K prompt beside a decoding sandbox**: the decoder ran 23.3 tok/s before, 11.9 tok/s while both were
+backlogged, and finished 1500 tokens in 120 s; the cold prompt's first token came at 170 s (alone ~97 s; +7% for
+2048-token slices; + the decoder's ~60 s of GPU). No allocation failure at this size on this branch.
+
+**D2** (2B decider at 2 calls/s, fresh 23-24K prefills):
+
+| | concurrent | scheduled, 8192 alone | scheduled, 2048 alone |
+|---|---|---|---|
+| decider beside a decode: median / p90 | 218 / 224 ms | 419 / 475 ms | 419 / 476 ms |
+| Flash-Next decode beside deciders | -20% | -30% | -33% |
+| decider beside a prefill: median / p90 | 380 / 421 ms | 5.6 / 8.7 s | 1.8 / 1.9 s |
+| prefill time per token beside deciders | +53% | +25% | +9% (and +10% alone, for 2048 slices) |
+
+A scheduled decider waits for the slice in progress, whole (the next call arrives just after a slice starts), so
+its latency is the slice length; concurrent, the two models share the GPU at kernel granularity with little real
+overlap. Decision rule fixed before measuring: concurrent, since its p90 beside a prefill (421 ms) is below a
+unit's wait.
+
+## 13. Keyed grace, and a departure that is not a stop (stream GM, 2026-10-11)
+
+G3 forward onto main e4cabdc (merge 667d4d4), then two changes found by a cordis-shaped client: a non-streaming
+chat completion with an `Idempotency-Key`, a 10 s client timeout, retried with the same key. Its answer (1200 tokens,
+~45 s of decode) outlasts every attempt.
+
+**The gap.** Section 7's adoption only works while the departed attempt is still in flight, and a departure is
+fenced at the next unit boundary (~0.3 s). A client that retries at once was adopted (4 times; answered at attempt
+5, one generation). A client that backs off 2 s (the OpenAI SDKs back off 0.5-8 s) found its attempt fenced every
+time: 6 admissions, the decode redone 5 times, and no answer unless a restart happened to fit in 10 s.
+
+**Keyed grace** (`Options::keyed_grace_s`, `--sched-keyed-grace`, default 30 s): a departed request with a key is
+fenced only at the first boundary after the grace, measured from when the server learned of the departure. Until
+then it runs on: a retry with the key adopts it, or replays it once it finished (`halo:sched_grace_finished_total`).
+Keyless departures are fenced at once, as before. The price is the late-effect bound: work for a client that
+never comes back grows from `GONE_BOUND` to `GONE_BOUND + GRACE` (model: `goneBound`).
+
+**A departure is not a stop.** The service's text callback returns false both for a stop string and when a write
+fails (the client left); `ScheduledGenerator::Wait` took every false for a consumer stop, so the engine finished the
+request *completed* at its next token, stored the truncated text for replay and marked the key finished. A retry with
+the key then got the truncated answer as a finished one (`finish_reason: stop`): one of the probe's runs got 266 of
+1200 tokens this way. Which path saw the departure first (the callback, or `Wait`'s 20 ms poll) was a race. Now the
+service reports its own departure through `Params::cancelled`, and `Wait` checks it before taking a false for a stop.
+Main (no replay store) is not affected.
+
+**Counting.** With adoption, every reader that left was recorded as a cancelled request with the tokens it had seen
+(one 1200-token generation counted 3825). A reader that leaves a keyed request, or is taken over by a retry, is now
+`detached` (finish reason) and counts no tokens; the first reader to receive the whole answer (directly, by adoption
+or by replay) counts them once.
+
+**Model** (`spec/scheduler/`): rule `keyedGrace`; caller kind `ns` (sandbox C may be a non-streaming caller whose
+answer, `NS_TOK = CT + 1` decode units, outlasts its timeout); property `noRedoWithinGrace` (a retry that reaches the
+server within `GRACE` of its attempt's departure never finds it fenced with decoding done); mutant `noKeyedGrace`
+breaks it; witnesses `wNsTimeout`, `wNsDone`, `wFinishedDetached`. `workAfterGoneBounded` uses `goneBound`. The
+replay traces were regenerated (24 traces, 1154 compared steps; 42 of their 43 adoptions come after the server knew
+the client had left).
+
+**Tests.** `Scheduler.KeyedDepartureRunsOnThroughItsGrace`, `Scheduler.KeyedDepartureFinishedWithinItsGraceIsReplayed`;
+`ScheduledGenerator.ARetryWithTheKeyGetsTheWholeAnswerAfterTheCallbackFoundTheClientGone` (fails without the fix with
+the truncated answer, 3 of 3 runs); the Hegel machine runs with the model's grace; mutants `sched-no-keyed-grace`,
+`sg-detached-reader-counts-tokens`, `sg-departure-taken-for-stop`.
+
+**Measured** (`retry_probe.py`, 8 attempts, 10 s timeout, greedy, reference answer sha 41d06cc6df42):
+
+| Client | G3 as merged | + keyed grace and the fix |
+|---|---|---|
+| key, retry at once | answered at attempt 5, 47.6 s; 1 generation; counted 3825 tokens, 4 "cancelled" | attempt 5, 47.4 s; 1 generation; 1200 tokens, 4 "detached"; = reference |
+| key, retry after 2 s | 6 generations (5 fenced), answered at 74 s with a truncated replayed answer (266 tokens, `stop`) | attempt 4, 47.2 s; 1 generation (3 adoptions); = reference |
+| no key, retry after 2 s | never answered (8 generations) | unchanged |
+
+Restarting after a fenced mid-decode departure is exact: three cuts at 5 s (300 tokens) and six keyed cuts at 10 s
+(1200 tokens) both answered byte-identically to the uninterrupted reference, on this branch and on main.

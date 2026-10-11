@@ -14,6 +14,7 @@
 
 #include "core/json.hpp"
 #include "decide/systemone.hpp"
+#include "server/decider_gate.hpp"
 #include "server/http.hpp"
 
 namespace halo::server {
@@ -27,8 +28,10 @@ class DecisionEngine {
 };
 
 /// Registers POST /v1/systemone on `server` for `engine` (which must outlive
-/// the server). Requests are evaluated one at a time.
-void RegisterSystemOne(HttpServer& server, DecisionEngine& engine);
+/// the server). Requests are evaluated one at a time, through `gate` when
+/// given (G3: concurrent with Flash-Next or a scheduled unit; it must outlive
+/// the server), else under the route's own mutex.
+void RegisterSystemOne(HttpServer& server, DecisionEngine& engine, DeciderGate* gate = nullptr);
 
 }  // namespace halo::server
 

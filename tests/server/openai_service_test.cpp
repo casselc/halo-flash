@@ -20,12 +20,15 @@
 #include <atomic>
 #include <cctype>
 #include <deque>
+#include <future>
 #include <map>
 #include <memory>
 #include <chrono>
 #include <mutex>
 #include <optional>
 #include <random>
+#include <set>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -36,6 +39,7 @@
 #include "server/http.hpp"
 #include "server/openai_response.hpp"
 #include "server/openai_service.hpp"
+#include "server/scheduled_generator.hpp"
 #include "text/chat_template.hpp"
 
 namespace gs = hegel::generators;
@@ -667,6 +671,133 @@ class SteppedGenerator : public TextGenerator {
   std::timed_mutex engine;
 };
 
+
+/// G3: SteppedGenerator's plans served through the real ScheduledGenerator (server/scheduled_generator.hpp: the
+/// scheduler, its engine thread, admission, fences, publication) on a fake engine. A prompt's bytes are its tokens;
+/// a request prefills in kChunks slices and then decodes one piece a step (token kWord + w, with its big size in the
+/// high bits; kStop ends it); each unit sleeps 300 us and counts as work; a planned hold blocks the engine thread
+/// at its unit until released or until the scheduler knows the client is gone (then that unit does no work).
+class FakeBackend : public ScheduledBackend {
+ public:
+  static constexpr std::int32_t kWord = 1 << 20, kStop = kWord - 1;
+  explicit FakeBackend(SteppedGenerator& plans) : g_(plans) {}
+  std::function<bool(Id)> departed;  // whether the scheduler knows `id`'s client left (set once the generator exists)
+
+  bool Encode(const std::string& prompt, std::vector<std::int32_t>* ids, std::size_t* stable) const override {
+    ids->clear();
+    for (unsigned char ch : prompt) ids->push_back(ch);
+    *stable = ids->empty() ? 0 : ids->size() - 1;
+    return true;
+  }
+  [[nodiscard]] std::string TokenBytes(text::TokenId t) const override {
+    if (static_cast<std::int32_t>(t) < kWord) return {};
+    const std::uint32_t v = static_cast<std::uint32_t>(t) - kWord, w = v & 0xffff, big = (v >> 16) * 1024;
+    return w == 0 ? std::string("r\n</think>\n\n") : big ? std::string(big, static_cast<char>('a' + w % 26))
+                                                         : "w" + std::to_string(w) + " ";
+  }
+  [[nodiscard]] bool IsStop(text::TokenId t) const override { return static_cast<std::int32_t>(t) == kStop; }
+  [[nodiscard]] bool HasTokenizer() const override { return true; }
+  [[nodiscard]] double BytesPerToken() const override { return 1; }
+  void Admitted(Id id, std::span<const std::int32_t> prompt) override {
+    std::string text(prompt.begin(), prompt.end());
+    std::shared_ptr<SteppedGenerator::Run> run;
+    {
+      std::lock_guard<std::mutex> lk(g_.mu);
+      g_.prompts.push_back(text);
+      if (auto it = g_.plans.find(LastMarker(text)); it != g_.plans.end() && !it->second.empty()) {
+        run = it->second.front();
+        it->second.pop_front();
+      }
+    }
+    if (!run) run = std::make_shared<SteppedGenerator::Run>();
+    run->phase = SteppedGenerator::kQueued;
+    std::lock_guard<std::mutex> lk(mu_);
+    runs_[id] = {run};
+  }
+  bool Begin(Id id, std::span<const std::int32_t>, std::size_t, std::uint32_t, bool, bool, SpecDecodeStats*,
+             std::size_t* reused, std::uint64_t* bound, std::string*) override {
+    Of(id).run->phase = SteppedGenerator::kPrefill;
+    *reused = 0;
+    *bound = 0;
+    return true;
+  }
+  bool PrefillSlice(Id id, std::uint32_t, std::size_t* ran, bool* done, std::string*) override {
+    auto& r = Of(id);
+    *ran = 0;
+    *done = false;
+    if (!Unit(id, *r.run, r.chunk)) return true;  // its client left during a hold: nothing done
+    *ran = 1;
+    *done = ++r.chunk >= SteppedGenerator::kChunks;
+    if (*done) r.run->phase = SteppedGenerator::kDecode;
+    return true;
+  }
+  bool Step(Id id, std::int32_t, std::uint32_t, const sampling::SamplingConfig&, sampling::SamplerState*,
+            DecodeCycle* c, std::string*) override {
+    c->tokens.assign(1, Next(id));
+    return true;
+  }
+  bool StepBatch(std::vector<BatchItem>& items, std::string*) override {
+    for (auto& it : items) it.out = Next(it.id);
+    return true;
+  }
+  void Ran(Id, std::int32_t) override {}
+  void Finish(Id id) override { End(id, false); }
+  void Abandon(Id id) override { End(id, true); }
+  std::optional<Scheduler::Retained> Park(Id id) override {
+    End(id, true);
+    return std::nullopt;
+  }
+  void Fenced(Id id) override { End(id, true); }
+  void Evict(Scheduler::Key) override {}
+  [[nodiscard]] bool HasLease(Id id) const override {
+    std::lock_guard<std::mutex> lk(mu_);
+    return runs_.count(id) > 0 && runs_.at(id).run->phase.load() >= SteppedGenerator::kPrefill;
+  }
+  [[nodiscard]] std::uint64_t Generation() const override { return 0; }
+  [[nodiscard]] std::vector<Scheduler::Retained> Retained() const override { return {}; }
+  void SetPins(const std::set<std::uint64_t>&) override {}
+
+ private:
+  struct R {
+    std::shared_ptr<SteppedGenerator::Run> run;
+    int chunk = 0, word = 0;
+  };
+  R& Of(Id id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    return runs_.at(id);
+  }
+  // One unit of `id`: a planned hold first; false (no work) when its client left during it.
+  bool Unit(Id id, SteppedGenerator::Run& run, int u) {
+    if (u == run.hold_at) {
+      run.work_at_hold = run.work.load();
+      run.held = true;
+      while (!run.release && !(departed && departed(id))) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      run.held = false;
+      if (departed && departed(id)) return false;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(300));
+    ++run.work;
+    return true;
+  }
+  std::int32_t Next(Id id) {
+    auto& r = Of(id);
+    if (r.word > r.run->words || !Unit(id, *r.run, SteppedGenerator::kChunks + r.word)) return kStop;
+    const int w = r.word++;
+    return kWord + w + static_cast<std::int32_t>((r.run->big / 1024) << 16);
+  }
+  void End(Id id, bool cancelled) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = runs_.find(id);
+    if (it == runs_.end()) return;
+    if (cancelled) it->second.run->cancelled = true;
+    it->second.run->phase = SteppedGenerator::kDone;
+    runs_.erase(it);
+  }
+  SteppedGenerator& g_;
+  mutable std::mutex mu_;
+  std::map<Id, R> runs_;
+};
+
 /// The in-memory store, with an injectable write failure (a full disk, a locked SQLite file).
 struct FailableStore : InMemoryResponseStore {
   using InMemoryResponseStore::InMemoryResponseStore;
@@ -681,21 +812,38 @@ struct FailableStore : InMemoryResponseStore {
 };
 
 struct ServingRig {
-  explicit ServingRig(int sse_keepalive_ms = 0) : server({.send_timeout_ms = 200}) {
+  /// `scheduled`: the service runs on the G3 ScheduledGenerator over a FakeBackend serving `gen`'s plans.
+  explicit ServingRig(int sse_keepalive_ms = 0, bool scheduled = false) : server({.send_timeout_ms = 200}) {
     ServiceOptions o;
     o.sse_keepalive_ms = sse_keepalive_ms;
     o.observer = &observed;
     o.store = &store;
     o.now_s = [] { return std::int64_t{1700000000}; };
-    service = std::make_unique<OpenAiService>(gen, o);
+    o.on_refused = [this](const std::string& why) {
+      std::lock_guard<std::mutex> lk(observed.mu);
+      refused.push_back(why);
+    };
+    if (scheduled) {
+      auto fb = std::make_unique<FakeBackend>(gen);
+      fake = fb.get();
+      sched = std::make_unique<ScheduledGenerator>(std::move(fb), 1u << 20);
+      fake->departed = [s = sched.get()](Scheduler::Id id) {
+        const auto v = s->scheduler().Request(id);
+        return !v || v->departed;
+      };
+    }
+    service = std::make_unique<OpenAiService>(scheduled ? static_cast<TextGenerator&>(*sched) : gen, o);
     service->Register(server);
     std::string err;
     if (!server.Start(&err)) throw std::runtime_error(err);
   }
   ~ServingRig() { server.Stop(); }
-  SteppedGenerator gen;
+  SteppedGenerator gen;  // (before `sched`: the fake backend serves its plans)
+  std::unique_ptr<ScheduledGenerator> sched;
+  FakeBackend* fake = nullptr;
   FailableStore store{100000};
   Recording observed;
+  std::vector<std::string> refused;  // 429s, by why (under observed.mu)
   HttpServer server;
   std::unique_ptr<OpenAiService> service;
 };
@@ -704,7 +852,7 @@ struct ServingRig {
 struct Conn {
   int fd = -1;
   std::string raw;
-  Conn(int port, const std::string& body, int rcvbuf = 0) {
+  Conn(int port, const std::string& body, int rcvbuf = 0, const std::string& headers = "") {
     fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (rcvbuf) ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
     const timeval tv{10, 0};  // a reply that never comes fails the test instead of hanging it
@@ -714,7 +862,7 @@ struct Conn {
     a.sin_port = htons(static_cast<std::uint16_t>(port));
     ::inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
     if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0) throw std::runtime_error("connect");
-    const std::string req = "POST /v1/responses HTTP/1.1\r\nConnection: close\r\nContent-Length: " +
+    const std::string req = "POST /v1/responses HTTP/1.1\r\nConnection: close\r\n" + headers + "Content-Length: " +
                             std::to_string(body.size()) + "\r\n\r\n" + body;
     ::send(fd, req.data(), req.size(), MSG_NOSIGNAL);
   }
@@ -826,8 +974,11 @@ bool Await(const std::function<bool()>& f, int ms = 5000) {
 //   - continuing from a completed response sends its delivered text back to the generator; from a cancelled one, 400.
 TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
   hegel::test([](hegel::TestCase& tc) {
-    ServingRig rig;
-    rig.gen.spec = tc.draw(gs::booleans());  // decode in speculative cycles (--mtp-model)
+    // G3: the same machine on the scheduled generator (fair scheduler, engine thread; a fake engine) as well; there
+    // three sandboxes also run at once, and a sandbox's second request is refused 429 while its first is in flight.
+    const bool scheduled = tc.draw(gs::booleans());
+    ServingRig rig(0, scheduled);
+    rig.gen.spec = !scheduled && tc.draw(gs::booleans());  // decode in speculative cycles (--mtp-model; B = 1 only)
     rig.gen.spec_seed = tc.draw(gs::integers<std::uint64_t>());
     const int port = rig.server.port();
     std::vector<Finished> done;
@@ -904,7 +1055,7 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
     for (int step = 0; step < steps; ++step) {
       const auto rule = tc.draw(gs::sampled_from<std::string>(
           {"complete", "leave-queued", "leave-prefill", "leave-decode", "stall", "retry", "continue",
-           "store-fails"}));
+           "store-fails", "concurrent", "limit429"}));
       const bool stream = tc.draw(gs::booleans());
       const int words = tc.draw(gs::integers<int>({.min_value = 1, .max_value = 8}));
       const auto max_tokens = tc.draw(gs::integers<std::uint32_t>({.min_value = 1, .max_value = 12}));
@@ -932,6 +1083,17 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
           Conn vc(port, v.body);
           ASSERT_TRUE(Await([&] { return v.run->phase.load() == SteppedGenerator::kQueued; }));
           v.work_at_leave = 0;
+        }
+        // Scheduled: the holder's unit holds the engine thread, so the victim is fenced at the next unit boundary,
+        // after the release (never having run) -- once the scheduler knows its client left (its HTTP thread polls
+        // the connection every 20 ms).
+        if (scheduled) {
+          ASSERT_TRUE(Await([&] {
+            int connected = 0;
+            for (const auto& r : rig.sched->scheduler().Requests()) connected += !r.departed;
+            return connected == 1;  // the holder
+          }));
+          h.run->release = true;
         }
         ASSERT_TRUE(Await([&] { return v.run->phase.load() == SteppedGenerator::kDone; })) << "the departed request stayed queued";
         h.run->release = true;
@@ -989,6 +1151,61 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
           ASSERT_NE(c.Body().find("not stored"), std::string::npos) << c.Body();
         }
         finish(std::move(f));
+      } else if (rule == "concurrent") {
+        // Three sandboxes (distinct principals) at once: each gets its whole answer.
+        std::vector<Finished> fs;
+        std::vector<std::unique_ptr<Conn>> cs;
+        for (int k = 0; k < 3; ++k) {
+          const auto m = fresh();
+          fs.push_back({m, RequestBody(m, stream, max_tokens), 0, stream, {}, rig.gen.Plan(m, -1, words)});
+          cs.push_back(std::make_unique<Conn>(port, fs.back().body, 0, "X-Halo-Principal: sandbox-" + m + "\r\n"));
+        }
+        std::vector<std::thread> readers;
+        for (auto& c : cs) readers.emplace_back([&c] { c->ReadToEnd(); });
+        for (auto& t : readers) t.join();
+        for (int k = 0; k < 3; ++k) {
+          fs[static_cast<std::size_t>(k)].got = Delivered(*cs[static_cast<std::size_t>(k)], stream);
+          EXPECT_TRUE(fs[static_cast<std::size_t>(k)].got.full) << cs[static_cast<std::size_t>(k)]->raw.substr(0, 300);
+          finish(std::move(fs[static_cast<std::size_t>(k)]));
+        }
+      } else if (rule == "limit429" && scheduled) {
+        // D3: a sandbox's second request while its first is in flight is refused 429 with Retry-After before
+        // anything is sent; it never runs, and nothing is recorded or stored for it.
+        const auto hm = fresh(), sm = fresh();
+        Finished h{hm, RequestBody(hm, stream, 64), 0, stream, {}, rig.gen.Plan(hm, 1, words)};
+        Conn hc(port, h.body, 0, "X-Halo-Principal: sandbox-limited\r\n");
+        std::thread reader([&] { hc.ReadToEnd(); });
+        struct Join {
+          std::thread& t;
+          SteppedGenerator::Run& r;
+          ~Join() {
+            r.release = true;
+            if (t.joinable()) t.join();
+          }
+        } join{reader, *h.run};
+        ASSERT_TRUE(Await([&] { return h.run->held.load(); }));
+        const auto second = rig.gen.Plan(sm, -1, words);
+        std::size_t refused_before = 0;
+        {
+          std::lock_guard<std::mutex> lk(rig.observed.mu);
+          refused_before = rig.refused.size();
+        }
+        Conn sc(port, RequestBody(sm, tc.draw(gs::booleans()), 64), 0, "X-Halo-Principal: sandbox-limited\r\n");
+        sc.ReadToEnd();
+        ASSERT_EQ(sc.Status(), 429) << sc.raw.substr(0, 300);
+        ASSERT_NE(sc.raw.find("Retry-After: "), std::string::npos) << sc.raw.substr(0, 300);
+        ASSERT_NE(sc.Body().find("rate_limit_exceeded"), std::string::npos) << sc.Body();
+        ASSERT_EQ(second->phase.load(), SteppedGenerator::kPlanned) << "a refused request was admitted";
+        {
+          std::lock_guard<std::mutex> lk(rig.observed.mu);
+          ASSERT_EQ(rig.refused.size(), refused_before + 1);
+          for (const auto& r : rig.observed.records) ASSERT_NE(LastMarker(r.input), sm) << "a refused request was recorded";
+        }
+        h.run->release = true;
+        reader.join();
+        h.got = Delivered(hc, stream);
+        EXPECT_TRUE(h.got.full);
+        finish(std::move(h));
       } else if (rule == "retry" && !done.empty()) {
         // The same body again (a client retrying after a lost answer): a new, independent response.
         const Finished prev = done[tc.draw(gs::integers<std::size_t>({.min_value = 0, .max_value = done.size() - 1}))];
@@ -1026,10 +1243,189 @@ TEST(OpenAiService, ServingModelUnderDeparturesStallsAndRetries) {
   }, {.test_cases = 25});
 }
 
+// G3 D3 through the service: a sandbox's second turn while its first is in flight is answered 429 with
+// Retry-After and an OpenAI rate-limit error before anything streams; it never reaches the engine. Another sandbox
+// (or the same one once its turn finished) is served.
+TEST(OpenAiService, ScheduledSecondTurnOfASandboxIsRefused429) {
+  ServingRig rig(0, true);
+  const int port = rig.server.port();
+  auto held = rig.gen.Plan("m901x", 1, 3);
+  Conn first(port, RequestBody("m901x", true, 16), 0, "X-Halo-Principal: sb\r\n");
+  std::thread reader([&] { first.ReadToEnd(); });
+  ASSERT_TRUE(Await([&] { return held->held.load(); }));
+  auto refused = rig.gen.Plan("m902x", -1, 3);
+  Conn second(port, RequestBody("m902x", true, 16), 0, "X-Halo-Principal: sb\r\n");
+  second.ReadToEnd();
+  EXPECT_EQ(second.Status(), 429) << second.raw.substr(0, 300);
+  EXPECT_NE(second.raw.find("Retry-After: "), std::string::npos);
+  EXPECT_NE(second.Body().find("\"type\":\"rate_limit_exceeded\""), std::string::npos) << second.Body();
+  EXPECT_EQ(refused->phase.load(), SteppedGenerator::kPlanned);
+  Conn other(port, RequestBody("m903x", false, 16), 0, "X-Halo-Principal: sb-other\r\n");
+  held->release = true;
+  other.ReadToEnd();
+  reader.join();
+  EXPECT_EQ(other.Status(), 200);
+  EXPECT_TRUE(Delivered(first, true).full);
+  Conn again(port, RequestBody("m904x", false, 16), 0, "X-Halo-Principal: sb\r\n");
+  again.ReadToEnd();
+  EXPECT_EQ(again.Status(), 200) << again.raw.substr(0, 300);
+}
+
+// G3 M4 (--decider-mode scheduled): a decider evaluation is a scheduler unit on the engine thread. Six arrive while
+// a request's first prefill slice runs: the four with credit (D4 burst 4, no refill here) run at the next unit
+// boundary, ahead of that request's remaining slices; the two without credit take the decider class's fair share;
+// every evaluation runs once, on the engine thread, and the request's answer is unchanged. /metrics counts them.
+TEST(ScheduledDecider, CreditedDecidersRunAtTheNextBoundaryOnTheEngineThread) {
+  SteppedGenerator gen;
+  auto plan = gen.Plan("m1x", -1, 3);
+  ScheduledOptions o;
+  o.sched.decider_burst = 4;
+  o.sched.decider_refill_per_s = 0;
+  std::mutex mu;
+  std::vector<Scheduler::Kind> kinds;
+  std::vector<std::future<bool>> deciders;
+  std::atomic<int> ran{0}, off_engine{0};
+  std::atomic<bool> launched{false};
+  ScheduledGenerator* self = nullptr;
+  const auto main_id = std::this_thread::get_id();
+  o.before_unit = [&](const Scheduler::Unit& u) {
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      kinds.push_back(u.kind);
+    }
+    if (u.kind != Scheduler::Kind::kSlice || launched.exchange(true)) return;
+    const auto engine_id = std::this_thread::get_id();
+    for (int i = 0; i < 6; ++i)
+      deciders.push_back(std::async(std::launch::async, [&, engine_id] {
+        std::string e;
+        return self->RunDecider(
+            [&, engine_id] {
+              if (std::this_thread::get_id() != engine_id || std::this_thread::get_id() == main_id) ++off_engine;
+              ++ran;
+            },
+            &e);
+      }));
+    // Wait (on the engine thread, between units) until all six are admitted.
+    for (int spin = 0; spin < 5000; ++spin) {
+      int n = 0;
+      for (const auto& v : self->scheduler().Requests()) n += v.decider ? 1 : 0;
+      if (n == 6) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  };
+  ScheduledGenerator sg(std::make_unique<FakeBackend>(gen), 1u << 20, {}, o);
+  self = &sg;
+  const std::string prompt = "a turn m1x";
+  std::vector<std::int32_t> ids(prompt.begin(), prompt.end());
+  TextGenerator::Params p;
+  p.max_tokens = 16;
+  std::vector<text::TokenId> got;
+  const auto r = sg.GenerateIds(ids, ids.size() - 1, p, [&](text::TokenId t) {
+    got.push_back(t);
+    return true;
+  });
+  for (auto& f : deciders) EXPECT_TRUE(f.get());
+  EXPECT_TRUE(r.error.empty()) << r.error;
+  EXPECT_FALSE(r.cancelled);
+  {  // the same request served alone
+    SteppedGenerator gen2;
+    gen2.Plan("m1x", -1, 3);
+    ScheduledGenerator alone(std::make_unique<FakeBackend>(gen2), 1u << 20);
+    std::vector<text::TokenId> want;
+    const auto r2 = alone.GenerateIds(ids, ids.size() - 1, p, [&](text::TokenId t) {
+      want.push_back(t);
+      return true;
+    });
+    EXPECT_TRUE(r2.error.empty());
+    EXPECT_FALSE(want.empty());
+    EXPECT_EQ(got, want);
+  }
+  EXPECT_EQ(ran.load(), 6);
+  EXPECT_EQ(off_engine.load(), 0);
+  std::vector<Scheduler::Kind> k;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    k = kinds;
+  }
+  ASSERT_GE(k.size(), 5u);
+  EXPECT_EQ(k[0], Scheduler::Kind::kSlice);
+  for (int i = 1; i <= 4; ++i) EXPECT_EQ(k[static_cast<std::size_t>(i)], Scheduler::Kind::kDecide) << "unit " << i;
+  EXPECT_EQ(std::count(k.begin(), k.end(), Scheduler::Kind::kDecide), 6);
+  const auto c = sg.scheduler().counters();
+  EXPECT_EQ(c.decides, 6u);
+  EXPECT_EQ(c.decider_out_of_credit, 2u);
+  std::string m;
+  sg.RenderMetrics(m, "model_name=\"t\"");
+  EXPECT_NE(m.find("halo:sched_decides_total{model_name=\"t\"} 6\n"), std::string::npos) << m;
+  EXPECT_NE(m.find("halo:sched_unit_seconds_count{model_name=\"t\",kind=\"decide\"} 6\n"), std::string::npos);
+  EXPECT_NE(m.find("halo:sched_queue_wait_seconds_count{model_name=\"t\"} 1\n"), std::string::npos);
+  EXPECT_EQ(m.find("# TYPE halo:sched_unit_seconds histogram"), m.rfind("# TYPE halo:sched_unit_seconds histogram"));
+}
+
 // Audit F7: a store write that fails is answered with an error, never a finished response whose id later 404s.
 // Non-streaming: a 500 naming the store; streaming: an error event in place of response.completed. Nothing is
 // kept, the observer records an error, and continuing from the id is a 404; once the store works again the same
 // request succeeds (a retry is safe: every attempt is a new immutable response).
+// G3 keyed grace + the departure/stop distinction (cordis's non-streaming retries): a client found gone by the text
+// callback (as the service finds it: a failed write) is a departure, not a stop string. The keyed request runs on
+// through its grace, and the retry with the same key gets the whole answer (adopted, or replayed once finished), as
+// the request served alone; never a truncated answer marked finished. The generation's tokens count once.
+TEST(ScheduledGenerator, ARetryWithTheKeyGetsTheWholeAnswerAfterTheCallbackFoundTheClientGone) {
+  const std::string prompt = "a review m77x";
+  std::string want;
+  {
+    SteppedGenerator alone_gen;
+    alone_gen.Plan("m77x", -1, 120);
+    ScheduledGenerator alone(std::make_unique<FakeBackend>(alone_gen), 1u << 20);
+    TextGenerator::Params p;
+    p.prompt = prompt;
+    p.max_tokens = 1000;
+    const auto r = alone.Generate(p, [&](std::string_view piece) { return want.append(piece), true; });
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    ASSERT_FALSE(r.cancelled);
+  }
+  SteppedGenerator gen;
+  // The engine holds mid-decode (the fake's hold, with no departure hook: it waits for the release only), so the
+  // client leaves while the answer is still being generated.
+  auto plan = gen.Plan("m77x", SteppedGenerator::kChunks + 4, 120);
+  gen.Plan("m77x", -1, 120);  // only used if the retry were (wrongly) a new request
+  ScheduledGenerator sg(std::make_unique<FakeBackend>(gen), 1u << 20);
+  TextGenerator::Params p;
+  p.prompt = prompt;
+  p.max_tokens = 1000;
+  p.idempotency_key = "review-1";
+  std::atomic<bool> gone{false}, leaving{false};
+  p.cancelled = [&] { return gone.load(); };
+  std::string first;
+  auto leave = std::async(std::launch::async, [&] {
+    while (!plan->held) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    leaving = true;
+    plan->release = true;
+  });
+  const auto r1 = sg.Generate(p, [&](std::string_view piece) {
+    first.append(piece);
+    if (!leaving) return true;
+    gone = true;  // the next write failed: the client left
+    return false;
+  });
+  leave.get();
+  EXPECT_TRUE(r1.cancelled);
+  EXPECT_TRUE(r1.detached);
+  EXPECT_TRUE(r1.uncounted);
+  EXPECT_LT(first.size(), want.size());
+  TextGenerator::Params retry = p;
+  retry.cancelled = [] { return false; };
+  std::string second;
+  const auto r2 = sg.Generate(retry, [&](std::string_view piece) { return second.append(piece), true; });
+  EXPECT_TRUE(r2.error.empty()) << r2.error;
+  EXPECT_FALSE(r2.cancelled);
+  EXPECT_FALSE(r2.uncounted);  // this reader counts the generation's tokens
+  EXPECT_EQ(second, want);
+  const auto c = sg.scheduler().counters();
+  EXPECT_EQ(c.adopted + c.replayed, 1u);
+  EXPECT_EQ(c.admitted, 1u);  // one generation
+}
+
 TEST(OpenAiService, AFailedStoreWriteIsAnErrorAndKeepsNothing) {
   ServingRig rig;
   const int port = rig.server.port();

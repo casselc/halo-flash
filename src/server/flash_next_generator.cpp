@@ -10,19 +10,6 @@
 
 namespace halo::server {
 
-std::size_t CompleteUtf8Prefix(std::string_view bytes) {
-  // Look back at most 3 bytes for the lead byte of a sequence that the
-  // buffer cuts short.
-  const std::size_t n = bytes.size();
-  for (std::size_t back = 1; back <= std::min<std::size_t>(3, n); ++back) {
-    const auto c = static_cast<unsigned char>(bytes[n - back]);
-    if ((c & 0xC0) == 0x80) continue;  // continuation byte: keep looking
-    const std::size_t need = c >= 0xF0 && c <= 0xF4 ? 4 : c >= 0xE0 && c < 0xF0 ? 3 : c >= 0xC2 && c < 0xE0 ? 2 : 1;
-    return need > back ? n - back : n;  // ASCII or invalid lead bytes pass through
-  }
-  return n;
-}
-
 FlashNextGenerator::FlashNextGenerator(engine::FlashNextGpu& engine, const text::Tokenizer& tokenizer,
                                        std::uint32_t max_context, SessionCacheOptions cache, SpecOptions spec)
     : engine_(engine), tok_(&tokenizer), max_context_(max_context), cache_(engine, cache), spec_(std::move(spec)),

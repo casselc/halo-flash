@@ -1,39 +1,45 @@
-quint 0.32.0, seed 0x5eed, steps 120, samples 20000 (design) / 5000 (mutants)
-sim   design                safety                 20000 x 120 ok       (expect ok      )  310.0s (all 11 properties)
-sim   design                safety                 20000 x 120 ok       (expect ok      )  317.0s (all 11 properties, second seed 0xbeef)
-wit   design wPreempted was witnessed in 19994 trace(s) out of 20000 explored (99.97%)
-wit   design wBatched was witnessed in 14039 trace(s) out of 20000 explored (70.19%)
-wit   design wDeciderBetweenSlices was witnessed in 19958 trace(s) out of 20000 explored (99.79%)
+quint 0.32.0, seed 0x5eed, steps 160, samples 20000 (design) / 5000 (mutants)
+sim   design                safety                 20000 x 160 ok       (expect ok      )  590.7s (all 13 properties)
+sim   design                safety                 20000 x 160 ok       (expect ok      )  588.9s (all 13 properties, second seed 0xbeef)
+wit   design wPreempted was witnessed in 20000 trace(s) out of 20000 explored (100.00%)
+wit   design wBatched was witnessed in 18255 trace(s) out of 20000 explored (91.27%)
+wit   design wDeciderBetweenSlices was witnessed in 19998 trace(s) out of 20000 explored (99.99%)
 wit   design wDeciderFair was witnessed in 20000 trace(s) out of 20000 explored (100.00%)
-wit   design wParkedOnCancel was witnessed in 2592 trace(s) out of 20000 explored (12.96%)
-wit   design wEvicted was witnessed in 6818 trace(s) out of 20000 explored (34.09%)
-wit   design wMem429 was witnessed in 18930 trace(s) out of 20000 explored (94.65%)
-wit   design wRetryAfter429 was witnessed in 15065 trace(s) out of 20000 explored (75.33%)
-wit   design wTimeout was witnessed in 8173 trace(s) out of 20000 explored (40.87%)
-wit   design wFencedFin was witnessed in 4349 trace(s) out of 20000 explored (21.75%)
-wit   design wFencedVanished was witnessed in 1220 trace(s) out of 20000 explored (6.10%)
-wit   design wLateArrival was witnessed in 8819 trace(s) out of 20000 explored (44.09%)
-wit   design wReplayed was witnessed in 7 trace(s) out of 20000 explored (0.03%)
-wit   design wAdopted was witnessed in 7310 trace(s) out of 20000 explored (36.55%)
-wit   design wTurn2Done was witnessed in 184 trace(s) out of 20000 explored (0.92%)
-sim   noIdempotency         noRecompute             5000 x 120 ok       (expect ok      )   30.9s (keyless: park on cancel + bind at start still avoid recompute)
-sim   noIdempotency         boundedWait             5000 x 120 ok       (expect ok      )   35.0s (keyless)
-wit   noIdempotency wLimit429 was witnessed in 1504 trace(s) out of 5000 explored (30.08%)
-wit   noIdempotency wBoundLater was witnessed in 247 trace(s) out of 5000 explored (4.94%)
-sim   today                 boundedWait             5000 x 120 VIOLATED (expect VIOLATED)    1.6s a turn waits for another sandbox's whole request
-sim   today                 deciderLatency          5000 x 120 VIOLATED (expect VIOLATED)    1.6s a decider waits for a whole agent request
-sim   noPreempt             boundedWait             5000 x 120 VIOLATED (expect VIOLATED)    1.7s 
-sim   noDeciderPrio         deciderLatency          5000 x 120 VIOLATED (expect VIOLATED)    1.6s 
-sim   strictDeciderPrio     boundedWait             5000 x 120 VIOLATED (expect VIOLATED)    1.6s a decider flood starves the sandboxes
-sim   noFence               workAfterGoneBounded    5000 x 120 VIOLATED (expect VIOLATED)    2.0s 
-sim   noDeadPeerProbe       workAfterGoneBounded    5000 x 120 VIOLATED (expect VIOLATED)    1.6s a peer gone without FIN
-sim   noHeartbeat           noSpuriousTimeout       5000 x 120 VIOLATED (expect VIOLATED)    1.5s AUDIT D3
-sim   dropOnCancel          noRecompute             5000 x 120 VIOLATED (expect VIOLATED)    1.5s 
-sim   bindAtAdmission       noRecompute             5000 x 120 VIOLATED (expect VIOLATED)    1.5s (keyless; with keys it is equivalent)
-sim   memoryReadingOnly     noOvercommit            5000 x 120 VIOLATED (expect VIOLATED)    1.5s AUDIT D1/E3
-sim   releasedStaysCharged  refuseOnlyIfShort       5000 x 120 VIOLATED (expect VIOLATED)    1.5s AUDIT F3
-sim   evictPlanned          withinReservation       5000 x 120 VIOLATED (expect VIOLATED)    5.0s 
-sim   queued429             rejectedNeverRuns       5000 x 120 VIOLATED (expect VIOLATED)    1.5s AUDIT N4
-sim   noIdempotency         generatedOnce           5000 x 120 VIOLATED (expect VIOLATED)   26.7s a retry after a lost answer
-sim   noIdempotency         noSelfInflicted429      5000 x 120 VIOLATED (expect VIOLATED)    1.6s a retry refused for its own attempt
+wit   design wParkedOnCancel was witnessed in 8097 trace(s) out of 20000 explored (40.48%)
+wit   design wEvicted was witnessed in 10373 trace(s) out of 20000 explored (51.87%)
+wit   design wMem429 was witnessed in 19433 trace(s) out of 20000 explored (97.17%)
+wit   design wRetryAfter429 was witnessed in 18445 trace(s) out of 20000 explored (92.22%)
+wit   design wTimeout was witnessed in 10114 trace(s) out of 20000 explored (50.57%)
+wit   design wFencedFin was witnessed in 269 trace(s) out of 20000 explored (1.34%)
+wit   design wFencedVanished was witnessed in 81 trace(s) out of 20000 explored (0.40%)
+wit   design wLateArrival was witnessed in 9942 trace(s) out of 20000 explored (49.71%)
+wit   design wReplayed was witnessed in 15 trace(s) out of 20000 explored (0.07%)
+wit   design wAdopted was witnessed in 14349 trace(s) out of 20000 explored (71.75%)
+wit   design wTurn2Done was witnessed in 9569 trace(s) out of 20000 explored (47.84%)
+wit   design wChainFanout was witnessed in 3575 trace(s) out of 20000 explored (17.88%)
+wit   design wNsTimeout was witnessed in 8308 trace(s) out of 20000 explored (41.54%)
+wit   design wNsDone was witnessed in 258 trace(s) out of 20000 explored (1.29%)
+wit   design wFinishedDetached was witnessed in 1323 trace(s) out of 20000 explored (6.62%)
+sim   noIdempotency         noRecompute             5000 x 160 ok       (expect ok      )   52.4s (keyless: park on cancel + bind at start still avoid recompute)
+sim   noIdempotency         boundedWait             5000 x 160 ok       (expect ok      )   58.6s (keyless)
+wit   noIdempotency wLimit429 was witnessed in 1853 trace(s) out of 5000 explored (37.06%)
+wit   noIdempotency wBoundLater was witnessed in 151 trace(s) out of 5000 explored (3.02%)
+sim   today                 boundedWait             5000 x 160 VIOLATED (expect VIOLATED)    1.8s a turn waits for another sandbox's whole request
+sim   today                 deciderLatency          5000 x 160 VIOLATED (expect VIOLATED)    1.8s a decider waits for a whole agent request
+sim   noPreempt             boundedWait             5000 x 160 VIOLATED (expect VIOLATED)    1.8s 
+sim   noDeciderPrio         deciderLatency          5000 x 160 VIOLATED (expect VIOLATED)    1.8s 
+sim   strictDeciderPrio     boundedWait             5000 x 160 VIOLATED (expect VIOLATED)    1.9s a decider flood starves the sandboxes
+sim   noFence               workAfterGoneBounded    5000 x 160 VIOLATED (expect VIOLATED)    1.8s 
+sim   noDeadPeerProbe       workAfterGoneBounded    5000 x 160 VIOLATED (expect VIOLATED)    2.0s a peer gone without FIN
+sim   noHeartbeat           noSpuriousTimeout       5000 x 160 VIOLATED (expect VIOLATED)    1.7s AUDIT D3
+sim   dropOnCancel          noRecompute             5000 x 160 VIOLATED (expect VIOLATED)    1.9s 
+sim   noKeyedGrace          noRedoWithinGrace       5000 x 160 VIOLATED (expect VIOLATED)    1.8s a non-streaming caller's retry decodes its turn again
+sim   bindAtAdmission       noRecompute             5000 x 160 VIOLATED (expect VIOLATED)    2.0s (keyless; with keys it is equivalent)
+sim   memoryReadingOnly     noOvercommit            5000 x 160 VIOLATED (expect VIOLATED)    1.9s AUDIT D1/E3
+sim   releasedStaysCharged  refuseOnlyIfShort       5000 x 160 VIOLATED (expect VIOLATED)    1.8s AUDIT F3
+sim   evictPlanned          withinReservation       5000 x 160 VIOLATED (expect VIOLATED)    1.9s 
+sim   queued429             rejectedNeverRuns       5000 x 160 VIOLATED (expect VIOLATED)    1.7s AUDIT N4
+sim   noIdempotency         generatedOnce          20000 x 160 VIOLATED (expect VIOLATED)  305.6s a retry after a lost answer
+sim   noIdempotency         noSelfInflicted429      5000 x 160 VIOLATED (expect VIOLATED)    2.1s a retry refused for its own attempt
+sim   oneLevelSfq           chainFair               5000 x 160 VIOLATED (expect VIOLATED)    2.1s A2A D9: a fan-out chain takes a share per sandbox
 failures: 0
