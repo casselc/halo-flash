@@ -379,9 +379,11 @@ void ScheduledGenerator::RenderMetrics(std::string& out, const std::string& labe
   counter("halo:sched_refused_memory_total", "429s: no ledger room.", c.memory429);
   counter("halo:sched_evictions_total", "Retained prefixes evicted by admission.", c.evictions);
   counter("halo:sched_fenced_total", "Requests fenced after their client left.", c.fenced);
-  counter("halo:sched_grace_finished_total", "Keyed requests that finished while their client was away (replayable).",
+  counter("halo:sched_grace_finished_total", "Requests that finished while their client was away (a keyed one is replayable).",
           c.grace_finished);
   counter("halo:sched_parked_total", "Fenced prefills whose progress was parked.", c.parked);
+  counter("halo:sched_fenced_decoded_tokens_total",
+          "Tokens decoded by requests that were then fenced (in no answer's usage).", fenced_decoded_.load());
   counter("halo:sched_units_total", "Scheduler units run.", c.units);
   counter("halo:sched_slices_total", "Prefill slices.", c.slices);
   counter("halo:sched_batches_total", "Decode units.", c.batches);
@@ -629,6 +631,8 @@ void ScheduledGenerator::Loop() {
       if (!job) continue;
       if (backend_->HasLease(id)) backend_->Abandon(id);
       backend_->Fenced(id);
+      // Its prefill progress may be parked for a retry; its decoded tokens are discarded.
+      if (job->run) fenced_decoded_ += job->run->outcome().completion;
       {
         std::lock_guard<std::mutex> lk(job->mu);
         job->result.cancelled = true;

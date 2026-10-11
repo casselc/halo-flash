@@ -3462,3 +3462,13 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "OpenAiService.HaloAnswerSaysHowAKeyedRequestWasAnswered"
 why = "/v1/messages does not say how it answered"
+
+[[mutant]]
+name = "sg-fenced-tokens-uncounted"
+file = "src/server/scheduled_generator.cpp"
+find = '      if (job->run) fenced_decoded_ += job->run->outcome().completion;'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.TokensDecodedByAFencedRequestAreCounted"
+why = "tokens a fenced request decoded are in no metric: a client cannot measure work no answer reports"

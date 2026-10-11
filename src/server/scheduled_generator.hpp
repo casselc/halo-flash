@@ -197,6 +197,8 @@ class ScheduledGenerator : public TextGenerator {
   mutable std::mutex stats_mu_;
   UnitStats stats_;  // guarded by stats_mu_
   std::atomic<bool> stop_{false};
+  /// Tokens decoded by requests that were then fenced: generated work no answer's usage reports.
+  std::atomic<std::uint64_t> fenced_decoded_{0};
   std::thread thread_;  // last: started once everything else is constructed
 };
 

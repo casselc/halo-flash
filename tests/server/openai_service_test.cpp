@@ -1313,6 +1313,33 @@ TEST(OpenAiService, ScheduledSecondTurnOfASandboxIsRefused429) {
   EXPECT_EQ(again.Status(), 200) << again.raw.substr(0, 300);
 }
 
+// A request fenced mid-decode (its client left, no key) discards the tokens it decoded: no answer's usage reports
+// them, so the scheduler counts them (halo:sched_fenced_decoded_tokens_total).
+TEST(OpenAiService, TokensDecodedByAFencedRequestAreCounted) {
+  ServingRig rig(0, true);
+  const int port = rig.server.port();
+  const auto fenced_tokens = [&] {
+    std::string out;
+    rig.sched->RenderMetrics(out, "");
+    const auto at = out.find("\nhalo:sched_fenced_decoded_tokens_total");
+    return at == std::string::npos ? -1.0 : std::atof(out.c_str() + out.find(' ', at + 1) + 1);
+  };
+  EXPECT_EQ(fenced_tokens(), 0.0);
+  // Held after a few decode steps; released as its client leaves (before the server knows), so the departure is
+  // found while it decodes, and it is fenced at the next unit boundary with tokens decoded.
+  auto held = rig.gen.Plan("m931x", SteppedGenerator::kChunks + 3, 2000);
+  {
+    Conn c(port, RequestBody("m931x", true, 2000));
+    ASSERT_TRUE(Await([&] { return held->held.load(); }));
+    held->release = true;
+  }  // the client leaves mid-decode
+  ASSERT_TRUE(Await([&] { return rig.sched->scheduler().counters().fenced >= 1; }))
+      << "grace_finished " << rig.sched->scheduler().counters().grace_finished;
+  const double n = fenced_tokens();
+  EXPECT_GE(n, 1.0) << "the fenced request had decoded tokens";
+  EXPECT_LE(n, 2000.0);
+}
+
 // Halo-Answer says how a request was answered: "generated" (a new generation), "adopted" (the one running for its
 // idempotency key), "replayed" (its key's stored answer, no engine work); on /v1/messages too. A server whose
 // generator keeps no keys sends none.
