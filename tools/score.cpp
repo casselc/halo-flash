@@ -10,6 +10,11 @@
 //   halo_score --model <shard-00001.gguf> --fixtures <dir> [--device hip|hrx|cpu] [--limit N]
 //              [--prefill 1] [--prefill-int8 0|1]   (prompts through the batched prefill)
 //              [--start N]   (skip the first N cases: resume an interrupted run)
+//              [--targets-prefill 1] (each continuation token as a one-token Prefill: the batch-shaped GEMM
+//                             kernels instead of the decode GEMVs; with --prefill 1)
+//              [--argmax-out FILE] (each target position's argmax, one line per case)
+//              [--batch N]   (N cases at once: each its own session, the prompt prefilled, the continuation
+//                             tokens stepped in lockstep through StepBatch: the batched decode kernels; --prefill 1)
 //              [--moe-topk N] (route each token to N experts, renormalized; CODESIGN arm B)
 
 #include <chrono>
@@ -65,6 +70,9 @@ int main(int argc, char** argv) {
   int limit = 1 << 30;
   bool eager = true;  // graph replay is the default once instantiation is fast on the real model
   bool prefill = false;
+  bool targets_prefill = false;  // --targets-prefill 1: continuation tokens through Prefill, one token a call
+  std::string argmax_out;        // --argmax-out FILE
+  std::uint32_t batch = 1;       // --batch N
   int start = 0;  // --start N: skip the manifest's first N cases (resume an interrupted run)
   bool ngram_resident = false;  // --ngram-resident 1: the n-gram table in RAM (~29 GB)
   std::uint32_t moe_topk = 0;  // --moe-topk N: experts per token (0: the file's count; CODESIGN arm B)
@@ -79,6 +87,9 @@ int main(int argc, char** argv) {
     else if (a == "--eager") eager = std::string(argv[i + 1]) == "1";
     else if (a == "--int8-moe") engine::FlashNextGpu::int8_act_moe_ = std::string(argv[i + 1]) == "1";
     else if (a == "--prefill") prefill = std::string(argv[i + 1]) == "1";
+    else if (a == "--targets-prefill") targets_prefill = std::string(argv[i + 1]) == "1";
+    else if (a == "--argmax-out") argmax_out = argv[i + 1];
+    else if (a == "--batch") batch = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--fa-attention") engine::FlashNextGpu::prefill_fa_attention_ = std::string(argv[i + 1]) == "1";
     else if (a == "--fused-moe-combine") engine::FlashNextGpu::prefill_fused_moe_combine_ = std::string(argv[i + 1]) == "1";
     else if (a == "--blocked-xh") engine::FlashNextGpu::prefill_blocked_xh_ = std::string(argv[i + 1]) == "1";
@@ -149,6 +160,16 @@ int main(int argc, char** argv) {
   const auto step = [&](std::int32_t token, std::span<float> logits) {
     return cpu ? cpu->Step(token, logits, {}, &error) : gpu->Step(token, logits, &error);
   };
+  if (targets_prefill && !gpu) return std::fprintf(stderr, "--targets-prefill needs a GPU device\n"), 2;
+  // A continuation token: stepped (decode kernels), or with --targets-prefill a one-token Prefill (the chunk path's
+  // batch-shaped kernels at T = 1).
+  const auto target_step = [&](std::int32_t token, std::span<float> logits) {
+    if (!targets_prefill) return step(token, logits);
+    const std::int32_t t[1] = {token};
+    return gpu->Prefill(t, logits, &error);
+  };
+  std::FILE* argmax_file = argmax_out.empty() ? nullptr : std::fopen(argmax_out.c_str(), "w");
+  if (!argmax_out.empty() && !argmax_file) return std::fprintf(stderr, "--argmax-out %s: cannot open\n", argmax_out.c_str()), 1;
 
   std::ifstream manifest(fixtures + "/manifest-aligned.tsv");
   std::string line;
@@ -156,7 +177,86 @@ int main(int argc, char** argv) {
   std::size_t targets = 0, aligned = 0, agree = 0, cases = 0, misaligned_cases = 0;
   std::vector<float> logits(c.vocab_size);
   const auto t0 = std::chrono::steady_clock::now();
-  while (std::getline(manifest, line) && static_cast<int>(cases) < limit) {
+  if (batch > 1 && (!gpu || !prefill || targets_prefill))
+    return std::fprintf(stderr, "--batch needs a GPU device and --prefill 1 (not --targets-prefill)\n"), 2;
+  if (batch > engine::FlashNextGpu::kMaxBatch)
+    return std::fprintf(stderr, "--batch is at most %u\n", engine::FlashNextGpu::kMaxBatch), 2;
+  if (batch > 1) std::printf("batch %u: batched kernels %s\n", batch, gpu->BatchSupported() ? "yes" : gpu->BatchUnsupported().c_str());
+  // --batch: cases wait here until a group is full (or the manifest ends), then are scored together.
+  struct Case {
+    std::string id;
+    std::vector<text::TokenId> ids, target;
+    std::vector<std::string> api_top;
+    bool aligned = false;
+  };
+  std::vector<Case> pending;
+  const auto score_group = [&]() -> bool {
+    const std::size_t n = pending.size();
+    if (n == 0) return true;
+    if (!gpu->Reset(&error)) return false;
+    std::vector<engine::FlashNextGpu::SessionId> sid(n, 0);
+    for (std::size_t b = 0; b < n; ++b) {
+      if (b > 0 && !gpu->NewSession(&sid[b], &error)) return false;
+      const std::vector<std::int32_t> head(pending[b].ids.begin(), pending[b].ids.end() - 1);
+      if (!gpu->BindSession(sid[b], &error) || (!head.empty() && !gpu->Prefill(head, {}, &error))) return false;
+    }
+    if (!gpu->BindSession(0, &error)) return false;
+    std::vector<std::int32_t> prev(n);
+    std::vector<std::vector<float>> lg(n, std::vector<float>(c.vocab_size));
+    std::vector<double> case_nll(n, 0);
+    std::vector<std::size_t> case_agree(n, 0), case_aligned(n, 0);
+    std::vector<std::vector<std::uint32_t>> arg(n);
+    std::size_t longest = 0;
+    for (std::size_t b = 0; b < n; ++b) {
+      prev[b] = static_cast<std::int32_t>(pending[b].ids.back());
+      longest = std::max(longest, pending[b].target.size());
+    }
+    for (std::size_t j = 0; j < longest; ++j) {
+      std::vector<engine::FlashNextGpu::BatchEntry> entries;
+      std::vector<std::size_t> who;
+      for (std::size_t b = 0; b < n; ++b)
+        if (j < pending[b].target.size()) {
+          entries.push_back({sid[b], prev[b], lg[b]});
+          who.push_back(b);
+        }
+      if (!gpu->StepBatch(entries, &error)) return false;
+      for (auto b : who) {
+        const auto& cs = pending[b];
+        case_nll[b] -= LogSoftmaxAt(lg[b], cs.target[j]);
+        arg[b].push_back(Argmax(lg[b]));
+        if (cs.aligned) {
+          ++case_aligned[b];
+          const auto top = by_bytes.find(cs.api_top[j]);
+          case_agree[b] += top != by_bytes.end() && top->second == Argmax(lg[b]);
+        }
+        prev[b] = static_cast<std::int32_t>(cs.target[j]);
+      }
+    }
+    for (std::size_t b = 0; b < n; ++b) {
+      const auto& cs = pending[b];
+      nll += case_nll[b];
+      targets += cs.target.size();
+      aligned += case_aligned[b];
+      agree += case_agree[b];
+      ++cases;
+      if (argmax_file) {
+        std::fprintf(argmax_file, "%s", cs.id.c_str());
+        for (auto a : arg[b]) std::fprintf(argmax_file, " %u", a);
+        std::fprintf(argmax_file, "\n");
+      }
+      const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      std::printf("%s  prompt %4zu  targets %3zu  nll %.4f%s   | running nll %.6f  agreement %.2f%%  (%.0f s)"
+                  "  case_sum %.9f agree %zu/%zu\n",
+                  cs.id.c_str(), cs.ids.size(), cs.target.size(), case_nll[b] / cs.target.size(),
+                  cs.aligned ? "" : "  (misaligned)", nll / targets, aligned ? 100.0 * agree / aligned : 0.0, secs,
+                  case_nll[b], case_agree[b], case_aligned[b]);
+    }
+    for (std::size_t b = 1; b < n; ++b)
+      if (!gpu->DropSession(sid[b], &error)) return false;
+    pending.clear();
+    return true;
+  };
+  while (std::getline(manifest, line) && static_cast<int>(cases + pending.size()) < limit) {
     if (line.empty() || line[0] == '#') continue;
     if (start > 0) {
       --start;
@@ -207,6 +307,11 @@ int main(int argc, char** argv) {
     for (std::size_t i = 0; is_aligned && i < target.size(); ++i)
       is_aligned = api_tokens[i] == tok->TokenBytes(target[i]);
     misaligned_cases += !is_aligned;
+    if (batch > 1) {
+      pending.push_back({id, ids, target, api_top, is_aligned});
+      if (pending.size() == batch && !score_group()) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      continue;
+    }
 
     if (cpu) cpu->Reset();
     else if (!gpu->Reset(&error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
@@ -220,9 +325,11 @@ int main(int argc, char** argv) {
     std::int32_t prev = static_cast<std::int32_t>(ids.back());
     double case_nll = 0;
     const std::size_t aligned0 = aligned, agree0 = agree;
+    if (argmax_file) std::fprintf(argmax_file, "%s", id.c_str());
     for (std::size_t j = 0; j < target.size(); ++j) {
-      if (!step(prev, logits)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+      if (!target_step(prev, logits)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
       case_nll -= LogSoftmaxAt(logits, target[j]);
+      if (argmax_file) std::fprintf(argmax_file, " %u", Argmax(logits));
       if (is_aligned) {
         ++aligned;
         const auto top = by_bytes.find(api_top[j]);
@@ -230,6 +337,7 @@ int main(int argc, char** argv) {
       }
       prev = static_cast<std::int32_t>(target[j]);
     }
+    if (argmax_file) std::fprintf(argmax_file, "\n"), std::fflush(argmax_file);
     nll += case_nll;
     targets += target.size();
     ++cases;
@@ -241,6 +349,7 @@ int main(int argc, char** argv) {
                 aligned - aligned0);
     std::fflush(stdout);
   }
+  if (batch > 1 && !score_group()) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
   std::printf("cases %zu, target tokens %zu, aligned %zu (%zu misaligned cases)\nNLL %.6f   API top-token agreement %.2f%%\n",
               cases, targets, aligned, misaligned_cases, nll / targets, aligned ? 100.0 * agree / aligned : 0.0);
   if (ngram) {
