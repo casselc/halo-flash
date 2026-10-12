@@ -53,7 +53,8 @@ class Server:
         log = open(os.path.join(self.args.out, f"serve.{self.starts}.log"), "w")
         self.proc = subprocess.Popen(
             [self.args.serve, "--model", self.args.model, "--port", str(self.args.port), "--max-context", "4096",
-             "--op-capture-s", str(self.args.capture_s)], stdout=log, stderr=subprocess.STDOUT)
+             "--op-capture-s", str(self.args.capture_s), "--op-records", str(self.args.records)],
+            stdout=log, stderr=subprocess.STDOUT)
         self.starts += 1
         for _ in range(300):
             try:
@@ -199,6 +200,12 @@ class Probe:
                 else:
                     self.event(s)
                     self.settle(a, "closed", 0)
+                    if s == "closed":
+                        st, _, _ = self.submit(a)  # a copy arriving after its not-after
+                        if st == 202:
+                            self.fail("a copy was accepted after its not-after")
+                        elif st == 410:
+                            self.event("late copy rejected")
             elif s == "running":
                 if cancel_running:
                     cancel_running = False
@@ -327,6 +334,7 @@ def main():
     p.add_argument("--capture-s", type=int, default=3)
     p.add_argument("--window-ms", type=int, default=20000)
     p.add_argument("--max-attempts", type=int, default=6)
+    p.add_argument("--records", type=int, default=100000, help="halo_serve --op-records (small: refusals)")
     p.add_argument("--out", default="op_fault_probe.out")
     sys.exit(Probe(p.parse_args()).run())
 

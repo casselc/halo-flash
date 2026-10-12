@@ -342,7 +342,13 @@ held or not, captured or unknown. Ours covers what that abstraction assumes atom
      - Main c4a39ff, small model, seeds 1-3, 16 operations each: 48 of 48 committed, 81 attempts, 8 incarnations,
        0 failures.
      - Every fault above was reached, with `closed` by deadline and `unknown` after each restart.
-     - Not reached: a retention or record refusal, and a 410 late copy (the probe's budget and window are generous).
+     - With `--records 3` (seeds 4-5): 11,679 refused copies (503 `records`) and 26 late copies answered 410 after
+       `closed`, with 0 failures.
+       - 28 of 32 operations committed. The other 4 used up their 6 attempts while tombstones held the records until
+         their not-after passed.
+       - A full ceiling becomes refusals that clear as deadlines pass, never lost state. A record is held for up to
+         `max_submit_age_s`, so the ceiling needed is about the submit rate times that window.
+       - The probe resends refused copies at once; an outbox should wait for Retry-After.
      - Positive control: the same probe against a server built with `opapi-ops-cancel-untombed` failed ("a copy
        was accepted after cancelled_before_accept").
      - This is halo's side of the RFC 0007 milestone; the milestone itself runs cordis's adapter against it.
