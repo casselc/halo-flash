@@ -804,9 +804,16 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
     rt::Buffer xq, xs;    // relaxed kernels: the columns' activations as int8 and their per-32 scales
     rt::Buffer xq2, xs2;  // ... and the residual's (HALO_RELAXED_RESID: two int8 levels)
     rt::Buffer lq, la, lq2, la2;  // relaxed mixers: each column's SiLU(low-rank) as two int8 levels
+    // Entry-merged per-session launches: per entry the sessions' state addresses (kTabSlots a layer: k, v,
+    // index_k, block_k, conv), and the attention scratch the single path keeps once (block scores, visible
+    // list, softmax scores).
+    rt::Buffer tab, block_scores, visible, scores;
+    std::vector<std::uint64_t> tab_host;
     std::size_t entry_stride = 0;
     std::vector<std::uint8_t> host;
   };
+  static constexpr std::uint32_t kTabSlots = 5;
+  bool MergedEntries() const;
   BatchBuffers bb_;
   bool bb_ready_ = false;
   bool AllocBatch(std::string* error);

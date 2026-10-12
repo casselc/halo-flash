@@ -1664,3 +1664,85 @@ extern "C" __global__ void __launch_bounds__(256)
   }
   ProbeStore(acc, part + static_cast<std::size_t>(s) * B * rows, r0, rows, B, rows);
 }
+
+// ---- Per-entry work, entries merged into one launch -------------------------------------------------------
+// The single-token kernels' bodies, unchanged, run for entry e = blockIdx.y on its slices: batch scratch at
+// base + e * stride (floats), step parameters at params + e * pstride (uint32s), and session state (its KV
+// cache, conv state) from a table of device pointers, entry e's at tab + e * tstride. One launch replaces B
+// launches that each kept a few blocks busy; every value is the single kernel's (byte-identical).
+namespace {
+template <typename T>
+__device__ inline T* EntryPtr(const std::uint64_t* tab, std::uint32_t tstride, std::uint32_t slot) {
+  return reinterpret_cast<T*>(tab[static_cast<std::size_t>(blockIdx.y) * tstride + slot]);
+}
+__device__ inline std::size_t EntryOff(std::uint32_t stride) { return static_cast<std::size_t>(blockIdx.y) * stride; }
+}  // namespace
+
+// grid (heads, B)
+extern "C" __global__ void halo_split_qgate_y(const float* qg, float* q, float* gate, std::uint32_t hd,
+                                              std::uint32_t qg_stride, std::uint32_t q_stride) {
+  HaloSplitQgateBody(qg + EntryOff(qg_stride), q + EntryOff(q_stride), gate + EntryOff(q_stride), hd);
+}
+// In place; grid (nvec, B)
+extern "C" __global__ void halo_rmsnorm_y(float* x, const float* w_all, std::uint32_t d, float eps,
+                                          std::uint32_t w_stride, std::uint32_t stride) {
+  float* xe = x + EntryOff(stride);
+  HaloRmsnormBody(xe, w_all, xe, d, eps, w_stride);
+}
+// grid (heads, B)
+extern "C" __global__ void halo_rope_neox_p_y(float* x, const std::uint32_t* params, std::uint32_t head_dim,
+                                              std::uint32_t rotary_dim, std::uint32_t slot, std::uint32_t scale,
+                                              float theta, std::uint32_t stride, std::uint32_t pstride) {
+  RopeNeox(x + EntryOff(stride), head_dim, rotary_dim, params[EntryOff(pstride) + slot] * scale, theta);
+}
+// dst = entry's table slot `tslot`. grid (ceil(n / 256), B)
+extern "C" __global__ void halo_copy_at_y(const std::uint64_t* tab, std::uint32_t tstride, std::uint32_t tslot,
+                                          const float* src, const std::uint32_t* params, std::uint32_t slot,
+                                          std::uint32_t stride, std::uint32_t n, std::uint32_t src_stride,
+                                          std::uint32_t pstride) {
+  HaloCopyAtBody(EntryPtr<float>(tab, tstride, tslot), src + EntryOff(src_stride), params + EntryOff(pstride), slot,
+                 stride, n);
+}
+// raw = entry's table slot `tslot` (its index_k). grid (1, B)
+extern "C" __global__ void halo_pool_block_y(const std::uint64_t* tab, std::uint32_t tstride, std::uint32_t tslot,
+                                             float* pooled, const std::uint32_t* params, std::uint32_t ratio,
+                                             std::uint32_t dim, std::uint32_t pooled_stride, std::uint32_t pstride) {
+  HaloPoolBlockBody(EntryPtr<const float>(tab, tstride, tslot), pooled + EntryOff(pooled_stride),
+                    params + EntryOff(pstride), ratio, dim);
+}
+// blocks = entry's table slot `tslot` (its block_k). grid (blocks, B)
+extern "C" __global__ void halo_qsa_scores_b_y(const float* q, const std::uint64_t* tab, std::uint32_t tstride,
+                                               std::uint32_t tslot, float* score, const std::uint32_t* params,
+                                               std::uint32_t heads, std::uint32_t dim, std::uint32_t q_stride,
+                                               std::uint32_t score_stride, std::uint32_t pstride) {
+  HaloQsaScoresBBody(q + EntryOff(q_stride), EntryPtr<const float>(tab, tstride, tslot), score + EntryOff(score_stride),
+                     params + EntryOff(pstride), heads, dim);
+}
+// grid (1, B), block 256
+extern "C" __global__ void __launch_bounds__(256)
+    halo_qsa_select256_y(const float* score, std::uint32_t* visible, const std::uint32_t* params, std::uint32_t k,
+                         std::uint32_t ratio, std::uint32_t score_stride, std::uint32_t visible_stride,
+                         std::uint32_t pstride) {
+  QsaSelect256(score + EntryOff(score_stride), visible + EntryOff(visible_stride), params + EntryOff(pstride), k, ratio);
+}
+// kc / vc = entry's table slots kslot / kslot + 1. q, gate and out share q_stride. grid (num_heads, B), block 256
+extern "C" __global__ void __launch_bounds__(256)
+    halo_attention_select_b_y(const float* q, const std::uint64_t* tab, std::uint32_t tstride, std::uint32_t kslot,
+                              const float* gate, const std::uint32_t* visible, float* out, float* scores,
+                              const std::uint32_t* params, std::uint32_t num_heads, std::uint32_t num_kv_heads,
+                              std::uint32_t hd, std::uint32_t max_n, std::uint32_t q_stride,
+                              std::uint32_t visible_stride, std::uint32_t scores_stride, std::uint32_t pstride) {
+  HaloAttentionSelectBBody(q + EntryOff(q_stride), EntryPtr<const float>(tab, tstride, kslot),
+                           EntryPtr<const float>(tab, tstride, kslot + 1), gate + EntryOff(q_stride),
+                           visible + EntryOff(visible_stride), out + EntryOff(q_stride),
+                           scores + EntryOff(scores_stride), params + EntryOff(pstride), num_heads, num_kv_heads, hd,
+                           max_n);
+}
+// state = entry's table slot `tslot` (its conv state). grid (channels / 128, B), block 128
+extern "C" __global__ void halo_conv_l2norm_y(const float* in, const std::uint64_t* tab, std::uint32_t tstride,
+                                              std::uint32_t tslot, const float* w, float* out, std::uint32_t channels,
+                                              std::uint32_t kern, std::uint32_t l2_channels, float eps,
+                                              std::uint32_t stride) {
+  HaloConvL2normBody(in + EntryOff(stride), EntryPtr<float>(tab, tstride, tslot), w, out + EntryOff(stride), channels,
+                     kern, l2_channels, eps);
+}

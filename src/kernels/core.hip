@@ -244,7 +244,7 @@ HALO_MATVEC(halo_matvec_iq4_nl, LoadIQ4_NL)
 // RMSNorm over n_vec vectors of length d (one block each): x * w / rms.
 // Vector b uses weights w + b * w_stride (0 = shared gamma; d = grouped norm
 // with one gamma per hyper-connection stream).
-extern "C" __global__ void halo_rmsnorm(const float* x, const float* w_all, float* y, std::uint32_t d, float eps,
+__device__ __forceinline__ void HaloRmsnormBody(const float* x, const float* w_all, float* y, std::uint32_t d, float eps,
                                         std::uint32_t w_stride) {
   __shared__ float scratch[32];
   const float* xv = x + blockIdx.x * d;
@@ -255,6 +255,10 @@ extern "C" __global__ void halo_rmsnorm(const float* x, const float* w_all, floa
   ss = BlockSum(ss, scratch);
   const float scale = 1.0f / sqrtf(ss / static_cast<float>(d) + eps);
   for (std::uint32_t i = threadIdx.x; i < d; i += blockDim.x) yv[i] = xv[i] * scale * w[i];
+}
+extern "C" __global__ void halo_rmsnorm(const float* x, const float* w_all, float* y, std::uint32_t d, float eps,
+                                        std::uint32_t w_stride) {
+  HaloRmsnormBody(x, w_all, y, d, eps, w_stride);
 }
 
 // In-place x / sqrt(sum x^2 + eps) per vector (DeltaNet q/k).
@@ -335,10 +339,14 @@ extern "C" __global__ void halo_sigmoid_gate(float* x, const float* gate, std::u
 }
 
 // dst[params[slot] * stride + i] = src[i]: appends one row to a cache.
-extern "C" __global__ void halo_copy_at(float* dst, const float* src, const std::uint32_t* params, std::uint32_t slot,
+__device__ __forceinline__ void HaloCopyAtBody(float* dst, const float* src, const std::uint32_t* params, std::uint32_t slot,
                                         std::uint32_t stride, std::uint32_t n) {
   float* d = dst + static_cast<std::size_t>(params[slot]) * stride;
   for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) d[i] = src[i];
+}
+extern "C" __global__ void halo_copy_at(float* dst, const float* src, const std::uint32_t* params, std::uint32_t slot,
+                                        std::uint32_t stride, std::uint32_t n) {
+  HaloCopyAtBody(dst, src, params, slot, stride, n);
 }
 
 extern "C" __global__ void halo_copy(float* dst, const float* src, std::uint32_t n) {
@@ -346,12 +354,15 @@ extern "C" __global__ void halo_copy(float* dst, const float* src, std::uint32_t
 }
 
 // Splits [heads][2*hd] (q|gate per head) into q[heads][hd] and gate[heads][hd].
-extern "C" __global__ void halo_split_qgate(const float* qg, float* q, float* gate, std::uint32_t hd) {
+__device__ __forceinline__ void HaloSplitQgateBody(const float* qg, float* q, float* gate, std::uint32_t hd) {
   const float* src = qg + blockIdx.x * 2 * hd;
   for (std::uint32_t i = threadIdx.x; i < hd; i += blockDim.x) {
     q[blockIdx.x * hd + i] = src[i];
     gate[blockIdx.x * hd + i] = src[hd + i];
   }
+}
+extern "C" __global__ void halo_split_qgate(const float* qg, float* q, float* gate, std::uint32_t hd) {
+  HaloSplitQgateBody(qg, q, gate, hd);
 }
 
 // halo_split_qgate, the q rows' halo_rmsnorm (shared gamma) and
@@ -715,7 +726,7 @@ extern "C" __global__ void halo_ple_history_advance(const float* normalized, flo
 // The block is the one holding this step's token: pooled every step, so the
 // value written when the block completes is final, and an incomplete
 // block's slot is never read before then.
-extern "C" __global__ void halo_pool_block(const float* raw, float* pooled, const std::uint32_t* params,
+__device__ __forceinline__ void HaloPoolBlockBody(const float* raw, float* pooled, const std::uint32_t* params,
                                            std::uint32_t ratio, std::uint32_t dim) {
   const std::uint32_t block = params[kHaloBlock];
   for (std::uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
@@ -723,6 +734,10 @@ extern "C" __global__ void halo_pool_block(const float* raw, float* pooled, cons
     for (std::uint32_t t = 0; t < ratio; ++t) acc += raw[(block * ratio + t) * dim + i] / static_cast<float>(ratio);
     pooled[i] = acc;
   }
+}
+extern "C" __global__ void halo_pool_block(const float* raw, float* pooled, const std::uint32_t* params,
+                                           std::uint32_t ratio, std::uint32_t dim) {
+  HaloPoolBlockBody(raw, pooled, params, ratio, dim);
 }
 
 // P4: pools blocks b0 .. b0 + gridDim.x - 1 straight into their cache rows
@@ -810,8 +825,7 @@ extern "C" __global__ void halo_attention_select(const float* q, const float* kc
 // time, and the V sum reads 16 positions' values before folding them in order; the scores and the visible list
 // come through LDS in tiles. Each thread still owns its key rows (phase 1) and its output dimension (phase 3), so
 // every dot product and sum keeps its order. hd % 32 == 0, hd <= blockDim.x <= 256. grid (num_heads), block 256
-extern "C" __global__ void __launch_bounds__(256)
-    halo_attention_select_b(const float* q, const float* kc, const float* vc, const float* gate,
+__device__ __forceinline__ void HaloAttentionSelectBBody(const float* q, const float* kc, const float* vc, const float* gate,
                             const std::uint32_t* visible, float* out, float* scores, const std::uint32_t* params,
                             std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t hd,
                             std::uint32_t max_n) {
@@ -879,6 +893,13 @@ extern "C" __global__ void __launch_bounds__(256)
     __syncthreads();
   }
   if (i < hd) out[h * hd + i] = acc / den * Sigmoid(gate[h * hd + i]);
+}
+extern "C" __global__ void __launch_bounds__(256)
+    halo_attention_select_b(const float* q, const float* kc, const float* vc, const float* gate,
+                            const std::uint32_t* visible, float* out, float* scores, const std::uint32_t* params,
+                            std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t hd,
+                            std::uint32_t max_n) {
+  HaloAttentionSelectBBody(q, kc, vc, gate, visible, out, scores, params, num_heads, num_kv_heads, hd, max_n);
 }
 // P4: token t = blockIdx.y; visible lists `max_n` apart, scores
 // num_heads * max_n apart. grid (num_heads, T)
@@ -2981,7 +3002,7 @@ extern "C" __global__ void __launch_bounds__(256)
 // Causal conv step (as halo_conv_step) and, for the first l2_channels
 // channels (DeltaNet q and k), the per-head L2 norm. One block per head of d
 // channels (blockDim == d).
-extern "C" __global__ void halo_conv_l2norm(const float* in, float* state, const float* w, float* out,
+__device__ __forceinline__ void HaloConvL2normBody(const float* in, float* state, const float* w, float* out,
                                             std::uint32_t channels, std::uint32_t kern, std::uint32_t l2_channels,
                                             float eps) {
   __shared__ float scratch[32];
@@ -2999,6 +3020,11 @@ extern "C" __global__ void halo_conv_l2norm(const float* in, float* state, const
     v *= 1.0f / sqrtf(ss + eps);
   }
   if (ch < channels) out[ch] = v;
+}
+extern "C" __global__ void halo_conv_l2norm(const float* in, float* state, const float* w, float* out,
+                                            std::uint32_t channels, std::uint32_t kern, std::uint32_t l2_channels,
+                                            float eps) {
+  HaloConvL2normBody(in, state, w, out, channels, kern, l2_channels, eps);
 }
 
 // halo_gdn_step_d128 with the per-head gated RMSNorm in the epilogue
@@ -9148,7 +9174,7 @@ extern "C" __global__ void __launch_bounds__(256)
 // halo_qsa_scores with q in LDS, the block's key row read 8 floats at a time, and the heads' dot products run
 // as independent chains side by side (each still summed over i in order; acc adds the heads in order), so the
 // scores are bit-identical. heads <= 8, heads * dim <= 2048, dim % 8 == 0. grid / block as halo_qsa_scores.
-extern "C" __global__ void halo_qsa_scores_b(const float* q, const float* blocks, float* score,
+__device__ __forceinline__ void HaloQsaScoresBBody(const float* q, const float* blocks, float* score,
                                              const std::uint32_t* params, std::uint32_t heads, std::uint32_t dim) {
   __shared__ float qs[2048];
   for (std::uint32_t i = threadIdx.x; i < heads * dim; i += blockDim.x) qs[i] = q[i];
@@ -9173,6 +9199,10 @@ extern "C" __global__ void halo_qsa_scores_b(const float* q, const float* blocks
       if (h < heads) acc += fmaxf(0.0f, dot[h]);
     score[b] = acc;
   }
+}
+extern "C" __global__ void halo_qsa_scores_b(const float* q, const float* blocks, float* score,
+                                             const std::uint32_t* params, std::uint32_t heads, std::uint32_t dim) {
+  HaloQsaScoresBBody(q, blocks, score, params, heads, dim);
 }
 
 

@@ -34,6 +34,18 @@ constexpr std::size_t kQ8ActFloats = 1280;  // struct Q8Act in core.hip
 
 bool FlashNextGpu::BatchSupported() const { return BatchUnsupported().empty(); }
 
+// The per-session launches (attention's small kernels, the DeltaNet conv) merged over the entries, one launch
+// each with grid.y = entry: when the decode options pick the kernels the merged ones wrap. Not for a verify
+// (its entries are one session's consecutive positions, each row reading the state the one before wrote).
+bool FlashNextGpu::MergedEntries() const {
+  const auto& c = w_.config;
+  static const bool env = std::getenv("HALO_BATCH_MERGE") == nullptr || std::atoi(std::getenv("HALO_BATCH_MERGE")) != 0;
+  return env && !verify_ && !kv16_only_ && !attn_state_only_ && decode_attn_batched_ && c.head_dim % 32 == 0 &&
+         c.head_dim <= kBlock && (decode_opt_ & kDecodeQsaScores) && (decode_opt_ & kDecodeSelect256) &&
+         (decode_opt_ & kDecodeIndexerDual) && c.indexer_heads <= 8 && c.indexer_heads * c.indexer_head_dim <= 2048 &&
+         c.indexer_head_dim % 8 == 0 && c.ssm_conv_kernel >= 1;
+}
+
 // The layers whose routed experts take the grouped batched kernels: Moe()'s fast path with the activations
 // quantized by the router launch (Q4_K gate / up, Q5_1 or repacked Q8 down).
 bool FlashNextGpu::BatchedMoe(const model::LayerWeights& l) const {
@@ -124,7 +136,9 @@ bool FlashNextGpu::AllocBatch(std::string* error) {
       a(b.xq2, (std::max<std::size_t>({D, H, c.SsmValueDim(), c.AttentionQDim()}) + 3) / 4) &&
       a(b.xs2, std::max<std::size_t>({D, H, c.SsmValueDim(), c.AttentionQDim()}) / 32) &&
       a(b.lq, (c.hc_low_rank + 3) / 4) && a(b.la, c.hc_low_rank / 32) && a(b.lq2, (c.hc_low_rank + 3) / 4) &&
-      a(b.la2, c.hc_low_rank / 32);
+      a(b.la2, c.hc_low_rank / 32) && a(b.tab, 2ull * kTabSlots * c.num_layers) &&
+      a(b.block_scores, max_context_ / c.compress_ratio + 1) && a(b.visible, AttnVisibleStride()) &&
+      a(b.scores, std::size_t{c.num_heads} * AttnVisibleStride());
   if (!ok) return false;
   bb_ready_ = true;
   return true;
@@ -321,6 +335,85 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
                    rt::Arg::Val(H)},
                   error);
   };
+  // Entry-merged per-session launches (MergedEntries): entry e's state addresses at bb_.tab + e * ts.
+  const bool merged = MergedEntries();
+  const std::uint32_t ts = kTabSlots * c.num_layers, ps = static_cast<std::uint32_t>(bb_.entry_stride / 4);
+  const rt::Arg tab = rt::Arg::Buf(bb_.tab), eparams = rt::Arg::Buf(bb_.params, params_offset_);
+  // Attention's per-session work for every entry, after the batched q / k / v projections: the single path's
+  // Attention() launches in its order, each merged over the entries.
+  const auto attention = [&](const model::LayerWeights& l, std::uint32_t il) {
+    const std::uint32_t nh = c.num_heads, nkv = c.num_kv_heads, hd = c.head_dim, idim = c.indexer_head_dim;
+    const std::uint32_t ih = c.indexer_heads, qd = c.AttentionQDim(), kvd = c.AttentionKvDim();
+    const std::uint32_t ratio = c.compress_ratio, budget = c.indexer_top_k / ratio;
+    const std::uint32_t max_blocks = max_context_ / ratio + 1, vs = AttnVisibleStride(), slot = il * kTabSlots;
+    const auto norm = [&](const rt::Buffer& x, const model::TensorRef& w, std::uint32_t nvec, std::uint32_t dim,
+                          std::uint32_t stride) {
+      return Launch("halo_rmsnorm_y", {nvec, B}, {kBlock},
+                    {rt::Arg::Buf(x), rt::Arg::Buf(tensors_.at(w.data).buf), rt::Arg::Val(dim), rt::Arg::Val(c.rms_eps),
+                     rt::Arg::Val<std::uint32_t>(0), rt::Arg::Val(stride)},
+                    error);
+    };
+    const auto rope = [&](const rt::Buffer& x, std::uint32_t heads, std::uint32_t dim, std::uint32_t pslot,
+                          std::uint32_t scale, std::uint32_t stride) {
+      return Launch("halo_rope_neox_p_y", {heads, B}, {64},
+                    {rt::Arg::Buf(x), eparams, rt::Arg::Val(dim), rt::Arg::Val(c.rotary_dim), rt::Arg::Val(pslot),
+                     rt::Arg::Val(scale), rt::Arg::Val(c.rope_theta), rt::Arg::Val(stride), rt::Arg::Val(ps)},
+                    error);
+    };
+    const auto append = [&](std::uint32_t tslot, const rt::Buffer& row, std::uint32_t pslot, std::uint32_t n) {
+      return Launch("halo_copy_at_y", {Blocks(n), B}, {kBlock},
+                    {tab, rt::Arg::Val(ts), rt::Arg::Val(slot + tslot), rt::Arg::Buf(row), eparams, rt::Arg::Val(pslot),
+                     rt::Arg::Val(n), rt::Arg::Val(n), rt::Arg::Val(n), rt::Arg::Val(ps)},
+                    error);
+    };
+    const auto& iqw = l.indexer_q;
+    const auto& ikw = l.indexer_k;
+    const bool dual = iqw.type == core::GgmlType::kBF16 && ikw.type == iqw.type && iqw.cols == ikw.cols &&
+                      iqw.cols % 32 == 0;
+    const auto rq = static_cast<std::uint32_t>(iqw.rows), rk = static_cast<std::uint32_t>(ikw.rows);
+    const std::uint32_t b1 = Blocks(rq, 8);
+    return Launch("halo_split_qgate_y", {nh, B}, {kBlock},
+                  {rt::Arg::Buf(bb_.qg), rt::Arg::Buf(bb_.q), rt::Arg::Buf(bb_.gate), rt::Arg::Val(hd),
+                   rt::Arg::Val(2 * qd), rt::Arg::Val(qd)},
+                  error) &&
+           norm(bb_.q, l.attn_q_norm, nh, hd, qd) && norm(bb_.k, l.attn_k_norm, nkv, hd, kvd) &&
+           rope(bb_.q, nh, hd, kHaloPosition, 1, qd) && rope(bb_.k, nkv, hd, kHaloPosition, 1, kvd) &&
+           append(0, bb_.k, kHaloPosition, kvd) && append(1, bb_.v, kHaloPosition, kvd) &&
+           (dual ? Launch("halo_matvec_bf16_dual_y", {b1 + Blocks(rk, 8), B}, {256},
+                          {rt::Arg::Buf(tensors_.at(iqw.data).buf), rt::Arg::Buf(bb_.iq), rt::Arg::Val(rq),
+                           rt::Arg::Buf(tensors_.at(ikw.data).buf), rt::Arg::Buf(bb_.ik), rt::Arg::Val(rk),
+                           rt::Arg::Buf(bb_.mixed), rt::Arg::Val(static_cast<std::uint32_t>(iqw.cols)), rt::Arg::Val(b1),
+                           rt::Arg::Val(H), rt::Arg::Val(ih * idim), rt::Arg::Val(idim)},
+                          error)
+                 : each([&](std::uint32_t) {
+                     return MatVec(iqw, 0, mixed_, iq_, error) && MatVec(ikw, 0, mixed_, ik_, error);
+                   })) &&
+           append(2, bb_.ik, kHaloPosition, idim) && norm(bb_.iq, l.indexer_q_norm, ih, idim, ih * idim) &&
+           rope(bb_.iq, ih, idim, kHaloPosition, 1, ih * idim) &&
+           Launch("halo_pool_block_y", {1, B}, {128},
+                  {tab, rt::Arg::Val(ts), rt::Arg::Val(slot + 2), rt::Arg::Buf(bb_.pooled), eparams, rt::Arg::Val(ratio),
+                   rt::Arg::Val(idim), rt::Arg::Val(idim), rt::Arg::Val(ps)},
+                  error) &&
+           norm(bb_.pooled, l.indexer_k_norm, 1, idim, idim) && rope(bb_.pooled, 1, idim, kHaloBlock, ratio, idim) &&
+           append(3, bb_.pooled, kHaloBlock, idim) &&
+           Launch("halo_qsa_scores_b_y",
+                  {(decode_opt_ & kDecodeScoresWide) ? Blocks(max_blocks) : std::min(Blocks(max_blocks), 64u), B},
+                  {kBlock},
+                  {rt::Arg::Buf(bb_.iq), tab, rt::Arg::Val(ts), rt::Arg::Val(slot + 3), rt::Arg::Buf(bb_.block_scores),
+                   eparams, rt::Arg::Val(ih), rt::Arg::Val(idim), rt::Arg::Val(ih * idim), rt::Arg::Val(max_blocks),
+                   rt::Arg::Val(ps)},
+                  error) &&
+           Launch("halo_qsa_select256_y", {1, B}, {256},
+                  {rt::Arg::Buf(bb_.block_scores), rt::Arg::Buf(bb_.visible), eparams, rt::Arg::Val(budget),
+                   rt::Arg::Val(ratio), rt::Arg::Val(max_blocks), rt::Arg::Val(vs), rt::Arg::Val(ps)},
+                  error) &&
+           Launch("halo_attention_select_b_y", {nh, B}, {kBlock},
+                  {rt::Arg::Buf(bb_.q), tab, rt::Arg::Val(ts), rt::Arg::Val(slot), rt::Arg::Buf(bb_.gate),
+                   rt::Arg::Buf(bb_.visible), rt::Arg::Buf(bb_.ctx), rt::Arg::Buf(bb_.scores), eparams, rt::Arg::Val(nh),
+                   rt::Arg::Val(nkv), rt::Arg::Val(hd), rt::Arg::Val(vs), rt::Arg::Val(qd), rt::Arg::Val(vs),
+                   rt::Arg::Val(nh * vs), rt::Arg::Val(ps)},
+                  error);
+  };
   const auto& emb = tensors_.at(w_.token_embd.data);
   bool ok = each([&](std::uint32_t) {
     const rt::Arg eargs[] = {rt::Arg::Buf(emb.buf), rt::Arg::Buf(embd_), rt::Arg::Buf(ple_emb_, params_offset_),
@@ -367,6 +460,12 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
                    rt::Arg::Val(c.ssm_num_v_heads), rt::Arg::Val(H), rt::Arg::Val(H), rt::Arg::Val(c.ssm_num_v_heads),
                    rt::Arg::Val(NGS)},
                   error) &&
+           (!merged ||
+            Launch("halo_conv_l2norm_y", {ch / 128, B}, {128},
+                   {rt::Arg::Buf(bb_.qkv), tab, rt::Arg::Val(ts), rt::Arg::Val(il * kTabSlots + 4),
+                    rt::Arg::Buf(tensors_.at(l.ssm_conv1d.data).buf), rt::Arg::Buf(bb_.conv_out), rt::Arg::Val(ch),
+                    rt::Arg::Val(c.ssm_conv_kernel), rt::Arg::Val(2 * kd), rt::Arg::Val(c.rms_eps), rt::Arg::Val(ch)},
+                   error)) &&
            each([&](std::uint32_t e) {
              auto& s = linear_[il];
              // Verify rows: the state after row e (all rows but the last) for rollback.
@@ -376,11 +475,11 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
                return CopyFloats(v[2 * il], s.state, s.state.bytes / 4, error) &&
                       CopyFloats(v[2 * il + 1], s.conv, s.conv.bytes / 4, error);
              };
-             return Launch("halo_conv_l2norm", {ch / 128}, {128},
+             return (merged || Launch("halo_conv_l2norm", {ch / 128}, {128},
                            {rt::Arg::Buf(qkv_), rt::Arg::Buf(s.conv), rt::Arg::Buf(tensors_.at(l.ssm_conv1d.data).buf),
                             rt::Arg::Buf(conv_out_), rt::Arg::Val(ch), rt::Arg::Val(c.ssm_conv_kernel),
                             rt::Arg::Val(2 * kd), rt::Arg::Val(c.rms_eps)},
-                           error) &&
+                           error)) &&
                     Launch("halo_gdn_step_d128_norm_r", {c.ssm_num_v_heads}, {128},
                            {rt::Arg::Buf(conv_out_), rt::Arg::Buf(conv_out_, kd * 4ull),
                             rt::Arg::Buf(conv_out_, 2ull * kd * 4), rt::Arg::Buf(alpha_), rt::Arg::Buf(beta_),
@@ -395,12 +494,13 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
     } else {
       const std::uint32_t qd = c.AttentionQDim(), kvd = c.AttentionKvDim();
       ok = gemv(l.attn_q, bb_.mixed, H, bb_.qg, 2 * qd) && gemv(l.attn_k, bb_.mixed, H, bb_.k, kvd) &&
-           gemv(l.attn_v, bb_.mixed, H, bb_.v, kvd) && each([&](std::uint32_t) {
+           gemv(l.attn_v, bb_.mixed, H, bb_.v, kvd) &&
+           (merged ? attention(l, il) : each([&](std::uint32_t) {
              skip_attn_proj_ = true;
              const bool r = Attention(l, attn_[il], error);
              skip_attn_proj_ = false;
              return r;
-           }) &&
+           })) &&
            gemv(l.attn_out, bb_.ctx, qd, bb_.block_out, H);
     }
     if (!ok || !combine() || !mix(l.hc_ffn, true)) return false;
@@ -538,6 +638,7 @@ bool FlashNextGpu::StepBatch(std::span<const BatchEntry> entries, std::string* e
   const std::uint32_t ratio = c.compress_ratio, budget = c.indexer_top_k / ratio;
   std::vector<model::NgramHistory> hist(B);
   std::vector<std::uint32_t> pos(B), rows(c.ple_layer >= 0 ? c.ple_heads : 0);
+  std::vector<std::uint64_t> tab(std::size_t{B} * c.num_layers * kTabSlots, 0);
   std::size_t upload = 0;
   for (std::uint32_t i = 0; i < B; ++i) {
     const auto& e = entries[i];
@@ -547,6 +648,14 @@ bool FlashNextGpu::StepBatch(std::span<const BatchEntry> entries, std::string* e
     }
     pos[i] = position_;
     hist[i] = ngram_history_;
+    // The session's state addresses for the merged launches (kTabSlots a layer).
+    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+      std::uint64_t* t = tab.data() + (std::size_t{i} * c.num_layers + il) * kTabSlots;
+      const auto addr = [](const rt::Buffer& b) { return reinterpret_cast<std::uint64_t>(b.device); };
+      if (il < attn_.size()) t[0] = addr(attn_[il].k), t[1] = addr(attn_[il].v), t[2] = addr(attn_[il].index_k),
+                             t[3] = addr(attn_[il].block_k);
+      if (il < linear_.size()) t[4] = addr(linear_[il].conv);
+    }
     if (position_ >= max_context_ || e.token < 0 || static_cast<std::uint32_t>(e.token) >= c.vocab_size) {
       (void)BindSession(bound, nullptr);
       return fail(position_ >= max_context_ ? "context is full" : "token out of range");
@@ -607,6 +716,10 @@ bool FlashNextGpu::StepBatch(std::span<const BatchEntry> entries, std::string* e
     upload = i * bb_.entry_stride + used;
   }
   if (!BindSession(bound, error) || !dev_.Upload(bb_.params, 0, bb_.host.data(), upload, error)) return false;
+  if (tab != bb_.tab_host) {
+    if (!dev_.Upload(bb_.tab, 0, tab.data(), tab.size() * 8, error)) return false;
+    bb_.tab_host = std::move(tab);
+  }
   const Head head = sample ? Head::kSample : want_logits ? Head::kLogits : Head::kNone;
   std::vector<SessionId> ids(B);
   for (std::uint32_t i = 0; i < B; ++i) ids[i] = entries[i].session;

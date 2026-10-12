@@ -186,6 +186,15 @@ LDS: one block a CU) and gained 3 ms; per-column work done once gained 9.7. B=8 
 B=4 76.36 -> 72.54; B=2 none (not used there). Quality: short dNLL -0.00039, agreement +0.00 pp; long -0.00031;
 argmax 0.86% / 0.39%. Left: the inject rows (17 us a call, latency-bound) and the up projection (~60 GB/s).
 
+**Per-session launches merged over the entries (exact and relaxed).** Attention's small per-session kernels (q / gate
+split, the q / k / indexer / pooled norms and ropes, the K / V / indexer / block appends, the indexer projections,
+pooling, QSA scores and selection, attention itself) and the DeltaNet conv ran once per entry, a few blocks each.
+Each now runs once a layer for all entries (`_y` kernels: grid.y = entry), the single kernel's body unchanged on
+entry e's scratch slice and step parameters, its KV cache and conv state from a per-entry pointer table (`bb_.tab`,
+uploaded when the session list changes). Byte-identical; not for a verify (its entries are one session's
+consecutive rows). `HALO_BATCH_MERGE=0` for the per-entry launches. B=8 113.83 -> 107.35 ms (74.5 tok/s), B=4
+72.51 -> 69.69, B=2 51.70 -> 50.66. Left per entry: the DeltaNet step (bandwidth-bound per session) and sampling.
+
 ## 4. Tests
 
 - `Sessions.SwarmMatchesFreshReplay` (Hegel, swarm: each run enables a random subset of the rules): new / fork /

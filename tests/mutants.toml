@@ -3655,3 +3655,54 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "Sessions.RelaxedBatchedStepsStayCloseToSingleSteps"
 why = "the relaxed mixer never computes its inject rows: the residual streams lose the block output's injection"
+
+# ---- Per-session launches merged over the batch entries (batch_decode.hip "_y" kernels) ----
+[[mutant]]
+name = "bm-attention-v-from-k-slot"
+file = "src/kernels/batch_decode.hip"
+find = '                           EntryPtr<const float>(tab, tstride, kslot + 1), gate + EntryOff(q_stride),'
+replace = '                           EntryPtr<const float>(tab, tstride, kslot), gate + EntryOff(q_stride),'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.BatchedStepsEqualSingleSteps"
+why = "merged attention reads V from the entry's K cache"
+
+[[mutant]]
+name = "bm-rope-entry-params"
+file = "src/kernels/batch_decode.hip"
+find = '  RopeNeox(x + EntryOff(stride), head_dim, rotary_dim, params[EntryOff(pstride) + slot] * scale, theta);'
+replace = '  RopeNeox(x + EntryOff(stride), head_dim, rotary_dim, params[slot] * scale, theta);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.BatchedStepsEqualSingleSteps"
+why = "every entry rotated at entry 0's position (sessions at different positions)"
+
+[[mutant]]
+name = "bm-conv-entry-0-state"
+file = "src/kernels/batch_decode.hip"
+find = '  HaloConvL2normBody(in + EntryOff(stride), EntryPtr<float>(tab, tstride, tslot), w, out + EntryOff(stride), channels,'
+replace = '  HaloConvL2normBody(in + EntryOff(stride), reinterpret_cast<float*>(tab[tslot]), w, out + EntryOff(stride), channels,'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.BatchedStepsEqualSingleSteps"
+why = "every entry's DeltaNet conv reads and shifts entry 0's conv state"
+
+[[mutant]]
+name = "bm-select-shared-visible"
+file = "src/kernels/batch_decode.hip"
+find = '  QsaSelect256(score + EntryOff(score_stride), visible + EntryOff(visible_stride), params + EntryOff(pstride), k, ratio);'
+replace = '  QsaSelect256(score + EntryOff(score_stride), visible, params + EntryOff(pstride), k, ratio);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.BatchedStepsEqualSingleSteps"
+why = "the entries' visible lists overwrite one another"
+
+[[mutant]]
+name = "bm-table-not-refreshed"
+file = "src/engine/batch_decode.cpp"
+find = '  if (tab != bb_.tab_host) {'
+replace = '  if (bb_.tab_host.empty()) {'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.BatchedStepsEqualSingleSteps"
+why = "a new session list keeps the first list's state addresses"
