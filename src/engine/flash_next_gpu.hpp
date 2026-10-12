@@ -808,6 +808,7 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
     // index_k, block_k, conv), and the attention scratch the single path keeps once (block scores, visible
     // list, softmax scores).
     rt::Buffer tab, block_scores, visible, scores;
+    rt::Buffer ple_key, ple_value;  // the PLE layer's key / value projections, per entry (batched)
     std::vector<std::uint64_t> tab_host;
     std::size_t entry_stride = 0;
     std::vector<std::uint8_t> host;
@@ -832,6 +833,7 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
   /// Points the per-token scratch members at entry b's slices of bb_ and binds its session (recording only).
   void BatchEntryScope(std::uint32_t b, std::span<const SessionId> sessions, bool enter);
   bool skip_attn_proj_ = false;  // Attention(): projections done by the batched caller
+  bool skip_ple_proj_ = false;   // Ple(): key / value projections done by the batched caller
   bool attn_state_only_ = false;  // Attention(): cache rows only (draft-block catch-up)
   rt::Buffer probe_x_, probe_part_, probe_y_, probe_h_, probe_ep_, probe_tab_;
   std::uint32_t probe_B_ = 0;

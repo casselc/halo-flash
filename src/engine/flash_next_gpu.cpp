@@ -491,8 +491,9 @@ bool FlashNextGpu::HcMix(const model::HcMixer& m, bool inject, std::string* erro
 bool FlashNextGpu::Ple(const model::LayerWeights& l, std::string* error) {
   const auto& c = w_.config;
   const std::uint32_t D = c.HcDim();
-  return MatVec(l.ple_key, 0, ple_emb_, ple_key_, error) &&
-         MatVec(l.ple_value, 0, ple_emb_, ple_value_, error) && GroupedNorm(ple_key_, l.ple_norm_key, ple_key_, error) &&
+  return (skip_ple_proj_ ||
+          (MatVec(l.ple_key, 0, ple_emb_, ple_key_, error) && MatVec(l.ple_value, 0, ple_emb_, ple_value_, error))) &&
+         GroupedNorm(ple_key_, l.ple_norm_key, ple_key_, error) &&
          GroupedNorm(res_, l.ple_norm_query, ple_query_, error) &&
          Launch("halo_ple_gate", {c.hc_count}, {kBlock},
                 {rt::Arg::Buf(ple_key_), rt::Arg::Buf(ple_query_), rt::Arg::Buf(ple_value_), rt::Arg::Buf(ple_gated_),

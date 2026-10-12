@@ -138,7 +138,7 @@ bool FlashNextGpu::AllocBatch(std::string* error) {
       a(b.lq, (c.hc_low_rank + 3) / 4) && a(b.la, c.hc_low_rank / 32) && a(b.lq2, (c.hc_low_rank + 3) / 4) &&
       a(b.la2, c.hc_low_rank / 32) && a(b.tab, 2ull * kTabSlots * c.num_layers) &&
       a(b.block_scores, max_context_ / c.compress_ratio + 1) && a(b.visible, AttnVisibleStride()) &&
-      a(b.scores, std::size_t{c.num_heads} * AttnVisibleStride());
+      a(b.scores, std::size_t{c.num_heads} * AttnVisibleStride()) && a(b.ple_key, D) && a(b.ple_value, H);
   if (!ok) return false;
   bb_ready_ = true;
   return true;
@@ -166,7 +166,8 @@ void FlashNextGpu::BatchEntryScope(std::uint32_t e, std::span<const SessionId> s
       {&expert_ids_, &bb_.ids, k}, {&expert_weights_, &bb_.wts, k}, {&q8act_, &bb_.q8act, kQ8ActFloats},
       {&moe_h_, &bb_.moe_h, k * c.expert_ff}, {&moe_part_, &bb_.moe_part, k * H}, {&eg_, &bb_.eg, sff},
       {&sgate_, &bb_.sgate, 1}, {&logits_, &bb_.logits, c.vocab_size},
-      {&sample_out_, &bb_.sample_out, (sizeof(HaloSampleOut) + 3) / 4}};
+      {&sample_out_, &bb_.sample_out, (sizeof(HaloSampleOut) + 3) / 4}, {&ple_key_, &bb_.ple_key, D},
+      {&ple_value_, &bb_.ple_value, H}};
   static std::vector<rt::Buffer> saved;
   if (enter) {
     saved.clear();
@@ -245,6 +246,19 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
     return Launch("halo_q8x_cols", {(cols / 32 + 7) / 8, B}, {256},
                   {rt::Arg::Buf(x), rt::Arg::Val(xstride), rt::Arg::Val(cols), rt::Arg::Buf(bb_.xq), rt::Arg::Buf(bb_.xs),
                    rt::Arg::Buf(xq2), rt::Arg::Buf(xs2)},
+                  error);
+  };
+  // The exact batched GEMV (each column the single kernel's value).
+  const auto exact_gemv = [&](const model::TensorRef& t, const rt::Buffer& x, std::uint32_t xstride, const rt::Buffer& y,
+                              std::uint32_t ystride) {
+    const auto& d = tensors_.at(t.data);
+    const auto rows = static_cast<std::uint32_t>(t.rows), cols = static_cast<std::uint32_t>(t.cols);
+    const bool r2 = rows < 2048;
+    return Launch(((r2 ? "halo_gemv_q8r_r2" : "halo_gemv_q8r_r4") + ng + var).c_str(), {Blocks(rows, r2 ? 16 : 32) * NG},
+                  {256},
+                  {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(x), rt::Arg::Buf(y), rt::Arg::Val(rows),
+                   rt::Arg::Val(cols), rt::Arg::Val(d.qstride), rt::Arg::Val(xstride), rt::Arg::Val(ystride),
+                   rt::Arg::Val(NG)},
                   error);
   };
   const auto gemv = [&](const model::TensorRef& t, const rt::Buffer& x, std::uint32_t xstride, const rt::Buffer& y,
@@ -425,11 +439,26 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
   for (std::uint32_t il = 0; ok && il < c.num_layers; ++il) {
     const auto& l = w_.layers[il];
     cur_layer_ = il;
+    // PLE: the key / value projections of every entry's n-gram embedding (its step parameters' region) batched on
+    // the exact kernels (each column the single kernel's), the rest per entry.
+    const auto q8r = [&](const model::TensorRef& t) {
+      auto it = tensors_.find(t.data);
+      return it != tensors_.end() && static_cast<bool>(it->second.qs);
+    };
+    static const bool ple_env = EnvOr("HALO_BATCH_PLE", 1) != 0;  // 0: per entry (A/B)
+    const bool ple_batched = ple_env && c.IsPleLayer(il) && q8r(l.ple_key) && q8r(l.ple_value);
+    if (ple_batched) {
+      const auto es = static_cast<std::uint32_t>(bb_.entry_stride / 4);
+      if (!exact_gemv(l.ple_key, bb_.params, es, bb_.ple_key, D) || !exact_gemv(l.ple_value, bb_.params, es, bb_.ple_value, H))
+        return false;
+    }
+    skip_ple_proj_ = ple_batched;
     if (c.IsPleLayer(il) && !each([&](std::uint32_t e) {
           return Ple(l, error) && (!verify_ || e + 1 >= B ||
                                    CopyFloats(verify_snap_[e][2 * c.num_layers], ple_history_, ple_history_.bytes / 4, error));
         }))
-      return false;
+      return skip_ple_proj_ = false, false;
+    skip_ple_proj_ = false;
     if (!mix(l.hc_attn, true)) return false;
     if (l.linear) {
       const auto& tq = tensors_.at(l.ssm_qkv.data);

@@ -3763,3 +3763,23 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "OpenAiService.AFreshGenerationReportsItsKeysDiscardedTokens"
 why = "a fenced attempt's tokens never reach the key's history"
+
+[[mutant]]
+name = "bm-ple-entry-0-embedding"
+file = "src/engine/batch_decode.cpp"
+find = '      const auto es = static_cast<std::uint32_t>(bb_.entry_stride / 4);'
+replace = '      const auto es = 0u;'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.BatchedStepsEqualSingleSteps"
+why = "every entry's PLE projections read entry 0's n-gram embedding"
+
+[[mutant]]
+name = "bm-ple-value-not-projected"
+file = "src/engine/batch_decode.cpp"
+find = '      if (!exact_gemv(l.ple_key, bb_.params, es, bb_.ple_key, D) || !exact_gemv(l.ple_value, bb_.params, es, bb_.ple_value, H))'
+replace = '      if (!exact_gemv(l.ple_key, bb_.params, es, bb_.ple_key, D))'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.BatchedStepsEqualSingleSteps"
+why = "the PLE value projection is skipped in batch and per entry: stale values (the equivalent mutant, skip_ple_proj_ never set, only recomputes the same values into the same slices)"

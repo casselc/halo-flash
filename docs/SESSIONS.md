@@ -194,6 +194,8 @@ entry e's scratch slice and step parameters, its KV cache and conv state from a 
 uploaded when the session list changes). Byte-identical; not for a verify (its entries are one session's
 consecutive rows). `HALO_BATCH_MERGE=0` for the per-entry launches. B=8 113.83 -> 107.35 ms (74.5 tok/s), B=4
 72.51 -> 69.69, B=2 51.70 -> 50.66. Left per entry: the DeltaNet step (bandwidth-bound per session) and sampling.
+The PLE layer's key / value projections read each entry's n-gram embedding as a column of the exact batched GEMV
+(`HALO_BATCH_PLE=0`: per entry): B=8 -0.55 ms.
 
 ## 4. Tests
 
