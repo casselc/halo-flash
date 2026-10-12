@@ -148,14 +148,6 @@ TextGenerator::Admission ScheduledGenerator::AdmitIds(std::span<const std::int32
       backend_->Admitted(adm.id, job->ids);
       ticket->job = job;
       a.answer = "generated";
-      if (!t.key.empty()) {
-        a.discarded_tokens = 0;
-        if (auto it = discarded_.find(t.key); it != discarded_.end()) {
-          a.discarded_tokens = static_cast<std::int64_t>(it->second);
-          discarded_.erase(it);
-          std::erase(discarded_order_, t.key);
-        }
-      }
       kick_ = true;
       wake_.notify_all();
       break;
@@ -196,6 +188,9 @@ TextGenerator::Admission ScheduledGenerator::AdmitIds(std::span<const std::int32
       a.why = adm.outcome == O::kLimit ? "limit" : "memory";
       return a;
   }
+  // Every admitted answer with a key carries the key's cumulative discarded tokens (generated, adopted or replayed:
+  // a resend's answer may be lost and a later one replayed, so each must carry the whole count).
+  if (!a.answer.empty() && !t.key.empty()) a.discarded_tokens = DiscardedFor(t.key);
   a.ticket = ticket;
   return a;
 }
@@ -642,9 +637,11 @@ void ScheduledGenerator::Fence(const std::vector<Scheduler::Id>& ids) {
       std::lock_guard<std::mutex> lk(mu_);
       held_.push_back(job);
       jobs_.erase(id);
-      if (!job->key.empty()) {  // reported to the key's next generation
-        auto [it, fresh] = discarded_.try_emplace(job->key, 0);
-        it->second += decoded;
+      if (!job->key.empty()) {  // added to the key's cumulative count
+        (void)DiscardedFor(job->key);  // forgets an expired record, refreshes a live one
+        auto [it, fresh] = discarded_.try_emplace(job->key);
+        it->second.tokens += decoded;
+        it->second.used_ms = NowMs();
         if (fresh) discarded_order_.push_back(job->key);
         while (discarded_order_.size() > kMaxDiscardedKeys) {
           discarded_.erase(discarded_order_.front());
@@ -653,6 +650,21 @@ void ScheduledGenerator::Fence(const std::vector<Scheduler::Id>& ids) {
       }
     }
   }
+}
+
+std::int64_t ScheduledGenerator::DiscardedFor(const std::string& key) {
+  auto it = discarded_.find(key);
+  if (it == discarded_.end()) return 0;
+  const std::int64_t now = NowMs();
+  if (now - it->second.used_ms > opt_.sched.replay_ttl_s * 1000) {  // forgotten, as the scheduler forgets the key
+    discarded_.erase(it);
+    std::erase(discarded_order_, key);
+    return 0;
+  }
+  it->second.used_ms = now;
+  std::erase(discarded_order_, key);
+  discarded_order_.push_back(key);
+  return static_cast<std::int64_t>(it->second.tokens);
 }
 
 void ScheduledGenerator::Loop() {

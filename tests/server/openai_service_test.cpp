@@ -1344,8 +1344,9 @@ TEST(OpenAiService, TokensDecodedByAFencedRequestAreCounted) {
   EXPECT_LE(n, 2000.0);
 }
 
-// A keyed request fenced mid-decode (its grace ran out) discards what it decoded; the key's next request, generated
-// afresh, says how much in Halo-Discarded-Tokens (the fenced-tokens counter's delta), and a later one says 0.
+// A keyed request fenced mid-decode (its grace ran out) discards what it decoded. Every later answer with the key says
+// how much in Halo-Discarded-Tokens: the key's cumulative count over every fenced attempt (the fenced-tokens counter's
+// deltas), on generated and replayed answers alike (cordis: a fresh answer may be lost and a replay received instead).
 TEST(OpenAiService, AFreshGenerationReportsItsKeysDiscardedTokens) {
   ServingRig rig(0, true, /*keyed_grace_s=*/0.05);
   const int port = rig.server.port();
@@ -1386,11 +1387,16 @@ TEST(OpenAiService, AFreshGenerationReportsItsKeysDiscardedTokens) {
   const long long d2 = fenced_attempt("m941x", &h2);  // generated afresh, and fenced again
   ASSERT_GE(d2, 1);
   EXPECT_EQ(h2, std::to_string(d1)) << "the first attempt's tokens";
+  // The attempt since then was fenced too: the next generated answer carries both, and so does a replay of it.
   (void)rig.gen.Plan("m941x", -1, 3);
   Conn again(port, RequestBody("m941x", false, 16), 0, "Idempotency-Key: k941\r\n");
   again.ReadToEnd();
   EXPECT_EQ(header(again, "Halo-Answer"), "generated");
-  EXPECT_EQ(header(again, "Halo-Discarded-Tokens"), std::to_string(d2)) << "only the attempt since the last report";
+  EXPECT_EQ(header(again, "Halo-Discarded-Tokens"), std::to_string(d1 + d2)) << "cumulative over the key's fences";
+  Conn replay(port, RequestBody("m941x", false, 16), 0, "Idempotency-Key: k941\r\n");
+  replay.ReadToEnd();
+  EXPECT_EQ(header(replay, "Halo-Answer"), "replayed");
+  EXPECT_EQ(header(replay, "Halo-Discarded-Tokens"), std::to_string(d1 + d2)) << "a replay carries the count too";
   (void)rig.gen.Plan("m942x", -1, 3);
   Conn other(port, RequestBody("m942x", false, 16), 0, "Idempotency-Key: k942\r\n");
   other.ReadToEnd();

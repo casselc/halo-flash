@@ -248,11 +248,14 @@ The usage an adopted or replayed answer reports is that one generation's. A serv
 off`, or a build before G3) sends no `Halo-Answer` at all: a client can tell from its absence that keys are not
 honoured. A 429 carries none (nothing was admitted).
 
-**`Halo-Discarded-Tokens: N`** comes with `Halo-Answer: generated` on a request that has an idempotency key: the
-tokens decoded by the key's earlier attempts that were fenced since the key's last report (work in no answer's
-usage; 0 when none). A client that resends a lost keyed request can charge the lost send exactly: N tokens when
-the answer is generated, nothing when it is adopted or replayed. The server forgets the count of a key never sent
-again after 4096 other keys; `halo:sched_fenced_decoded_tokens_total` counts all of them.
+**`Halo-Discarded-Tokens: N`** comes on every admitted answer to a request with an idempotency key (generated,
+adopted or replayed): N is the key's cumulative count of tokens decoded by attempts that were fenced (work in no
+answer's usage), 0 when none. A client resending a lost keyed request charges its lost sends N (capped at their
+worst case), from whichever answer it receives: a fresh answer may be lost and a replay received instead, so every
+answer carries the whole count. A key's record lasts while the key is used and is forgotten after `replay_ttl_s`
+(600 s) without use or past 4096 keys; a resend after that is generated with no history (N 0 or absent), and a
+client should charge such a lost send its worst case. `halo:sched_fenced_decoded_tokens_total` counts every
+key.
 
 ## 8. Q6: observability
 

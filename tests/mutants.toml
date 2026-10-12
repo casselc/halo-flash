@@ -3476,7 +3476,7 @@ why = "tokens a fenced request decoded are in no metric: a client cannot measure
 [[mutant]]
 name = "sg-discarded-not-reported"
 file = "src/server/scheduled_generator.cpp"
-find = '        it->second += decoded;'
+find = '        it->second.tokens += decoded;'
 replace = ''
 suite = "cpu-asan"
 binary = "server_tests"
@@ -3484,20 +3484,24 @@ filter = "OpenAiService.AFreshGenerationReportsItsKeysDiscardedTokens"
 why = "a key's fenced attempts' tokens are not reported to its next generation: the client charges blind"
 
 [[mutant]]
-name = "sg-discarded-not-cleared"
+name = "sg-discarded-not-cumulative"
 file = "src/server/scheduled_generator.cpp"
-find = '          discarded_.erase(it);'
-replace = ''
+find = '        it->second.tokens += decoded;'
+replace = '        it->second.tokens = decoded;'
 suite = "cpu-asan"
 binary = "server_tests"
 filter = "OpenAiService.AFreshGenerationReportsItsKeysDiscardedTokens"
-why = "discarded tokens are reported again to every later generation of the key"
+why = "a key's count is only its latest fenced attempt's: a key fenced twice under-reports"
 
-# ---- The model's traces through the serving stack (tests/server/serving_replay_test.cpp) ---------------------------
-# Each must be killed by ServingReplay. Not kept, as they survive it for want of the case in the corpus: D5's default
-# key off (every trace request sends an Idempotency-Key; turn.cpp's D5 is covered by AnthropicService and OpenAiService
-# tests); every reader of a finished generation counting (Wait's done path: only one reader is ever attached at
-# completion, an earlier one is handed off and a replay counts at admission, so the flag cannot be set: equivalent).
+[[mutant]]
+name = "sg-discarded-replay-unreported"
+file = "src/server/scheduled_generator.cpp"
+find = '  if (!a.answer.empty() && !t.key.empty()) a.discarded_tokens = DiscardedFor(t.key);'
+replace = '  if (a.answer == "generated" && !t.key.empty()) a.discarded_tokens = DiscardedFor(t.key);'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.AFreshGenerationReportsItsKeysDiscardedTokens"
+why = "a replayed answer carries no count: a lost fresh answer's report is never seen (cordis phase K)"
 
 [[mutant]]
 name = "ih-answer-header-constant"
