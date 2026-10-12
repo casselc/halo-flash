@@ -1,189 +1,325 @@
 // -*- mode: Bluespec; -*-
-// operation.qnt: halo-flash's half of the operation contract (docs/OPERATIONS.md; cordis RFC 0007,
-// whose operation.qnt is the platform's ledger over an executor that either holds an attempt or does not).
+// operation.qnt: halo-flash's half of the operation contract (docs/OPERATIONS.md; cordis RFC 0007, whose
+// operation.qnt is the platform's accounting over an executor that either holds an attempt or does not).
 //
-// This model adds what the executor side needs for its answers to be safe to act on: submits travel over a
-// network that loses, delays and duplicates them, and the executor is ephemeral (a restart drops everything it
-// holds). The platform names each attempt (operation, attempt number) and the executor incarnation it believes
-// is current; the executor answers a status query with one of
-//   running | done (cost) | unknown (another incarnation) | forgotten (evicted before capture) | never accepted.
-// The rules that make "never accepted" true and the accounting hold:
-//  - fence: a submit names the incarnation it was sent to and is rejected by any other one, so a late copy
-//    can never start an attempt in an incarnation the platform did not send it to;
-//  - tomb: within an incarnation, an attempt id once accepted, captured, evicted or abandoned is remembered, so
-//    a duplicate or late copy of its submit is a no-op;
-//  - promise: a finished result is held until the platform captures it; when that would need more than HOLD
-//    attempts held, the executor refuses the submit (a 503 with Retry-After) instead of evicting;
-//  - abandon: the platform may give up an attempt the executor says it never accepted only by a cancel that
-//    tombstones the id, and then settles it at 0.
+// Scope: executor identity, delivery of every verb over a network that loses, delays and duplicates messages, the
+// executor's clock and deadlines, and the platform's durable capture of a result. The platform is the ledger: its
+// rows (`recs`), settlement and receipt outbox are durable; what it has fetched and not yet committed is not
+// (`pCrash`). The workflow (cordis) applies receipts, which the outbox may deliver more than once.
 //
-// Properties: runsOnce (no attempt executes twice), accounted (real spend <= settled + reserved),
-// appliedOnce, reservationsHeld, neverAcceptedTrue (a "never accepted" answer is never given for an attempt
-// that ran), and noOvercharge (settled <= real; only where nothing becomes unknown: a promise, no restart).
+// The executor (halo) is ephemeral: a restart is a new incarnation that holds and remembers nothing. Every verb
+// carries the attempt's identity (operation, attempt: unique per platform) and the incarnation it is meant for;
+// another incarnation answers `unknown` and acts on nothing. Time is the executor's monotonic clock; every answer
+// carries it, and a deadline (`nb`, a submit's not-after) is in that clock, so no two clocks are ever compared.
+//
+// Rules (RULES; each has a mutant in operation_modes.qnt):
+//  fence         a verb meant for another incarnation is rejected
+//  deadline      a submit past its not-after is rejected; an id never accepted and past its not-after is `closed`
+//  tomb          an attempt id the executor has seen stays known until its not-after has passed and, if it ran,
+//                its outcome was acknowledged: a duplicate or late submit is a no-op
+//  ackOutcome    an expired result keeps its outcome (usage) until acknowledged, though its body is gone
+//  reserve       a submit is accepted only with a retention slot for its eventual result
+//  promise       a finished result is never dropped before its ack or the end of its capture window
+//  commitThenAck the platform acknowledges only what it has durably committed
+//  cancelTomb    a cancel of an attempt the executor never accepted tombstones it
+//  refusalOpen   a refused copy (429/503) does not end the attempt: the reservation stays until a terminal answer
+//  dedupReceipt  the workflow applies a receipt once per attempt
 module operation {
-
   type Rules = {
-    fence: bool,     // a submit carrying another incarnation is rejected (false: accepted by whoever gets it)
-    tomb: bool,      // ids are remembered for the incarnation's life (false: forgotten when captured or evicted)
-    promise: bool,   // finished results are held until captured; refuse at HOLD instead of evicting
-    abandonTomb: bool, // abandoning a never-accepted attempt tombstones it (false: the platform just settles it at 0)
+    fence: bool, deadline: bool, tomb: bool, ackOutcome: bool, reserve: bool, promise: bool,
+    commitThenAck: bool, cancelTomb: bool, refusalOpen: bool, dedupReceipt: bool,
   }
   const RULES: Rules
-  const RESTART: bool  // the executor may restart
+  const RESTART: bool     // the executor may restart
+  const PCRASH: bool      // the platform may crash (losing what it fetched and has not committed)
 
-  pure val N = 2      // operations, in order
-  pure val MAXA = 3   // attempts per operation
-  pure val R = 2      // an attempt's worst-case cost: its reservation
-  pure val HOLD = 1   // attempts the executor can hold at once
+  pure val N = 2          // operations
+  pure val MAXA = 3       // attempts per operation
+  pure val R = 2          // an attempt's worst-case cost: its reservation
+  pure val HOLD = 1       // retention slots
+  pure val W = 3          // a submit's not-after: W ticks past the platform's latest reading of the executor's clock
+  pure val HOLD_T = 4     // a finished result's body is held at most this long (the advertised capture window)
+  pure val MAXT = 14      // ticks per run
   pure val IDS = 0.to(N * MAXA - 1)
 
-  type PSt = Unused | Pending | Settled | Lost | Abandoned
-  type PRec = { op: int, inc: int, st: PSt }                 // the platform's ledger row for an attempt
-  type XRec = { held: bool, ran: bool, cost: int, tomb: bool } // the executor's record (this incarnation)
-  type Msg = { id: int, inc: int }                           // a submit in flight
+  type PSt = Unused | Pending | Committed | Lost | Closed
+  type PRec = { op: int, inc: int, nb: int, st: PSt, refusedSeen: bool, cancelSeen: bool }
+  type Tomb = TNone | TCancelled | TReleased | TExpired | TEvicted
+  // held: accepted, holding a retention slot (running, or finished with its body); tomb: what remains after
+  type XRec = { held: bool, ran: bool, cost: int, doneAt: int, tomb: Tomb, acked: bool, nb: int }
+  type Kind = Submit | Cancel | Ack
+  type Msg = { kind: Kind, id: int, inc: int, nb: int }
+  type Answer = AUnknown | ARunning | ADone | AReleased | AExpired | AForgotten | ACancelled | AClosed | ANever
 
   type S = {
-    done: int, tries: List[int], pinc: int,        // platform: operations applied, attempts per operation, believed incarnation
-    recs: int -> PRec,
-    reserved: int, settled: int, applied: List[int],
-    inc: int, ex: int -> XRec,                     // executor
+    time: int,
+    // platform (durable: recs, reserved, settled, outbox; volatile: fetched, pinc)
+    recs: int -> PRec, tries: List[int], pinc: int, fetched: Set[(int, int)],
+    reserved: int, settled: int, outbox: Set[int],
+    // workflow
+    appliedIds: Set[int], applied: List[int],
+    // executor
+    inc: int, ex: int -> XRec,
     net: Set[Msg],
     // ghosts
-    real: int, runs: int -> int, lied: bool,
-    restarts: int, neverAnswers: int, deduped: int, stale: int, refused: int, abandoned: int, unknowns: int,
-    forgotten: int, evicted: int,
+    real: int, runs: int -> int, lied: bool, receiptLost: bool, promiseBroken: bool,
+    restarts: int, pcrashes: int, nevers: int, deduped: int, stale: int, late: int, refused: int,
+    closedByDeadline: int, cancelledBefore: int, cancelledRunning: int, expiredSettled: int, unknowns: int,
+    forgotten: int, pruned: int, ackDropped: int, dupReceipts: int, recoveredAfterCrash: int,
   }
   var s: S
 
-  pure val X0: XRec = { held: false, ran: false, cost: 0, tomb: false }
+  pure val X0: XRec = { held: false, ran: false, cost: 0, doneAt: 0, tomb: TNone, acked: false, nb: 0 }
 
   action init = s' = {
-    done: 0, tries: [0, 0], pinc: 0,
-    recs: IDS.mapBy(_ => { op: 0, inc: 0, st: Unused }),
-    reserved: 0, settled: 0, applied: [0, 0],
+    time: 0,
+    recs: IDS.mapBy(_ => { op: 0, inc: 0, nb: 0, st: Unused, refusedSeen: false, cancelSeen: false }), tries: [0, 0], pinc: 0,
+    fetched: Set(), reserved: 0, settled: 0, outbox: Set(),
+    appliedIds: Set(), applied: [0, 0],
     inc: 0, ex: IDS.mapBy(_ => X0),
     net: Set(),
-    real: 0, runs: IDS.mapBy(_ => 0), lied: false,
-    restarts: 0, neverAnswers: 0, deduped: 0, stale: 0, refused: 0, abandoned: 0, unknowns: 0,
-    forgotten: 0, evicted: 0,
+    real: 0, runs: IDS.mapBy(_ => 0), lied: false, receiptLost: false, promiseBroken: false,
+    restarts: 0, pcrashes: 0, nevers: 0, deduped: 0, stale: 0, late: 0, refused: 0,
+    closedByDeadline: 0, cancelledBefore: 0, cancelledRunning: 0, expiredSettled: 0, unknowns: 0,
+    forgotten: 0, pruned: 0, ackDropped: 0, dupReceipts: 0, recoveredAfterCrash: 0,
   }
 
-  pure def pendingFor(recs: int -> PRec, op: int): bool = IDS.exists(i => recs.get(i).op == op and recs.get(i).st == Pending)
-  // release an attempt's result: with tombstones its id stays known; without, the executor forgets it entirely
-  pure def forget(x: XRec, tomb: bool): XRec = if (tomb) { ...x, held: false, tomb: true } else X0
-  pure def heldCount(ex: int -> XRec): int = IDS.filter(i => ex.get(i).held).size()
+  pure def liveFor(recs: int -> PRec, op: int): bool =
+    IDS.exists(i => recs.get(i).op == op and (recs.get(i).st == Pending or recs.get(i).st == Committed))
+  // retention slots in use: with `reserve`, every accepted attempt holds one from acceptance; without, only results
+  pure def slots(ex: int -> XRec, reserve: bool): int =
+    IDS.filter(i => ex.get(i).held and (reserve or ex.get(i).ran)).size()
 
-  // ---- platform ---------------------------------------------------------------------------------------------
-  // a new attempt of an operation, under a reservation of R, sent to the incarnation it believes in.
-  // Operations are independent: both may be in flight at once
+  // the executor's answer to a status query for `id` meant for incarnation `qinc`
+  pure def answer(st: S, id: int, qinc: int, nb: int, deadline: bool): Answer = {
+    val x = st.ex.get(id)
+    if (qinc != st.inc) AUnknown
+    else if (x.held and not(x.ran)) ARunning
+    else if (x.held) ADone
+    else if (x.tomb == TReleased) AReleased
+    else if (x.tomb == TExpired) AExpired
+    else if (x.tomb == TEvicted) AForgotten
+    else if (x.tomb == TCancelled) ACancelled
+    else if (deadline and st.time > nb) AClosed
+    else ANever
+  }
+
+  // settle a pending attempt at `cost` with no receipt (the operation may be attempted again, as a new attempt)
+  pure def lose(st: S, id: int, end: PSt, cost: int): S =
+    { ...st, recs: st.recs.set(id, { ...st.recs.get(id), st: end }), reserved: st.reserved - R, settled: st.settled + cost }
+
+  // ---- platform -------------------------------------------------------------------------------------------
+  // a new attempt of an operation with no live attempt and no committed result, under a reservation of R
   action pSubmit: bool = {
     nondet op = 0.to(N - 1).oneOf()
     val id = op * MAXA + s.tries[op]
+    val nb = s.time + W
     all {
-      s.tries[op] < MAXA, s.applied[op] == 0, not(pendingFor(s.recs, op)),
+      s.tries[op] < MAXA, not(liveFor(s.recs, op)),
       s' = { ...s,
-        recs: s.recs.set(id, { op: op, inc: s.pinc, st: Pending }),
+        recs: s.recs.set(id, { op: op, inc: s.pinc, nb: nb, st: Pending, refusedSeen: false, cancelSeen: false }),
         tries: s.tries.replaceAt(op, s.tries[op] + 1), reserved: s.reserved + R,
-        net: s.net.union(Set({ id: id, inc: s.pinc })) },
+        net: s.net.union(Set({ kind: Submit, id: id, inc: s.pinc, nb: nb })) },
     }
   }
 
-  // the same attempt sent again (a timeout, a lost answer): always under the incarnation it was first sent to
+  // resend a pending attempt's submit exactly as first sent (a timeout, a lost answer, a refusal)
   action pResend: bool = {
     nondet id = IDS.oneOf()
     val r = s.recs.get(id)
-    all { r.st == Pending, s' = { ...s, net: s.net.union(Set({ id: id, inc: r.inc })) } }
+    all { r.st == Pending, s' = { ...s, net: s.net.union(Set({ kind: Submit, id: id, inc: r.inc, nb: r.nb })) } }
   }
 
-  // the platform learns the current incarnation (every answer carries it)
+  action pCancel: bool = {
+    nondet id = IDS.oneOf()
+    val r = s.recs.get(id)
+    all { r.st == Pending, s' = { ...s, net: s.net.union(Set({ kind: Cancel, id: id, inc: r.inc, nb: r.nb })) } }
+  }
+
+  // every answer carries the incarnation
   action pLearn: bool = all { s.pinc != s.inc, s' = { ...s, pinc: s.inc } }
 
-  // a status query for a pending attempt, answered from the executor's current state
+  // a status query for a pending attempt. A `done` answer is only fetched (volatile) here; pCommit makes it durable
   action pStatus: bool = {
     nondet id = IDS.oneOf()
     val r = s.recs.get(id)
+    val a = answer(s, id, r.inc, r.nb, RULES.deadline)
     val x = s.ex.get(id)
+    val ack = Set({ kind: Ack, id: id, inc: r.inc, nb: r.nb })
+    val lie = s.lied or s.runs.get(id) > 0
     all {
-      r.st == Pending,
-      r.inc != s.inc or not(x.held and not(x.ran)),  // a running attempt: nothing to do
-      if (r.inc != s.inc) {
-        // unknown: the attempt may have run in the incarnation it was sent to; settle the worst case
-        s' = { ...s, recs: s.recs.set(id, { ...r, st: Lost }), reserved: s.reserved - R, settled: s.settled + R,
-               pinc: s.inc, unknowns: s.unknowns + 1 }
-      } else if (x.held and x.ran) {
-        // done: captured at its cost, receipt applied, the result released (acknowledged)
-        s' = { ...s, recs: s.recs.set(id, { ...r, st: Settled }), reserved: s.reserved - R,
-               settled: s.settled + x.cost, applied: s.applied.replaceAt(r.op, s.applied[r.op] + 1),
-               done: s.done + 1,
-               ex: s.ex.set(id, forget(x, RULES.tomb)) }
-      } else if (x.tomb) {
-        // forgotten: it was accepted here and evicted before capture; it may have run
-        s' = { ...s, recs: s.recs.set(id, { ...r, st: Lost }), reserved: s.reserved - R, settled: s.settled + R,
-               forgotten: s.forgotten + 1 }
-      } else {
-        // never accepted (so far): keep it pending; the platform may resend it or abandon it
-        s' = { ...s, neverAnswers: s.neverAnswers + 1, lied: s.lied or s.runs.get(id) > 0 }
-      }
+      r.st == Pending, a != ARunning,
+      match a {
+        | AUnknown => s' = { ...lose(s, id, Lost, R), pinc: s.inc, unknowns: s.unknowns + 1 }
+        // the commitThenAck mutant acknowledges what it has only fetched
+        | ADone => s' = { ...s, fetched: s.fetched.union(Set((id, x.cost))),
+                          net: if (RULES.commitThenAck) s.net else s.net.union(ack) }
+        // released although the platform never committed it: the result is gone (only without commitThenAck)
+        | AReleased => s' = { ...lose(s, id, Lost, x.cost), receiptLost: true }
+        // the capture window passed: settled at its actual usage, acknowledged so the outcome can be pruned
+        | AExpired => s' = { ...lose(s, id, Lost, x.cost), expiredSettled: s.expiredSettled + 1, net: s.net.union(ack) }
+        | AForgotten => s' = { ...lose(s, id, Lost, R), forgotten: s.forgotten + 1 }
+        | ACancelled => s' = { ...lose(s, id, Closed, 0), cancelledBefore: s.cancelledBefore + 1, lied: lie }
+        | AClosed => s' = { ...lose(s, id, Closed, 0), closedByDeadline: s.closedByDeadline + 1, lied: lie }
+        | ANever => s' = { ...s, nevers: s.nevers + 1, lied: lie }
+        | ARunning => s' = s
+      },
     }
   }
 
-  // give up an attempt the executor has never accepted: cancel it (a tombstone), then settle it at 0
-  action pAbandon: bool = {
+  // the refusalOpen mutant: a refused copy is taken as the attempt's end and settled at 0
+  action pTakeRefusal: bool = {
     nondet id = IDS.oneOf()
     val r = s.recs.get(id)
-    val x = s.ex.get(id)
+    all { not(RULES.refusalOpen), r.st == Pending, r.refusedSeen, s' = lose(s, id, Closed, 0) }
+  }
+
+  // the answer to a cancel, `cancelled_before_accept`, closes the attempt at 0 without waiting for its not-after
+  action pTakeCancel: bool = {
+    nondet id = IDS.oneOf()
+    val r = s.recs.get(id)
+    all { r.st == Pending, r.cancelSeen, s' = { ...lose(s, id, Closed, 0), cancelledBefore: s.cancelledBefore + 1 } }
+  }
+
+  // durably commit a fetched result: the row settles at its cost and its receipt enters the outbox
+  action pCommit: bool = {
+    nondet f = s.fetched.oneOf()
+    val id = f._1
+    val r = s.recs.get(id)
     all {
-      r.st == Pending, r.inc == s.inc, not(x.held), not(x.tomb),
-      s' = { ...s, recs: s.recs.set(id, { ...r, st: Abandoned }), reserved: s.reserved - R,
-             ex: s.ex.set(id, { ...x, tomb: RULES.abandonTomb }), abandoned: s.abandoned + 1 },
+      s.fetched.size() > 0,
+      if (r.st == Pending)
+        s' = { ...s, recs: s.recs.set(id, { ...r, st: Committed }), reserved: s.reserved - R,
+               settled: s.settled + f._2, outbox: s.outbox.union(Set(id)), fetched: s.fetched.exclude(Set(f)),
+               recoveredAfterCrash: if (s.pcrashes > 0) s.recoveredAfterCrash + 1 else s.recoveredAfterCrash }
+      else s' = { ...s, fetched: s.fetched.exclude(Set(f)) },
     }
   }
 
-  // ---- network and executor --------------------------------------------------------------------------------
-  // a submit copy arrives; it may stay in flight as a duplicate
+  // acknowledge a committed result, as often as the platform likes (acks are lost too)
+  action pAck: bool = {
+    nondet id = IDS.oneOf()
+    val r = s.recs.get(id)
+    all { r.st == Committed, s' = { ...s, net: s.net.union(Set({ kind: Ack, id: id, inc: r.inc, nb: r.nb })) } }
+  }
+
+  action pCrash: bool = all { PCRASH, s.pcrashes < 2, s' = { ...s, fetched: Set(), pcrashes: s.pcrashes + 1 } }
+
+  // the outbox delivers a receipt to the workflow, any number of times
+  action wApply: bool = {
+    nondet id = s.outbox.oneOf()
+    val op = s.recs.get(id).op
+    all {
+      s.outbox.size() > 0,
+      if (RULES.dedupReceipt and s.appliedIds.contains(id)) s' = { ...s, dupReceipts: s.dupReceipts + 1 }
+      else s' = { ...s, appliedIds: s.appliedIds.union(Set(id)), applied: s.applied.replaceAt(op, s.applied[op] + 1) },
+    }
+  }
+
+  // ---- network and executor -------------------------------------------------------------------------------
   action deliver: bool = {
     nondet m = s.net.oneOf()
     nondet keep = Set(true, false).oneOf()
+    nondet c = 0.to(R).oneOf()
     val x = s.ex.get(m.id)
     val net2 = if (keep) s.net else s.net.exclude(Set(m))
     all {
       s.net.size() > 0,
       if (RULES.fence and m.inc != s.inc) s' = { ...s, net: net2, stale: s.stale + 1 }
-      else if (x.held or x.tomb) s' = { ...s, net: net2, deduped: s.deduped + 1 }
-      else if (RULES.promise and heldCount(s.ex) >= HOLD) s' = { ...s, net: net2, refused: s.refused + 1 }
-      else s' = { ...s, net: net2, ex: s.ex.set(m.id, { ...x, held: true }) },
+      else match m.kind {
+        | Submit =>
+          if (x.held or x.tomb != TNone) s' = { ...s, net: net2, deduped: s.deduped + 1 }
+          else if (RULES.deadline and s.time > m.nb) s' = { ...s, net: net2, late: s.late + 1 }
+          else if (slots(s.ex, RULES.reserve) >= HOLD)
+            s' = { ...s, net: net2, refused: s.refused + 1,
+                   recs: s.recs.set(m.id, { ...s.recs.get(m.id), refusedSeen: true }) }
+          else s' = { ...s, net: net2, ex: s.ex.set(m.id, { ...x, held: true, nb: m.nb }) }
+        | Cancel =>
+          if (not(x.held) and x.tomb == TNone)
+            // answered `cancelled_before_accept` (the platform sees it: cancelSeen); the cancelTomb mutant answers
+            // the same without remembering the id
+            s' = { ...s, net: net2, ex: s.ex.set(m.id, if (RULES.cancelTomb) { ...x, tomb: TCancelled, nb: m.nb } else x),
+                   recs: s.recs.set(m.id, { ...s.recs.get(m.id), cancelSeen: true }) }
+          else if (x.held and not(x.ran))
+            // stops at the next unit boundary: a finished, cancelled result with its actual usage (0..R)
+            s' = { ...s, net: net2, ex: s.ex.set(m.id, { ...x, ran: true, cost: c, doneAt: s.time }), real: s.real + c,
+                   runs: s.runs.set(m.id, s.runs.get(m.id) + 1), cancelledRunning: s.cancelledRunning + 1 }
+          else s' = { ...s, net: net2 }
+        | Ack =>
+          if (x.held and x.ran) s' = { ...s, net: net2, ex: s.ex.set(m.id, { ...x, held: false, tomb: TReleased, acked: true }) }
+          else if (x.tomb == TExpired) s' = { ...s, net: net2, ex: s.ex.set(m.id, { ...x, acked: true }) }
+          else s' = { ...s, net: net2 }
+      },
     }
   }
 
-  // a held attempt runs to its end, spending 1..R
+  // a message is lost
+  action drop: bool = {
+    nondet m = s.net.oneOf()
+    all { s.net.size() > 0, s' = { ...s, net: s.net.exclude(Set(m)),
+                                   ackDropped: if (m.kind == Ack) s.ackDropped + 1 else s.ackDropped } }
+  }
+
+  // a held attempt runs to its end, spending 1..R. Without a reserved slot (the reserve mutant) a result that
+  // finds the retention budget full is dropped at once: the promise is broken
   action xRun: bool = {
     nondet id = IDS.oneOf()
     nondet c = 1.to(R).oneOf()
     val x = s.ex.get(id)
+    val full = not(RULES.reserve) and slots(s.ex, false) >= HOLD
     all {
       x.held, not(x.ran),
-      s' = { ...s, ex: s.ex.set(id, { ...x, ran: true, cost: c }), real: s.real + c,
-             runs: s.runs.set(id, s.runs.get(id) + 1) },
+      s' = { ...s,
+        ex: s.ex.set(id, if (full) { ...x, held: false, ran: true, cost: c, doneAt: s.time, tomb: TExpired }
+                         else { ...x, ran: true, cost: c, doneAt: s.time }),
+        real: s.real + c, runs: s.runs.set(id, s.runs.get(id) + 1),
+        promiseBroken: s.promiseBroken or full },
     }
   }
 
-  // without a promise, a finished result not yet captured may be evicted under load
-  action evict: bool = {
+  // the capture window ends: the body goes, the outcome stays until acknowledged (the ackOutcome mutant drops it)
+  action xExpire: bool = {
+    nondet id = IDS.oneOf()
+    val x = s.ex.get(id)
+    all {
+      x.held, x.ran, s.time >= x.doneAt + HOLD_T,
+      s' = { ...s, ex: s.ex.set(id, { ...x, held: false, tomb: TExpired, acked: not(RULES.ackOutcome) }) },
+    }
+  }
+
+  // without a promise, a finished result may be evicted under load before its window ends
+  action xEvict: bool = {
     nondet id = IDS.oneOf()
     val x = s.ex.get(id)
     all {
       not(RULES.promise), x.held, x.ran,
-      s' = { ...s, ex: s.ex.set(id, forget(x, RULES.tomb)), evicted: s.evicted + 1 },
+      s' = { ...s, ex: s.ex.set(id, { ...x, held: false, tomb: TEvicted }), promiseBroken: true },
     }
   }
 
-  // a restart: a new incarnation holding nothing, remembering nothing
+  // a tombstone is pruned once its not-after has passed and, if it ran, its outcome was acknowledged.
+  // The tomb mutant prunes as soon as nothing is held
+  action xPrune: bool = {
+    nondet id = IDS.oneOf()
+    val x = s.ex.get(id)
+    all {
+      not(x.held), x.tomb != TNone,
+      RULES.tomb implies (s.time > x.nb and (x.acked or not(x.ran))),
+      s' = { ...s, ex: s.ex.set(id, X0), pruned: s.pruned + 1 },
+    }
+  }
+
   action restart: bool = all {
     RESTART, s.restarts < 2,
     s' = { ...s, inc: s.inc + 1, ex: IDS.mapBy(_ => X0), restarts: s.restarts + 1 },
   }
 
-  action step = any { pSubmit, pResend, pLearn, pStatus, pAbandon, deliver, xRun, evict, restart }
+  action tick: bool = all { s.time < MAXT, s' = { ...s, time: s.time + 1 } }
+
+  action step = any {
+    pSubmit, pResend, pCancel, pLearn, pStatus, pTakeRefusal, pTakeCancel, pCommit, pAck, pCrash, wApply,
+    deliver, drop, xRun, xExpire, xEvict, xPrune, restart, tick,
+  }
 
   // ---- properties ------------------------------------------------------------------------------------------
   val runsOnce: bool = IDS.forall(i => s.runs.get(i) <= 1)
@@ -191,17 +327,28 @@ module operation {
   val appliedOnce: bool = s.applied.foldl(true, (ok, n) => ok and n <= 1)
   val reservationsHeld: bool = s.reserved == R * IDS.filter(i => s.recs.get(i).st == Pending).size()
   val neverAcceptedTrue: bool = not(s.lied)
+  val noReceiptLost: bool = not(s.receiptLost)
+  val promiseKept: bool = not(s.promiseBroken)
   val noOvercharge: bool = s.settled <= s.real
-  val safety: bool = runsOnce and accounted and appliedOnce and reservationsHeld and neverAcceptedTrue
+  val core: bool = and { runsOnce, accounted, appliedOnce, reservationsHeld, neverAcceptedTrue, noReceiptLost }
+  val safety: bool = core and promiseKept
 
-  // witnesses (passed to --witnesses; each must be reached)
-  val wDone: bool = s.done == N
-  val wRestartedThenDone: bool = s.restarts > 0 and s.done == N
-  val wNeverThenDone: bool = s.neverAnswers > 0 and s.done == N
-  val wDeduped: bool = s.deduped > 0
-  val wStaleRejected: bool = s.stale > 0
+  // witnesses (each must be reached)
+  val wDone: bool = s.applied == [1, 1]
+  val wRestartedThenDone: bool = s.restarts > 0 and wDone
+  val wCrashedThenCommitted: bool = s.recoveredAfterCrash > 0
+  val wAckLostThenDone: bool = s.ackDropped > 0 and wDone
+  val wDupReceipt: bool = s.dupReceipts > 0
+  val wNeverThenDone: bool = s.nevers > 0 and wDone
+  val wClosedByDeadline: bool = s.closedByDeadline > 0
+  val wCancelledBefore: bool = s.cancelledBefore > 0
+  val wCancelledRunningCommitted: bool = s.cancelledRunning > 0 and s.outbox.size() > 0
+  val wExpiredSettled: bool = s.expiredSettled > 0
   val wRefused: bool = s.refused > 0
-  val wAbandonedThenDone: bool = s.abandoned > 0 and s.done == N
+  val wStale: bool = s.stale > 0
+  val wLate: bool = s.late > 0
+  val wDeduped: bool = s.deduped > 0
+  val wPruned: bool = s.pruned > 0
   val wUnknown: bool = s.unknowns > 0
   val wForgotten: bool = s.forgotten > 0
 }

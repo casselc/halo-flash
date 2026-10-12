@@ -1,33 +1,62 @@
 // -*- mode: Bluespec; -*-
-// operation_modes: operation.qnt's design, its worlds and its mutants.
-//  - design: restarts, a retention promise, every rule;
-//  - promised: no restart, a promise: nothing becomes unknown, so noOvercharge holds;
-//  - cacheLike: no promise (eviction under load): noOvercharge is violated (a forgotten result is settled at the
-//    worst case), safety still holds;
-//  - noFence: a late submit from an earlier incarnation starts the attempt again after it was settled as
-//    unknown -> runsOnce, accounted;
-//  - noTomb: a duplicate submit of a captured attempt runs it again -> runsOnce;
-//  - abandonUntombed: an abandoned attempt's late submit runs after it was settled at 0 -> accounted.
-//  - cacheNoTomb: an evicted result is forgotten outright, so the executor answers "never accepted" for an attempt
-//    that ran: "I no longer know" told as "never accepted" -> neverAcceptedTrue.
+// operation_modes: operation.qnt's design, its worlds, and one mutant per rule (that rule off).
+// design: executor restarts, platform crashes, every rule
 module design {
-  import operation(RULES = { fence: true, tomb: true, promise: true, abandonTomb: true }, RESTART = true).* from "./operation"
+  import operation(RESTART = true, PCRASH = true,
+    RULES = { fence: true, deadline: true, tomb: true, ackOutcome: true, reserve: true, promise: true, commitThenAck: true, cancelTomb: true, refusalOpen: true, dedupReceipt: true }).* from "./operation"
 }
+// promised: no executor restart: nothing becomes unknown, so noOvercharge holds
 module promised {
-  import operation(RULES = { fence: true, tomb: true, promise: true, abandonTomb: true }, RESTART = false).* from "./operation"
+  import operation(RESTART = false, PCRASH = true,
+    RULES = { fence: true, deadline: true, tomb: true, ackOutcome: true, reserve: true, promise: true, commitThenAck: true, cancelTomb: true, refusalOpen: true, dedupReceipt: true }).* from "./operation"
 }
+// cacheLike: eviction under load: noOvercharge and promiseKept violated, core holds
 module cacheLike {
-  import operation(RULES = { fence: true, tomb: true, promise: false, abandonTomb: true }, RESTART = false).* from "./operation"
+  import operation(RESTART = false, PCRASH = true,
+    RULES = { fence: true, deadline: true, tomb: true, ackOutcome: true, reserve: true, promise: false, commitThenAck: true, cancelTomb: true, refusalOpen: true, dedupReceipt: true }).* from "./operation"
 }
+// noFence: fence off -> runsOnce: a stale-incarnation submit reruns an attempt settled as unknown
 module noFence {
-  import operation(RULES = { fence: false, tomb: true, promise: true, abandonTomb: true }, RESTART = true).* from "./operation"
+  import operation(RESTART = true, PCRASH = true,
+    RULES = { fence: false, deadline: true, tomb: true, ackOutcome: true, reserve: true, promise: true, commitThenAck: true, cancelTomb: true, refusalOpen: true, dedupReceipt: true }).* from "./operation"
 }
-module noTomb {
-  import operation(RULES = { fence: true, tomb: false, promise: true, abandonTomb: true }, RESTART = false).* from "./operation"
+// noDeadline: deadline off -> runsOnce: a late submit is accepted after its tombstone was pruned
+module noDeadline {
+  import operation(RESTART = true, PCRASH = true,
+    RULES = { fence: true, deadline: false, tomb: true, ackOutcome: true, reserve: true, promise: true, commitThenAck: true, cancelTomb: true, refusalOpen: true, dedupReceipt: true }).* from "./operation"
 }
-module abandonUntombed {
-  import operation(RULES = { fence: true, tomb: true, promise: true, abandonTomb: false }, RESTART = false).* from "./operation"
+// pruneEarly: tomb off -> runsOnce: a duplicate submit is accepted after its tombstone was pruned early
+module pruneEarly {
+  import operation(RESTART = true, PCRASH = true,
+    RULES = { fence: true, deadline: true, tomb: false, ackOutcome: true, reserve: true, promise: true, commitThenAck: true, cancelTomb: true, refusalOpen: true, dedupReceipt: true }).* from "./operation"
 }
-module cacheNoTomb {
-  import operation(RULES = { fence: true, tomb: false, promise: false, abandonTomb: true }, RESTART = false).* from "./operation"
+// dropExpiredOutcome: ackOutcome off -> neverAcceptedTrue: an expired outcome pruned unacknowledged is answered as closed
+module dropExpiredOutcome {
+  import operation(RESTART = true, PCRASH = true,
+    RULES = { fence: true, deadline: true, tomb: true, ackOutcome: false, reserve: true, promise: true, commitThenAck: true, cancelTomb: true, refusalOpen: true, dedupReceipt: true }).* from "./operation"
+}
+// noReserve: reserve off -> promiseKept: results finishing together overflow the retention budget
+module noReserve {
+  import operation(RESTART = true, PCRASH = true,
+    RULES = { fence: true, deadline: true, tomb: true, ackOutcome: true, reserve: false, promise: true, commitThenAck: true, cancelTomb: true, refusalOpen: true, dedupReceipt: true }).* from "./operation"
+}
+// ackBeforeCommit: commitThenAck off -> noReceiptLost: a platform crash between ack and commit loses the result
+module ackBeforeCommit {
+  import operation(RESTART = true, PCRASH = true,
+    RULES = { fence: true, deadline: true, tomb: true, ackOutcome: true, reserve: true, promise: true, commitThenAck: false, cancelTomb: true, refusalOpen: true, dedupReceipt: true }).* from "./operation"
+}
+// cancelUntombed: cancelTomb off -> accounted: a late submit runs after a cancelled attempt was settled at 0
+module cancelUntombed {
+  import operation(RESTART = true, PCRASH = true,
+    RULES = { fence: true, deadline: true, tomb: true, ackOutcome: true, reserve: true, promise: true, commitThenAck: true, cancelTomb: false, refusalOpen: true, dedupReceipt: true }).* from "./operation"
+}
+// refusalCloses: refusalOpen off -> accounted: a refused copy settled at 0, then another copy runs
+module refusalCloses {
+  import operation(RESTART = true, PCRASH = true,
+    RULES = { fence: true, deadline: true, tomb: true, ackOutcome: true, reserve: true, promise: true, commitThenAck: true, cancelTomb: true, refusalOpen: false, dedupReceipt: true }).* from "./operation"
+}
+// noReceiptDedup: dedupReceipt off -> appliedOnce: a duplicate receipt is applied twice
+module noReceiptDedup {
+  import operation(RESTART = true, PCRASH = true,
+    RULES = { fence: true, deadline: true, tomb: true, ackOutcome: true, reserve: true, promise: true, commitThenAck: true, cancelTomb: true, refusalOpen: true, dedupReceipt: false }).* from "./operation"
 }
