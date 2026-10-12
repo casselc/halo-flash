@@ -177,6 +177,15 @@ lost 0.27 pp of agreement (short dNLL +0.0004): two levels are the default (`HAL
 LM head exact recovered nothing (argmax 0.95%) for +2.8 ms. Not yet relaxed: the mixers (22 ms at B = 8), the shared
 expert and router (7.5), the routed experts (51, bandwidth on the union), per-entry work (~20).
 
+**Relaxed mixers (B >= 4).** The hyper-connection mixers' down (320 x 10240) and up (4 x 2560 x 320) projections:
+per column once, the norm and its two-level quantization (`halo_hc_norm_q8x`), the down projection as a split-K
+int8 GEMV (7 parts, the dense kernel with `chunk`), the inject rows in fp32 (`halo_hc_inject_dot`), SiLU of the
+parts' sum quantized (`halo_hc_ls_q8`), and the up projection with the gated combine (`halo_hc_mix_up_i8`). The
+first try kept the exact kernels' shape (each row block normalizing and quantizing its whole chunk in 38 KB of
+LDS: one block a CU) and gained 3 ms; per-column work done once gained 9.7. B=8 123.46 -> 113.73 ms (70.3 tok/s),
+B=4 76.36 -> 72.54; B=2 none (not used there). Quality: short dNLL -0.00039, agreement +0.00 pp; long -0.00031;
+argmax 0.86% / 0.39%. Left: the inject rows (17 us a call, latency-bound) and the up projection (~60 GB/s).
+
 ## 4. Tests
 
 - `Sessions.SwarmMatchesFreshReplay` (Hegel, swarm: each run enables a random subset of the rules): new / fork /

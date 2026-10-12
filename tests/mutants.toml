@@ -3621,3 +3621,33 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "Sessions.SpecStepDraftsEqualsGreedyStepping"
 why = "an MTP verify takes the relaxed kernels: speculative decoding no longer equals greedy stepping"
+
+[[mutant]]
+name = "br-mix-silu-dropped"
+file = "src/kernels/batch_decode.hip"
+find = '    ls[j] = Silu(a / static_cast<float>(hc));'
+replace = '    ls[j] = a / static_cast<float>(hc);'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.RelaxedBatchedStepsStayCloseToSingleSteps"
+why = "the relaxed mixer's low-rank activation skips its SiLU"
+
+[[mutant]]
+name = "br-mix-down-part-plane"
+file = "src/kernels/batch_decode.hip"
+find = '  y += static_cast<std::size_t>(blockIdx.y) * rows;'
+replace = ''
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.RelaxedBatchedStepsStayCloseToSingleSteps"
+why = "every split-K part of the mixer's down projection writes the first part's plane"
+
+[[mutant]]
+name = "br-mix-inject-skipped"
+file = "src/engine/batch_decode.cpp"
+find = '             (!inject || Launch("halo_hc_inject_dot", {hc, B}, {256},'
+replace = '             (true || Launch("halo_hc_inject_dot", {hc, B}, {256},'
+suite = "gpu"
+binary = "gpu_tests"
+filter = "Sessions.RelaxedBatchedStepsStayCloseToSingleSteps"
+why = "the relaxed mixer never computes its inject rows: the residual streams lose the block output's injection"

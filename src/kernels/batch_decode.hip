@@ -226,11 +226,12 @@ template <int kRows, int NB, bool kResid = false>
 __device__ inline void Q8RowsDotI8B(const std::int8_t* qs, const std::uint16_t* d, const std::int8_t* xq,
                                     const float* xs, const std::int8_t* xq2, const float* xs2, std::uint32_t r0,
                                     bool active, std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride,
-                                    float (&out)[NB][kRows]) {
+                                    float (&out)[NB][kRows], std::uint32_t k0 = 0, std::uint32_t k1 = ~0u) {
   const std::uint32_t lane = threadIdx.x % kWarp, nblk = cols / 32;
   float acc[NB][kRows] = {};
+  k1 = min(k1, cols);
   if (active)
-    for (std::uint32_t c = lane * 16; c < cols; c += kWarp * 16) {
+    for (std::uint32_t c = k0 + lane * 16; c < k1; c += kWarp * 16) {
       int4 q[kRows];
       float sc[kRows];
 #pragma unroll
@@ -273,7 +274,10 @@ template <int kRows, int NB, bool kResid>
 __device__ inline void GemvQ8rI8B(const std::int8_t* qs, const std::uint16_t* d, const std::int8_t* xq, const float* xs,
                                   const std::int8_t* xq2, const float* xs2, float* y, std::uint32_t rows,
                                   std::uint32_t cols, std::uint32_t qstride, std::uint32_t ystride,
-                                  std::uint32_t groups) {
+                                  std::uint32_t groups, std::uint32_t chunk) {
+  // Split K (chunk % 512 == 0): part blockIdx.y sums columns [part chunk, (part + 1) chunk) into y's plane part.
+  const std::uint32_t k0 = blockIdx.y * chunk;
+  y += static_cast<std::size_t>(blockIdx.y) * rows;
   const std::uint32_t bx = blockIdx.x / groups, g = blockIdx.x % groups;
   xq += static_cast<std::size_t>(g) * NB * cols;
   xs += static_cast<std::size_t>(g) * NB * (cols / 32);
@@ -284,7 +288,7 @@ __device__ inline void GemvQ8rI8B(const std::int8_t* qs, const std::uint16_t* d,
   y += static_cast<std::size_t>(g) * NB * ystride;
   const std::uint32_t r0 = (bx * (blockDim.x / kWarp) + threadIdx.x / kWarp) * kRows;
   float out[NB][kRows];
-  Q8RowsDotI8B<kRows, NB, kResid>(qs, d, xq, xs, xq2, xs2, r0, r0 < rows, rows, cols, qstride, out);
+  Q8RowsDotI8B<kRows, NB, kResid>(qs, d, xq, xs, xq2, xs2, r0, r0 < rows, rows, cols, qstride, out, k0, k0 + chunk);
   if (r0 >= rows || threadIdx.x % kWarp != 0) return;
 #pragma unroll
   for (int b = 0; b < NB; ++b)
@@ -299,8 +303,8 @@ __device__ inline void GemvQ8rI8B(const std::int8_t* qs, const std::uint16_t* d,
       halo_gemv_q8r_i8##SUF##_r##R##_b##NB(const std::int8_t* qs, const std::uint16_t* d, const std::int8_t* xq,    \
                                            const float* xs, const std::int8_t* xq2, const float* xs2, float* y,      \
                                            std::uint32_t rows, std::uint32_t cols, std::uint32_t qstride,            \
-                                           std::uint32_t ystride, std::uint32_t groups) {                            \
-    GemvQ8rI8B<R, NB, RES>(qs, d, xq, xs, xq2, xs2, y, rows, cols, qstride, ystride, groups);                        \
+                                           std::uint32_t ystride, std::uint32_t groups, std::uint32_t chunk) {       \
+    GemvQ8rI8B<R, NB, RES>(qs, d, xq, xs, xq2, xs2, y, rows, cols, qstride, ystride, groups, chunk);                 \
   }
 #define HALO_GEMV_I8_ROWS(NB, R) HALO_GEMV_I8_ROWS_V(NB, R, , false) HALO_GEMV_I8_ROWS_V(NB, R, x, true)
 #define HALO_GEMV_I8_B(NB)                                                                                           \
@@ -927,6 +931,150 @@ HALO_FOR_NB(HALO_MIX_A_B)
   }
 HALO_FOR_NB(HALO_MIX_B_B)
 #undef HALO_MIX_B_B
+
+// ---- Relaxed mixers (B >= 4, docs/SESSIONS.md 3): helpers for halo_hc_ls_q8 / halo_hc_mix_up_i8 below.
+namespace {
+// Two int8 levels of n floats (n % 32 == 0) of each of NB columns (x column stride xstride): q1 / q2 (column stride
+// n bytes), s1 / s2 (column stride n / 32). The block's warps share the 32-value blocks.
+template <int NB>
+__device__ inline void QuantizeTwoLevelLds(const float* x, std::uint32_t xstride, std::uint32_t n, std::int8_t* q1,
+                                           float* s1, std::int8_t* q2, float* s2) {
+  const std::uint32_t lane = threadIdx.x % kWarp, per = n / 32;
+  for (std::uint32_t blk = threadIdx.x / kWarp; blk < NB * per; blk += blockDim.x / kWarp) {
+    const std::uint32_t b = blk / per, j = blk % per;
+    const float v = x[b * xstride + j * 32 + lane];
+    float amax = fabsf(v);
+    for (int o = kWarp / 2; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o, kWarp));
+    const float sa = amax / 127.0f;
+    const int qa = sa > 0.0f ? static_cast<int>(rintf(v / sa)) : 0;
+    const float r = v - static_cast<float>(qa) * sa;
+    float rmax = fabsf(r);
+    for (int o = kWarp / 2; o > 0; o >>= 1) rmax = fmaxf(rmax, __shfl_xor(rmax, o, kWarp));
+    const float sb = rmax / 127.0f;
+    const int qb = sb > 0.0f ? static_cast<int>(rintf(r / sb)) : 0;
+    q1[b * n + j * 32 + lane] = static_cast<std::int8_t>(qa);
+    q2[b * n + j * 32 + lane] = static_cast<std::int8_t>(qb);
+    if (lane == 0) s1[b * per + j] = sa, s2[b * per + j] = sb;
+  }
+}
+// One 16-weight piece of a row against two int8 levels (16 bytes each, scales a1 / a2): the piece's dot.
+__device__ inline float Dot16TwoLevel(const int4& w, const int4& x1, const int4& x2, float a1, float a2) {
+  int i = __builtin_amdgcn_sudot4(true, w.x, true, x1.x, 0, false);
+  i = __builtin_amdgcn_sudot4(true, w.y, true, x1.y, i, false);
+  i = __builtin_amdgcn_sudot4(true, w.z, true, x1.z, i, false);
+  i = __builtin_amdgcn_sudot4(true, w.w, true, x1.w, i, false);
+  int j = __builtin_amdgcn_sudot4(true, w.x, true, x2.x, 0, false);
+  j = __builtin_amdgcn_sudot4(true, w.y, true, x2.y, j, false);
+  j = __builtin_amdgcn_sudot4(true, w.z, true, x2.z, j, false);
+  j = __builtin_amdgcn_sudot4(true, w.w, true, x2.w, j, false);
+  return a1 * static_cast<float>(i) + a2 * static_cast<float>(j);
+}
+}  // namespace
+
+// Relaxed mixers, restructured (per-column work once, no large LDS): norm + quantize, then the down projection as a
+// split-K int8 GEMV (halo_gemv_q8r_i8x_*), the inject rows, the parts' reduce + SiLU + quantize, the up projection.
+
+// xn = res x scale x norm_w for each of B columns (D = hc h values), written, and quantized to two int8 levels per 32
+// (xq / xs / xq2 / xs2, column stride D). Grid (D / 256, B), 256 threads: a warp per 32 values.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_norm_q8x(const float* res, const float* scale, const float* norm_w, float* xn, std::uint32_t hc,
+                     std::uint32_t h, std::int8_t* xq, float* xs, std::int8_t* xq2, float* xs2) {
+  const std::uint32_t b = blockIdx.y, D = hc * h, lane = threadIdx.x % kWarp;
+  const std::uint32_t blk = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp, i = blk * 32 + lane;
+  if (blk >= D / 32) return;
+  const float v = res[static_cast<std::size_t>(b) * D + i] * scale[b * hc + i / h] * norm_w[i];
+  xn[static_cast<std::size_t>(b) * D + i] = v;
+  float amax = fabsf(v);
+  for (int o = kWarp / 2; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o, kWarp));
+  const float sa = amax / 127.0f;
+  const int qa = sa > 0.0f ? static_cast<int>(rintf(v / sa)) : 0;
+  const float r = v - static_cast<float>(qa) * sa;
+  float rmax = fabsf(r);
+  for (int o = kWarp / 2; o > 0; o >>= 1) rmax = fmaxf(rmax, __shfl_xor(rmax, o, kWarp));
+  const float sb = rmax / 127.0f;
+  const int qb = sb > 0.0f ? static_cast<int>(rintf(r / sb)) : 0;
+  xq[static_cast<std::size_t>(b) * D + i] = static_cast<std::int8_t>(qa);
+  xq2[static_cast<std::size_t>(b) * D + i] = static_cast<std::int8_t>(qb);
+  if (lane == 0) xs[static_cast<std::size_t>(b) * (D / 32) + blk] = sa, xs2[static_cast<std::size_t>(b) * (D / 32) + blk] = sb;
+}
+
+// The inject rows (fp32, hc of them) against xn: inject[b hc + r] (one part). Grid (hc, B), 256 threads.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_inject_dot(const float* inject_w, const float* xn, float* inject, std::uint32_t hc, std::uint32_t D) {
+  __shared__ float scratch[32];
+  const std::uint32_t r = blockIdx.x, b = blockIdx.y;
+  const float* w = inject_w + static_cast<std::size_t>(r) * D;
+  const float* x = xn + static_cast<std::size_t>(b) * D;
+  float acc = 0.0f;
+  for (std::uint32_t i = threadIdx.x; i < D; i += blockDim.x) acc = __builtin_fmaf(w[i], x[i], acc);
+  acc = BlockSum(acc, scratch);
+  if (threadIdx.x == 0) inject[b * hc + r] = acc;
+}
+
+// ls = SiLU(sum of the parts / hc) for each column (low_rank <= 512), quantized to two int8 levels per 32 (lq / la,
+// lq2 / la2, column stride low_rank and low_rank / 32). Grid B, 256 threads.
+extern "C" __global__ void __launch_bounds__(256)
+    halo_hc_ls_q8(const float* lo_part, std::uint32_t parts, std::uint32_t low_rank, std::uint32_t hc,
+                  std::int8_t* lq, float* la, std::int8_t* lq2, float* la2) {
+  __shared__ float ls[512];
+  const std::uint32_t b = blockIdx.x;
+  const float* lp = lo_part + static_cast<std::size_t>(b) * parts * low_rank;
+  for (std::uint32_t j = threadIdx.x; j < low_rank; j += blockDim.x) {
+    float a = 0.0f;
+    for (std::uint32_t p = 0; p < parts; ++p) a += lp[p * low_rank + j];
+    ls[j] = Silu(a / static_cast<float>(hc));
+  }
+  __syncthreads();
+  QuantizeTwoLevelLds<1>(ls, low_rank, low_rank, lq + static_cast<std::size_t>(b) * low_rank,
+                         la + static_cast<std::size_t>(b) * (low_rank / 32), lq2 + static_cast<std::size_t>(b) * low_rank,
+                         la2 + static_cast<std::size_t>(b) * (low_rank / 32));
+}
+
+// The up projection and the gated combine: mixed[b h + i] = mean over s of xn[b][s h + i] x sigmoid(row s h + i . ls_b),
+// ls from halo_hc_ls_q8. Column groups of NB interleaved with the row blocks; grid (ceil(h / 8) x groups).
+#define HALO_MIX_UP_I8(NB)                                                                                           \
+  extern "C" __global__ void __launch_bounds__(256) halo_hc_mix_up_i8_b##NB(                                         \
+      const std::int8_t* uqs, const std::uint16_t* ud, const std::int8_t* lq, const float* la,                       \
+      const std::int8_t* lq2, const float* la2, const float* xn, float* mixed, std::uint32_t hc, std::uint32_t h,    \
+      std::uint32_t low_rank, std::uint32_t qstride, std::uint32_t groups) {                                         \
+    const std::uint32_t c0z = (blockIdx.x % groups) * NB, nblk = low_rank / 32;                                      \
+    lq += static_cast<std::size_t>(c0z) * low_rank;                                                                  \
+    lq2 += static_cast<std::size_t>(c0z) * low_rank;                                                                 \
+    la += static_cast<std::size_t>(c0z) * nblk;                                                                      \
+    la2 += static_cast<std::size_t>(c0z) * nblk;                                                                     \
+    xn += static_cast<std::size_t>(c0z) * hc * h;                                                                    \
+    mixed += c0z * h;                                                                                                \
+    const std::uint32_t i = blockIdx.x / groups * (blockDim.x / kWarp) + threadIdx.x / kWarp;                        \
+    if (i >= h) return;                                                                                              \
+    const std::uint32_t lane = threadIdx.x % kWarp, c = lane * 16;                                                   \
+    const bool live = c < low_rank;                                                                                  \
+    int4 q[4];                                                                                                       \
+    float sc[4];                                                                                                     \
+    _Pragma("unroll") for (int s = 0; s < 4; ++s) {                                                                  \
+      const std::size_t r = static_cast<std::size_t>(min(static_cast<std::uint32_t>(s), hc - 1)) * h + i;            \
+      const std::uint32_t cc = live ? c : 0;                                                                         \
+      q[s] = *reinterpret_cast<const int4*>(uqs + r * qstride + cc);                                                 \
+      sc[s] = F16(ud[r * nblk + cc / 32]);                                                                           \
+    }                                                                                                                \
+    _Pragma("unroll") for (int b = 0; b < NB; ++b) {                                                                 \
+      float acc[4] = {};                                                                                             \
+      if (live) {                                                                                                    \
+        const int4 x1 = *reinterpret_cast<const int4*>(lq + static_cast<std::size_t>(b) * low_rank + c);             \
+        const int4 x2 = *reinterpret_cast<const int4*>(lq2 + static_cast<std::size_t>(b) * low_rank + c);            \
+        const float a1 = la[b * nblk + c / 32], a2 = la2[b * nblk + c / 32];                                         \
+        _Pragma("unroll") for (int s = 0; s < 4; ++s) if (static_cast<std::uint32_t>(s) < hc) acc[s] =              \
+            sc[s] * Dot16TwoLevel(q[s], x1, x2, a1, a2);                                                             \
+      }                                                                                                              \
+      float m = 0.0f;                                                                                                \
+      _Pragma("unroll") for (int s = 0; s < 4; ++s) {                                                                \
+        const float g = WarpSum(acc[s]);                                                                             \
+        if (static_cast<std::uint32_t>(s) < hc) m += xn[static_cast<std::size_t>(b) * hc * h + s * h + i] * Sigmoid(g); \
+      }                                                                                                              \
+      if (lane == 0) mixed[b * h + i] = m / static_cast<float>(hc);                                                  \
+    }                                                                                                                \
+  }
+HALO_FOR_NB(HALO_MIX_UP_I8)
+#undef HALO_MIX_UP_I8
 
 // ---- Draft-block catch-up over prompt rows (src/engine/mtp_catchup.cpp) -----------------------------------------
 // halo_matvec_bf16_dual with the column on grid y: column b reads x + b * xstride and writes y1 + b * y1stride,

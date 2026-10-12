@@ -803,6 +803,7 @@ std::int64_t span_seen_ = -1;  // launches of span_kernel_ since SpanArm(); -1: 
     rt::Buffer logits, sample_out, params;  // params: per entry, the single step's upload layout (entry_stride)
     rt::Buffer xq, xs;    // relaxed kernels: the columns' activations as int8 and their per-32 scales
     rt::Buffer xq2, xs2;  // ... and the residual's (HALO_RELAXED_RESID: two int8 levels)
+    rt::Buffer lq, la, lq2, la2;  // relaxed mixers: each column's SiLU(low-rank) as two int8 levels
     std::size_t entry_stride = 0;
     std::vector<std::uint8_t> host;
   };

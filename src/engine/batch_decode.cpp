@@ -119,10 +119,12 @@ bool FlashNextGpu::AllocBatch(std::string* error) {
       a(b.q8act, kQ8ActFloats) && a(b.ucount, 1) && a(b.uexp, k) && a(b.unum, k) && a(b.upair, k * 8) &&
       a(b.moe_h, k * c.expert_ff) && a(b.moe_part, k * H) && a(b.eg, sff) && a(b.sgate, 1) &&
       a(b.logits, c.vocab_size) && a(b.sample_out, (sizeof(HaloSampleOut) + 3) / 4) &&
-      a(b.xq, (std::max<std::size_t>({H, c.SsmValueDim(), c.AttentionQDim()}) + 3) / 4) &&
-      a(b.xs, std::max<std::size_t>({H, c.SsmValueDim(), c.AttentionQDim()}) / 32) &&
-      a(b.xq2, (std::max<std::size_t>({H, c.SsmValueDim(), c.AttentionQDim()}) + 3) / 4) &&
-      a(b.xs2, std::max<std::size_t>({H, c.SsmValueDim(), c.AttentionQDim()}) / 32);
+      a(b.xq, (std::max<std::size_t>({D, H, c.SsmValueDim(), c.AttentionQDim()}) + 3) / 4) &&
+      a(b.xs, std::max<std::size_t>({D, H, c.SsmValueDim(), c.AttentionQDim()}) / 32) &&
+      a(b.xq2, (std::max<std::size_t>({D, H, c.SsmValueDim(), c.AttentionQDim()}) + 3) / 4) &&
+      a(b.xs2, std::max<std::size_t>({D, H, c.SsmValueDim(), c.AttentionQDim()}) / 32) &&
+      a(b.lq, (c.hc_low_rank + 3) / 4) && a(b.la, c.hc_low_rank / 32) && a(b.lq2, (c.hc_low_rank + 3) / 4) &&
+      a(b.la2, c.hc_low_rank / 32);
   if (!ok) return false;
   bb_ready_ = true;
   return true;
@@ -216,6 +218,11 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
   // Activations as two int8 levels (x ~ q s + q2 s2), a second v_dot4 chain per column: the one-level arithmetic
   // cost 0.27 pp of API agreement, this none, for 2 ms at B = 8 (streams/BD). HALO_RELAXED_RESID=0: one level.
   static const bool resid = EnvOr("HALO_RELAXED_RESID", 1) != 0;
+  // The mixers' down / up projections relaxed too (two int8 levels in LDS, v_dot4), up to 4 columns a group (LDS);
+  // HALO_RELAXED_MIX=0: the exact mixers.
+  static const bool relax_mix_env = EnvOr("HALO_RELAXED_MIX", 1) != 0;
+  // From B = 4: at B = 2 the extra launches cost what the int8 arithmetic saves (51.62 -> 51.83 ms).
+  const bool relaxed_mix = relaxed && relax_mix_env && B >= 4;
   const std::string i8 = resid ? "halo_gemv_q8r_i8x" : "halo_gemv_q8r_i8";
   const rt::Buffer none{};
   const auto& xq2 = resid ? bb_.xq2 : none;
@@ -241,7 +248,7 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
                     {rt::Arg::Buf(d.qs), rt::Arg::Buf(d.d), rt::Arg::Buf(bb_.xq), rt::Arg::Buf(bb_.xs), rt::Arg::Buf(xq2),
                      rt::Arg::Buf(xs2), rt::Arg::Buf(y),
                      rt::Arg::Val(rows), rt::Arg::Val(cols), rt::Arg::Val(d.qstride), rt::Arg::Val(ystride),
-                     rt::Arg::Val(ngr)},
+                     rt::Arg::Val(ngr), rt::Arg::Val(cols)},
                     error);
     }
     return Launch(((r2 ? "halo_gemv_q8r_r2" : "halo_gemv_q8r_r4") + ng + var).c_str(), {Blocks(rows, r2 ? 16 : 32) * NG},
@@ -255,6 +262,40 @@ bool FlashNextGpu::RecordBatch(std::span<const SessionId> sessions, Head head, s
     const auto& dn = tensors_.at(m.down.data);
     const auto& upt = tensors_.at(m.up.data);
     const std::uint32_t down_blocks = Blocks(low, 16), inject_rows = inject ? hc : 0;
+    if (relaxed_mix) {
+      // Per column once: norm + quantize; the down projection a split-K int8 GEMV (its parts in lo_part); the inject
+      // rows; SiLU of the parts' sum, quantized; the up projection and the gated combine.
+      const std::uint32_t GU = GroupCols(B, 8), NGU = B / GU;
+      return Launch("halo_hc_norm_scales_u_y", {hc, B}, {256},
+                    {rt::Arg::Buf(bb_.res), rt::Arg::Buf(bb_.scale), rt::Arg::Val(c.hidden_size), rt::Arg::Val(c.rms_eps),
+                     rt::Arg::Val(hc)},
+                    error) &&
+             Launch("halo_hc_norm_q8x", {(D / 32 + 7) / 8, B}, {256},
+                    {rt::Arg::Buf(bb_.res), rt::Arg::Buf(bb_.scale), rt::Arg::Buf(tensors_.at(m.norm.data).buf),
+                     rt::Arg::Buf(bb_.xn), rt::Arg::Val(hc), rt::Arg::Val(H), rt::Arg::Buf(bb_.xq), rt::Arg::Buf(bb_.xs),
+                     rt::Arg::Buf(bb_.xq2), rt::Arg::Buf(bb_.xs2)},
+                    error) &&
+             Launch(("halo_gemv_q8r_i8x_r1_b" + std::to_string(relaxed_g)).c_str(), {Blocks(low, 8) * (B / relaxed_g), parts},
+                    {256},
+                    {rt::Arg::Buf(dn.qs), rt::Arg::Buf(dn.d), rt::Arg::Buf(bb_.xq), rt::Arg::Buf(bb_.xs),
+                     rt::Arg::Buf(bb_.xq2), rt::Arg::Buf(bb_.xs2), rt::Arg::Buf(bb_.lo_part), rt::Arg::Val(low),
+                     rt::Arg::Val(D), rt::Arg::Val(dn.qstride), rt::Arg::Val(parts * low), rt::Arg::Val(B / relaxed_g),
+                     rt::Arg::Val(chunk)},
+                    error) &&
+             (!inject || Launch("halo_hc_inject_dot", {hc, B}, {256},
+                                {rt::Arg::Buf(tensors_.at(m.inject.data).buf), rt::Arg::Buf(bb_.xn), rt::Arg::Buf(bb_.inject),
+                                 rt::Arg::Val(hc), rt::Arg::Val(D)},
+                                error)) &&
+             Launch("halo_hc_ls_q8", {B}, {256},
+                    {rt::Arg::Buf(bb_.lo_part), rt::Arg::Val(parts), rt::Arg::Val(low), rt::Arg::Val(hc),
+                     rt::Arg::Buf(bb_.lq), rt::Arg::Buf(bb_.la), rt::Arg::Buf(bb_.lq2), rt::Arg::Buf(bb_.la2)},
+                    error) &&
+             Launch(("halo_hc_mix_up_i8_b" + std::to_string(GU)).c_str(), {Blocks(H, 8) * NGU}, {256},
+                    {rt::Arg::Buf(upt.qs), rt::Arg::Buf(upt.d), rt::Arg::Buf(bb_.lq), rt::Arg::Buf(bb_.la),
+                     rt::Arg::Buf(bb_.lq2), rt::Arg::Buf(bb_.la2), rt::Arg::Buf(bb_.xn), rt::Arg::Buf(bb_.mixed),
+                     rt::Arg::Val(hc), rt::Arg::Val(H), rt::Arg::Val(low), rt::Arg::Val(upt.qstride), rt::Arg::Val(NGU)},
+                    error);
+    }
     return Launch("halo_hc_norm_scales_u_y", {hc, B}, {256},
                   {rt::Arg::Buf(bb_.res), rt::Arg::Buf(bb_.scale), rt::Arg::Val(c.hidden_size), rt::Arg::Val(c.rms_eps),
                    rt::Arg::Val(hc)},
