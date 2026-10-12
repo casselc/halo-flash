@@ -217,13 +217,17 @@ HttpParser::Status HttpParser::Next(HttpRequest* out) {
 const char* ReasonPhrase(int status) {
   switch (status) {
     case 200: return "OK";
+    case 202: return "Accepted";
     case 400: return "Bad Request";
     case 401: return "Unauthorized";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 408: return "Request Timeout";
+    case 409: return "Conflict";
+    case 410: return "Gone";
     case 411: return "Length Required";
     case 413: return "Content Too Large";
+    case 422: return "Unprocessable Content";
     case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
     case 429: return "Too Many Requests";

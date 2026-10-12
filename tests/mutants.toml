@@ -1294,8 +1294,8 @@ why = "a client that left mid-stream is recorded as finish_reason stop and its t
 [[mutant]]
 name = "svc-no-liveness-check"
 file = "src/server/openai_service.cpp"
-find = 'const auto gone = [connected] { return connected && !connected(); };'
-replace = 'const auto gone = [connected] { return connected && false; };'
+find = 'const auto gone0 = [connected, op] { return op ? op->cancelled && op->cancelled() : connected && !connected(); };'
+replace = 'const auto gone0 = [connected, op] { return op ? op->cancelled && op->cancelled() : connected && false; };'
 suite = "cpu-asan"
 binary = "server_tests"
 filter = "OpenAiService.ADepartedNonStreamingClientStopsGeneration:OpenAiService.ServingModelUnderDeparturesStallsAndRetries"
@@ -3952,3 +3952,67 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "Operations.*"
 why = "a submit naming another request under an accepted attempt's identity is taken as a duplicate"
+
+# The operation verbs (src/server/operation_service.cpp, the operation path of openai_service.cpp).
+[[mutant]]
+name = "opapi-svc-observer-departure-cancels"
+file = "src/server/operation_service.cpp"
+find = '''      for (const auto& f : batch)
+        if (!write(f)) return;'''
+replace = '''      for (const auto& f : batch)
+        if (!write(f)) return (void)ops_.Cancel(ref, inc_.NowMs());'''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationService.AnObserverSeesTheEventsAndItsDepartureCancelsNothing"
+why = "an observer leaving the stream cancels the attempt (a disconnect must never cancel)"
+
+[[mutant]]
+name = "opapi-svc-refusal-keeps-record"
+file = "src/server/operation_service.cpp"
+find = '''      // The scheduler refused it: this copy was not accepted.
+      ops_.Withdraw(ref.id);'''
+replace = '''      // The scheduler refused it: this copy was not accepted.'''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationService.ASchedulerRefusalIsNotAnAcceptance"
+why = "a scheduler refusal leaves a running record behind: answered as refused, reported as accepted"
+
+[[mutant]]
+name = "opapi-svc-cancel-not-polled"
+file = "src/server/operation_service.cpp"
+find = '    h.cancelled = [this, &ref] { return stopping_.load() || ops_.CancelRequested(ref.id); };'
+replace = '    h.cancelled = [this, &ref] { return stopping_.load(); };'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationService.CancelBeforeAcceptanceAndWhileRunning"
+why = "a cancel is recorded but the running attempt never stops"
+
+[[mutant]]
+name = "opapi-svc-cancelled-usage-dropped"
+file = "src/server/openai_service.cpp"
+find = '      op->done({std::move(final), error, finish, usage.prompt_tokens, usage.cached_tokens, usage.completion_tokens});'
+replace = '      op->done({std::move(final), error, finish, usage.prompt_tokens, usage.cached_tokens, cancelled ? 0 : usage.completion_tokens});'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationService.CancelBeforeAcceptanceAndWhileRunning"
+why = "a cancelled attempt reports no completion tokens, as if cancellation proved nothing was spent"
+
+[[mutant]]
+name = "opapi-svc-digest-unchecked"
+file = "src/server/operation_service.cpp"
+find = '''  if (const std::string* d = http.Header("halo-digest"); d && *d != digest)'''
+replace = '''  if (const std::string* d = http.Header("halo-digest"); false && d && *d != digest)'''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationService.VerbsBindIncarnationDigestDeadlineAndMode"
+why = "a submit whose Halo-Digest is not its body's is accepted"
+
+[[mutant]]
+name = "opapi-svc-mode-unchecked"
+file = "src/server/operation_service.cpp"
+find = '  if (mode->str() != ours)'
+replace = '  if (false)'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationService.VerbsBindIncarnationDigestDeadlineAndMode"
+why = "an exact-mode submit runs on a relaxed server"

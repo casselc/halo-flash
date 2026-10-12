@@ -19,7 +19,7 @@ std::string ContractJson(const Incarnation& inc, const ContractInfo& info) {
   doc.set("incarnation", Value::String(inc.id()));
   doc.set("time_ms", Value::Int(inc.NowMs()));
   doc.set("inference", std::move(inference));
-  doc.set("operations", Value::Null());  // the operation verbs are not served yet
+  doc.set("operations", info.operations ? info.operations() : Value::Null());
   return json::DumpPython(doc);
 }
 

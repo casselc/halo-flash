@@ -121,9 +121,15 @@ class Operations {
   /// The running attempt finished (a cancelled one too, finish "cancelled"), with its actual usage. False if the
   /// attempt is not running here.
   bool Finish(const Id& id, std::string body, Usage usage, std::string finish, std::int64_t now);
+  /// The attempt was accepted here but never started: the scheduler refused it, or it could not run (an error
+  /// answered to the submit). Its record and reservation go, as if this copy had been refused: a later copy may be
+  /// accepted. False if the attempt is not running here.
+  bool Withdraw(const Id& id);
   /// Whether a cancel asked the running attempt to stop.
   [[nodiscard]] bool CancelRequested(const Id& id) const;
 
+  /// Expires and prunes as of `now`, and returns whether `id` is held (running, or finished with its body).
+  [[nodiscard]] bool Holds(const Id& id, std::int64_t now);
   [[nodiscard]] Stats stats(std::int64_t now) const;
   [[nodiscard]] const std::string& incarnation() const { return incarnation_; }
   [[nodiscard]] const Options& options() const { return opt_; }

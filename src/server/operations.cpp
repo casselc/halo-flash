@@ -205,6 +205,22 @@ bool Operations::Finish(const Id& id, std::string body, Usage usage, std::string
   return true;
 }
 
+bool Operations::Withdraw(const Id& id) {
+  std::lock_guard<std::mutex> lk(mu_);
+  const auto it = recs_.find(id);
+  if (it == recs_.end() || it->second.st != St::kRunning) return false;
+  Release(it->second);
+  recs_.erase(it);
+  return true;
+}
+
+bool Operations::Holds(const Id& id, std::int64_t now) {
+  std::lock_guard<std::mutex> lk(mu_);
+  Sweep(now);
+  const auto it = recs_.find(id);
+  return it != recs_.end() && (it->second.st == St::kRunning || it->second.st == St::kDone);
+}
+
 bool Operations::CancelRequested(const Id& id) const {
   std::lock_guard<std::mutex> lk(mu_);
   const auto it = recs_.find(id);
