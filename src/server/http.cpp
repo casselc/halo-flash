@@ -398,7 +398,7 @@ void HttpServer::AcceptLoop() {
     }
     if (active_.load() >= opt_.max_connections) {
       // On the accept thread: a short deadline, so a client that does not read cannot hold up accepting.
-      (void)SendAll(fd, SerializeResponse(HttpResponse::Json(503, ErrorJson("too many connections")), false),
+      (void)SendAll(fd, SerializeResponse(Stamped(HttpResponse::Json(503, ErrorJson("too many connections"))), false),
                     std::min(opt_.send_timeout_ms, 1000));
       ::close(fd);
       continue;
@@ -429,6 +429,11 @@ void HttpServer::AcceptLoop() {
     for (int fd : fds_) ::shutdown(fd, SHUT_RDWR);
   }
   reap(true);
+}
+
+HttpResponse HttpServer::Stamped(HttpResponse r) const {
+  if (opt_.stamp) opt_.stamp(r.headers);
+  return r;
 }
 
 HttpResponse HttpServer::Dispatch(const HttpRequest& req) {
@@ -488,14 +493,14 @@ void HttpServer::Serve(int fd) {
     } body_wipe{req};
     const auto st = parser.Next(&req);
     if (st == HttpParser::Status::kError) {
-      (void)SendAll(fd, SerializeResponse(HttpResponse::Json(parser.error_status(), ErrorJson(parser.error())), false),
+      (void)SendAll(fd, SerializeResponse(Stamped(HttpResponse::Json(parser.error_status(), ErrorJson(parser.error()))), false),
                     opt_.send_timeout_ms);
       return;
     }
     if (st == HttpParser::Status::kRequest) {
       idle_ms = 0;
       req.connected = [this, fd] { return !stopping_.load() && PeerOpen(fd); };
-      HttpResponse resp = Dispatch(req);
+      HttpResponse resp = Stamped(Dispatch(req));
       const bool keep = req.keep_alive && !stopping_.load();
       if (!resp.stream) {
         if (!SendAll(fd, SerializeResponse(resp, keep), opt_.send_timeout_ms) || !keep) return;

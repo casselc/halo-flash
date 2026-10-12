@@ -75,7 +75,9 @@
 #include "rt/device.hpp"
 #include "server/anthropic_service.hpp"
 #include "server/flash_next_generator.hpp"
+#include "server/contract.hpp"
 #include "server/http.hpp"
+#include "server/incarnation.hpp"
 #include "server/kv_choice.hpp"
 #include "server/metrics.hpp"
 #include "server/openai_service.hpp"
@@ -644,11 +646,16 @@ int main(int argc, char** argv) {
   server::OpenAiService service(*generator, so);
   if (anthropic_aliases.empty()) anthropic_aliases.push_back({"claude-*", ""});
   server::AnthropicService anthropic(*generator, so, anthropic_aliases);
+  // Every answer names this process's incarnation and its clock (docs/OPERATIONS.md section 2).
+  const server::Incarnation incarnation;
+  const auto stamp = [&incarnation](std::vector<std::pair<std::string, std::string>>& h) { incarnation.Stamp(h); };
   server::HttpServer http({.host = host,
                            .port = port,
                            .send_timeout_ms = static_cast<int>(std::min(send_timeout_s * 1000, 3.6e6)),
-                           .api_key = api_key});
+                           .api_key = api_key,
+                           .stamp = stamp});
   service.Register(http);
+  server::RegisterContract(http, incarnation, {.relaxed = engine::FlashNextGpu::batch_relaxed_});
   if (sched_generator)
     metrics.AddSection([sched_generator](std::string& out, const std::string& labels) {
       sched_generator->RenderMetrics(out, labels);
@@ -679,6 +686,7 @@ int main(int argc, char** argv) {
     ao.max_connections = 4;
     ao.api_key = api_key;
     ao.unix_path = admin_socket;
+    ao.stamp = stamp;
     admin = std::make_unique<server::HttpServer>(ao);
     register_spill(*admin, true);
     if (!admin->Start(&error)) return std::fprintf(stderr, "--admin-socket: %s\n", error.c_str()), 1;

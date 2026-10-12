@@ -6,7 +6,9 @@
 //     API keys, concurrent clients, a client leaving mid-stream (the writer
 //     reports it), a client that stops reading (cut off after the send
 //     timeout, so others sharing its lock proceed), the connection limit,
-//     and Stop() with idle connections.
+//     and Stop() with idle connections;
+//   - the operation contract's stamp: every answer (handled, refused, a parse error, the connection limit) names the
+//     incarnation and its clock, and GET /v1/halo/contract agrees with them.
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -28,7 +30,10 @@
 #include <thread>
 #include <vector>
 
+#include "core/json.hpp"
+#include "server/contract.hpp"
 #include "server/http.hpp"
+#include "server/incarnation.hpp"
 
 namespace gs = hegel::generators;
 using namespace halo::server;
@@ -585,4 +590,95 @@ TEST(Http, UnixSocketPathLengthIsBounded) {
   std::string err;
   EXPECT_FALSE(s.Start(&err));
   EXPECT_NE(err.find("too long"), std::string::npos) << err;
+}
+
+namespace {
+
+/// The value of header `name` in a response head, or "" when absent.
+std::string HeaderOf(const std::string& head, const std::string& name) {
+  const std::string key = "\r\n" + name + ": ";
+  const auto at = head.find(key);
+  if (at == std::string::npos) return "";
+  const auto from = at + key.size();
+  return head.substr(from, head.find("\r\n", from) - from);
+}
+
+bool IsHex32(const std::string& s) {
+  return s.size() == 32 && std::all_of(s.begin(), s.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+}
+
+}  // namespace
+
+TEST(Http, IncarnationsAreRandomAndTheirClocksNeverRunBackward) {
+  const Incarnation a, b;
+  EXPECT_TRUE(IsHex32(a.id())) << a.id();
+  EXPECT_NE(a.id(), b.id());
+  std::int64_t last = a.NowMs();
+  for (int i = 0; i < 1000; ++i) {
+    const std::int64_t now = a.NowMs();
+    EXPECT_GE(now, last);
+    last = now;
+  }
+  const Incarnation old("00112233445566778899aabbccddeeff", Incarnation::Clock::now() - std::chrono::seconds(5));
+  EXPECT_GE(old.NowMs(), 5000);
+}
+
+// Every answer the server writes names the incarnation and its clock, whichever path wrote it: a handler, the API
+// key check, routing, a parse error, a stream's head, the connection limit (docs/OPERATIONS.md section 2).
+TEST(Http, EveryAnswerNamesTheIncarnationAndItsClock) {
+  const Incarnation inc("00112233445566778899aabbccddeeff", Incarnation::Clock::now() - std::chrono::seconds(5));
+  TestServer t({.max_connections = 2,
+                .api_key = "k",
+                .stamp = [&inc](std::vector<std::pair<std::string, std::string>>& h) { inc.Stamp(h); }});
+  const int port = t.server.port();
+  std::int64_t last = 0;
+  const auto check = [&](const Reply& r, int status, const char* what) {
+    EXPECT_EQ(r.status, status) << what;
+    EXPECT_EQ(HeaderOf(r.head, "Halo-Incarnation"), inc.id()) << what;
+    const std::string time = HeaderOf(r.head, "Halo-Time");
+    ASSERT_FALSE(time.empty()) << what;
+    const std::int64_t ms = std::stoll(time);
+    EXPECT_GE(ms, 5000) << what;
+    EXPECT_GE(ms, last) << what;
+    last = ms;
+  };
+  const std::string auth = "Authorization: Bearer k\r\n";
+  check(Call(port, "GET /ping HTTP/1.1\r\n" + auth + "\r\n"), 200, "handled");
+  check(Call(port, "GET /ping HTTP/1.1\r\n\r\n"), 401, "refused at the API key");
+  check(Call(port, "GET /nope HTTP/1.1\r\n" + auth + "\r\n"), 404, "no route");
+  check(Call(port, "GET /throw HTTP/1.1\r\n" + auth + "\r\n"), 500, "a handler that threw");
+  check(Call(port, "GET / HTTP/3.0\r\n\r\n"), 505, "a parse error");
+  check(Call(port, "GET /sse?2 HTTP/1.1\r\n" + auth + "\r\n"), 200, "a stream's head");
+  const int a = Connect(port), b = Connect(port);
+  ASSERT_GE(a, 0);
+  ASSERT_GE(b, 0);
+  for (int i = 0; i < 200 && t.server.active_connections() < 2; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  check(Call(port, "GET /ping HTTP/1.1\r\n" + auth + "\r\n"), 503, "the connection limit");
+  ::close(a);
+  ::close(b);
+}
+
+// GET /v1/halo/contract: the incarnation and clock the answer's headers carry, the inference mode, and no operation
+// verbs yet (stage 1).
+TEST(Http, TheContractNamesTheIncarnationItsClockAndTheInferenceMode) {
+  const Incarnation inc("00112233445566778899aabbccddeeff", Incarnation::Clock::now() - std::chrono::seconds(5));
+  HttpServer server({.stamp = [&inc](std::vector<std::pair<std::string, std::string>>& h) { inc.Stamp(h); }});
+  RegisterContract(server, inc, {.relaxed = true});
+  std::string err;
+  ASSERT_TRUE(server.Start(&err)) << err;
+  const Reply r = Call(server.port(), "GET /v1/halo/contract HTTP/1.1\r\n\r\n");
+  ASSERT_EQ(r.status, 200);
+  const auto doc = halo::json::Parse(r.body, &err);
+  ASSERT_TRUE(doc) << err;
+  EXPECT_EQ(doc->find("incarnation")->str(), inc.id());
+  EXPECT_EQ(HeaderOf(r.head, "Halo-Incarnation"), inc.id());
+  const auto time_ms = static_cast<std::int64_t>(doc->find("time_ms")->number());
+  EXPECT_GE(time_ms, 5000);
+  EXPECT_LE(time_ms, std::stoll(HeaderOf(r.head, "Halo-Time")));  // the document is built before the head is sent
+  EXPECT_EQ(doc->find("inference")->find("mode")->str(), "relaxed");
+  EXPECT_TRUE(doc->find("operations")->is(halo::json::Value::Kind::kNull));
+  const auto exact = halo::json::Parse(ContractJson(inc, {.relaxed = false}), &err);
+  ASSERT_TRUE(exact) << err;
+  EXPECT_EQ(exact->find("inference")->find("mode")->str(), "exact");
+  server.Stop();
 }

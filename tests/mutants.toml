@@ -3783,3 +3783,54 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "Sessions.BatchedStepsEqualSingleSteps"
 why = "the PLE value projection is skipped in batch and per entry: stale values (the equivalent mutant, skip_ple_proj_ never set, only recomputes the same values into the same slices)"
+
+# The operation contract, stage 1 (docs/OPERATIONS.md section 2): every answer names the incarnation and its clock.
+[[mutant]]
+name = "opapi-stamp-skips-parse-errors"
+file = "src/server/http.cpp"
+find = '      (void)SendAll(fd, SerializeResponse(Stamped(HttpResponse::Json(parser.error_status(), ErrorJson(parser.error()))), false),'
+replace = '      (void)SendAll(fd, SerializeResponse(HttpResponse::Json(parser.error_status(), ErrorJson(parser.error())), false),'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Http.EveryAnswerNamesTheIncarnationAndItsClock"
+why = "a parse error is answered without the incarnation"
+
+[[mutant]]
+name = "opapi-stamp-skips-connection-limit"
+file = "src/server/http.cpp"
+find = '      (void)SendAll(fd, SerializeResponse(Stamped(HttpResponse::Json(503, ErrorJson("too many connections"))), false),'
+replace = '      (void)SendAll(fd, SerializeResponse(HttpResponse::Json(503, ErrorJson("too many connections")), false),'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Http.EveryAnswerNamesTheIncarnationAndItsClock"
+why = "the connection limit's 503 is answered without the incarnation"
+
+[[mutant]]
+name = "opapi-time-not-the-incarnation-clock"
+file = "src/server/incarnation.cpp"
+find = '  headers.emplace_back("Halo-Time", std::to_string(NowMs()));'
+replace = '  headers.emplace_back("Halo-Time", std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count() % 1000));'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Http.EveryAnswerNamesTheIncarnationAndItsClock"
+why = "Halo-Time is not measured from the incarnation's start (it wraps, so it can run backward)"
+
+[[mutant]]
+name = "opapi-contract-mode-inverted"
+file = "src/server/contract.cpp"
+find = '  inference.set("mode", Value::String(info.relaxed ? "relaxed" : "exact"));'
+replace = '  inference.set("mode", Value::String(info.relaxed ? "exact" : "relaxed"));'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Http.TheContractNamesTheIncarnationItsClockAndTheInferenceMode"
+why = "the contract advertises exact inference for a server running relaxed kernels"
+
+[[mutant]]
+name = "opapi-incarnation-not-random"
+file = "src/server/incarnation.cpp"
+find = '    const ssize_t n = ::getrandom(bytes.data() + got, bytes.size() - got, 0);'
+replace = '    const ssize_t n = static_cast<ssize_t>(bytes.size() - got);'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Http.IncarnationsAreRandomAndTheirClocksNeverRunBackward"
+why = "every process gets the same incarnation, so a restart is invisible"
