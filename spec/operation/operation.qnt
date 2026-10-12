@@ -24,10 +24,15 @@
 //  cancelTomb    a cancel of an attempt the executor never accepted tombstones it
 //  refusalOpen   a refused copy (429/503) does not end the attempt: the reservation stays until a terminal answer
 //  dedupReceipt  the workflow applies a receipt once per attempt
+//  metaBound     records (held attempts, tombstones, unacknowledged outcomes) are capped at META: a submit or a
+//                cancel that would need one more is refused; nothing is erased to make room
+//
+// Every verb carries the attempt's not-after (and, in the API, its digest): a status for an attempt whose submit
+// never arrived is answered against the carried deadline (cordis expiry.qnt's guessDeadline).
 module operation {
   type Rules = {
     fence: bool, deadline: bool, tomb: bool, ackOutcome: bool, reserve: bool, promise: bool,
-    commitThenAck: bool, cancelTomb: bool, refusalOpen: bool, dedupReceipt: bool,
+    commitThenAck: bool, cancelTomb: bool, refusalOpen: bool, dedupReceipt: bool, metaBound: bool,
   }
   const RULES: Rules
   const RESTART: bool     // the executor may restart
@@ -37,6 +42,7 @@ module operation {
   pure val MAXA = 3       // attempts per operation
   pure val R = 2          // an attempt's worst-case cost: its reservation
   pure val HOLD = 1       // retention slots
+  pure val META = 2       // records: held attempts and tombstones
   pure val W = 3          // a submit's not-after: W ticks past the platform's latest reading of the executor's clock
   pure val HOLD_T = 4     // a finished result's body is held at most this long (the advertised capture window)
   pure val MAXT = 14      // ticks per run
@@ -89,6 +95,12 @@ module operation {
   // retention slots in use: with `reserve`, every accepted attempt holds one from acceptance; without, only results
   pure def slots(ex: int -> XRec, reserve: bool): int =
     IDS.filter(i => ex.get(i).held and (reserve or ex.get(i).ran)).size()
+
+  pure def records(ex: int -> XRec): int = IDS.filter(i => ex.get(i).held or ex.get(i).tomb != TNone).size()
+
+  // the metaBound mutant makes room by erasing a record (any tombstone) instead of refusing
+  pure def eraseOne(ex: int -> XRec, victim: int): int -> XRec =
+    if (not(ex.get(victim).held) and ex.get(victim).tomb != TNone) ex.set(victim, X0) else ex
 
   // the executor's answer to a status query for `id` meant for incarnation `qinc`
   pure def answer(st: S, id: int, qinc: int, nb: int, deadline: bool): Answer = {
@@ -221,8 +233,13 @@ module operation {
     nondet m = s.net.oneOf()
     nondet keep = Set(true, false).oneOf()
     nondet c = 0.to(R).oneOf()
-    val x = s.ex.get(m.id)
+    nondet victim = IDS.oneOf()
     val net2 = if (keep) s.net else s.net.exclude(Set(m))
+    // at the record ceiling: the design refuses; the mutant erases a tombstone and goes on
+    val full = records(s.ex) >= META
+    val ex1 = if (full and not(RULES.metaBound)) eraseOne(s.ex, victim) else s.ex
+    val metaRefuse = full and RULES.metaBound
+    val x = ex1.get(m.id)
     all {
       s.net.size() > 0,
       if (RULES.fence and m.inc != s.inc) s' = { ...s, net: net2, stale: s.stale + 1 }
@@ -230,15 +247,16 @@ module operation {
         | Submit =>
           if (x.held or x.tomb != TNone) s' = { ...s, net: net2, deduped: s.deduped + 1 }
           else if (RULES.deadline and s.time > m.nb) s' = { ...s, net: net2, late: s.late + 1 }
-          else if (slots(s.ex, RULES.reserve) >= HOLD)
+          else if (metaRefuse or slots(ex1, RULES.reserve) >= HOLD)
             s' = { ...s, net: net2, refused: s.refused + 1,
                    recs: s.recs.set(m.id, { ...s.recs.get(m.id), refusedSeen: true }) }
-          else s' = { ...s, net: net2, ex: s.ex.set(m.id, { ...x, held: true, nb: m.nb }) }
+          else s' = { ...s, net: net2, ex: ex1.set(m.id, { ...x, held: true, nb: m.nb }) }
         | Cancel =>
-          if (not(x.held) and x.tomb == TNone)
+          if (not(x.held) and x.tomb == TNone and metaRefuse) s' = { ...s, net: net2, refused: s.refused + 1 }
+          else if (not(x.held) and x.tomb == TNone)
             // answered `cancelled_before_accept` (the platform sees it: cancelSeen); the cancelTomb mutant answers
             // the same without remembering the id
-            s' = { ...s, net: net2, ex: s.ex.set(m.id, if (RULES.cancelTomb) { ...x, tomb: TCancelled, nb: m.nb } else x),
+            s' = { ...s, net: net2, ex: ex1.set(m.id, if (RULES.cancelTomb) { ...x, tomb: TCancelled, nb: m.nb } else x),
                    recs: s.recs.set(m.id, { ...s.recs.get(m.id), cancelSeen: true }) }
           else if (x.held and not(x.ran))
             // stops at the next unit boundary: a finished, cancelled result with its actual usage (0..R)

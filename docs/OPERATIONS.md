@@ -1,9 +1,14 @@
-# The operation API (proposal, revision 2, 2026-10-12)
+# The operation API (proposal, revision 3, 2026-10-12)
 
 Status: **proposed**. This is halo-flash's half of cordis RFC 0007 ("Boundaries, and the operation contract").
 No code changes until the contract is agreed. The model is `spec/operation/`.
 
-Revision 2 follows the third review of revision 1 (58e60d3). Changes:
+Revision 3 aligns with cordis RFC 0007 revision 4, the normative text, which adopts this proposal:
+- every verb carries the attempt's `not_after` and digest;
+- records (held attempts, tombstones, unacknowledged outcomes) have a ceiling, and halo refuses rather than erases
+  (model mutant `eraseForRoom`).
+
+Revision 2 followed the third review of revision 1 (58e60d3). Changes:
 - the durable capture is split into fetch, commit and acknowledge;
 - every verb is bound to an incarnation and an owner;
 - deadlines are in halo's clock, and expiry is modelled;
@@ -32,7 +37,7 @@ server remembers for a bounded time. Today:
   - The attempt is the unit of execution and accounting. A new execution is a new attempt that the platform
     authorized; halo never starts one on its own.
 - **Binding.** A submit binds the attempt to a digest of its immutable parts: `api`, `request`, `not_after`, and the
-  execution mode (section 4). A second submit of the same attempt with another digest gets 409 `conflict` and
+  execution mode (section 4). Any later message for the attempt naming another digest gets 409 `conflict` and
   changes nothing.
 - **Incarnation.** 128 random bits chosen at process start. It is per process, not a durable epoch (RFC 0007 open
   question 2): halo persists nothing an operation depends on.
@@ -52,7 +57,14 @@ server remembers for a bounded time. Today:
 
 ## 3. Verbs
 
-All requests carry `Halo-Incarnation` and are authenticated. All answers carry `Halo-Incarnation` and `Halo-Time`.
+All requests carry `Halo-Incarnation`, `Halo-Not-After` and `Halo-Digest`, and are authenticated. All answers carry
+`Halo-Incarnation` and `Halo-Time`.
+
+**Every verb carries the deadline and digest.** That lets halo answer for an attempt whose submit never arrived.
+With no record, it compares its clock with the carried `not_after`: `never_accepted` before it, `closed` after it.
+Without a carried deadline, halo would have to guess one, and an early guess answers `closed` while a copy can still
+be accepted (cordis `expiry.qnt`, `guessDeadline`). A cancel's tombstone records the carried `not_after` and
+digest, so a later submit naming another digest is a conflict.
 
 | Verb | Request | Answers |
 |---|---|---|
@@ -92,6 +104,8 @@ would answer it, settled at the worst case.
    or from a later status) or `closed`.
 4. **Resend a submit exactly as first sent.** Same identity, incarnation, deadline and digest. It is never re-aimed
    at a new incarnation.
+5. **Repeat a cancel until it is answered.** The cancel or its answer can be lost, and it can race acceptance or
+   completion. A cancelled attempt that ran has a terminal result with its actual usage.
 
 ## 4. Usage and execution modes
 
@@ -125,6 +139,15 @@ would answer it, settled at the worst case.
 
   If the reservations would exceed the retention budget, halo refuses with 503 and Retry-After. Many attempts
   finishing together therefore cannot overflow it (mutant `noReserve`).
+- **Records are bounded, never erased to make room.** A record is a held attempt, a tombstone or an
+  unacknowledged outcome. Each accepted attempt and each cancel-before-accept holds one until it is pruned.
+  - At the `max_records` ceiling, halo refuses the submit or the cancel with 503, reason `records`, and
+    Retry-After. A refused cancel leaves the outbox waiting for `closed`.
+  - Erasing a tombstone or an unacknowledged outcome to make room would turn "it ran" into `closed` (mutant
+    `eraseForRoom`).
+  - **What a platform that stops acknowledging sees** (RFC 0007 open question 3): the contract and `/metrics` report
+    records in use, unacknowledged outcomes and the oldest one's age. A 503 names `records` or `retention`, never
+    a generic failure.
 - **Tombstones.** An attempt id stays known until its `not_after` has passed and, if it ran, its outcome was
   acknowledged. Until then a duplicate or late submit is a no-op. Memory is about 50 bytes per id seen in one
   `max_submit_age_s` window, plus unacknowledged outcomes.
@@ -137,6 +160,7 @@ would answer it, settled at the worst case.
 ```json
 {"incarnation": "9f…", "time_ms": 123456,
  "retention": {"capture_s": 3600, "until": "ack or capture window", "budget_bytes": 268435456},
+ "records": {"max": 100000, "in_use": 12, "unacked_outcomes": 1, "oldest_unacked_ms": 5021},
  "dedup": {"scope": "owner, incarnation", "max_submit_age_s": 600},
  "cancel": "next unit boundary (<= one decode unit or one prefill slice); usage reported",
  "cost": "tokens: prompt, cached, completion (disjoint); engine_ms measured",
@@ -191,6 +215,7 @@ held or not, captured or unknown. Ours covers what that abstraction assumes atom
   attempt that ran.
 - `noReceiptLost`: no result is released before it was committed.
 - `promiseKept`: no body is dropped before its ack or its window.
+- Status and cancel are answered against the deadline they carry (`answer(…, nb, …)`).
 - `noOvercharge`: settled ≤ real; it holds where nothing becomes unknown.
 
 `run.sh` (`quint run` only), seed 0x5eed, 10 000 samples × 60 steps; `results.txt`:
@@ -209,6 +234,7 @@ held or not, captured or unknown. Ours covers what that abstraction assumes atom
 | cancelUntombed | cancel tombstones | accounted | **violated**: a late copy runs after `cancelled_before_accept` settled it at 0 |
 | refusalCloses | a refusal closes only its copy | accounted | **violated**: a refused copy settled at 0, then another copy runs |
 | noReceiptDedup | receipt dedup | appliedOnce | **violated** |
+| eraseForRoom | records refused at the ceiling | neverAcceptedTrue | **violated**: a tombstone erased for room makes a run attempt read `closed` |
 
 **Witnesses.** Every one is reached:
 - done, with and without restarts (`promised`: 216 of 10 000 traces);

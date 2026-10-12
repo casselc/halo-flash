@@ -41,6 +41,7 @@ sim ackBeforeCommit    noReceiptLost     VIOLATED
 sim cancelUntombed     accounted         VIOLATED
 sim refusalCloses      accounted         VIOLATED
 sim noReceiptDedup     appliedOnce       VIOLATED
+sim eraseForRoom       neverAcceptedTrue VIOLATED
 wit design wDone wRestartedThenDone wCrashedThenCommitted wAckLostThenDone wDupReceipt wNeverThenDone \
   wClosedByDeadline wCancelledBefore wCancelledRunningCommitted wExpiredSettled wRefused wStale wLate wDeduped \
   wPruned wUnknown
