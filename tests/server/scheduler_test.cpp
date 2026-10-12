@@ -839,6 +839,69 @@ TEST(Scheduler, FinishedKeyReplaysWithinItsTtl) {
   EXPECT_EQ(s.Arrive(Agent("A", "", "turn-1", 100, 1), now + 11000).outcome, Scheduler::Outcome::kQueued);
 }
 
+// A key's history (Halo-Admitted-Sends, Halo-Discarded-Tokens): every request attached to the key counts, a refused
+// one does not; a fence keeps it; forgetting a finished key (its TTL, or past max_keys) forgets it with the key, so
+// a regeneration after that reports only the sends since (cordis observe_forget.qnt: forgetDiscarded).
+TEST(Scheduler, KeyHistoryCountsSendsAndIsForgottenWithTheKey) {
+  Scheduler::Options o;
+  o.replay_ttl_s = 10;
+  o.keyed_grace_s = 0;
+  o.plimit = 1;
+  o.max_keys = 1;
+  Scheduler s(o);
+  using O = Scheduler::Outcome;
+  std::int64_t now = 0;
+  std::map<Scheduler::Id, std::uint64_t> left;
+  const auto finish = [&](Scheduler::Id id) {
+    left[id] = 100;
+    RunUnit(s, &now, &left);
+    auto u = s.Next(now);
+    ASSERT_EQ(u.kind, Scheduler::Kind::kBatch);
+    s.Done(u, {{id, 0, 1, false, true, true}}, now, u.charged);
+  };
+  // Send 1 generates; send 2 (its answer lost) replays: 1, 2.
+  const auto a = s.Arrive(Agent("A", "", "k1", 100, 1), now);
+  ASSERT_EQ(a.outcome, O::kQueued);
+  EXPECT_EQ(a.sends, 1u);
+  EXPECT_EQ(a.discarded, 0u);
+  finish(a.id);
+  const auto r = s.Arrive(Agent("A", "", "k1", 100, 1), now + 1000);
+  ASSERT_EQ(r.outcome, O::kReplayed);
+  EXPECT_EQ(r.sends, 2u);
+  // The key is forgotten (TTL): the next send generates under a new state, counted from 1.
+  now += 11000;
+  const auto b = s.Arrive(Agent("A", "", "k1", 100, 1), now);
+  ASSERT_EQ(b.outcome, O::kQueued);
+  EXPECT_EQ(b.sends, 1u) << "the forgotten state's sends are not reported";
+  // Refused (the principal's limit: b is in flight) touches no key state.
+  const auto refused = s.Arrive(Agent("A", "", "k2", 100, 1), now);
+  ASSERT_EQ(refused.outcome, O::kLimit);
+  EXPECT_EQ(refused.sends, 0u);
+  // b is fenced: its history stays, and the discarded tokens go into it.
+  s.Depart(b.id, now);
+  EXPECT_EQ(s.Boundary(now + 1), std::vector<Scheduler::Id>{b.id});
+  s.NoteDiscarded("k1", 7, now + 1);
+  s.NoteDiscarded("k-unknown", 5, now + 1);  // no history: dropped
+  now += 10;
+  const auto c = s.Arrive(Agent("A", "", "k1", 100, 1), now);
+  ASSERT_EQ(c.outcome, O::kQueued);
+  EXPECT_EQ(c.sends, 2u);
+  EXPECT_EQ(c.discarded, 7u);
+  finish(c.id);
+  // k2 finishes too: past max_keys (1) the older finished key, k1, is forgotten with its history.
+  const auto k2 = s.Arrive(Agent("A", "", "k2", 100, 1), now);
+  ASSERT_EQ(k2.outcome, O::kQueued);
+  EXPECT_EQ(k2.sends, 1u) << "the refused send was not counted";
+  finish(k2.id);
+  now += 10;
+  (void)s.Arrive(Agent("C", "", "", 100, 1), now);  // an admission forgets keys
+  const auto d = s.Arrive(Agent("A", "", "k1", 100, 1), now);
+  EXPECT_EQ(d.outcome, O::kQueued);
+  EXPECT_EQ(d.sends, 1u) << "evicted with its finished key";
+  EXPECT_EQ(d.discarded, 0u);
+  EXPECT_EQ(s.Arrive(Agent("B", "", "k-unknown", 100, 1), now).sends, 1u) << "a note for a key with no history";
+}
+
 // The ledger: an admission evicts unpinned retained prefixes least recently used first, and refuses (429) only
 // when even that cannot make room; the evictions are carried out at the next boundary.
 TEST(Scheduler, AdmissionEvictsLruAndRefusesOnlyWhenShort) {

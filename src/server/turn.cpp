@@ -47,6 +47,7 @@ std::vector<std::pair<std::string, std::string>> AnswerHeaders(const TextGenerat
   std::vector<std::pair<std::string, std::string>> h;
   if (!a.answer.empty()) h.emplace_back("Halo-Answer", a.answer);
   if (a.discarded_tokens >= 0) h.emplace_back("Halo-Discarded-Tokens", std::to_string(a.discarded_tokens));
+  if (a.admitted_sends >= 0) h.emplace_back("Halo-Admitted-Sends", std::to_string(a.admitted_sends));
   return h;
 }
 

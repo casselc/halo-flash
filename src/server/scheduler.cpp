@@ -97,8 +97,9 @@ std::int64_t Scheduler::RemainingEstimate(const Req& r) const {
 
 void Scheduler::ForgetKeys(std::int64_t now) {
   const std::int64_t ttl = opt_.replay_ttl_s * opt_.per_second;
+  // A forgotten finished key takes its history with it.
   for (auto it = keys_.begin(); it != keys_.end();) {
-    if (it->second.finished && now - it->second.at > ttl) it = keys_.erase(it);
+    if (it->second.finished && now - it->second.at > ttl) history_.erase(it->first), it = keys_.erase(it);
     else ++it;
   }
   // Bound the finished keys kept: the oldest go first.
@@ -108,8 +109,26 @@ void Scheduler::ForgetKeys(std::int64_t now) {
     auto oldest = keys_.end();
     for (auto it = keys_.begin(); it != keys_.end(); ++it)
       if (it->second.finished && (oldest == keys_.end() || it->second.at < oldest->second.at)) oldest = it;
+    history_.erase(oldest->first);
     keys_.erase(oldest);
     --finished;
+  }
+  // Histories of keys with no state (fenced or failed attempts): kept replay_ttl_s from their last use, max_keys
+  // at most, the least recently used first.
+  std::vector<std::pair<std::int64_t, std::string>> loose;
+  for (auto it = history_.begin(); it != history_.end();) {
+    if (keys_.count(it->first)) {
+      ++it;
+    } else if (now - it->second.used > ttl) {
+      it = history_.erase(it);
+    } else {
+      loose.emplace_back(it->second.used, it->first);
+      ++it;
+    }
+  }
+  if (loose.size() > opt_.max_keys) {
+    std::sort(loose.begin(), loose.end());
+    for (std::size_t i = 0; i + opt_.max_keys < loose.size(); ++i) history_.erase(loose[i].second);
   }
   // Finished and cancelled requests no key refers to are gone.
   for (auto it = reqs_.begin(); it != reqs_.end();) {
@@ -162,6 +181,16 @@ Scheduler::Admission Scheduler::Arrive(const Turn& turn, std::int64_t now, bool 
     ++counters_.admitted;
     return a.id = r.id, a;
   }
+  // A keyed request attached to its key (replayed, adopted, dropped as a duplicate, or queued) is counted in the
+  // key's history; one refused (kLimit, kMemory) touches no key state.
+  const auto counted = [&]() -> Admission& {
+    KeyHistory& h = history_[r.key];
+    ++h.sends;
+    h.used = now;
+    a.sends = h.sends;
+    a.discarded = h.discarded;
+    return a;
+  };
   // 1. idempotency: a finished key replays; an in-flight one is adopted (its client left, or this is that
   // client's retry over a connection the server has not seen fail yet); a late copy of an in-flight key whose
   // sender is gone is dropped.
@@ -171,7 +200,7 @@ Scheduler::Admission Scheduler::Arrive(const Turn& turn, std::int64_t now, bool 
         ++counters_.replayed;
         a.outcome = Outcome::kReplayed;
         a.target = it->second.id;
-        return a;
+        return counted();
       }
       auto rit = reqs_.find(it->second.id);
       if (rit != reqs_.end() && Active(rit->second)) {
@@ -179,13 +208,13 @@ Scheduler::Admission Scheduler::Arrive(const Turn& turn, std::int64_t now, bool 
           ++counters_.duplicates;
           a.outcome = Outcome::kDuplicate;
           a.target = rit->second.id;
-          return a;
+          return counted();
         }
         rit->second.departed = false;
         ++counters_.adopted;
         a.outcome = Outcome::kAdopted;
         a.target = rit->second.id;
-        return a;
+        return counted();
       }
     }
   }
@@ -251,9 +280,19 @@ Scheduler::Admission Scheduler::Arrive(const Turn& turn, std::int64_t now, bool 
     if (!x.decider && x.principal == r.principal && Runnable(x, now))
       r.vreq = first ? x.vreq : std::min(r.vreq, x.vreq), first = false;
   reqs_[r.id] = r;
-  if (!r.key.empty()) keys_[r.key] = {r.id, false, now};
   ++counters_.admitted;
-  return a.id = r.id, a;
+  a.id = r.id;
+  if (r.key.empty()) return a;
+  keys_[r.key] = {r.id, false, now};
+  return counted();
+}
+
+void Scheduler::NoteDiscarded(const std::string& key, std::uint64_t tokens, std::int64_t now) {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = history_.find(key);
+  if (it == history_.end()) return;  // forgotten: the tokens belong to no current key state
+  it->second.discarded += tokens;
+  it->second.used = now;
 }
 
 void Scheduler::Depart(Id id, std::int64_t now) {

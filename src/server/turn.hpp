@@ -43,8 +43,9 @@ void DefaultIdempotencyKey(GenerationRequest& req, std::string_view material, Ap
 [[nodiscard]] TextGenerator::Admission AdmitTurn(TextGenerator& gen, const GenerationRequest& req,
                                                  const std::string& prompt, const std::function<bool()>& gone);
 
-/// The Halo-Answer header for an admitted request (none when the generator keeps no keys), and for a keyed request
-/// generated afresh Halo-Discarded-Tokens: the tokens its key's fenced attempts had decoded (0 when none).
+/// The Halo-Answer header for an admitted request (none when the generator keeps no keys), and for a keyed one its
+/// key's history: Halo-Discarded-Tokens (tokens its fenced attempts decoded) and Halo-Admitted-Sends (requests
+/// admitted under the key's current state, this one included).
 [[nodiscard]] std::vector<std::pair<std::string, std::string>> AnswerHeaders(const TextGenerator::Admission& a);
 void AddAnswerHeader(HttpResponse& r, const TextGenerator::Admission& a);
 

@@ -3475,8 +3475,8 @@ why = "tokens a fenced request decoded are in no metric: a client cannot measure
 
 [[mutant]]
 name = "sg-discarded-not-reported"
-file = "src/server/scheduled_generator.cpp"
-find = '        it->second.tokens += decoded;'
+file = "src/server/scheduler.cpp"
+find = '  it->second.discarded += tokens;'
 replace = ''
 suite = "cpu-asan"
 binary = "server_tests"
@@ -3485,9 +3485,9 @@ why = "a key's fenced attempts' tokens are not reported to its next generation: 
 
 [[mutant]]
 name = "sg-discarded-not-cumulative"
-file = "src/server/scheduled_generator.cpp"
-find = '        it->second.tokens += decoded;'
-replace = '        it->second.tokens = decoded;'
+file = "src/server/scheduler.cpp"
+find = '  it->second.discarded += tokens;'
+replace = '  it->second.discarded = tokens;'
 suite = "cpu-asan"
 binary = "server_tests"
 filter = "OpenAiService.AFreshGenerationReportsItsKeysDiscardedTokens"
@@ -3496,8 +3496,8 @@ why = "a key's count is only its latest fenced attempt's: a key fenced twice und
 [[mutant]]
 name = "sg-discarded-replay-unreported"
 file = "src/server/scheduled_generator.cpp"
-find = '  if (!a.answer.empty() && !t.key.empty()) a.discarded_tokens = DiscardedFor(t.key);'
-replace = '  if (a.answer == "generated" && !t.key.empty()) a.discarded_tokens = DiscardedFor(t.key);'
+find = '  if (!a.answer.empty() && !t.key.empty()) {'
+replace = '  if (a.answer == "generated" && !t.key.empty()) {'
 suite = "cpu-asan"
 binary = "server_tests"
 filter = "OpenAiService.AFreshGenerationReportsItsKeysDiscardedTokens"
@@ -3706,3 +3706,60 @@ suite = "gpu"
 binary = "gpu_tests"
 filter = "Sessions.BatchedStepsEqualSingleSteps"
 why = "a new session list keeps the first list's state addresses"
+
+# ---- Halo-Admitted-Sends: a key's history lives and dies with the key (cordis observe_forget.qnt) ----
+[[mutant]]
+name = "as-ttl-forget-keeps-history"
+file = "src/server/scheduler.cpp"
+find = '    if (it->second.finished && now - it->second.at > ttl) history_.erase(it->first), it = keys_.erase(it);'
+replace = '    if (it->second.finished && now - it->second.at > ttl) it = keys_.erase(it);'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Scheduler.KeyHistoryCountsSendsAndIsForgottenWithTheKey"
+why = "a finished key forgotten by its TTL keeps its history: a regeneration reports the lost state's sends"
+
+[[mutant]]
+name = "as-evicted-key-keeps-history"
+file = "src/server/scheduler.cpp"
+find = '    history_.erase(oldest->first);'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Scheduler.KeyHistoryCountsSendsAndIsForgottenWithTheKey"
+why = "a finished key evicted past max_keys keeps its history"
+
+[[mutant]]
+name = "as-replay-not-counted"
+file = "src/server/scheduler.cpp"
+find = '''        a.target = it->second.id;
+        return counted();
+      }
+      auto rit'''
+replace = '''        a.target = it->second.id;
+        return a;
+      }
+      auto rit'''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Scheduler.KeyHistoryCountsSendsAndIsForgottenWithTheKey:OpenAiService.AFreshGenerationReportsItsKeysDiscardedTokens"
+why = "a replayed send is not counted"
+
+[[mutant]]
+name = "as-header-not-sent"
+file = "src/server/turn.cpp"
+find = '  if (a.admitted_sends >= 0) h.emplace_back("Halo-Admitted-Sends", std::to_string(a.admitted_sends));'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.AFreshGenerationReportsItsKeysDiscardedTokens"
+why = "the count is kept but never sent"
+
+[[mutant]]
+name = "as-fence-note-dropped"
+file = "src/server/scheduled_generator.cpp"
+find = "      if (!job->key.empty()) sched_.NoteDiscarded(job->key, decoded, NowMs());  // the key's cumulative count"
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OpenAiService.AFreshGenerationReportsItsKeysDiscardedTokens"
+why = "a fenced attempt's tokens never reach the key's history"

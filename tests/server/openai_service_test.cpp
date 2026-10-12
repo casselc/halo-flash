@@ -1363,7 +1363,7 @@ TEST(OpenAiService, AFreshGenerationReportsItsKeysDiscardedTokens) {
   };
   // One attempt with the key, fenced mid-decode; returns the tokens it discarded and the Conn's headers.
   std::uint64_t fenced = 0;
-  const auto fenced_attempt = [&](const std::string& marker, std::string* discarded_header) {
+  const auto fenced_attempt = [&](const std::string& marker, std::string* discarded_header, std::string* sends_header) {
     const double before = fenced_tokens();
     auto held = rig.gen.Plan(marker, SteppedGenerator::kChunks + 3, 2000);
     {
@@ -1375,35 +1375,42 @@ TEST(OpenAiService, AFreshGenerationReportsItsKeysDiscardedTokens) {
       const ssize_t n = ::recv(c.fd, b, sizeof b, 0);
       if (n > 0) c.raw.assign(b, static_cast<std::size_t>(n));
       *discarded_header = header(c, "Halo-Discarded-Tokens");
+      *sends_header = header(c, "Halo-Admitted-Sends");
     }  // the client leaves mid-decode; its grace runs out
     EXPECT_TRUE(Await([&] { return rig.sched->scheduler().counters().fenced >= fenced + 1; }));
     ++fenced;
     return static_cast<long long>(fenced_tokens() - before);
   };
-  std::string h1, h2;
-  const long long d1 = fenced_attempt("m941x", &h1);
+  std::string h1, h2, n1, n2;
+  const long long d1 = fenced_attempt("m941x", &h1, &n1);
   ASSERT_GE(d1, 1);
   EXPECT_EQ(h1, "0") << "the key's first attempt discarded nothing before it";
-  const long long d2 = fenced_attempt("m941x", &h2);  // generated afresh, and fenced again
+  EXPECT_EQ(n1, "1") << "Halo-Admitted-Sends counts this send";
+  const long long d2 = fenced_attempt("m941x", &h2, &n2);  // generated afresh, and fenced again
   ASSERT_GE(d2, 1);
   EXPECT_EQ(h2, std::to_string(d1)) << "the first attempt's tokens";
+  EXPECT_EQ(n2, "2") << "the fenced send stays counted";
   // The attempt since then was fenced too: the next generated answer carries both, and so does a replay of it.
   (void)rig.gen.Plan("m941x", -1, 3);
   Conn again(port, RequestBody("m941x", false, 16), 0, "Idempotency-Key: k941\r\n");
   again.ReadToEnd();
   EXPECT_EQ(header(again, "Halo-Answer"), "generated");
   EXPECT_EQ(header(again, "Halo-Discarded-Tokens"), std::to_string(d1 + d2)) << "cumulative over the key's fences";
+  EXPECT_EQ(header(again, "Halo-Admitted-Sends"), "3");
   Conn replay(port, RequestBody("m941x", false, 16), 0, "Idempotency-Key: k941\r\n");
   replay.ReadToEnd();
   EXPECT_EQ(header(replay, "Halo-Answer"), "replayed");
   EXPECT_EQ(header(replay, "Halo-Discarded-Tokens"), std::to_string(d1 + d2)) << "a replay carries the count too";
+  EXPECT_EQ(header(replay, "Halo-Admitted-Sends"), "4") << "a replay is counted and carries the count";
   (void)rig.gen.Plan("m942x", -1, 3);
   Conn other(port, RequestBody("m942x", false, 16), 0, "Idempotency-Key: k942\r\n");
   other.ReadToEnd();
   EXPECT_EQ(header(other, "Halo-Discarded-Tokens"), "0");
+  EXPECT_EQ(header(other, "Halo-Admitted-Sends"), "1");
   Conn keyless(port, RequestBody("m942x", false, 16));
   keyless.ReadToEnd();
   EXPECT_EQ(header(keyless, "Halo-Discarded-Tokens"), "-") << "only keyed requests report it";
+  EXPECT_EQ(header(keyless, "Halo-Admitted-Sends"), "-");
 }
 
 // A retry that adopts a generation already decoding (its first client looks connected: a vanished peer) takes the

@@ -191,19 +191,6 @@ class ScheduledGenerator : public TextGenerator {
     std::shared_ptr<std::atomic<bool>> counted;  ///< the job's: whether its completion tokens were counted
   };
   std::map<Scheduler::Id, Stored> replay_;  // finished answers (kept while their keys may replay)
-  /// Tokens decoded by fenced attempts, by idempotency key: cumulative over every attempt fenced under the key,
-  /// reported on every admitted answer with the key (Halo-Discarded-Tokens). A key's record lasts while the key is
-  /// used, and is forgotten after the scheduler's replay TTL without use (as a finished key) or past
-  /// kMaxDiscardedKeys keys (the least recently used first).
-  struct Discarded {
-    std::uint64_t tokens = 0;
-    std::int64_t used_ms = 0;
-  };
-  std::map<std::string, Discarded> discarded_;
-  std::deque<std::string> discarded_order_;  // least recently used first
-  static constexpr std::size_t kMaxDiscardedKeys = 4096;
-  /// The key's cumulative discarded tokens (0 when none within its retention), its record refreshed (mu_ held).
-  std::int64_t DiscardedFor(const std::string& key);
   std::deque<Scheduler::Id> replay_order_;
   std::uint64_t synced_generation_ = ~0ull;
   std::chrono::steady_clock::time_point epoch_;

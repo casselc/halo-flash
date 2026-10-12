@@ -94,6 +94,11 @@ class Scheduler {
     Id id = 0;          ///< this request (kQueued)
     Id target = 0;      ///< the earlier attempt (kReplayed, kAdopted)
     std::int64_t retry_after_s = 0;  ///< kLimit, kMemory
+    /// A keyed admission (any outcome but kLimit / kMemory): the key's history as of this request, counting it.
+    /// sends: requests admitted under the key's current state (Halo-Admitted-Sends); discarded: tokens decoded by
+    /// its fenced attempts (Halo-Discarded-Tokens). Both start from 0 when the key's state is created and are
+    /// forgotten with it (KeyHistory).
+    std::uint64_t sends = 0, discarded = 0;
   };
 
   /// A retained prefix the ledger counts (the session cache's resident entries).
@@ -143,6 +148,8 @@ class Scheduler {
   /// The client of `id` is known gone at `now` (FIN, a failed write, the send deadline): fenced at the next
   /// boundary, or, for a keyed request, at the first boundary after its grace (Options::keyed_grace_s).
   void Depart(Id id, std::int64_t now);
+  /// `tokens` decoded by a fenced attempt under `key`, added to the key's history (if the key still has one).
+  void NoteDiscarded(const std::string& key, std::uint64_t tokens, std::int64_t now);
   /// Engine thread: fence, evict, pick. kNone: nothing runnable (wait for an arrival).
   Unit Next(std::int64_t now);
   /// A boundary with no pick: fences and evictions as Next() does them; returns the requests fenced. (The trace
@@ -212,6 +219,15 @@ class Scheduler {
     bool finished = false;
     std::int64_t at = 0;
   };
+  /// A key's history: what a client needs to account for its sends under the key. It is created by the key's first
+  /// admission and lives while the key does: while the key has a request in flight or a finished answer kept for
+  /// replay, and after a fence or failure (no KeyState) for replay_ttl_s without use, max_keys such keys at most
+  /// (the least recently used first). When the scheduler forgets a finished key, its history goes with it, so a
+  /// regenerated answer never reports sends or tokens from before the key's answer was forgotten.
+  struct KeyHistory {
+    std::uint64_t sends = 0, discarded = 0;
+    std::int64_t used = 0;
+  };
   struct Entry {
     Retained r;
     std::uint64_t used = 0;  // LRU clock
@@ -240,6 +256,7 @@ class Scheduler {
   mutable std::mutex mu_;
   std::map<Id, Req> reqs_;            // active ones, and finished / cancelled ones until their key is forgotten
   std::map<std::string, KeyState> keys_;
+  std::map<std::string, KeyHistory> history_;
   std::map<Key, Entry> retained_;
   std::vector<Key> evicting_;         // decided by an admission, carried out at the next boundary
   std::uint64_t evicting_bytes_ = 0;  // ... their bytes (no longer counted as retained)

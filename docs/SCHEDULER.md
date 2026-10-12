@@ -248,14 +248,22 @@ The usage an adopted or replayed answer reports is that one generation's. A serv
 off`, or a build before G3) sends no `Halo-Answer` at all: a client can tell from its absence that keys are not
 honoured. A 429 carries none (nothing was admitted).
 
-**`Halo-Discarded-Tokens: N`** comes on every admitted answer to a request with an idempotency key (generated,
-adopted or replayed): N is the key's cumulative count of tokens decoded by attempts that were fenced (work in no
-answer's usage), 0 when none. A client resending a lost keyed request charges its lost sends N (capped at their
-worst case), from whichever answer it receives: a fresh answer may be lost and a replay received instead, so every
-answer carries the whole count. A key's record lasts while the key is used and is forgotten after `replay_ttl_s`
-(600 s) without use or past 4096 keys; a resend after that is generated with no history (N 0 or absent), and a
-client should charge such a lost send its worst case. `halo:sched_fenced_decoded_tokens_total` counts every
-key.
+**A key's history: `Halo-Discarded-Tokens: N` and `Halo-Admitted-Sends: n`.** Both come on every admitted answer
+to a request with an idempotency key (generated, adopted or replayed), and describe the same key state:
+- N: tokens decoded by attempts under the key that were fenced (work in no answer's usage), cumulative, 0 when none;
+- n: requests admitted under the key, this one included: every one halo-flash attached to the key (generated,
+  adopted, replayed, or dropped as a late duplicate, and those later fenced). A request refused before that (429
+  or 503: no key state touched) is not counted.
+
+A key's state is created by its first admission and forgotten with the key: when a finished key's answer is no
+longer kept (`replay_ttl_s`, 600 s, or past `max_keys`, 4096 finished keys, oldest first), its history goes too,
+and a key with no request in flight and no answer kept (its attempts fenced or failed) keeps its history for
+`replay_ttl_s` from its last use, at most `max_keys` such keys. After that both start again from 0: a later answer
+reports only what happened since. So a client that made S sends under a key and receives an answer with n can
+account for every send: the S - n it does not see counted were never received or were admitted before the key was
+forgotten, and it charges each its worst case, plus N, capped at all the sends' worst cases (cordis
+`observe_forget.qnt`). Without the count, a send generated and lost before the key was forgotten would be charged
+nowhere. `halo:sched_fenced_decoded_tokens_total` counts every key's fenced tokens.
 
 ## 8. Q6: observability
 
