@@ -159,15 +159,22 @@ would answer it, settled at the worst case.
 
 ```json
 {"incarnation": "9f…", "time_ms": 123456,
- "retention": {"capture_s": 3600, "until": "ack or capture window", "budget_bytes": 268435456},
- "records": {"max": 100000, "in_use": 12, "unacked_outcomes": 1, "oldest_unacked_ms": 5021},
- "dedup": {"scope": "owner, incarnation", "max_submit_age_s": 600},
- "cancel": "next unit boundary (<= one decode unit or one prefill slice); usage reported",
- "cost": "tokens: prompt, cached, completion (disjoint); engine_ms measured",
- "repeat": {"external_effects": "none", "spend": "a new attempt spends again",
-            "exact": "identical greedy output on the same build and weights",
-            "relaxed": "greedy output may differ with batch participation"}}
+ "inference": {"mode": "relaxed", "cost": "tokens: prompt, cached, completion",
+               "repeat": {"external_effects": "none", "spend": "a new generation spends again",
+                          "exact": "identical greedy output on the same build and weights",
+                          "relaxed": "greedy output may differ with batch participation"}},
+ "operations": {"apis": ["completions", "chat"], "owner": "X-Halo-Principal",
+                "digest": "sha256 (hex) of the submit body",
+                "retention": {"capture_s": 3600, "until": "ack or capture window", "budget_bytes": 268435456,
+                              "reserve": "at acceptance: 16384 + max_tokens x 256 bytes", "reserved_bytes": 0},
+                "records": {"max": 100000, "in_use": 12, "unacked_outcomes": 1, "oldest_unacked_ms": 5021},
+                "dedup": {"scope": "owner, incarnation", "max_submit_age_s": 600},
+                "cancel": "next unit boundary (<= one decode unit or one prefill slice); usage reported",
+                "disconnect": "never cancels"}}
 ```
+
+`operations` is `null` on a server run with `--operations 0`: the verbs are not served, and every field above it
+still is.
 
 A server started with `--operations off` advertises no operation contract and keeps today's header contract.
 
@@ -271,13 +278,64 @@ held or not, captured or unknown. Ours covers what that abstraction assumes atom
    - The server suite passes under ASan (99 tests).
    - A live `halo_serve` on the small model answered the contract, a 404 and a completion with the same
      incarnation and an increasing `Halo-Time`.
-2. **Operation keys in the scheduler**: binding digests, the incarnation and deadline checks, tombstones, retention
-   reservation, the capture window, and ack release.
+2. **Operation records**: binding digests, the incarnation and deadline checks, tombstones, retention
+   reservation, the capture window, and ack release. **Done** (`src/server/operations.{hpp,cpp}`).
+   - **A class of its own, `Operations`, not the scheduler's key table.** The record rules (tombstones, digests,
+     the window, release on ack) share nothing with key replay, and are kept in one place. An accepted attempt still
+     executes as an ordinary request through the scheduler's admission and fairness (stage 3).
+   - The caller passes the time (the incarnation's clock). One mutex.
+   - Status, cancel and ack are answered against the deadline the verb carries.
+   - A record is pruned at the first verb after its not-after, once its outcome (if it ran) was acknowledged.
+   - **Tests.** Eight directed tests, one per rule. `OperationsModel.PropertiesHoldUnderTheModelsActions` is a Hegel
+     state machine with the model's actors:
+     - a platform that keeps the contract's rules, crashing and losing what it fetched;
+     - a network that loses, delays and duplicates every verb;
+     - the executor, which finishes attempts (cancelled ones with their usage) and restarts under a new incarnation.
+
+     After each action it checks runsOnce, accounted, neverAcceptedTrue, noReceiptLost, promiseKept, the record
+     ceiling and the retention budget. 2,000 cases; 14 positive-control situations, each reached in every run.
+   - Mutants `opapi-ops-*`, one per executor rule (fence, deadline, prune, expired outcome, reserve, erase for room,
+     cancel tombstone, capture window, digest): 9 of 9 killed.
+   - The server suite passes under ASan and TSan (108 tests).
    - Tested with a Hegel state machine against `operation.qnt`'s executor actions, as the G3 scheduler is.
    - Each model mutant becomes a `tests/mutants.toml` entry.
    - Measure refusals and reserved versus used bytes on the 8-agent pool.
-3. **The endpoints and the stream**, with HTTP tests for every status answer and fault: a lost or late submit, a
-   duplicate, a restart between submit and status, a cancel racing acceptance and completion, a lost ack, and
-   expiry.
+3. **The endpoints and the stream.** **Done** (`src/server/operation_service.{hpp,cpp}`; `halo_serve --operations 1`,
+   the default).
+   - **Execution.** An accepted attempt runs on a worker thread through `OpenAiService::RunOperation`: the same
+     rendering, scheduler admission, fairness (the owner is the principal) and turn runner as `/v1/completions` and
+     `/v1/chat/completions`.
+     - It has no idempotency key: an attempt is its own identity and never a replay.
+     - It has no connection: it is cancelled only by the cancel verb or the server stopping.
+     - A scheduler refusal (principal limit, memory) withdraws the record and answers the submit 429/503 with
+       Retry-After, as a refusal of that copy.
+     - A cancelled attempt keeps its final object and its actual usage.
+   - **Digest.** The SHA-256 (hex) of the submit's body bytes, which carry api, request, not_after and mode. A
+     submit may send it as `Halo-Digest` and must then match. Every other verb carries it with `Halo-Incarnation`
+     and `Halo-Not-After`.
+   - **Answers.** 202 accepted; 200 a duplicate's status; 409 stale incarnation (with the current one) or conflict;
+     410 late; 400 too far ahead; 422 a mode the server does not run; 503 `records`/`retention`. Status for another
+     incarnation is 200 `unknown`. Fetch of an attempt not done is 409 with its status. Observe is 410 with the
+     status once the body is gone.
+   - **Observation.** The stream's events (the chunks a streaming request would get) are kept with the held body.
+     `?from=N` replays from event N, then follows to the end, then sends an `event: status` frame. An observer
+     leaving cancels nothing.
+   - **Scope today:** the completions and chat APIs. `engine_ms` is reported as 0 until the engine attributes time
+     per request.
+   - **Tests.** `OperationService.*` (7) over HTTP with a scripted generator:
+     - a run, fetch and ack, with a duplicate that runs nothing;
+     - incarnation, digest, deadline and mode binding;
+     - a scheduler refusal that leaves no record;
+     - the record ceiling;
+     - a cancel before acceptance (the late copy is a no-op) and while running (finish `cancelled`, usage kept);
+     - an observer that leaves (the attempt finishes), and replay from an offset;
+     - the contract section.
+   - Mutants `opapi-svc-*`: 6 of 6 killed. `svc-no-liveness-check` was retargeted to the shared departure check.
+     The server suite passes under ASan and TSan (115 tests).
+   - **Live** (`halo_serve`, small model, under the GPU lock): a submit answered 202; its duplicate 200; done with
+     its usage; fetch, the stream replay and ack worked; a stale incarnation answered `unknown`. A 3,500-token
+     attempt cancelled after 0.5 s finished `cancelled` at 285 tokens.
+   - **Not yet tested end to end:** a restart between submit and status, a lost ack and expiry on a live server.
+     They are covered by the model and the state machine; the RFC 0007 milestone runs them live.
 4. **Cordis's adapter** moves to the verbs (commit before ack, receipt dedup), and the header rules
    (`observe_report.qnt`, `observe_forget.qnt`) retire for it.

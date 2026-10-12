@@ -78,6 +78,7 @@
 #include "server/contract.hpp"
 #include "server/http.hpp"
 #include "server/incarnation.hpp"
+#include "server/operation_service.hpp"
 #include "server/kv_choice.hpp"
 #include "server/metrics.hpp"
 #include "server/openai_service.hpp"
@@ -233,6 +234,8 @@ int main(int argc, char** argv) {
   std::vector<server::ModelAlias> anthropic_aliases;
   int port = 8080;
   double send_timeout_s = 30;
+  bool operations = true;             // --operations
+  server::OperationServiceOptions op_opt;  // --op-*
   double sse_keepalive_s = 15;
   std::uint32_t moe_topk = 0;  // --moe-topk N: experts per token (0: the file's count; CODESIGN arm B)
   double ngram_cache_gb = 4.0;  // cache of n-gram rows read from disk, GiB (0: off)
@@ -257,6 +260,10 @@ int main(int argc, char** argv) {
           "usage: halo_serve --model <shard-00001.gguf> | --qwen35-model <gguf> --qwen35-tokenizer <gguf> [options]\n"
           "  --host 127.0.0.1 --port 8080 --device hip|hrx --max-context 32768 --api-key KEY --model-id NAME\n"
           "  --send-timeout S      a client write with no progress for S seconds (default 30) cancels the request\n"
+          "  --operations 0|1      the operation verbs, /v1/operations (default 1; docs/OPERATIONS.md)\n"
+          "  --op-capture-s S      a finished operation's body is held S seconds without an ack (default 3600)\n"
+          "  --op-records N        operation records: held attempts, tombstones, unacked outcomes (default 100000)\n"
+          "  --op-budget-mb M      operation retention budget, reserved at acceptance (default 256)\n"
           "  --sse-keepalive S     streams: an SSE comment after S idle seconds while queued or prefilling (default 15; 0: off)\n"
           "  --kv-f16 0|1          KV kind: 1 fp16-only (26.2 KB/token), 0 default kinds (75.3 KB/token).\n"
           "                        Not given: fp16-only when --max-context > --kv-f16-above, else default.\n"
@@ -316,6 +323,10 @@ int main(int argc, char** argv) {
     else if (a == "--device") device = v;
     else if (a == "--host") host = v;
     else if (a == "--port") port = std::atoi(v.c_str());
+    else if (a == "--operations") operations = v == "1";
+    else if (a == "--op-capture-s") op_opt.records.capture_ms = std::atoll(v.c_str()) * 1000;
+    else if (a == "--op-records") op_opt.records.max_records = static_cast<std::size_t>(std::atoll(v.c_str()));
+    else if (a == "--op-budget-mb") op_opt.records.budget_bytes = static_cast<std::uint64_t>(std::atoll(v.c_str())) << 20;
     else if (a == "--send-timeout") {
       send_timeout_s = std::atof(v.c_str());
       if (!(send_timeout_s > 0)) return std::fprintf(stderr, "--send-timeout must be positive seconds\n"), 2;
@@ -649,13 +660,20 @@ int main(int argc, char** argv) {
   // Every answer names this process's incarnation and its clock (docs/OPERATIONS.md section 2).
   const server::Incarnation incarnation;
   const auto stamp = [&incarnation](std::vector<std::pair<std::string, std::string>>& h) { incarnation.Stamp(h); };
+  // Declared before the HTTP server: its workers must stop (Stop) before the operation service's are waited for.
+  op_opt.relaxed = engine::FlashNextGpu::batch_relaxed_;
+  std::unique_ptr<server::OperationService> op_service;
+  if (operations) op_service = std::make_unique<server::OperationService>(service, incarnation, op_opt);
   server::HttpServer http({.host = host,
                            .port = port,
                            .send_timeout_ms = static_cast<int>(std::min(send_timeout_s * 1000, 3.6e6)),
                            .api_key = api_key,
                            .stamp = stamp});
   service.Register(http);
-  server::RegisterContract(http, incarnation, {.relaxed = engine::FlashNextGpu::batch_relaxed_});
+  if (op_service) op_service->Register(http);
+  server::ContractInfo contract{.relaxed = engine::FlashNextGpu::batch_relaxed_};
+  if (op_service) contract.operations = [&op_service] { return op_service->Contract(); };
+  server::RegisterContract(http, incarnation, contract);
   if (sched_generator)
     metrics.AddSection([sched_generator](std::string& out, const std::string& labels) {
       sched_generator->RenderMetrics(out, labels);

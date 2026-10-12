@@ -184,10 +184,35 @@ class OpenAiService {
   HttpResponse Responses(const HttpRequest& req);
   HttpResponse GetResponse(const std::string& id);
 
+  /// Operation execution (docs/OPERATIONS.md): a completions or chat request run by the operation service, with
+  /// no connection behind it. A disconnect never applies; `cancelled` is the explicit cancel (or the server stopping).
+  struct OperationHooks {
+    std::function<bool()> cancelled;
+    /// Right after admission, refused or not (a refusal: the attempt never runs, and done is not called).
+    std::function<void(const TextGenerator::Admission&)> admitted;
+    /// The answer's stream-shaped events (chunks), as they are produced: the observation stream.
+    std::function<void(std::vector<json::Value>&)> events;
+    /// The end: the final object (with cancelled answers too: their usage is real), or an error.
+    struct End {
+      json::Value final;
+      std::string error;       ///< non-empty: generation failed
+      std::string finish;      ///< "stop", "length", "tool_calls", "cancelled" or "error"
+      std::uint64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0;
+    };
+    std::function<void(End)> done;
+  };
+  /// Parses `body` as an `api` request (kCompletions or kChat); nullopt with `error` set when it is not one.
+  std::optional<GenerationRequest> ParseOperation(Api api, const json::Value& body, std::string* error) const;
+  /// Admits and runs `req` with the hooks; blocking (the operation service calls it on a worker thread). Returns
+  /// an error response instead when the request cannot run (an unknown variant, a conversation that cannot be
+  /// rendered); then no hook was called.
+  std::optional<HttpResponse> RunOperation(Api api, GenerationRequest req, const OperationHooks& hooks);
+
  private:
   /// `connected` (optional): whether the client is still there (HttpRequest::connected).
+  /// `op` (optional): run as an operation (see OperationHooks).
   HttpResponse Generate(Api api, GenerationRequest req, const json::Value* prior,
-                        const std::function<bool()>& connected);
+                        const std::function<bool()>& connected, const OperationHooks* op = nullptr);
   /// Stores a finished Responses turn (`final`, after `conversation`); empty on success, else why it was not
   /// stored (then nothing was kept).
   std::string Store(const std::string& id, const json::Value& conversation, const json::Value& final);

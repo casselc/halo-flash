@@ -207,8 +207,29 @@ HttpResponse OpenAiService::GetResponse(const std::string& id) {
   return HttpResponse::Json(200, CompactJson(stored->response));
 }
 
+std::optional<GenerationRequest> OpenAiService::ParseOperation(Api api, const Value& body, std::string* error) const {
+  RequestError e;
+  std::optional<GenerationRequest> req = api == Api::kCompletions ? ParseCompletionsRequest(body, opt_.defaults, &e)
+                                         : api == Api::kChat      ? ParseChatRequest(body, opt_.defaults, &e)
+                                                                  : std::nullopt;
+  if (!req) *error = api == Api::kCompletions || api == Api::kChat ? e.message : "operations serve completions and chat";
+  return req;
+}
+
+std::optional<HttpResponse> OpenAiService::RunOperation(Api api, GenerationRequest req, const OperationHooks& hooks) {
+  bool ran = false;
+  OperationHooks h = hooks;
+  h.admitted = [&ran, &hooks](const TextGenerator::Admission& a) {
+    ran = true;
+    if (hooks.admitted) hooks.admitted(a);
+  };
+  HttpResponse r = Generate(api, std::move(req), nullptr, nullptr, &h);
+  if (ran) return std::nullopt;
+  return r;
+}
+
 HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value* prior,
-                                     const std::function<bool()>& connected) {
+                                     const std::function<bool()>& connected, const OperationHooks* op) {
   if (req.model.empty()) req.model = opt_.model_id;
   if (!req.variant.empty()) {
     const auto names = opt_.variants ? opt_.variants() : std::vector<std::string>{};
@@ -245,10 +266,13 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
   const char* prefix = api == Api::kChat ? "chatcmpl-" : api == Api::kResponses ? "resp_" : "cmpl-";
   const std::string id = prefix + opt_.new_id();
   // D5: a turn's key material is (previous_response_id, input): a client's retry of the same turn carries the same key.
-  DefaultIdempotencyKey(req, req.previous_response_id + '\n' + (api == Api::kCompletions ? prompt : CompactJson(req.messages)),
+  // An operation has none: its attempt is its identity, and a new attempt executes anew (never a replay).
+  if (op) req.stream = false, req.idempotency_key.clear(), req.store = false;
+  else DefaultIdempotencyKey(req, req.previous_response_id + '\n' + (api == Api::kCompletions ? prompt : CompactJson(req.messages)),
                         api);
-  const auto gone0 = [connected] { return connected && !connected(); };
+  const auto gone0 = [connected, op] { return op ? op->cancelled && op->cancelled() : connected && !connected(); };
   const auto admission = AdmitTurn(gen_, req, prompt, gone0);
+  if (op && op->admitted) op->admitted(admission);
   if (admission.refused) {
     // Not done, and never will be: the scheduler took it off the queue as it answered (docs/SCHEDULER.md 4).
     Value inner = Value::MakeObject();
@@ -269,6 +293,8 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
     std::string error;  // the request failed (generation, or the store write): answered with it
     Value final;
     bool cancelled = false;  // the client left before the answer was delivered
+    std::string finish;
+    Usage usage;
   };
   // Shared by the streaming callback, which runs after this returns.
   struct Run {
@@ -278,8 +304,8 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
     Value conversation;
   };
   auto run = std::make_shared<Run>(Run{std::move(req), std::move(prompt), std::move(popt), std::move(conversation)});
-  // The client closed its end (or the server is stopping): nobody will receive the rest.
-  const auto gone = [connected] { return connected && !connected(); };
+  // The client closed its end (or the server is stopping): nobody will receive the rest. An operation: cancelled.
+  const auto gone = gone0;
   // `poll`: Params::cancelled (gone, plus the stream's keepalive).
   const auto ticket = admission.ticket;
   const auto execute = [this, api, id, run, gone, ticket](std::vector<Value>* events, const std::function<bool()>& flush,
@@ -349,11 +375,32 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
       if (!store_->Put(id, {Value::Null(), final}, &err))
         std::fprintf(stderr, "halo_serve: storing cancelled response %s failed: %s\n", id.c_str(), err.c_str());
     }
-    return Executed{error, std::move(final), cancelled};
+    const std::string finish = !error.empty() ? "error"
+                               : cancelled      ? "cancelled"
+                               : result.length_limited && !turn.stopped ? "length"
+                               : builder.has_tool_calls() ? "tool_calls"
+                                                          : "stop";
+    return Executed{error, std::move(final), cancelled, finish, usage};
   };
 
+  if (op) {
+    // An operation: no connection. Its events go to the observation stream as they are produced; its end, whole,
+    // cancelled or failed, to the operation's record.
+    std::vector<Value> events;
+    const auto flush = [&events, op] {
+      if (op->events && !events.empty()) op->events(events);
+      events.clear();
+      return true;
+    };
+    auto [error, final, cancelled, finish, usage] = execute(&events, flush, gone);
+    flush();
+    if (op->done)
+      op->done({std::move(final), error, finish, usage.prompt_tokens, usage.cached_tokens, usage.completion_tokens});
+    return HttpResponse::Json(200, "{}");
+  }
+
   if (!run->req.stream) {
-    auto [error, final, cancelled] = execute(nullptr, [] { return true; }, gone);
+    auto [error, final, cancelled, finish, usage] = execute(nullptr, [] { return true; }, gone);
     HttpResponse r =
         !error.empty() ? HttpResponse::Json(500, CompactJson(ErrorBody({error, ""})))
         : cancelled  // nobody is there to read it, unless the server is stopping
@@ -370,7 +417,7 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
                  [](SsePump& p) { p.Write(": keepalive\n\n"); });
     const auto flush = [&pump] { return pump.Flush(); };
     const auto poll = [&pump, &gone] { return pump.Poll(gone); };
-    auto [error, final, cancelled] = execute(&pump.events, flush, poll);
+    auto [error, final, cancelled, finish, usage] = execute(&pump.events, flush, poll);
     pump.Flush();
     if (!error.empty() && pump.alive()) {
       Value e = ErrorBody({error, ""});
