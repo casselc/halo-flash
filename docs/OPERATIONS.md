@@ -335,7 +335,16 @@ held or not, captured or unknown. Ours covers what that abstraction assumes atom
    - **Live** (`halo_serve`, small model, under the GPU lock): a submit answered 202; its duplicate 200; done with
      its usage; fetch, the stream replay and ack worked; a stale incarnation answered `unknown`. A 3,500-token
      attempt cancelled after 0.5 s finished `cancelled` at 285 tokens.
-   - **Not yet tested end to end:** a restart between submit and status, a lost ack and expiry on a live server.
-     They are covered by the model and the state machine; the RFC 0007 milestone runs them live.
+   - **Live fault probe** (`tools/op_fault_probe.py`): a minimal outbox that keeps the contract's rules against a live
+     `halo_serve`. It injects lost, duplicated and late submits, cancels before acceptance and while running, lost
+     acks, a platform that forgets a fetch, expiry past a 3 s capture window and server restarts, and checks every
+     answer against the contract.
+     - Main c4a39ff, small model, seeds 1-3, 16 operations each: 48 of 48 committed, 81 attempts, 8 incarnations,
+       0 failures.
+     - Every fault above was reached, with `closed` by deadline and `unknown` after each restart.
+     - Not reached: a retention or record refusal, and a 410 late copy (the probe's budget and window are generous).
+     - Positive control: the same probe against a server built with `opapi-ops-cancel-untombed` failed ("a copy
+       was accepted after cancelled_before_accept").
+     - This is halo's side of the RFC 0007 milestone; the milestone itself runs cordis's adapter against it.
 4. **Cordis's adapter** moves to the verbs (commit before ack, receipt dedup), and the header rules
    (`observe_report.qnt`, `observe_forget.qnt`) retire for it.
