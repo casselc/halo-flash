@@ -1615,6 +1615,80 @@ TEST(ScheduledDecider, CreditedDecidersRunAtTheNextBoundaryOnTheEngineThread) {
   EXPECT_EQ(m.find("# TYPE halo:sched_unit_seconds histogram"), m.rfind("# TYPE halo:sched_unit_seconds histogram"));
 }
 
+// engine_ms (the operation contract's usage): a request's share of every unit it took part in. On the test clock
+// every unit takes 10 ms. Alone, a request is charged every unit whole; two requests that share batched units split
+// them, and between them they are charged exactly the time of the units they ran in.
+TEST(ScheduledGenerator, EngineTimeIsEachRequestsShareOfItsUnits) {
+  const auto run = [](int requests) {
+    SteppedGenerator gen;
+    std::vector<std::shared_ptr<SteppedGenerator::Run>> plans;
+    // The first request holds before its first decode unit until the second is admitted, so they batch.
+    for (int i = 0; i < requests; ++i)
+      plans.push_back(gen.Plan("m" + std::to_string(i) + "x", i == 0 && requests > 1 ? SteppedGenerator::kChunks : -1, 24));
+    std::atomic<std::int64_t> now{0};
+    std::atomic<int> units{0};
+    ScheduledOptions o;
+    o.sched.plimit = 4;
+    o.now_ms = [&] { return now.load(); };
+    o.before_unit = [&](const Scheduler::Unit&) {
+      now += 10;
+      ++units;
+    };
+    ScheduledGenerator sg(std::make_unique<FakeBackend>(gen), 1u << 20, {}, o);
+    std::vector<std::future<TextGenerator::Result>> fs;
+    const auto start = [&sg](int i) {
+      return std::async(std::launch::async, [&sg, i] {
+        const std::string prompt = "a turn m" + std::to_string(i) + "x";
+        std::vector<std::int32_t> ids(prompt.begin(), prompt.end());
+        TextGenerator::Params p;
+        p.max_tokens = 64;
+        return sg.GenerateIds(ids, ids.size() - 1, p, [](text::TokenId) { return true; });
+      });
+    };
+    fs.push_back(start(0));
+    if (requests > 1) {
+      while (!plans[0]->held) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      fs.push_back(start(1));
+      while (sg.scheduler().Requests().size() < 2) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      plans[0]->release = true;
+    }
+    double total = 0;
+    for (auto& f : fs) {
+      const auto r = f.get();
+      EXPECT_TRUE(r.error.empty()) << r.error;
+      EXPECT_GT(r.engine_ms, 0);
+      total += r.engine_ms;
+    }
+    return std::pair<double, int>(total, units.load());
+  };
+  const auto [alone, alone_units] = run(1);
+  EXPECT_DOUBLE_EQ(alone, 10.0 * alone_units);
+  const auto [two, two_units] = run(2);
+  EXPECT_DOUBLE_EQ(two, 10.0 * two_units);
+  EXPECT_LT(two, 2 * alone);  // the batched units were split between them, not charged to both
+}
+
+// A reader that leaves early (a cancel) returns before its request finishes: its engine_ms is the time spent until
+// then, never 0.
+TEST(ScheduledGenerator, ACancelledReaderCarriesTheEngineTimeSpent) {
+  SteppedGenerator gen;
+  gen.Plan("m0x", -1, 40);
+  std::atomic<std::int64_t> now{0};
+  ScheduledOptions o;
+  o.now_ms = [&] { return now.load(); };
+  o.before_unit = [&](const Scheduler::Unit&) { now += 10; };
+  ScheduledGenerator sg(std::make_unique<FakeBackend>(gen), 1u << 20, {}, o);
+  const std::string prompt = "a turn m0x";
+  std::vector<std::int32_t> ids(prompt.begin(), prompt.end());
+  std::atomic<int> seen{0};
+  TextGenerator::Params p;
+  p.max_tokens = 64;
+  p.cancelled = [&] { return seen.load() >= 12; };
+  const auto r = sg.GenerateIds(ids, ids.size() - 1, p, [&](text::TokenId) { return ++seen, true; });
+  EXPECT_TRUE(r.cancelled);
+  EXPECT_GE(r.engine_ms, 40.0);  // at least the three prefill slices and one decode unit
+}
+
 // Audit F7: a store write that fails is answered with an error, never a finished response whose id later 404s.
 // Non-streaming: a 500 naming the store; streaming: an error event in place of response.completed. Nothing is
 // kept, the observer records an error, and continuing from the id is a 404; once the store works again the same

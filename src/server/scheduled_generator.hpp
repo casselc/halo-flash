@@ -172,6 +172,8 @@ class ScheduledGenerator : public TextGenerator {
   Result Wait(const std::shared_ptr<Job>& job, std::uint64_t gen, const Params& params,
               const std::function<bool(text::TokenId)>* on_token, const std::function<bool(std::string_view)>* on_text);
   std::int64_t NowMs() const;
+  /// NowMs with sub-millisecond resolution (engine_ms attribution).
+  double UnitNowMs() const;
 
   std::unique_ptr<ScheduledBackend> backend_;
   const std::uint32_t max_context_;
@@ -196,6 +198,9 @@ class ScheduledGenerator : public TextGenerator {
   std::chrono::steady_clock::time_point epoch_;
   double bytes_per_token_ = 0;
   bool spec_active_ = false;                // a request decodes with MTP (engine thread)
+  // The unit running now (engine thread): its start on the unit clock and its participants, for engine_ms.
+  double unit_t0_ms_ = 0;
+  std::size_t unit_n_ = 0;
   std::vector<Job*> unpublished_;           // finished, answered after the scheduler's Done (engine thread)
   std::vector<std::shared_ptr<Job>> held_;  // ... kept alive until then
   struct UnitStats {

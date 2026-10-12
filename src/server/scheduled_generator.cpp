@@ -23,6 +23,7 @@ struct ScheduledGenerator::Job {
   std::function<void()> work;  // a decider evaluation (Scheduler kDecide): runs on the engine thread
   std::int64_t admitted_ms = 0;
   bool waited = false;  // its queue wait (admission to its first unit) was observed (engine thread)
+  double engine_ms = 0;  // its share of the units it took part in, before the current one (engine thread)
   // engine thread only
   bool begun = false, spec = false, finished = false;
   std::unique_ptr<sampling::SamplerState> state;
@@ -79,6 +80,10 @@ ScheduledGenerator::~ScheduledGenerator() {
 
 std::int64_t ScheduledGenerator::NowMs() const {
   return opt_.now_ms ? opt_.now_ms() : static_cast<std::int64_t>(Ms(epoch_, Clock::now()));
+}
+
+double ScheduledGenerator::UnitNowMs() const {
+  return opt_.now_ms ? static_cast<double>(opt_.now_ms()) : Ms(epoch_, Clock::now());
 }
 
 std::shared_ptr<ScheduledGenerator::Job> ScheduledGenerator::FindShared(Job& job) {
@@ -175,6 +180,7 @@ TextGenerator::Admission ScheduledGenerator::AdmitIds(std::span<const std::int32
       ticket->tokens = it->second.tokens;
       ticket->result = it->second.result;
       ticket->result.replayed = true;
+      ticket->result.engine_ms = 0;  // no work was done for this reader
       ticket->result.uncounted = it->second.counted->exchange(true);
       break;
     }
@@ -440,6 +446,8 @@ void ScheduledGenerator::FinishJob(Job& job, const std::string& error) {
     job.pending.clear();
     job.result.error = error;
     job.result.spec = job.spec_stats;
+    // Its share of the units before this one, and of this one up to now (a request finishes inside its last unit).
+    job.result.engine_ms = job.engine_ms + (unit_n_ ? (UnitNowMs() - unit_t0_ms_) / static_cast<double>(unit_n_) : 0);
     completed = error.empty() && !job.result.cancelled;
     if (kTrace)
       std::fprintf(stderr, "sched: finish %llu tokens %zu error '%s' cancelled %d\n",
@@ -695,6 +703,8 @@ void ScheduledGenerator::Loop() {
     for (auto id : unit.ids)
       if (auto j = Find(id)) jobs.push_back(j);
       else ps.push_back({id, 0, 0, false, true, false});  // vanished (cannot happen): let it go
+    unit_t0_ms_ = opt_.now_ms ? static_cast<double>(t0_ms) : Ms(epoch_, t0);  // the start `elapsed` measures from
+    unit_n_ = jobs.size();
     if (unit.kind == Scheduler::Kind::kSlice && !jobs.empty()) {
       Scheduler::Progress p{jobs[0]->id};
       RunSlice(*jobs[0], unit.slice_tokens, &p);
@@ -709,6 +719,17 @@ void ScheduledGenerator::Loop() {
       }
     }
     const auto elapsed = opt_.now_ms ? NowMs() - t0_ms : static_cast<std::int64_t>(Ms(t0, Clock::now()));
+    // Requests that go on to a later unit: their share of this one.
+    if (unit_n_) {
+      const double share = (UnitNowMs() - unit_t0_ms_) / static_cast<double>(unit_n_);
+      for (const auto& j : jobs)
+        if (!j->finished) {
+          j->engine_ms += share;
+          std::lock_guard<std::mutex> lk(j->mu);
+          j->result.engine_ms = j->engine_ms;  // a reader that leaves early (cancelled) takes the time spent so far
+        }
+    }
+    unit_n_ = 0;
     {
       std::lock_guard<std::mutex> lk(stats_mu_);
       const double sec = static_cast<double>(elapsed) * 1e-3;

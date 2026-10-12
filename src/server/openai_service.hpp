@@ -86,6 +86,9 @@ class TextGenerator {
     std::uint64_t prompt_tokens = 0;
     std::uint64_t cached_tokens = 0;
     std::uint64_t completion_tokens = 0;
+    /// Engine time attributed to this request (ms): its share of every unit of GPU work it took part in (a unit's
+    /// length divided by its participants). 0 when the generator does not attribute time, and for a replay.
+    double engine_ms = 0;
     /// Prompt tokens prefilled by this request that a state the session cache retains afterwards holds (a
     /// checkpoint parked during the prefill, or the live session fast mode keeps): what a later request can
     /// reuse that it could not before. Anthropic's cache_creation_input_tokens.
@@ -198,6 +201,7 @@ class OpenAiService {
       std::string error;       ///< non-empty: generation failed
       std::string finish;      ///< "stop", "length", "tool_calls", "cancelled" or "error"
       std::uint64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0;
+      double engine_ms = 0;  ///< TextGenerator::Result::engine_ms
     };
     std::function<void(End)> done;
   };

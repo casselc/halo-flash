@@ -320,8 +320,17 @@ held or not, captured or unknown. Ours covers what that abstraction assumes atom
    - **Observation.** The stream's events (the chunks a streaming request would get) are kept with the held body.
      `?from=N` replays from event N, then follows to the end, then sends an `event: status` frame. An observer
      leaving cancels nothing.
-   - **Scope today:** the completions and chat APIs. `engine_ms` is reported as 0 until the engine attributes time
-     per request.
+   - **Scope today:** the completions and chat APIs.
+   - **`engine_ms`** is the request's share of every unit of GPU work it took part in: a unit's measured length
+     divided by its participants. A prefill slice is one request's; a batched decode unit is split. The unit a
+     request finishes in counts up to its finish.
+     - It is published after every unit, so a reader that leaves early (a cancel) carries the time spent so far.
+     - A replay reports 0.
+     - Tests: `ScheduledGenerator.EngineTimeIsEachRequestsShareOfItsUnits`, which checks that two batched requests
+       are charged exactly the units' time, split between them, and
+       `ScheduledGenerator.ACancelledReaderCarriesTheEngineTimeSpent`.
+     - Mutants `opapi-engine-*`: 3 of 3 killed.
+     - Live (small model): 32 tokens, 86 ms; an attempt cancelled after 0.5 s, 284 tokens and 502 ms.
    - **Tests.** `OperationService.*` (7) over HTTP with a scripted generator:
      - a run, fetch and ack, with a duplicate that runs nothing;
      - incarnation, digest, deadline and mode binding;

@@ -295,6 +295,7 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
     bool cancelled = false;  // the client left before the answer was delivered
     std::string finish;
     Usage usage;
+    double engine_ms = 0;
   };
   // Shared by the streaming callback, which runs after this returns.
   struct Run {
@@ -380,7 +381,7 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
                                : result.length_limited && !turn.stopped ? "length"
                                : builder.has_tool_calls() ? "tool_calls"
                                                           : "stop";
-    return Executed{error, std::move(final), cancelled, finish, usage};
+    return Executed{error, std::move(final), cancelled, finish, usage, result.engine_ms};
   };
 
   if (op) {
@@ -392,15 +393,16 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
       events.clear();
       return true;
     };
-    auto [error, final, cancelled, finish, usage] = execute(&events, flush, gone);
+    auto [error, final, cancelled, finish, usage, engine_ms] = execute(&events, flush, gone);
     flush();
     if (op->done)
-      op->done({std::move(final), error, finish, usage.prompt_tokens, usage.cached_tokens, usage.completion_tokens});
+      op->done({std::move(final), error, finish, usage.prompt_tokens, usage.cached_tokens, usage.completion_tokens,
+                engine_ms});
     return HttpResponse::Json(200, "{}");
   }
 
   if (!run->req.stream) {
-    auto [error, final, cancelled, finish, usage] = execute(nullptr, [] { return true; }, gone);
+    auto [error, final, cancelled, finish, usage, engine_ms] = execute(nullptr, [] { return true; }, gone);
     HttpResponse r =
         !error.empty() ? HttpResponse::Json(500, CompactJson(ErrorBody({error, ""})))
         : cancelled  // nobody is there to read it, unless the server is stopping
@@ -417,7 +419,7 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
                  [](SsePump& p) { p.Write(": keepalive\n\n"); });
     const auto flush = [&pump] { return pump.Flush(); };
     const auto poll = [&pump, &gone] { return pump.Poll(gone); };
-    auto [error, final, cancelled, finish, usage] = execute(&pump.events, flush, poll);
+    auto [error, final, cancelled, finish, usage, engine_ms] = execute(&pump.events, flush, poll);
     pump.Flush();
     if (!error.empty() && pump.alive()) {
       Value e = ErrorBody({error, ""});

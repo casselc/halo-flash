@@ -3990,8 +3990,8 @@ why = "a cancel is recorded but the running attempt never stops"
 [[mutant]]
 name = "opapi-svc-cancelled-usage-dropped"
 file = "src/server/openai_service.cpp"
-find = '      op->done({std::move(final), error, finish, usage.prompt_tokens, usage.cached_tokens, usage.completion_tokens});'
-replace = '      op->done({std::move(final), error, finish, usage.prompt_tokens, usage.cached_tokens, cancelled ? 0 : usage.completion_tokens});'
+find = '      op->done({std::move(final), error, finish, usage.prompt_tokens, usage.cached_tokens, usage.completion_tokens,'
+replace = '      op->done({std::move(final), error, finish, usage.prompt_tokens, usage.cached_tokens, cancelled ? 0 : usage.completion_tokens,'
 suite = "cpu-asan"
 binary = "server_tests"
 filter = "OperationService.CancelBeforeAcceptanceAndWhileRunning"
@@ -4016,3 +4016,34 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "OperationService.VerbsBindIncarnationDigestDeadlineAndMode"
 why = "an exact-mode submit runs on a relaxed server"
+
+# engine_ms: each request's share of its units (src/server/scheduled_generator.cpp).
+[[mutant]]
+name = "opapi-engine-whole-unit-to-each"
+file = "src/server/scheduled_generator.cpp"
+find = '      const double share = (UnitNowMs() - unit_t0_ms_) / static_cast<double>(unit_n_);'
+replace = '      const double share = UnitNowMs() - unit_t0_ms_;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ScheduledGenerator.EngineTimeIsEachRequestsShareOfItsUnits"
+why = "a batched unit is charged whole to every participant: engine time is counted several times"
+
+[[mutant]]
+name = "opapi-engine-last-unit-dropped"
+file = "src/server/scheduled_generator.cpp"
+find = '    job.result.engine_ms = job.engine_ms + (unit_n_ ? (UnitNowMs() - unit_t0_ms_) / static_cast<double>(unit_n_) : 0);'
+replace = '    job.result.engine_ms = job.engine_ms;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ScheduledGenerator.EngineTimeIsEachRequestsShareOfItsUnits"
+why = "the unit a request finishes in is not counted"
+
+[[mutant]]
+name = "opapi-engine-not-published-to-early-readers"
+file = "src/server/scheduled_generator.cpp"
+find = '          j->result.engine_ms = j->engine_ms;  // a reader that leaves early (cancelled) takes the time spent so far'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "ScheduledGenerator.ACancelledReaderCarriesTheEngineTimeSpent"
+why = "a cancelled reader returns with engine_ms 0 although its request ran"

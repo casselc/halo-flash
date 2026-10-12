@@ -257,7 +257,7 @@ HttpResponse OperationService::Submit(const HttpRequest& http) {
         o.set("error", std::move(e));
         return CompactJson(o);
       }();
-      ops_.Finish(ref.id, body, {end.prompt_tokens, end.cached_tokens, end.completion_tokens, 0}, end.finish,
+      ops_.Finish(ref.id, body, {end.prompt_tokens, end.cached_tokens, end.completion_tokens, end.engine_ms}, end.finish,
                   inc_.NowMs());
     };
     if (auto error = svc_.RunOperation(which, std::move(req), h)) {
