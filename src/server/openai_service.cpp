@@ -207,25 +207,50 @@ HttpResponse OpenAiService::GetResponse(const std::string& id) {
   return HttpResponse::Json(200, CompactJson(stored->response));
 }
 
-std::optional<GenerationRequest> OpenAiService::ParseOperation(Api api, const Value& body, std::string* error) const {
-  RequestError e;
-  std::optional<GenerationRequest> req = api == Api::kCompletions ? ParseCompletionsRequest(body, opt_.defaults, &e)
-                                         : api == Api::kChat      ? ParseChatRequest(body, opt_.defaults, &e)
-                                                                  : std::nullopt;
-  if (!req) *error = api == Api::kCompletions || api == Api::kChat ? e.message : "operations serve completions and chat";
-  return req;
-}
-
-std::optional<HttpResponse> OpenAiService::RunOperation(Api api, GenerationRequest req, const OperationHooks& hooks) {
-  bool ran = false;
-  OperationHooks h = hooks;
-  h.admitted = [&ran, &hooks](const TextGenerator::Admission& a) {
-    ran = true;
-    if (hooks.admitted) hooks.admitted(a);
+std::vector<std::pair<std::string, OperationApi>> OpenAiService::OperationApis() {
+  struct Run {
+    Api api;
+    GenerationRequest req;
+    std::optional<Value> prior;
   };
-  HttpResponse r = Generate(api, std::move(req), nullptr, nullptr, &h);
-  if (ran) return std::nullopt;
-  return r;
+  std::vector<std::pair<std::string, OperationApi>> out;
+  for (const auto& [name, api] : {std::pair{"completions", Api::kCompletions}, std::pair{"chat", Api::kChat},
+                                  std::pair{"responses", Api::kResponses}}) {
+    OperationApi a;
+    a.prepare = [this, api](const Value& body, const HttpRequest& submit,
+                            std::string* error) -> std::optional<OperationApi::Prepared> {
+      RequestError e;
+      auto req = api == Api::kCompletions ? ParseCompletionsRequest(body, opt_.defaults, &e)
+                 : api == Api::kChat      ? ParseChatRequest(body, opt_.defaults, &e)
+                                          : ParseResponsesRequest(body, opt_.defaults, &e);
+      if (!req) return *error = e.message, std::nullopt;
+      SetTurnContext(submit, *req);
+      auto run = std::make_shared<Run>(Run{api, std::move(*req), std::nullopt});
+      if (!run->req.previous_response_id.empty()) {
+        auto stored = store_->Get(run->req.previous_response_id);
+        if (!stored) return *error = "previous response not found: " + run->req.previous_response_id, std::nullopt;
+        if (stored->conversation.is(Kind::kNull))
+          return *error = "previous response " + run->req.previous_response_id + " was cancelled before it was delivered",
+                 std::nullopt;
+        run->prior = std::move(stored->conversation);
+      }
+      return OperationApi::Prepared{run, run->req.max_tokens};
+    };
+    a.run = [this](std::shared_ptr<void> p, const OperationHooks& hooks) -> std::optional<HttpResponse> {
+      auto run = std::static_pointer_cast<Run>(p);
+      bool admitted = false;
+      OperationHooks h = hooks;
+      h.admitted = [&admitted, &hooks](const OperationHooks::Admission& a) {
+        admitted = true;
+        if (hooks.admitted) hooks.admitted(a);
+      };
+      HttpResponse r = Generate(run->api, std::move(run->req), run->prior ? &*run->prior : nullptr, nullptr, &h);
+      if (admitted) return std::nullopt;
+      return r;
+    };
+    out.emplace_back(name, std::move(a));
+  }
+  return out;
 }
 
 HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value* prior,
@@ -272,7 +297,7 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
                         api);
   const auto gone0 = [connected, op] { return op ? op->cancelled && op->cancelled() : connected && !connected(); };
   const auto admission = AdmitTurn(gen_, req, prompt, gone0);
-  if (op && op->admitted) op->admitted(admission);
+  if (op && op->admitted) op->admitted({admission.refused, admission.retry_after_s, admission.why});
   if (admission.refused) {
     // Not done, and never will be: the scheduler took it off the queue as it answered (docs/SCHEDULER.md 4).
     Value inner = Value::MakeObject();
@@ -388,8 +413,12 @@ HttpResponse OpenAiService::Generate(Api api, GenerationRequest req, const Value
     // An operation: no connection. Its events go to the observation stream as they are produced; its end, whole,
     // cancelled or failed, to the operation's record.
     std::vector<Value> events;
-    const auto flush = [&events, op] {
-      if (op->events && !events.empty()) op->events(events);
+    const auto flush = [&events, op, api] {
+      if (op->events && !events.empty()) {
+        std::vector<std::string> frames;
+        for (const auto& e : events) frames.push_back(Frame(api, e));
+        op->events(frames);
+      }
       events.clear();
       return true;
     };

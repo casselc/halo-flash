@@ -114,9 +114,10 @@ struct Admitted {
 
 }  // namespace
 
-OperationService::OperationService(OpenAiService& service, const Incarnation& incarnation,
-                                   OperationServiceOptions options)
-    : svc_(service), inc_(incarnation), opt_(options), ops_(incarnation.id(), options.records) {}
+OperationService::OperationService(const Incarnation& incarnation, OperationServiceOptions options)
+    : inc_(incarnation), opt_(options), ops_(incarnation.id(), options.records) {}
+
+void OperationService::AddApi(std::string api, OperationApi adapter) { apis_[std::move(api)] = std::move(adapter); }
 
 OperationService::~OperationService() {
   stopping_ = true;
@@ -135,8 +136,7 @@ Value OperationService::Contract() const {
   const auto s = ops_.stats(inc_.NowMs());
   Value v = Value::MakeObject();
   Value apis = Value::MakeArray();
-  apis.push(Value::String("completions"));
-  apis.push(Value::String("chat"));
+  for (const auto& [name, a] : apis_) apis.push(Value::String(name));
   v.set("apis", std::move(apis));
   v.set("owner", Value::String("X-Halo-Principal"));
   v.set("digest", Value::String("sha256 (hex) of the submit body"));
@@ -192,8 +192,12 @@ HttpResponse OperationService::Submit(const HttpRequest& http) {
     return Error(400, "invalid_request_error", "attempt: a non-negative integer");
   if (!not_after || !not_after->is(Value::Kind::kInt) || !ParseI64(not_after->int_digits(), &nb))
     return Error(400, "invalid_request_error", "not_after: an integer (ms on the incarnation's clock)");
-  if (!api || !api->is(Value::Kind::kString) || (api->str() != "completions" && api->str() != "chat"))
-    return Error(400, "invalid_request_error", "api: \"completions\" or \"chat\"");
+  const auto adapter = api && api->is(Value::Kind::kString) ? apis_.find(api->str()) : apis_.end();
+  if (adapter == apis_.end()) {
+    std::string names;
+    for (const auto& [name, a] : apis_) names += (names.empty() ? "" : ", ") + name;
+    return Error(400, "invalid_request_error", "api: one of " + names);
+  }
   if (!request || !request->is(Value::Kind::kObject)) return Error(400, "invalid_request_error", "request: an object");
   const std::string ours = opt_.relaxed ? "relaxed" : "exact";
   if (!mode || !mode->is(Value::Kind::kString) || (mode->str() != "relaxed" && mode->str() != "exact"))
@@ -203,14 +207,11 @@ HttpResponse OperationService::Submit(const HttpRequest& http) {
   const std::string digest = core::Sha256Hex(http.body);
   if (const std::string* d = http.Header("halo-digest"); d && *d != digest)
     return Error(400, "invalid_request_error", "Halo-Digest is not the SHA-256 of the body");
-  const Api which = api->str() == "chat" ? Api::kChat : Api::kCompletions;
-  auto req = svc_.ParseOperation(which, *request, &err);
-  if (!req) return Error(400, "invalid_request_error", err);
+  auto prepared = adapter->second.prepare(*request, http, &err);
+  if (!prepared) return Error(400, "invalid_request_error", err);
   const std::string owner = http.Header("x-halo-principal") ? *http.Header("x-halo-principal") : "";
-  req->principal = owner;
-  if (const std::string* c = http.Header("x-halo-chain-id")) req->chain_root = *c;
   const Ops::Ref ref{{owner, op->str(), att}, *inc, nb, digest};
-  const std::uint64_t reserve = opt_.base_bytes + std::uint64_t{req->max_tokens} * opt_.bytes_per_token;
+  const std::uint64_t reserve = opt_.base_bytes + prepared->max_tokens * opt_.bytes_per_token;
   DropReleased();
   const Ops::Answer a = ops_.Submit(ref, reserve, inc_.NowMs());
   if (a.verdict != Ops::Verdict::kOk) return Answer(ref, a, inc_.id());
@@ -226,10 +227,10 @@ HttpResponse OperationService::Submit(const HttpRequest& http) {
     std::lock_guard<std::mutex> lk(workers_mu_);
     ++workers_;
   }
-  std::thread([this, ref, which, req = std::move(*req), live, admitted]() mutable {
-    OpenAiService::OperationHooks h;
+  std::thread([this, ref, run_api = adapter->second.run, run = std::move(prepared->run), live, admitted]() mutable {
+    OperationHooks h;
     h.cancelled = [this, &ref] { return stopping_.load() || ops_.CancelRequested(ref.id); };
-    h.admitted = [this, &ref, admitted](const TextGenerator::Admission& adm) {
+    h.admitted = [this, &ref, admitted](const OperationHooks::Admission& adm) {
       if (!adm.refused) {
         Ops::View v;
         v.status = Ops::Status::kRunning;
@@ -243,12 +244,12 @@ HttpResponse OperationService::Submit(const HttpRequest& http) {
       r.headers.emplace_back("Retry-After", std::to_string(std::max<std::int64_t>(1, adm.retry_after_s)));
       admitted->Set(std::move(r));
     };
-    h.events = [live](std::vector<Value>& events) {
+    h.events = [live](std::vector<std::string>& frames) {
       std::lock_guard<std::mutex> lk(live->mu);
-      for (const auto& e : events) live->frames.push_back("data: " + CompactJson(e) + "\n\n");
+      for (auto& f : frames) live->frames.push_back(std::move(f));
       live->cv.notify_all();
     };
-    h.done = [this, &ref](OpenAiService::OperationHooks::End end) {
+    h.done = [this, &ref](OperationHooks::End end) {
       const std::string body = end.error.empty() ? CompactJson(end.final) : [&] {
         Value e = Value::MakeObject();
         e.set("message", Value::String(end.error));
@@ -260,7 +261,7 @@ HttpResponse OperationService::Submit(const HttpRequest& http) {
       ops_.Finish(ref.id, body, {end.prompt_tokens, end.cached_tokens, end.completion_tokens, end.engine_ms}, end.finish,
                   inc_.NowMs());
     };
-    if (auto error = svc_.RunOperation(which, std::move(req), h)) {
+    if (auto error = run_api(std::move(run), h)) {
       ops_.Withdraw(ref.id);
       admitted->Set(std::move(*error));
     }

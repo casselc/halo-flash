@@ -663,7 +663,11 @@ int main(int argc, char** argv) {
   // Declared before the HTTP server: its workers must stop (Stop) before the operation service's are waited for.
   op_opt.relaxed = engine::FlashNextGpu::batch_relaxed_;
   std::unique_ptr<server::OperationService> op_service;
-  if (operations) op_service = std::make_unique<server::OperationService>(service, incarnation, op_opt);
+  if (operations) {
+    op_service = std::make_unique<server::OperationService>(incarnation, op_opt);
+    for (auto& [name, adapter] : service.OperationApis()) op_service->AddApi(name, std::move(adapter));
+    op_service->AddApi("messages", anthropic.OperationAdapter());
+  }
   server::HttpServer http({.host = host,
                            .port = port,
                            .send_timeout_ms = static_cast<int>(std::min(send_timeout_s * 1000, 3.6e6)),
@@ -754,6 +758,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "decider: %s\n", server::DeciderGate::Name(decider_gate->mode()));
     metrics.AddSection([g = decider_gate.get()](std::string& out, const std::string& labels) { g->Render(out, labels); });
     server::RegisterSystemOne(http, *decider, decider_gate.get());
+    if (op_service) op_service->AddApi("systemone", server::SystemOneOperationAdapter(*decider, decider_gate.get()));
   }
   if (!http.Start(&error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
   std::fprintf(stderr, "serving %s on http://%s:%d\n", model_id.c_str(), host.c_str(), http.port());
@@ -776,6 +781,8 @@ int main(int argc, char** argv) {
 #endif
   http.Stop();
   if (admin) admin->Stop();
+  // Running operations use the generator and the decider: cancelled and joined before either goes.
+  op_service.reset();
   // The generator (its session cache) uses the engine: it goes first. It is declared before the engine, so scope exit
   // alone would destroy the engine under it (a use-after-free at every shutdown, which a poisoned engine's quarantine
   // turned into a crash).

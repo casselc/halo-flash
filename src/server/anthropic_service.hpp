@@ -39,12 +39,17 @@ class AnthropicService {
   void Register(HttpServer& server);
 
   HttpResponse Messages(const HttpRequest& req);
+  /// The "messages" operation adapter (docs/OPERATIONS.md): rendered, admitted and run as /v1/messages, with no
+  /// idempotency key and no connection (only the cancel verb stops it).
+  OperationApi OperationAdapter();
   HttpResponse CountTokens(const HttpRequest& req);
 
  private:
   struct Prepared;
   /// Parses, resolves the model and renders; on failure `error` holds the answer.
   std::shared_ptr<Prepared> Prepare(const HttpRequest& http, bool count_tokens, HttpResponse* error);
+  /// Admits and runs a prepared request for a connection (`connected`) or as an operation (`op`).
+  HttpResponse Run(std::shared_ptr<Prepared> run, const std::function<bool()>& connected, const OperationHooks* op);
 
   TextGenerator& gen_;
   ServiceOptions opt_;

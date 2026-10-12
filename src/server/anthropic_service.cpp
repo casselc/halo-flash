@@ -113,14 +113,46 @@ HttpResponse AnthropicService::Messages(const HttpRequest& http) {
   HttpResponse error;
   const auto run = Prepare(http, /*count_tokens=*/false, &error);
   if (!run) return error;
+  return Run(run, http.connected, nullptr);
+}
+
+OperationApi AnthropicService::OperationAdapter() {
+  OperationApi a;
+  a.prepare = [this](const Value& body, const HttpRequest& submit,
+                     std::string* error) -> std::optional<OperationApi::Prepared> {
+    HttpRequest as = submit;  // its headers (principal, chain), with the operation's request as the body
+    as.body = CompactJson(body);
+    HttpResponse refused;
+    auto run = Prepare(as, /*count_tokens=*/false, &refused);
+    if (!run) return *error = refused.body, std::nullopt;
+    return OperationApi::Prepared{run, run->req.gen.max_tokens};
+  };
+  a.run = [this](std::shared_ptr<void> p, const OperationHooks& hooks) -> std::optional<HttpResponse> {
+    bool admitted = false;
+    OperationHooks h = hooks;
+    h.admitted = [&admitted, &hooks](const OperationHooks::Admission& adm) {
+      admitted = true;
+      if (hooks.admitted) hooks.admitted(adm);
+    };
+    HttpResponse r = Run(std::static_pointer_cast<Prepared>(p), nullptr, &h);
+    if (admitted) return std::nullopt;
+    return r;
+  };
+  return a;
+}
+
+HttpResponse AnthropicService::Run(std::shared_ptr<Prepared> run, const std::function<bool()>& connected,
+                                   const OperationHooks* op) {
   const std::string id = "msg_" + opt_.new_id();
-  const std::function<bool()> connected = http.connected;
-  const auto gone = [connected] { return connected && !connected(); };
+  const auto gone = [connected, op] { return op ? op->cancelled && op->cancelled() : connected && !connected(); };
   GenerationRequest& g = run->req.gen;
-  // D5: the key material is the rendered prompt (system, tools and messages).
-  DefaultIdempotencyKey(g, run->prompt, Api::kMessages);
+  // D5: the key material is the rendered prompt (system, tools and messages). An operation has none: its attempt is
+  // its identity, and a new attempt executes anew.
+  if (op) g.stream = false, g.idempotency_key.clear();
+  else DefaultIdempotencyKey(g, run->prompt, Api::kMessages);
   // G3: admitted before any response is sent (a streamed 429 is impossible once message_start went out).
   const auto admission = AdmitTurn(gen_, g, run->prompt, gone);
+  if (op && op->admitted) op->admitted({admission.refused, admission.retry_after_s, admission.why});
   if (admission.refused) {
     HttpResponse r = MessagesErrorResponse({429, "rate_limit_error",
                                             "the server is busy (" + admission.why + "); retry after " +
@@ -136,6 +168,9 @@ HttpResponse AnthropicService::Messages(const HttpRequest& http) {
     std::string error;
     Value final;
     bool cancelled = false;
+    std::string finish;
+    MessagesUsage usage;
+    double engine_ms = 0;
   };
   // `events` null: not streaming. `flush` writes the events so far (false once the client is gone); `poll` is
   // Params::cancelled (gone, plus the stream's pings).
@@ -180,7 +215,13 @@ HttpResponse AnthropicService::Messages(const HttpRequest& http) {
                : reason == StopReason::kToolUse                                         ? "tool_calls"
                                                                                         : "stop",
                builder.tool_calls());
-    return Executed{result.error.empty() ? "" : "generation failed: " + result.error, builder.Final(), cancelled};
+    const std::string finish = !result.error.empty() ? "error"
+                               : cancelled            ? "cancelled"
+                               : reason == StopReason::kMaxTokens || reason == StopReason::kContextWindow ? "length"
+                               : reason == StopReason::kToolUse ? "tool_calls"
+                                                                : "stop";
+    return Executed{result.error.empty() ? "" : "generation failed: " + result.error, builder.Final(), cancelled, finish,
+                    usage, result.engine_ms};
   };
 
   MessageBuilder::Options bo{id, run->served, run->req.omit_thinking,
@@ -189,9 +230,32 @@ HttpResponse AnthropicService::Messages(const HttpRequest& http) {
   if (!run->req.ignored.empty()) headers.emplace_back("x-halo-ignored", Join(run->req.ignored));
   for (auto& h : AnswerHeaders(admission)) headers.push_back(std::move(h));
 
+  if (op) {
+    // An operation: its events (message_start onward) go to the observation stream as they are produced; its end,
+    // whole, cancelled or failed, to the operation's record.
+    MessageBuilder builder(bo);
+    std::vector<Value> events;
+    const auto flush = [&events, op] {
+      if (op->events && !events.empty()) {
+        std::vector<std::string> frames;
+        for (const auto& e : events) frames.push_back(MessagesFrame(e));
+        op->events(frames);
+      }
+      events.clear();
+      return true;
+    };
+    builder.Start(gen_.CountTokens(run->prompt).value_or(0), &events);
+    flush();
+    auto [err, final, cancelled, finish, usage, engine_ms] = execute(builder, &events, flush, gone);
+    flush();
+    if (op->done)
+      op->done({std::move(final), err, finish, usage.prompt_tokens, usage.cache_read, usage.output_tokens,
+                engine_ms});
+    return HttpResponse::Json(200, "{}");
+  }
   if (!run->req.gen.stream) {
     MessageBuilder builder(bo);
-    auto [err, final, cancelled] = execute(builder, nullptr, [] { return true; }, gone);
+    auto [err, final, cancelled, finish, usage, engine_ms] = execute(builder, nullptr, [] { return true; }, gone);
     HttpResponse r = !err.empty() ? MessagesErrorResponse({500, "api_error", err})
                      : cancelled  ? MessagesErrorResponse({503, "api_error", "generation cancelled: the client left or the server is stopping"})
                                   : HttpResponse::Json(200, CompactJson(final));
@@ -211,7 +275,7 @@ HttpResponse AnthropicService::Messages(const HttpRequest& http) {
     });
     builder.Start(provisional, &pump.events);
     pump.Flush();
-    auto [err, final, cancelled] = execute(builder, &pump.events, [&pump] { return pump.Flush(); },
+    auto [err, final, cancelled, finish, usage, engine_ms] = execute(builder, &pump.events, [&pump] { return pump.Flush(); },
                                            [&pump, &gone] { return pump.Poll(gone); });
     pump.Flush();
     if (!err.empty() && pump.alive()) (void)pump.Write(MessagesFrame(MessagesErrorBody({500, "api_error", err})));

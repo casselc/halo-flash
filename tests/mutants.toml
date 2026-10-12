@@ -4047,3 +4047,34 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "ScheduledGenerator.ACancelledReaderCarriesTheEngineTimeSpent"
 why = "a cancelled reader returns with engine_ms 0 although its request ran"
+
+# The other APIs as operations (anthropic_service.cpp, systemone_service.cpp).
+[[mutant]]
+name = "opapi-msg-usage-dropped"
+file = "src/server/anthropic_service.cpp"
+find = '      op->done({std::move(final), err, finish, usage.prompt_tokens, usage.cache_read, usage.output_tokens,'
+replace = '      op->done({std::move(final), err, finish, usage.prompt_tokens, usage.cache_read, 0,'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationService.ResponsesMessagesAndSystemoneRunAsOperations"
+why = "a messages operation reports no output tokens"
+
+[[mutant]]
+name = "opapi-msg-frames-unnamed"
+file = "src/server/anthropic_service.cpp"
+find = '        for (const auto& e : events) frames.push_back(MessagesFrame(e));'
+replace = '        for (const auto& e : events) frames.push_back("data: " + CompactJson(e) + "\n\n");'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationService.ResponsesMessagesAndSystemoneRunAsOperations"
+why = "a messages operation's observation stream loses its event names (not the Messages stream format)"
+
+[[mutant]]
+name = "opapi-systemone-usage-unread"
+file = "src/server/systemone_service.cpp"
+find = '        if (const auto* in = u->find("input_tokens")) end.prompt_tokens = static_cast<std::uint64_t>(in->number());'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationService.ResponsesMessagesAndSystemoneRunAsOperations"
+why = "a systemone operation reports no input tokens"

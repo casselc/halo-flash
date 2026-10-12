@@ -15,6 +15,7 @@
 #include "core/json.hpp"
 #include "decide/systemone.hpp"
 #include "server/decider_gate.hpp"
+#include "server/operation_api.hpp"
 #include "server/http.hpp"
 
 namespace halo::server {
@@ -32,6 +33,11 @@ class DecisionEngine {
 /// given (G3: concurrent with Flash-Next or a scheduled unit; it must outlive
 /// the server), else under the route's own mutex.
 void RegisterSystemOne(HttpServer& server, DecisionEngine& engine, DeciderGate* gate = nullptr);
+
+/// The "systemone" operation adapter (docs/OPERATIONS.md): one evaluation, through `gate` as the route runs it.
+/// An evaluation is one unit of GPU work: a cancel that arrives while it runs takes effect after it (it finishes
+/// done). Usage: prompt_tokens is the answer's input_tokens; engine_ms the evaluation's length.
+OperationApi SystemOneOperationAdapter(DecisionEngine& engine, DeciderGate* gate = nullptr);
 
 }  // namespace halo::server
 

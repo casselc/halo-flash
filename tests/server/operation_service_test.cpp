@@ -23,12 +23,25 @@
 #include "server/http.hpp"
 #include "server/incarnation.hpp"
 #include "server/openai_service.hpp"
+#include "server/anthropic_service.hpp"
 #include "server/operation_service.hpp"
+#include "server/systemone_service.hpp"
 
 using namespace halo::server;
 namespace json = halo::json;
 
 namespace {
+
+/// Answers every evaluation with one choice and its input tokens.
+class Decider : public DecisionEngine {
+ public:
+  std::optional<json::Value> Evaluate(const halo::decide::Request&, std::string*) override {
+    ++runs;
+    std::string err;
+    return json::Parse(R"({"answers": {"q": {"choice": 1}}, "usage": {"input_tokens": 42}})", &err);
+  }
+  std::atomic<int> runs{0};
+};
 
 /// Emits `script` 3 bytes a token, `delay_ms` apart; refuses admission while `refuse` is set.
 class Gen : public TextGenerator {
@@ -128,7 +141,11 @@ struct Rig {
     so.new_id = [n]() mutable { return std::to_string(++n); };
     so.now_s = [] { return std::int64_t{1700000000}; };
     service = std::make_unique<OpenAiService>(gen, so);
-    ops = std::make_unique<OperationService>(*service, inc, OperationServiceOptions{.records = records, .relaxed = relaxed});
+    anthropic = std::make_unique<AnthropicService>(gen, so, std::vector<ModelAlias>{{"claude-*", ""}});
+    ops = std::make_unique<OperationService>(inc, OperationServiceOptions{.records = records, .relaxed = relaxed});
+    for (auto& [name, a] : service->OperationApis()) ops->AddApi(name, std::move(a));
+    ops->AddApi("messages", anthropic->OperationAdapter());
+    ops->AddApi("systemone", SystemOneOperationAdapter(decider));
     ops->Register(server);
     RegisterContract(server, inc, {.relaxed = relaxed, .operations = [this] { return ops->Contract(); }});
     std::string err;
@@ -139,9 +156,14 @@ struct Rig {
   /// A submit body for attempt `attempt` of operation `op`, not-after `ms_ahead` from now.
   std::string Body(const std::string& op, int attempt, std::int64_t ms_ahead = 60000, const std::string& mode = "relaxed",
                    const std::string& prompt = "hi") const {
-    return R"({"operation_id": ")" + op + R"(", "attempt": )" + std::to_string(attempt) +
-           R"(, "not_after": )" + std::to_string(inc.NowMs() + ms_ahead) + R"(, "api": "completions", "mode": ")" +
-           mode + R"(", "request": {"prompt": ")" + prompt + R"(", "max_tokens": 64}})";
+    return For(op, attempt, "completions", R"({"prompt": ")" + prompt + R"(", "max_tokens": 64})", ms_ahead, mode);
+  }
+  /// A submit body for `api` with `request` (JSON).
+  std::string For(const std::string& op, int attempt, const std::string& api, const std::string& request,
+                  std::int64_t ms_ahead = 60000, const std::string& mode = "relaxed") const {
+    return R"({"operation_id": ")" + op + R"(", "attempt": )" + std::to_string(attempt) + R"(, "not_after": )" +
+           std::to_string(inc.NowMs() + ms_ahead) + R"(, "api": ")" + api + R"(", "mode": ")" + mode +
+           R"(", "request": )" + request + "}";
   }
   Reply Submit(const std::string& body, const std::string& incarnation = "") {
     return Call(server.port(), "POST", "/v1/operations", body,
@@ -183,9 +205,11 @@ struct Rig {
   }
 
   Gen gen;
+  Decider decider;
   Incarnation inc;
   HttpServer server;
   std::unique_ptr<OpenAiService> service;
+  std::unique_ptr<AnthropicService> anthropic;
   std::unique_ptr<OperationService> ops;
 };
 
@@ -318,6 +342,52 @@ TEST(OperationService, TheContractDescribesTheVerbs) {
   const auto* ops = c.find("operations");
   ASSERT_TRUE(ops && ops->is(json::Value::Kind::kObject));
   EXPECT_EQ(ops->find("disconnect")->str(), "never cancels");
-  EXPECT_EQ(ops->find("apis")->items().size(), 2u);
+  EXPECT_EQ(ops->find("apis")->items().size(), 5u);
   EXPECT_TRUE(ops->find("retention")->find("capture_s"));
+}
+
+// The other APIs on top of operations: the same verbs, each API's own result object and stream frames.
+TEST(OperationService, ResponsesMessagesAndSystemoneRunAsOperations) {
+  Rig r;
+  const std::string resp = r.For("r1", 0, "responses", R"({"input": "hi", "max_output_tokens": 64})");
+  ASSERT_EQ(r.Submit(resp).status, 202);
+  ASSERT_EQ(r.AwaitEnd(resp), "done");
+  auto res = r.Verb("GET", resp, "result").Json();
+  EXPECT_EQ(res.find("object")->str(), "response");
+  EXPECT_EQ(r.Verb("GET", resp).Json().find("usage")->find("completion_tokens")->int_digits(), "7");
+  const auto rs = r.Verb("GET", resp, "stream");
+  EXPECT_NE(rs.body.find("event: response.created\n"), std::string::npos) << rs.body.substr(0, 400);
+  EXPECT_NE(rs.body.find("event: response.completed\n"), std::string::npos);
+
+  const std::string msg = r.For("m1", 0, "messages",
+                                R"({"model": "claude-x", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]})");
+  ASSERT_EQ(r.Submit(msg).status, 202);
+  ASSERT_EQ(r.AwaitEnd(msg), "done");
+  res = r.Verb("GET", msg, "result").Json();
+  EXPECT_EQ(res.find("type")->str(), "message");
+  EXPECT_NE(r.Verb("GET", msg, "result").body.find("hello world, all well"), std::string::npos);
+  const auto st = r.Verb("GET", msg).Json();
+  EXPECT_EQ(st.find("finish")->str(), "stop");
+  EXPECT_EQ(st.find("usage")->find("completion_tokens")->int_digits(), "7");
+  const auto ms = r.Verb("GET", msg, "stream");
+  EXPECT_NE(ms.body.find("event: message_start\n"), std::string::npos) << ms.body.substr(0, 400);
+  EXPECT_NE(ms.body.find("event: message_stop\n"), std::string::npos);
+
+  const std::string dec = r.For("d1", 0, "systemone", R"({"state": "s", "questions": {"q": {"type": "noul", "instructions": "x"}}})");
+  ASSERT_EQ(r.Submit(dec).status, 202);
+  ASSERT_EQ(r.AwaitEnd(dec), "done");
+  res = r.Verb("GET", dec, "result").Json();
+  EXPECT_TRUE(res.find("answers"));
+  EXPECT_TRUE(res.find("latency_ms"));
+  EXPECT_EQ(r.Verb("GET", dec).Json().find("usage")->find("prompt_tokens")->int_digits(), "42");
+  EXPECT_EQ(r.decider.runs.load(), 1);
+  EXPECT_EQ(r.Submit(dec).status, 200);  // a duplicate evaluates nothing
+  EXPECT_EQ(r.decider.runs.load(), 1);
+
+  // Each API's own validation, before anything is recorded.
+  EXPECT_EQ(r.Submit(r.For("m2", 0, "messages", R"({"model": "claude-x", "messages": []})")).status, 400);
+  EXPECT_EQ(r.Submit(r.For("d2", 0, "systemone", R"({"state": "s"})")).status, 400);
+  EXPECT_EQ(r.Submit(r.For("x1", 0, "embeddings", R"({})")).status, 400);
+  const auto c = r.Call0("GET", "/v1/halo/contract").Json();
+  EXPECT_EQ(c.find("operations")->find("apis")->items().size(), 5u);
 }

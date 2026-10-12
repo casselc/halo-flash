@@ -9,17 +9,18 @@
 //   POST /v1/operations/{op}/{attempt}/cancel            cancel
 //   POST /v1/operations/{op}/{attempt}/ack               ack (the platform committed the result)
 //
-// The records are Operations' (server/operations.hpp); this service binds them to HTTP and to execution. An
-// accepted attempt runs on a worker thread through OpenAiService::RunOperation: the scheduler's admission and
-// fairness as any request, with no connection behind it (a disconnect, of the submitter or of an observer, never
-// cancels; only the cancel verb does). A scheduler refusal (principal limit, memory) withdraws the record and
-// answers the submit 429/503, as a refusal of that copy.
+// The records are Operations' (server/operations.hpp); this service binds them to HTTP and to execution. A submit's
+// "api" names an adapter (server/operation_api.hpp) a service registered with AddApi: OpenAiService ("completions",
+// "chat", "responses"), AnthropicService ("messages"), and the decider ("systemone"). An accepted attempt runs on a
+// worker thread through its adapter: the scheduler's admission and fairness as any request, with no connection
+// behind it (a disconnect, of the submitter or of an observer, never cancels; only the cancel verb does). A
+// scheduler refusal (principal limit, memory) withdraws the record and answers the submit 429/503, as a refusal of
+// that copy.
 //
 // Identity: the owner is the request's principal (X-Halo-Principal, set by the broker; empty: anonymous), the
 // operation id and attempt are the platform's. Every verb carries Halo-Incarnation; status, fetch, observe,
 // cancel and ack also carry Halo-Not-After and Halo-Digest. The digest is the SHA-256 (hex) of the submit's body
 // bytes, which bind api, request, not_after and mode; a submit may carry it too, and must then match.
-// Operations serve the completions and chat APIs.
 
 #include <atomic>
 #include <condition_variable>
@@ -32,7 +33,7 @@
 #include "core/json.hpp"
 #include "server/http.hpp"
 #include "server/incarnation.hpp"
-#include "server/openai_service.hpp"
+#include "server/operation_api.hpp"
 #include "server/operations.hpp"
 
 namespace halo::server {
@@ -49,12 +50,14 @@ struct OperationServiceOptions {
 
 class OperationService {
  public:
-  OperationService(OpenAiService& service, const Incarnation& incarnation, OperationServiceOptions options);
+  OperationService(const Incarnation& incarnation, OperationServiceOptions options);
   /// Cancels every running attempt (as the server stopping) and waits for their workers.
   ~OperationService();
   OperationService(const OperationService&) = delete;
   OperationService& operator=(const OperationService&) = delete;
 
+  /// Serves `api` through `adapter`; before the server starts.
+  void AddApi(std::string api, OperationApi adapter);
   void Register(HttpServer& server);
   /// The contract's "operations" section (GET /v1/halo/contract).
   [[nodiscard]] json::Value Contract() const;
@@ -76,7 +79,7 @@ class OperationService {
   HttpResponse Observe(const Operations::Ref& ref, std::size_t from);
   void DropReleased();
 
-  OpenAiService& svc_;
+  std::map<std::string, OperationApi> apis_;
   const Incarnation& inc_;
   const OperationServiceOptions opt_;
   Operations ops_;

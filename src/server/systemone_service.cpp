@@ -38,4 +38,49 @@ void RegisterSystemOne(HttpServer& server, DecisionEngine& engine, DeciderGate* 
   });
 }
 
+OperationApi SystemOneOperationAdapter(DecisionEngine& engine, DeciderGate* gate) {
+  auto own = gate ? nullptr : std::make_shared<DeciderGate>();
+  DeciderGate* g = gate ? gate : own.get();
+  OperationApi a;
+  a.prepare = [](const json::Value& body, const HttpRequest&, std::string* error) -> std::optional<OperationApi::Prepared> {
+    auto request = decide::ParseRequest(body, error);
+    if (!request) return std::nullopt;
+    return OperationApi::Prepared{std::make_shared<decide::Request>(std::move(*request)), 0};
+  };
+  a.run = [&engine, g, own](std::shared_ptr<void> p, const OperationHooks& hooks) -> std::optional<HttpResponse> {
+    const auto& request = *std::static_pointer_cast<decide::Request>(p);
+    if (hooks.admitted) hooks.admitted({});
+    if (hooks.cancelled && hooks.cancelled()) {
+      if (hooks.done) hooks.done({json::Value::Null(), "", "cancelled", 0, 0, 0, 0});
+      return std::nullopt;
+    }
+    std::optional<json::Value> answer;
+    std::string error, gate_error;
+    double ms = 0;
+    const bool ran = g->Run(
+        [&] {
+          const auto start = std::chrono::steady_clock::now();
+          answer = engine.Evaluate(request, &error);
+          ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        },
+        &gate_error);
+    OperationHooks::End end;
+    if (!ran) {
+      end.error = "the decider could not run: " + gate_error, end.finish = "error";
+    } else if (!answer) {
+      end.error = error, end.finish = "error";
+    } else {
+      answer->set("latency_ms", json::Value::Float(std::round(ms * 100.0) / 100.0));
+      if (const auto* u = answer->find("usage"))
+        if (const auto* in = u->find("input_tokens")) end.prompt_tokens = static_cast<std::uint64_t>(in->number());
+      end.final = std::move(*answer);
+      end.finish = "stop";
+      end.engine_ms = ms;
+    }
+    if (hooks.done) hooks.done(std::move(end));
+    return std::nullopt;
+  };
+  return a;
+}
+
 }  // namespace halo::server

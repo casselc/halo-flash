@@ -73,7 +73,7 @@ digest, so a later submit naming another digest is a conflict.
 | status | `GET /v1/operations/{op}/{attempt}` | see below |
 | fetch | `GET /v1/operations/{op}/{attempt}/result` | the result body and usage, while held |
 | observe | `GET /v1/operations/{op}/{attempt}/stream?from=<event>` | SSE from an event offset while the body is held; 410 with the status afterwards. Leaving is an observer departing, never a cancel. Partial tokens are observations, not receipts. |
-| cancel | `POST /v1/operations/{op}/{attempt}/cancel` | `cancelled_before_accept` (the id is tombstoned: a later submit is a no-op); `stopping` (finishes at the next unit boundary as `done`, finish `cancelled`, with its actual usage); or the current terminal status |
+| cancel | `POST /v1/operations/{op}/{attempt}/cancel` | `cancelled_before_accept` (the id is tombstoned: a later submit is a no-op); `running` with `cancel_requested: true` (it finishes at the next unit boundary as `done`, finish `cancelled`, with its actual usage); or the current terminal status |
 | ack | `POST /v1/operations/{op}/{attempt}/ack` | the platform has durably committed the result: halo releases the body and keeps the outcome until the tombstone is pruned |
 
 **Status answers.**
@@ -320,7 +320,22 @@ held or not, captured or unknown. Ours covers what that abstraction assumes atom
    - **Observation.** The stream's events (the chunks a streaming request would get) are kept with the held body.
      `?from=N` replays from event N, then follows to the end, then sends an `event: status` frame. An observer
      leaving cancels nothing.
-   - **Scope today:** the completions and chat APIs.
+   - **APIs** (`"api"` in the submit; the contract lists them). Each runs through an adapter
+     (`server/operation_api.hpp`) that the API's service registers:
+     - `completions`, `chat` and `responses` (OpenAiService);
+     - `messages` (AnthropicService);
+     - `systemone` (the decider, when one is loaded).
+
+     The result is the API's own final object, and the observation stream is in that API's frame format (Responses
+     and Messages events carry their `event:` names).
+     - A `responses` operation may continue from a stored response with `previous_response_id`. It is not stored
+       itself: its result is the operation's.
+     - A `systemone` operation is one evaluation, a single unit of GPU work. A cancel that arrives while it runs
+       takes effect after it, and the attempt finishes `done`. Its usage is the answer's `input_tokens` as
+       `prompt_tokens`, and the evaluation's length as `engine_ms`.
+     - `halo_serve` now stops the operation service (cancelling and joining its workers) before it releases the
+       generator and the decider. Stage 3 released the generator first, which could pull it out from under a
+       running operation at shutdown.
    - **`engine_ms`** is the request's share of every unit of GPU work it took part in: a unit's measured length
      divided by its participants. A prefill slice is one request's; a batched decode unit is split. The unit a
      request finishes in counts up to its finish.
