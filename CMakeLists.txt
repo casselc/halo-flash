@@ -60,6 +60,7 @@ add_library(halo_server STATIC
   src/server/http.cpp
   src/server/incarnation.cpp
   src/server/contract.cpp
+  src/server/operations.cpp
   src/server/turn.cpp
   src/server/openai_service.cpp
   src/server/anthropic_request.cpp
@@ -249,7 +250,8 @@ if(HALO_BUILD_TESTS)
     tests/server/decode_loop_test.cpp
     tests/server/scheduler_test.cpp
     tests/server/scheduler_replay_test.cpp
-    tests/server/serving_replay_test.cpp)
+    tests/server/serving_replay_test.cpp
+    tests/server/operations_test.cpp)
   target_link_libraries(server_tests PRIVATE halo_server)
   target_compile_definitions(server_tests PRIVATE
     HALO_SERVER_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/server/data")

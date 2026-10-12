@@ -271,8 +271,25 @@ held or not, captured or unknown. Ours covers what that abstraction assumes atom
    - The server suite passes under ASan (99 tests).
    - A live `halo_serve` on the small model answered the contract, a 404 and a completion with the same
      incarnation and an increasing `Halo-Time`.
-2. **Operation keys in the scheduler**: binding digests, the incarnation and deadline checks, tombstones, retention
-   reservation, the capture window, and ack release.
+2. **Operation records**: binding digests, the incarnation and deadline checks, tombstones, retention
+   reservation, the capture window, and ack release. **Done** (`src/server/operations.{hpp,cpp}`).
+   - **A class of its own, `Operations`, not the scheduler's key table.** The record rules (tombstones, digests,
+     the window, release on ack) share nothing with key replay, and are kept in one place. An accepted attempt still
+     executes as an ordinary request through the scheduler's admission and fairness (stage 3).
+   - The caller passes the time (the incarnation's clock). One mutex.
+   - Status, cancel and ack are answered against the deadline the verb carries.
+   - A record is pruned at the first verb after its not-after, once its outcome (if it ran) was acknowledged.
+   - **Tests.** Eight directed tests, one per rule. `OperationsModel.PropertiesHoldUnderTheModelsActions` is a Hegel
+     state machine with the model's actors:
+     - a platform that keeps the contract's rules, crashing and losing what it fetched;
+     - a network that loses, delays and duplicates every verb;
+     - the executor, which finishes attempts (cancelled ones with their usage) and restarts under a new incarnation.
+
+     After each action it checks runsOnce, accounted, neverAcceptedTrue, noReceiptLost, promiseKept, the record
+     ceiling and the retention budget. 2,000 cases; 14 positive-control situations, each reached in every run.
+   - Mutants `opapi-ops-*`, one per executor rule (fence, deadline, prune, expired outcome, reserve, erase for room,
+     cancel tombstone, capture window, digest): 9 of 9 killed.
+   - The server suite passes under ASan and TSan (108 tests).
    - Tested with a Hegel state machine against `operation.qnt`'s executor actions, as the G3 scheduler is.
    - Each model mutant becomes a `tests/mutants.toml` entry.
    - Measure refusals and reserved versus used bytes on the 8-agent pool.

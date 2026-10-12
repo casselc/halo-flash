@@ -3834,3 +3834,121 @@ suite = "cpu-asan"
 binary = "server_tests"
 filter = "Http.IncarnationsAreRandomAndTheirClocksNeverRunBackward"
 why = "every process gets the same incarnation, so a restart is invisible"
+
+# The operation records (src/server/operations.cpp; model spec/operation/operation.qnt): one mutant per executor rule.
+[[mutant]]
+name = "opapi-ops-no-fence"
+file = "src/server/operations.cpp"
+find = '''Operations::Answer Operations::Submit(const Ref& ref, std::uint64_t reserve_bytes, std::int64_t now) {
+  std::lock_guard<std::mutex> lk(mu_);
+  Sweep(now);
+  Answer a;
+  if (ref.incarnation != incarnation_) {'''
+replace = '''Operations::Answer Operations::Submit(const Ref& ref, std::uint64_t reserve_bytes, std::int64_t now) {
+  std::lock_guard<std::mutex> lk(mu_);
+  Sweep(now);
+  Answer a;
+  if (false) {'''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationsModel.*"
+why = "model noFence: a submit meant for an earlier incarnation starts the attempt again in this one"
+
+[[mutant]]
+name = "opapi-ops-no-deadline"
+file = "src/server/operations.cpp"
+find = '  if (now > ref.not_after) return a.verdict = Verdict::kLate, a;'
+replace = ''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationsModel.*"
+why = "model noDeadline: a late copy is accepted after the attempt's record was pruned"
+
+[[mutant]]
+name = "opapi-ops-prune-early"
+file = "src/server/operations.cpp"
+find = '    if (settled && now > r.not_after) it = recs_.erase(it);'
+replace = '    if (settled) it = recs_.erase(it);'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationsModel.*"
+why = "model pruneEarly: a duplicate copy is accepted again once the record is pruned before its not-after"
+
+[[mutant]]
+name = "opapi-ops-drop-expired-outcome"
+file = "src/server/operations.cpp"
+find = '''      r.st = St::kExpired;
+      r.acked = false;'''
+replace = '''      r.st = St::kExpired;
+      r.acked = true;'''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationsModel.*"
+why = "model dropExpiredOutcome: an expired outcome is pruned unacknowledged, and an attempt that ran reads closed"
+
+[[mutant]]
+name = "opapi-ops-no-reserve"
+file = "src/server/operations.cpp"
+find = '  if (reserved_ + reserve_bytes > opt_.budget_bytes) {'
+replace = '  if (false) {'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationsModel.*"
+why = "model noReserve: running attempts' results are not reserved, so finished results overflow the budget"
+
+[[mutant]]
+name = "opapi-ops-erase-for-room"
+file = "src/server/operations.cpp"
+find = '''  if (ref.not_after > now + opt_.max_submit_age_ms) return a.verdict = Verdict::kTooFarAhead, a;
+  if (recs_.size() >= opt_.max_records) {
+    a.verdict = Verdict::kRefusedRecords;
+    a.retry_after_s = opt_.retry_after_s;
+    return a;
+  }
+  if (reserved_'''
+replace = '''  if (ref.not_after > now + opt_.max_submit_age_ms) return a.verdict = Verdict::kTooFarAhead, a;
+  if (recs_.size() >= opt_.max_records) {
+    for (auto it = recs_.begin(); it != recs_.end(); ++it)
+      if (it->second.st != St::kRunning && it->second.st != St::kDone) {
+        recs_.erase(it);
+        break;
+      }
+  }
+  if (reserved_'''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationsModel.*:Operations.AtTheRecordCeilingItRefusesAndErasesNothing"
+why = "model eraseForRoom: at the ceiling a tombstone is erased to make room, so a late copy runs or a run attempt reads closed"
+
+[[mutant]]
+name = "opapi-ops-cancel-untombed"
+file = "src/server/operations.cpp"
+find = '''  r.st = St::kCancelled;
+  r.not_after = ref.not_after;
+  r.digest = ref.digest;
+  a.view = ViewOf(recs_.emplace(ref.id, std::move(r)).first->second);'''
+replace = '''  a.view.status = Status::kCancelledBeforeAccept;'''
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationsModel.*"
+why = "model cancelUntombed: cancelled_before_accept is answered without a tombstone, and a late copy runs after it settled at 0"
+
+[[mutant]]
+name = "opapi-ops-expire-early"
+file = "src/server/operations.cpp"
+find = '    if (r.st == St::kDone && now >= r.done_at + opt_.capture_ms) {'
+replace = '    if (r.st == St::kDone && now > r.done_at) {'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "OperationsModel.*"
+why = "model promise: a body is released inside its capture window"
+
+[[mutant]]
+name = "opapi-ops-digest-ignored"
+file = "src/server/operations.cpp"
+find = '    a.verdict = it->second.digest == ref.digest ? Verdict::kDuplicate : Verdict::kConflict;'
+replace = '    a.verdict = Verdict::kDuplicate;'
+suite = "cpu-asan"
+binary = "server_tests"
+filter = "Operations.*"
+why = "a submit naming another request under an accepted attempt's identity is taken as a duplicate"
