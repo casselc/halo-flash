@@ -58,6 +58,8 @@ add_library(halo_server STATIC
   src/server/openai_request.cpp
   src/server/openai_response.cpp
   src/server/http.cpp
+  src/server/incarnation.cpp
+  src/server/contract.cpp
   src/server/turn.cpp
   src/server/openai_service.cpp
   src/server/anthropic_request.cpp

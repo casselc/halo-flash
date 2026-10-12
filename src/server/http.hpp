@@ -142,6 +142,10 @@ struct HttpServerOptions {
   /// at the path (another server answers a connect) refuses the start; Stop() unlinks the path only while it is
   /// still this server's socket (same inode).
   std::string unix_path;
+  /// Called on the headers of every answer this server writes (handled, refused at the API key, parse errors, too
+  /// many connections), just before its head is sent: the operation contract's Halo-Incarnation and Halo-Time
+  /// (docs/OPERATIONS.md section 2).
+  std::function<void(std::vector<std::pair<std::string, std::string>>&)> stamp;
 };
 
 class HttpServer {
@@ -175,6 +179,7 @@ class HttpServer {
   void AcceptLoop();
   void Serve(int fd);
   HttpResponse Dispatch(const HttpRequest& req);
+  [[nodiscard]] HttpResponse Stamped(HttpResponse r) const;
 
   HttpServerOptions opt_;
   std::map<std::pair<std::string, std::string>, HttpHandler> routes_;

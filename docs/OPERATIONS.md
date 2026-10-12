@@ -258,7 +258,19 @@ held or not, captured or unknown. Ours covers what that abstraction assumes atom
 ## 8. Implementation order (after agreement)
 
 1. **Incarnation, time and contract.** `Halo-Incarnation` and `Halo-Time` on every answer, and
-   `GET /v1/halo/contract`. Small; cordis can start recording them at once.
+   `GET /v1/halo/contract`. Small; cordis can start recording them at once. **Done.**
+   - Every answer the HTTP server writes is stamped: handled, refused at the API key, routing errors, parse errors
+     and the connection limit's 503 (`HttpServerOptions::stamp`). The admin socket is stamped too.
+   - Until stage 3, the contract's `operations` is `null`: the header contract is the one in force. `inference.mode`
+     is advertised already, from `--batch-relaxed`.
+   - The clock starts when the server is assembled, after the weights load.
+   - Tests: `Http.IncarnationsAreRandomAndTheirClocksNeverRunBackward`,
+     `Http.EveryAnswerNamesTheIncarnationAndItsClock`,
+     `Http.TheContractNamesTheIncarnationItsClockAndTheInferenceMode`.
+   - Mutants `opapi-*`, 5 of 5 killed.
+   - The server suite passes under ASan (99 tests).
+   - A live `halo_serve` on the small model answered the contract, a 404 and a completion with the same
+     incarnation and an increasing `Halo-Time`.
 2. **Operation keys in the scheduler**: binding digests, the incarnation and deadline checks, tombstones, retention
    reservation, the capture window, and ack release.
    - Tested with a Hegel state machine against `operation.qnt`'s executor actions, as the G3 scheduler is.
