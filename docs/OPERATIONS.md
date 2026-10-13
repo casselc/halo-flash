@@ -15,7 +15,7 @@ Revision 2 followed the third review of revision 1 (58e60d3). Changes:
 - a refusal closes only its copy;
 - cancellation is a message, and `on_detach` is gone;
 - retention is reserved when a submit is accepted;
-- usage is disjoint, and the repeat guarantee is corrected.
+- usage is defined (prompt includes cached), and the repeat guarantee is corrected.
 
 ## 1. Why
 
@@ -119,7 +119,11 @@ would answer it, settled at the worst case.
 
 ## 4. Usage and execution modes
 
-- **Usage is `{prompt, cached, completion}`, all disjoint.**
+- **Usage is `{prompt, cached, completion}`.** `prompt_tokens` is the whole prompt, and `cached_tokens` is the part of
+  it served from the prefix cache, so `cached ≤ prompt`. `completion` is disjoint from both. What an attempt
+  processed is `prompt + completion`; an earlier revision of this section called all three disjoint, which the
+  server never did (measured 2026-10-13: a repeated 321-token prompt answered `prompt_tokens: 321,
+  cached_tokens: 256`).
   - `completion` counts every token this attempt decoded, delivered or not; a cancelled attempt included.
   - There is no `discarded`: an attempt executes at most once, so its usage is all of its work.
   - Token counts are the accounting unit. `engine_ms`, the engine time attributed to the attempt, is reported as a
