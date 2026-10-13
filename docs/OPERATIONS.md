@@ -391,6 +391,21 @@ held or not, captured or unknown. Ours covers what that abstraction assumes atom
      - **Cordis 868d14e fixes both**: ids salted with the journal's store identity, and the HALO_URL-mode counts.
        Its `milestone.sh` unmodified, three runs against one halo process: 3 of 3 passed. Halo held 1, 2, then 3
        records, so each fresh journal's operations were distinct, with no conflict.
+     - **Closeout at cordis 08e1ff9** (the reviewer's two crash windows fixed: the ack obligation commits with the
+       answer, and expired usage is journaled before its ack). Against main 65eb6d1 on the real model:
+       - Cordis's `milestone.sh` unmodified, with `HALO_URL`, `HALO_REV`, `HALO_MODEL` and `MILESTONE_MANIFEST`:
+         3 of 3. Each run left a `manifest.json` pinning cordis 08e1ff9 (clean), halo 65eb6d1, the model file and
+         the contract as answered.
+       - **The full fault matrix through the actual adapter.** `tools/op_fault_proxy.py` stands in front of the real
+         `halo_serve` and speaks the stand-in's admin interface; `/admin/restart` restarts the process for real.
+         The milestone ran its fault schedule through it: 3 of 3 passed. In every run the proxy recorded each fault
+         firing: delayed, duplicated and lost-answer submits, a forced expiry settled at its usage (a second attempt
+         shipped: 2 generations, settled 173), a lost ack answer, and a real halo restart.
+         - The milestone copy differs from cordis's in four places, all in the stream directory MS
+           (`milestone_proxy.08e.sh`): real-model counts; admin timeout 300 s (a restart takes about 30 s); the
+           restart after the 2nd crash (the real critic passes in 3); and the faults stacked onto the one critic
+           operation.
+         - Halo ran with `--op-capture-s 2`.
      - **The fault probe on the real model** (seed 3): 16 of 16 operations committed over 3 incarnations, 0
        failures. It reached cancels before acceptance and while running, expiry, lost acks, duplicates, `closed`
        and `unknown` after restarts.
