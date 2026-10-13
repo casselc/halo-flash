@@ -376,5 +376,20 @@ held or not, captured or unknown. Ours covers what that abstraction assumes atom
      - Positive control: the same probe against a server built with `opapi-ops-cancel-untombed` failed ("a copy
        was accepted after cancelled_before_accept").
      - This is halo's side of the RFC 0007 milestone; the milestone itself runs cordis's adapter against it.
+   - **RFC 0007 milestone on the real model** (2026-10-12). Cordis ea32902 (engine, outbox adapter, journal) against
+     `halo_serve` at main df4b6e8, Qwen3.8-Flash-Next UD-Q4_K_XL, `milestone.sh` with `HALO_URL`. Evidence is in the
+     stream directory MS.
+     - **As shipped it fails, for two reasons on cordis's side.** Halo's answers were correct in both.
+       - Its counts are the stand-in's. The stand-in fails the critic twice; the real model answered `LGTM` at
+         once (86 tokens), so the run had 3 engine crashes and 1 critic computation, not at least 4 and exactly 3.
+       - Its operation ids repeat across fresh journals. A second run reused (owner, op, attempt 0) with another
+         not-after, so another digest, and halo answered 409 `conflict` while the first run's record was held.
+         RFC 0007 says ids are never reused.
+     - **With only those two counts relaxed, and a fresh halo per run, 3 of 3 runs passed.** Each shipped after 3
+       engine crashes with one done attempt for its one computation (settled 87), nothing unacknowledged at halo, no
+       acks owed, no deliveries pending and the audit clean.
+     - **The fault probe on the real model** (seed 3): 16 of 16 operations committed over 3 incarnations, 0
+       failures. It reached cancels before acceptance and while running, expiry, lost acks, duplicates, `closed`
+       and `unknown` after restarts.
 4. **Cordis's adapter** moves to the verbs (commit before ack, receipt dedup), and the header rules
    (`observe_report.qnt`, `observe_forget.qnt`) retire for it.
