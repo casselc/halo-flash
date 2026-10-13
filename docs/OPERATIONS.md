@@ -54,6 +54,16 @@ server remembers for a bounded time. Today:
   - Halo rejects a `not_after` more than `max_submit_age_s` (proposed 600 s) ahead.
   - **A restart restarts the clock with a new incarnation, so a deadline never outlives its clock.** This holds
     whether the platform and halo share a host or not.
+- **What a caller can resolve.** An attempt's usage can be read by status and result until it is acknowledged, but
+  only while this incarnation lives. A caller that settles cost from halo's records (yard's broker resolving a lost
+  answer, yard `design/AGENT-OPERATIONS.md` section 6) must treat these as unresolvable:
+  - an `unknown` after a restart;
+  - a `closed` after the deadline;
+  - a `never_accepted` past the deadline.
+
+  It keeps its conservative charge for such a call and never waits for an exact one. A caller whose own clock must
+  survive its restarts while keeping its incarnation cannot reuse this clock scheme; yard's Yard-Time is a
+  persistent logical clock for that reason.
 
 ## 3. Verbs
 
