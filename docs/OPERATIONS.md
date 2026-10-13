@@ -388,6 +388,9 @@ held or not, captured or unknown. Ours covers what that abstraction assumes atom
      - **With only those two counts relaxed, and a fresh halo per run, 3 of 3 runs passed.** Each shipped after 3
        engine crashes with one done attempt for its one computation (settled 87), nothing unacknowledged at halo, no
        acks owed, no deliveries pending and the audit clean.
+     - **Cordis 868d14e fixes both**: ids salted with the journal's store identity, and the HALO_URL-mode counts.
+       Its `milestone.sh` unmodified, three runs against one halo process: 3 of 3 passed. Halo held 1, 2, then 3
+       records, so each fresh journal's operations were distinct, with no conflict.
      - **The fault probe on the real model** (seed 3): 16 of 16 operations committed over 3 incarnations, 0
        failures. It reached cancels before acceptance and while running, expiry, lost acks, duplicates, `closed`
        and `unknown` after restarts.
